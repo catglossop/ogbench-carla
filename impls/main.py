@@ -9,7 +9,7 @@ import numpy as np
 import tqdm
 import wandb
 from absl import app, flags
-from agents import agents
+from jax_agents import agents
 from ml_collections import config_flags
 from utils.datasets import Dataset, GCDataset, HGCDataset
 from utils.env_utils import make_env_and_datasets
@@ -39,7 +39,7 @@ flags.DEFINE_integer('video_episodes', 1, 'Number of video episodes for each tas
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
 
-config_flags.DEFINE_config_file('agent', 'agents/gciql.py', lock_config=False)
+config_flags.DEFINE_config_file('agent', 'jax_agents/gciql.py', lock_config=False)
 
 
 def main(_):
@@ -60,7 +60,7 @@ def main(_):
     dataset_class = {
         'GCDataset': GCDataset,
         'HGCDataset': HGCDataset,
-    }[config['dataset_class']]
+    }.get(config['dataset_class'], )
     train_dataset = dataset_class(Dataset.create(**train_dataset), config)
     if val_dataset is not None:
         val_dataset = dataset_class(Dataset.create(**val_dataset), config)

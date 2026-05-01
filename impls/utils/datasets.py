@@ -145,6 +145,45 @@ class ReplayBuffer(Dataset):
         """Clear the replay buffer."""
         self.size = self.pointer = 0
 
+    def save(self, path):
+        """Save the (filled portion of the) buffer to a single ``.npz`` file.
+
+        Only the first ``self.size`` transitions are saved. ``path`` may be a
+        string or :class:`pathlib.Path` and is created (parents included) if missing.
+        ``.npz`` is appended if missing.
+        """
+        import os
+
+        path = str(path)
+        if not path.endswith('.npz'):
+            path = path + '.npz'
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        truncated = jax.tree_util.tree_map(lambda arr: np.asarray(arr[: self.size]), self._dict)
+        np.savez_compressed(path, **truncated)
+        return path
+
+    @classmethod
+    def load(cls, path, max_size=None):
+        """Load a buffer previously written by :meth:`save`.
+
+        ``max_size`` defaults to the loaded length; pass a larger value to leave
+        room for further appends.
+        """
+        with np.load(path, allow_pickle=False) as data:
+            arrays = {k: np.array(data[k]) for k in data.files}
+        first_len = max(arr.shape[0] for arr in arrays.values())
+        if max_size is None:
+            max_size = first_len
+        if max_size < first_len:
+            raise ValueError(f'max_size={max_size} smaller than loaded length {first_len}')
+        buffer_dict = {k: np.zeros((max_size,) + arr.shape[1:], dtype=arr.dtype) for k, arr in arrays.items()}
+        for k, arr in arrays.items():
+            buffer_dict[k][:first_len] = arr
+        buf = cls(buffer_dict)
+        buf.size = first_len
+        buf.pointer = first_len % max_size
+        return buf
+
 
 @dataclasses.dataclass
 class GCDataset:

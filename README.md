@@ -28,6 +28,8 @@
 
 </div>
 
+## NOTE: This version of the repo is for use with CARLA and requires some additional steps to work correctly. Please refer to [this README](https://github.com/catglossop/ogbench-carla/tree/master/ogbench/carla/README.md) for instructions. 
+
 # Overview
 
 OGBench is a benchmark designed to facilitate algorithms research in offline goal-conditioned reinforcement learning (RL),

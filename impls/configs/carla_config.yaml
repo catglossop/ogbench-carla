@@ -1,0 +1,31 @@
+# CARLA / Bench2Drive runtime configuration.
+#
+# Routes are NOT specified here. Pick a route on the command line:
+#   --route=parking-cut-in-001        (scenario-style name)
+#   --route=bench2drive_007           (file basename)
+#   --route=1711                      (XML <route id="...">)
+# See `python impls/main_carla.py --list_routes=true` for the full list.
+#
+# CARLA Python API + navigation agents live under PythonAPI/carla. Export before Python starts:
+#   export CARLA_PYTHON_API_ROOT=/home/carla/carla-0-9-16/PythonAPI/carla
+# or:
+#   export CARLA_ROOT=/home/carla/carla-0-9-16
+
+host: localhost
+port: 2000
+traffic_manager_port: 8000
+traffic_manager_seed: 0
+debug: 0
+record: ''
+timeout: 600.0
+
+# Leaderboard agent module: defaults to ogbench.carla.leaderboard_agents.observation_only
+# (registers a small sensor suite and never produces controls; the gym wrapper drives).
+track: SENSORS
+resume: False
+checkpoint: ./simulation_results.json
+debug_checkpoint: ./live_results.txt
+gpu_rank: 1
+
+repetitions: 1
+repetition_index: 0

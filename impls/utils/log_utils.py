@@ -54,8 +54,19 @@ def get_flag_dict():
     """Return the dictionary of flags."""
     flag_dict = {k: getattr(flags.FLAGS, k) for k in flags.FLAGS if '.' not in k}
     for k in flag_dict:
-        if isinstance(flag_dict[k], ml_collections.ConfigDict):
-            flag_dict[k] = flag_dict[k].to_dict()
+        value = flag_dict[k]
+        if isinstance(value, ml_collections.ConfigDict):
+            try:
+                value = value.to_dict()
+            except Exception:
+                # Unresolved placeholders (e.g. _ErrorConfig) can fail conversion.
+                value = str(value)
+        try:
+            import json
+            json.dumps(value)
+            flag_dict[k] = value
+        except Exception:
+            flag_dict[k] = str(value)
     return flag_dict
 
 

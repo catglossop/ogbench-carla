@@ -1,0 +1,8 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/pyright/main/packages/vscode-pyright/schemas/pyrightconfig.schema.json",
+  "venvPath": ".",
+  "venv": ".venv",
+  "extraPaths": ["/home/carla/carla-0-9-16/PythonAPI/carla"],
+  "stubPath": "",
+  "reportMissingImports": true
+}
