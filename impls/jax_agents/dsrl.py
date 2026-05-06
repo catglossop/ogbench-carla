@@ -13,10 +13,12 @@ something easy to read, run online, and extend:
 * **Stochastic noise actor** ``pi_psi(z|s)`` -- a tanh-squashed diagonal Gaussian
   whose samples ``z`` seed the flow.
 * **Critic ensemble** ``Q_theta(s, a)`` (size 2 by default) with a target copy.
-* Optional **SteerVLA hookup**: pass ``vla_actor`` (a callable
-  ``(obs_batch, noise_batch) -> action_batch``) into :meth:`DSRLAgent.create`
-  and the BC flow integration is replaced by that callable; useful when you have
-  a pretrained OpenPI / SteerVLA flow you want to keep frozen.
+* Optional **SteerVLA hookup**: pass ``vla_sample_fn`` (a callable
+  ``(obs_batch, noise_batch) -> action_batch``) into :meth:`DSRLAgent.create`.
+  :meth:`DSRLAgent.sample_actions_with_vla` uses it **instead of** Euler integration
+  through the learned BC flow for environment rollouts. The ``FlowActor`` submodule
+  stays in the network (Flax init calls ``flow(enc, x_t, t)``) and is still trained
+  via ``flow_loss`` and used in critic / actor targets through :meth:`_flow_sample`.
 
 Things deliberately omitted vs. the paper that you can add later:
 
@@ -177,7 +179,7 @@ class DSRLAgent(flax.struct.PyTreeNode):
         return actions
 
     def sample_actions_with_vla(self, observations, seed=None, temperature=1.0):
-        """When ``vla_sample_fn`` is provided, replace the JAX flow with the VLA call."""
+        """Rollout path only: when ``vla_sample_fn`` is set, map noise through VLA instead of BC flow."""
         if self.vla_sample_fn is None:
             return self.sample_actions(observations, seed=seed, temperature=temperature)
         seed = seed if seed is not None else self.rng
@@ -315,6 +317,8 @@ class DSRLAgent(flax.struct.PyTreeNode):
         ex_embedded = jnp.zeros(batch_shape + (embed_dim,), dtype=jnp.float32)
         ex_t = jnp.zeros(batch_shape + (1,), dtype=jnp.float32)
 
+        # BC flow-matching head must stay a Flax module: init calls ``flow(enc, x_t, t)``.
+        # OpenPI SteerVLA hooks only via ``vla_sample_fn`` (see ``sample_actions_with_vla``).
         flow_def = FlowActor(
             hidden_dims=tuple(config["flow_hidden_dims"]),
             action_dim=action_dim,
@@ -389,6 +393,11 @@ def get_config():
             warmup_steps=1000,
             updates_per_step=1,
             buffer_capacity=100_000,
+            # W&B: when ``observation_mode`` is ``image``, log ``rollout/curr_obs`` every N env steps.
+            image_log_curr_interval=1000,
+            # Pin JAX/XLA default GPU for RL (CARLA sim uses ``gpu_rank`` in carla_config.yaml).
+            # ``-1`` = do not override (JAX picks as usual).
+            training_gpu_rank=-1,
             # Ignored by DSRL but populated for symmetry with other agents.
             frame_stack=ml_collections.config_dict.placeholder(int),
             dataset_class="GCDataset",

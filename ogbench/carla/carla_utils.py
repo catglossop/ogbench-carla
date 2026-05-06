@@ -12,8 +12,11 @@ Public surface (intentionally small):
   latest sensor dict on ``info``.
 * :func:`run_leaderboard` -- escape hatch for the standard multi-route benchmark.
 
-Action space: ``Box(-1, 1, shape=(2,))`` interpreted as ``[accel, steer]``;
-positive ``accel`` becomes throttle, negative becomes brake.
+Action space: by default ``Box(-1, 1, shape=(2,))`` as ``[accel, steer]`` (positive
+``accel`` → throttle, negative → brake). When ``carla_config["steervla_action_execution"]``
+is set (see ``impls/main_carla.py`` with SteerVLA DSRL), the space becomes the flattened
+OpenPI trajectory chunk ``action_horizon * action_dim`` (normalized model outputs or policy
+space); controls follow ``simlingo/team_code/agent_steervla.py`` cumsums + PID.
 
 Observation:
 
@@ -100,6 +103,25 @@ from ogbench.carla.leaderboard_agents.observation_only import (
 # 3 velocity, 3 angular velocity, 3 acceleration, 1 speed, 3 last-applied control.
 STATE_DIM = 19
 ACTION_DIM = 2
+
+# Indices into ``obs["state"]`` for :func:`_ego_state_vector` (length :data:`STATE_DIM`).
+EGO_STATE_IDX_SPEED = 15
+EGO_STATE_IDX_THROTTLE = 16
+EGO_STATE_IDX_STEER = 17
+EGO_STATE_IDX_BRAKE = 18
+
+
+def ego_drive_metrics_from_state_vec(state: Any) -> Dict[str, float]:
+    """Speed (m/s) and last-applied CARLA ``VehicleControl`` from gym ``obs['state']``."""
+    s = np.asarray(state, dtype=np.float32).reshape(-1)
+    if s.size < STATE_DIM:
+        raise ValueError(f"ego state vector expected length >= {STATE_DIM}, got {s.size}")
+    return {
+        "ego_speed": float(s[EGO_STATE_IDX_SPEED]),
+        "control_throttle": float(s[EGO_STATE_IDX_THROTTLE]),
+        "control_steer": float(s[EGO_STATE_IDX_STEER]),
+        "control_brake": float(s[EGO_STATE_IDX_BRAKE]),
+    }
 
 
 def _zeros_rgb_image() -> np.ndarray:
@@ -301,7 +323,16 @@ def run_leaderboard(args: SimpleNamespace) -> bool:
     Returns ``True`` if the run crashed fatally.
     """
     statistics_manager = StatisticsManager(args.checkpoint, args.debug_checkpoint)
+    
+    prev_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_rank)
     leaderboard_evaluator = LeaderboardEvaluator(args, statistics_manager)
+    if prev_cuda_visible_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible_devices
+    else:
+        del os.environ["CUDA_VISIBLE_DEVICES"]
+    os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible_devices
+
     crashed = leaderboard_evaluator.run(args)
     del leaderboard_evaluator
     return crashed
@@ -382,9 +413,37 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 ),
             }
         )
-        self.action_space = gymnasium.spaces.Box(
-            low=-1.0, high=1.0, shape=(ACTION_DIM,), dtype=np.float32
-        )
+        self._steervla_exec_cfg: Optional[Dict[str, Any]] = None
+        self._steervla_decoder: Any | None = None
+        exec_raw = carla_config.get("steervla_action_execution")
+        if isinstance(exec_raw, dict):
+            need = ("output_action_format", "action_horizon", "action_dim", "action_input_space")
+            missing = [k for k in need if k not in exec_raw]
+            if missing:
+                raise ValueError(
+                    "carla_config['steervla_action_execution'] missing keys "
+                    f"{missing}; expected {need}"
+                )
+            ah = int(exec_raw["action_horizon"])
+            ad = int(exec_raw["action_dim"])
+            self._steervla_exec_cfg = exec_raw
+            try:
+                from ogbench.carla.steervla_simlingo_control import SimlingoStyleWaypointDecoder
+
+                self._steervla_decoder = SimlingoStyleWaypointDecoder()
+            except ImportError as e:
+                raise ImportError(
+                    "SteerVLA waypoint decoding failed to load dependencies "
+                    "(needs scipy, carla, openpi for normalized chunks). "
+                    f"Original error: {e}"
+                ) from e
+            self.action_space = gymnasium.spaces.Box(
+                low=-1.0, high=1.0, shape=(ah * ad,), dtype=np.float32
+            )
+        else:
+            self.action_space = gymnasium.spaces.Box(
+                low=-1.0, high=1.0, shape=(ACTION_DIM,), dtype=np.float32
+            )
 
     @property
     def evaluator(self) -> LeaderboardEvaluator:
@@ -399,7 +458,13 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         statistics_manager = StatisticsManager(
             self._args.checkpoint, self._args.debug_checkpoint
         )
+        prev_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(self._args.gpu_rank)
         self._evaluator = LeaderboardEvaluator(self._args, statistics_manager)
+        if prev_cuda_visible_devices is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible_devices
+        else:
+            del os.environ["CUDA_VISIBLE_DEVICES"]
         self._evaluator.manager = SteppableScenarioManager(
             self._args.timeout, statistics_manager, self._args.debug
         )
@@ -574,7 +639,30 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
     def step(
         self, action: np.ndarray
     ) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
-        control = _action_to_control(action)
+        flat = np.asarray(action, dtype=np.float32).reshape(-1)
+        control = None
+        if self._steervla_exec_cfg is not None and self._steervla_decoder is not None:
+            ah = int(self._steervla_exec_cfg["action_horizon"])
+            ad = int(self._steervla_exec_cfg["action_dim"])
+            expected = ah * ad
+            if flat.size == expected:
+                from ogbench.carla.steervla_simlingo_control import maybe_steervla_vehicle_control
+
+                control = maybe_steervla_vehicle_control(
+                    action,
+                    state_vec=self._get_state_vector(),
+                    exec_cfg=self._steervla_exec_cfg,
+                    decoder=self._steervla_decoder,
+                )
+            elif flat.size == ACTION_DIM:
+                control = _action_to_control(action)
+            else:
+                raise ValueError(
+                    f"SteerVLA chunk env expects action length {expected} or legacy {ACTION_DIM}, "
+                    f"got {flat.size}"
+                )
+        if control is None:
+            control = _action_to_control(action)
         self._last_control = control
         self.evaluator.manager.pending_control = control
 

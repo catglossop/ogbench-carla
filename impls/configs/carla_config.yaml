@@ -25,7 +25,9 @@ track: SENSORS
 resume: False
 checkpoint: ./simulation_results.json
 debug_checkpoint: ./live_results.txt
-gpu_rank: 1
+# CARLA UE / rendering adapter index (leaderboard subprocess). JAX RL GPU is separate:
+# set ``training_gpu_rank`` in the agent config (e.g. steervla_dsrl_config.py).
+gpu_rank: 0
 
 repetitions: 1
 repetition_index: 0

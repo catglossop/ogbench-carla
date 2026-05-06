@@ -8,10 +8,17 @@ to plug in a frozen SteerVLA flow.
 Set ``config.observation_mode`` to ``"state"`` (default) or ``"image"`` so DSRL
 reads either the vector ``obs['state']`` or RGB ``obs['image']`` from the CARLA env.
 
-Plugging in SteerVLA is two-line: at agent ``create()`` time, build a callable
-``vla_sample_fn(obs_batch, noise_batch) -> action_batch`` that wraps your
-loaded ``openpi`` policy and pass it to :meth:`DSRLAgent.create`. ``main_carla``
-does this when ``config.steervla.enabled = True`` and a checkpoint is provided.
+Set ``config.training_gpu_rank`` to pin JAX RL and SteerVLA OpenPI checkpoint restore
+to one GPU (``-1`` = default device / GPU 0 for restores). CARLA's sim GPU is ``gpu_rank``
+in ``impls/configs/carla_config.yaml``.
+
+Plugging in SteerVLA Pi0-CoT: set ``config.steervla.enabled`` and checkpoint paths; see
+:class:`vlas.steervla.SteerVLAActor`. ``main_carla`` builds ``vla_sample_fn`` and uses
+:meth:`jax_agents.dsrl.DSRLAgent.sample_actions_with_vla`; the DSRL network still uses an
+internal :class:`jax_agents.dsrl.FlowActor` for init and training losses (SteerVLA is not
+substituted as the Flax ``flow`` module).
+Action-expert-only fine-tuning must be done in OpenPI (``TrainConfig.freeze_filter``),
+not inside DSRL's Flax losses yet.
 """
 
 from __future__ import annotations
@@ -25,24 +32,56 @@ def get_config():
     config = dsrl_agent.get_config()
 
     config.lr = 3e-4
-    config.batch_size = 256
-    config.flow_steps = 5
+    config.batch_size = 1
+    config.flow_steps = 10
     config.noise_scale = 1.0
     config.alpha = 0.1
-    config.warmup_steps = 1000
-    config.updates_per_step = 1
-    config.buffer_capacity = 100_000
+    config.warmup_steps = 0
+    config.updates_per_step = 5
+    config.buffer_capacity = 1_000
+    config.image_log_curr_interval = 10
+    # config.steervla = None
     # DSRL trains on ``observation_mode`` only; env step always returns both keys.
-    config.observation_mode = "state"
-    config.steervla = None
+    config.observation_mode = "image"
+    # JAX RL device: ``-1`` = unset. CARLA uses ``gpu_rank`` in carla_config.yaml.
+    config.training_gpu_rank = 0
 
-    # config.steervla = ml_collections.ConfigDict(
-    #     dict(
-    #         enabled=False,
-    #         actor_config="pi05_steervla_inference",
-    #         checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
-    #         actor_url=None,
-    #     )
-    # )
+    config.steervla = ml_collections.ConfigDict(
+        dict(
+            enabled=True,
+            # Local OpenPI inference (ignored when actor_url is set):
+            actor_config="pi05_steervla_cot_ki",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
+            routing_command="Follow the route and stay in lane.",
+            cot_temperature=0.0,
+            include_ego_history=False,
+            proprio_norm=True,
+            # Replay buffer + CARLA ``step`` use OpenPI chunk layout (``action_horizon`` × ``action_dim``),
+            # executed like ``simlingo/team_code/agent_steervla.py`` (cumsums + PID). Set
+            # ``use_pi_action_chunk_for_env: false`` for legacy ``[accel, steer]`` controls only.
+            use_pi_action_chunk_for_env=True,
+            action_horizon=10,
+            action_dim=4,
+            # Query Pi0-CoT once, then execute this many rows from the returned action chunk
+            # before querying again. Set to 1 to query every env step.
+            actions_per_model_query=5,
+            # Reuse sampled CoT reasoning/subtask for this many env actions before sampling
+            # CoT again. With actions_per_model_query=5, this reuses CoT across two action chunks.
+            actions_per_cot=10,
+            output_action_format="DELTA_XY_T_DELTA_XY_SPACE",
+            sample_actions_num_steps=10,
+            sample_actions_low_memory=False,
+            sample_actions_jit_denoise_steps=False,
+            # ``Pi0CoT.sample_cot`` tuning. Disable reasoning replay for faster batch-1 online inference.
+            cot_jit_decode=False,
+            cot_jit_transformer_forward=True,
+            cot_replay_reasoning=False,
+            # Eager denoise by default (``sample_actions_low_memory=True``). For speed: set
+            # ``sample_actions_low_memory=False`` and ``sample_actions_jit_denoise_steps=True``
+            # (per-step ``nnx.jit``) or both false for outer ``nnx.jit`` (fastest, most VRAM).
+            # Remote HTTP actor (leave unset or falsy for local checkpoint load):
+            # actor_url="http://35.186.30.251:8000",
+        )
+    )
 
     return config

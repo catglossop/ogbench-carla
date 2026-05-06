@@ -31,7 +31,7 @@ classifiers = ["License :: OSI Approved :: MIT License"]
 dynamic = ["description"]
 
 [project.optional-dependencies]
-train = [
+train-gpu = [
     "jax[cuda12] >= 0.4.26",
     "flax >= 0.8.4",
     "distrax >= 0.1.5",
@@ -40,15 +40,29 @@ train = [
     "moviepy",
     "wandb",
 ]
+train-tpu = [
+    "jax[tpu]",
+    "flax >= 0.8.4",
+    "distrax >= 0.1.5",
+    "ml_collections",
+    "matplotlib",
+    "moviepy",
+    "wandb", 
+]
 carla = [
     "bench2drive @ git+https://github.com/catglossop/Bench2Drive.git",
     "openpi @ git+https://github.com/catglossop/steervla-pi.git",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
 ]
 dev = [
     "ruff",
 ]
-all = [
-    "ogbench[train,dev,carla]",
+all-gpu = [
+    "ogbench[train-gpu,dev,carla]",
+]
+all-tpu = [
+    "ogbench[train-tpu,dev,carla]",
 ]
 
 [project.urls]

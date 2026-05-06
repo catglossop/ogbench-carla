@@ -7,7 +7,7 @@ First, you will need to clone the repo and install the environment
 ```
 git clone https://github.com/catglossop/ogbench-carla.git
 cd ogbench-carla
-GIT_LFS_SKIP_SMUDGE=1 uv sync --extra all
+GIT_LFS_SKIP_SMUDGE=1 uv sync --extra all-<gpu, tpu> # choose your platform
 ```
 
 You must also install CARLA. We follow most of the same steps from the Bench2Drive: 
@@ -60,6 +60,27 @@ There are a couple configs to be aware of:
 
 Under `impls/configs`, agent configs can be found. Here, you can specify any arguments related to your RL agent (including SteerVLA configs)
 
+You can also select the kind of observation you want to use ("image" or "state" - note that image generation is slow so the sim runs at about 1/3 of real time)
+
+To use a remote actor, first on your server workstation (or TPU, whatever)
+```
+XLA_PYTHON_CLIENT_MEM_FRACTION="0.95" python impls/vlas/steervla_server.py --actor-config <config_name_from_steervla-pi> --checkpoint <gcs_checkpoint_path>
+```
+To launch on a TPU, you can use:
+```
+cd ~/ogbench-carla/impls/vlas
+./launch_steervla.sh <config_name> <checkpoint_path>
+```
+Change your user name in line 10 of `launch_steervla.sh`. 
+ To get the IP of a TPU, find the external IP on the TPU
+
+ ```
+ gcloud compute tpus tpu-vm describe <tpu-name> \
+    --zone=<zone> \
+    --format="value(networkEndpoints[0].ipAddress)"
+```
+
+Set the `actor_url` in the steervla config (see `impls/configs/steervla_dsrl_config.py` for an example)
 
 ### CARLA config
 
@@ -74,6 +95,30 @@ WANDB_MODE=online uv run python impls/main_carla.py \
   --save_buffer=true \
   --seed=0
 ```
+
+If desired, increase the allowed mem allocation for JAX
+
+```
+XLA_PYTHON_CLIENT_PREALLOCATE="true" \
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 \
+WANDB_MODE=online \
+uv run python impls/main_carla.py \
+  --agent=impls/configs/steervla_dsrl_config.py \
+  --route=parking-cut-in-001 \
+  --online_steps=5000 \
+  --save_buffer=true \
+  --seed=0
+```
+
+There are a couple levers to pull to speed up inference / optimize for memory size: 
+
+- `actions_per_model_query`: int - how many actions in the action chunk to execute open loop (speed)
+- `actions_per_cot`: int - how many actions to execute before getting new CoT (speed)
+- `sample_actions_low_memory`: bool - don't use jitting for action sampling (full loop) (memory - slows down inference)
+- `sample_actions_jit_denoise_steps`: bool - jit each denoising step (speed - uses more memory)
+- `cot_jit_decode`: bool - jit logit decoding (speed - uses memory)
+- `cot_jit_transfomer_forward`: bool - jit forward pass (speed - uses more memory)
+- `cot_replay_reasoning`: bool - replay reasoning for accuracy
 
 
 
