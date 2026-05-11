@@ -44,6 +44,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+import jax
+
+from jax_agents import agents
+from utils.flax_utils import restore_agent
 
 _IMPLS_ROOT = Path(__file__).resolve().parent
 if str(_IMPLS_ROOT) not in sys.path:
@@ -176,15 +180,6 @@ def _list_routes_and_exit() -> None:
         print(f"{e.scenario_name:<48} {e.file_name:<24} {e.route_id:<8} {e.town:<10} {e.scenario_type}")
 
 
-def run_steervla_checkpoint_smoke(*, training_gpu_rank: int = -1) -> None:
-    from vlas.steervla import SteerVLALocalActor
-
-    assert FLAGS.steervla_checkpoint, "steervla_checkpoint must be set"
-    actor = SteerVLALocalActor(FLAGS.steervla_actor_config, FLAGS.steervla_checkpoint)
-    actor.setup(training_gpu_rank=training_gpu_rank)
-    print("[SteerVLA] Checkpoint ready at:", actor.checkpoint_dir, flush=True)
-
-
 def _steervla_action_execution_cfg(steervla_cfg) -> dict[str, Any] | None:
     """Env + replay-buffer layout for OpenPI SteerVLA chunks (simlingo-style control)."""
     if steervla_cfg is None or not steervla_cfg.get("enabled"):
@@ -274,6 +269,7 @@ def run_online_carla(
     agent_config,
     exp_name: str,
     raw_carla_obs_holder: dict | None = None,
+    steervla_actor=None,
 ) -> None:
     import jax
     import tqdm
@@ -292,11 +288,42 @@ def run_online_carla(
     image_curr_interval = int(agent_config.get("image_log_curr_interval", 10))
 
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, "train.csv"))
+
+    def _cot_fields_from_raw(raw: dict | None) -> dict[str, np.ndarray]:
+        if steervla_actor is None or getattr(steervla_actor, "model_cfg", None) is None:
+            return {}
+        rlen = int(steervla_actor.model_cfg.max_reasoning_len)
+        slen = int(steervla_actor.model_cfg.max_subtask_len)
+        out = {
+            "reasoning": np.zeros((rlen,), dtype=np.int32),
+            "reasoning_mask": np.zeros((rlen,), dtype=bool),
+            "subtask": np.zeros((slen,), dtype=np.int32),
+            "subtask_mask": np.zeros((slen,), dtype=bool),
+        }
+        if not isinstance(raw, dict):
+            return out
+        for k, dt in (
+            ("reasoning", np.int32),
+            ("reasoning_mask", bool),
+            ("subtask", np.int32),
+            ("subtask_mask", bool),
+        ):
+            if raw.get(k) is None:
+                continue
+            arr = np.asarray(raw[k], dtype=dt).reshape(-1)
+            n = min(arr.size, out[k].size)
+            out[k][:n] = arr[:n]
+        return out
     
-    if raw_carla_obs_holder is not None and raw_carla_obs_holder.get("obs") is not None:
-        obs_raw = raw_carla_obs_holder["obs"]
+    raw_obs_holder = raw_carla_obs_holder
+
+    if raw_obs_holder is not None and raw_obs_holder.get("obs") is not None:
+        obs_raw = raw_obs_holder["obs"]
     else:
         obs_raw, _info = env.reset(seed=FLAGS.seed)
+    if raw_obs_holder is not None:
+        raw_obs_holder["obs"] = obs_raw
+        raw_obs_holder["next_obs"] = obs_raw
     obs = _extract_agent_obs(env, obs_raw, obs_mode)
     log_images = obs_mode == "image"
     if log_images:
@@ -313,11 +340,16 @@ def run_online_carla(
     example_transition = dict(
         observations=np.array(obs),
         actions=np.zeros((action_dim,), dtype=np.float32),
+        action_chunked=np.zeros((action_dim,), dtype=np.float32),
         rewards=np.float32(0.0),
         next_observations=np.array(obs),
         masks=np.float32(1.0),
         terminals=np.float32(0.0),
     )
+    if steervla_actor is not None:
+        cot0 = _cot_fields_from_raw(obs_raw)
+        example_transition.update(cot0)
+        example_transition.update({f"next_{k}": np.array(v) for k, v in cot0.items()})
     buffer = ReplayBuffer.create(example_transition, size=capacity)
 
     rng = jax.random.PRNGKey(FLAGS.seed + 1)
@@ -325,8 +357,8 @@ def run_online_carla(
     last_log_time = time.time()
 
     for step in tqdm.tqdm(range(1, FLAGS.online_steps + 1), smoothing=0.1, dynamic_ncols=True):
-        if raw_carla_obs_holder is not None:
-            raw_carla_obs_holder["obs"] = obs_raw
+        if raw_obs_holder is not None:
+            raw_obs_holder["obs"] = obs_raw
         rng, sub = jax.random.split(rng)
         if step <= warmup:
             action = env.action_space.sample()
@@ -336,23 +368,28 @@ def run_online_carla(
             else:
                 action_jax = agent.sample_actions(obs[None], seed=sub)
             action = np.asarray(action_jax[0])
-            
-        action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+        
+        action_chunked = np.asarray(action, dtype=np.float32).reshape(-1)
 
         next_obs_raw, reward, terminated, truncated, info = env.step(action)
+        if raw_obs_holder is not None:
+            raw_obs_holder["next_obs"] = next_obs_raw
         drive_metrics = ego_drive_metrics_from_state_vec(next_obs_raw["state"])
         next_obs = _extract_agent_obs(env, next_obs_raw, obs_mode)
         done = bool(terminated or truncated)
         end_img = np.copy(next_obs) if done and log_images else None
         buffer.add_transition(
-            dict(
-                observations=np.asarray(obs),
-                actions=action.astype(np.float32),
-                rewards=np.float32(reward),
-                next_observations=np.asarray(next_obs),
-                masks=np.float32(0.0 if terminated else 1.0),
-                terminals=np.float32(1.0 if done else 0.0),
-            )
+            {
+                "observations": np.asarray(obs),
+                "actions": action.astype(np.float32),
+                "action_chunked": action_chunked.astype(np.float32),
+                "rewards": np.float32(reward),
+                "next_observations": np.asarray(next_obs),
+                "masks": np.float32(0.0 if terminated else 1.0),
+                "terminals": np.float32(1.0 if done else 0.0),
+                **(_cot_fields_from_raw(obs_raw) if steervla_actor is not None else {}),
+                **({f"next_{k}": np.array(v) for k, v in _cot_fields_from_raw(next_obs_raw).items()} if steervla_actor is not None else {}),
+            }
         )
         obs = next_obs
         obs_raw = next_obs_raw
@@ -382,8 +419,10 @@ def run_online_carla(
                 )
             wandb.log(rollout_log, step=step)
             obs_raw, _info = env.reset(seed=FLAGS.seed + episode_count)
-            if raw_carla_obs_holder is not None:
-                raw_carla_obs_holder["obs"] = obs_raw
+            if raw_obs_holder is not None:
+                raw_obs_holder["obs"] = obs_raw
+                raw_obs_holder["next_obs"] = obs_raw
+                
             reset_vla_cache = getattr(getattr(agent, "vla_sample_fn", None), "reset_action_cache", None)
             if reset_vla_cache is not None:
                 reset_vla_cache()
@@ -403,7 +442,10 @@ def run_online_carla(
         if step > warmup and buffer.size >= batch_size:
             for _ in range(updates_per_step):
                 batch = buffer.sample(batch_size)
-                agent, update_info = agent.update(batch)
+                if getattr(agent, "vla_sample_fn", None) is not None:
+                    agent, update_info = agent.update_with_vla(batch)
+                else:
+                    agent, update_info = agent.update(batch)
 
             if step % FLAGS.log_interval == 0:
                 metrics = {f"training/{k}": float(v) for k, v in update_info.items()}
@@ -435,21 +477,6 @@ def main(_):
         return
 
     wandb_mode = _resolve_wandb_mode()
-
-    if FLAGS.eval_only and FLAGS.steervla_checkpoint:
-        exp_name = get_exp_name(FLAGS.seed)
-        setup_wandb(project="OGBench-CARLA", group=FLAGS.run_group, name=exp_name, mode=wandb_mode)
-        smoke_rank = int(FLAGS.agent.get("training_gpu_rank", -1))
-        _configure_jax_training_device(smoke_rank)
-        try:
-            run_steervla_checkpoint_smoke(training_gpu_rank=smoke_rank)
-        except Exception:
-            print("[SteerVLA] Checkpoint smoke test failed:", flush=True)
-            traceback.print_exc()
-            sys.exit(1)
-        wandb.finish()
-        print("[SteerVLA] Smoke test finished OK.", flush=True)
-        return
 
     config = FLAGS.agent
 
@@ -495,32 +522,36 @@ def main(_):
 
     raw_carla_holder: dict | None = None
     if steervla_cfg is not None and steervla_cfg.get("enabled"):
-        raw_carla_holder = {"obs": obs_dict}
+        raw_carla_holder = {"obs": obs_dict, "next_obs": obs_dict}
 
     agent_obs = _extract_agent_obs(env, obs_dict, obs_mode)
     ex_obs = np.expand_dims(agent_obs, 0)
     ex_actions = np.zeros((1,) + tuple(env.action_space.shape), dtype=np.float32)
 
-    import jax
-
-    from jax_agents import agents
-    from utils.flax_utils import restore_agent
-
     _configure_jax_training_device(int(config.get("training_gpu_rank", -1)))
 
     agent_class = agents[config["agent_name"]]
     create_kwargs = {}
+    steervla_actor = None
     if config["agent_name"] == "dsrl":
         tr_rank = int(config.get("training_gpu_rank", -1))
-        vla_sample_fn = (
+        vla_bundle = (
             _build_vla_sample_fn(steervla_cfg, raw_carla_holder, training_gpu_rank=tr_rank)
             if steervla_cfg is not None
             else None
         )
-        if vla_sample_fn is not None:
+        if vla_bundle is not None:
+            vla_sample_fn, steervla_actor = vla_bundle
             create_kwargs["vla_sample_fn"] = vla_sample_fn
+            url = steervla_cfg.get("actor_url") if steervla_cfg else None
+            if not (url and str(url).strip()):
+                create_kwargs["vla_train_state"] = steervla_actor.train_state
+                create_kwargs["openpi_train_config"] = steervla_actor.train_cfg
+                create_kwargs["steervla_actor"] = steervla_actor
+    
 
     agent = agent_class.create(FLAGS.seed, ex_obs, ex_actions, config, **create_kwargs)
+
     if FLAGS.restore_path is not None:
         agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
 
@@ -530,7 +561,14 @@ def main(_):
         FLAGS.save_buffer = FLAGS.save_buffer or False
 
     try:
-        run_online_carla(env, agent, config, exp_name, raw_carla_obs_holder=raw_carla_holder)
+        run_online_carla(
+            env,
+            agent,
+            config,
+            exp_name,
+            raw_carla_obs_holder=raw_carla_holder,
+            steervla_actor=steervla_actor,
+        )
     finally:
         try:
             env.close()

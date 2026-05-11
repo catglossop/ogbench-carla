@@ -1,6 +1,8 @@
 """SteerVLA / OpenPI: smoke-test loader, remote actor, and CARLA Pi0-CoT inference.
 
-**Checkpoint smoke tests** — :class:`SteerVLALocalActor` loads params via ``TrainConfig.model.load``.
+**Checkpoint smoke tests** — :class:`SteerVLAActor` (local checkpoint mode) restores OpenPI weights **once**, builds
+:class:`openpi.training.utils.TrainingState` via :func:`init_train_state`, and shares those params with the Pi0-CoT
+module used at inference.
 
 **Pi0-CoT + DSRL** — :class:`SteerVLAActor` and :func:`create_steervla_pi0_cot_sample_fn`
 implement ``vla_sample_fn`` for :class:`jax_agents.dsrl.DSRLAgent.sample_actions_with_vla`.
@@ -32,7 +34,7 @@ If both ``sample_actions_low_memory`` and ``sample_actions_jit_denoise_steps`` a
 wins. Lower ``sample_actions_num_steps`` to save time and memory. Tokenizer and NumPy packing stay
 outside JIT. CARLA uses only ``base_0_rgb`` (see :data:`CARLA_STEERVLA_IMAGE_KEYS`).
 
-:class:`SteerVLAActor` ``update`` on a local actor is a no-op for OpenPI weights.
+:class:`SteerVLAActor` ``update`` runs a VLA train step when DSRL is wired via :meth:`SteerVLAActor.attach_dsrl`.
 
 ``raw_obs_holder["obs"]`` must be the latest gym dict with ``"state"`` and ``"image"``
 before each VLA sample when using :meth:`SteerVLAActor.__call__` (``main_carla`` maintains this).
@@ -42,22 +44,39 @@ For :meth:`SteerVLAActor.get_action` / :meth:`SteerVLAActor.get_cot`, pass that 
 from __future__ import annotations
 
 import dataclasses
+import functools
+import re
 from pathlib import Path
 from typing import Any, Callable, Dict, MutableMapping, Optional
 
 import flax.nnx as nnx
+import flax.traverse_util as traverse_util
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 
 from openpi.models import model as _openpi_model
 from openpi.models.pi0_config import Pi0CoTConfig
 from openpi.models.tokenizer import CoTPaligemmaTokenizer
 from openpi.policies import steervla_policy as sv_policy
+from openpi.shared import array_typing as at
 from openpi.shared import download
+from openpi.shared import nnx_utils as nnx_utils
 from openpi.training import config as openpi_train_config
+from openpi.training import optimizer as _optimizer
+from openpi.training import utils as training_utils
+from openpi.training import weight_loaders as _weight_loaders
+import openpi.training.sharding as sharding
 
-from impls.vlas.utils import LocalActor, RemoteActor
+
+from impls.vlas.utils import RemoteActor
+from utils.flax_utils import TrainState
+from jax_agents.dsrl import (
+    DSRLAgent,
+    dsrl_critic_min_q,
+    dsrl_encode_obs_sample_noise_logprob,
+)
 
 # Only the front camera for OpenPI preprocess + SigLIP (skip zero-padded wrist streams).
 CARLA_STEERVLA_IMAGE_KEYS: tuple[str, ...] = ("base_0_rgb",)
@@ -68,6 +87,7 @@ def restore_openpi_params_on_single_gpu(
     *,
     training_gpu_rank: int = -1,
 ):
+    print(f"Restoring OpenPI params on single GPU {training_gpu_rank}", flush=True)
     """Load OpenPI checkpoint onto **one** accelerator.
 
     ``openpi.models.model.restore_params`` defaults to a mesh over ``jax.devices()``,
@@ -99,38 +119,194 @@ def restore_openpi_params_on_single_gpu(
     return params, device
 
 
-# ---------------------------------------------------------------------------
-# Smoke-test local actor (generic OpenPI load)
-# ---------------------------------------------------------------------------
+def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
+    """Load and validate weights for the provided parameter shape (can be a trainable subset)."""
+    loaded_params = loader.load(params_shape)
+    at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
+
+    # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
+    return traverse_util.unflatten_dict(
+        {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
+    )
 
 
-class SteerVLALocalActor(LocalActor):
-    """Loads JAX params via ``TrainConfig.model.load`` after ``maybe_download``."""
+def _merge_openpi_checkpoint_trees(loaded_params: at.Params, reference_params: at.Params, *, missing_regex: str) -> at.Params:
+    """Same semantics as ``openpi.training.weight_loaders._merge_params`` (released checkpoints + LoRA holes)."""
+    flat_ref = traverse_util.flatten_dict(reference_params, sep="/")
+    flat_loaded = traverse_util.flatten_dict(loaded_params, sep="/")
+    result: dict[str, Any] = {}
+    for k, v in flat_loaded.items():
+        if k in flat_ref:
+            ref_v = flat_ref[k]
+            if hasattr(ref_v, "dtype") and hasattr(v, "dtype") and v.dtype != ref_v.dtype:
+                result[k] = jnp.asarray(v, dtype=ref_v.dtype)
+            else:
+                result[k] = v
 
-    def __init__(self, actor_config: str, checkpoint_path: str) -> None:
-        super().__init__(actor_config, checkpoint_path)
-        self.checkpoint_dir: Optional[Path] = None
-        self.policy = None
+    flat_loaded.clear()
+    pattern = re.compile(missing_regex)
+    for k in {kk for kk in flat_ref if pattern.fullmatch(str(kk))}:
+        if k not in result:
+            result[k] = flat_ref[k]
 
-    def setup(self, *, training_gpu_rank: int = -1) -> None:
-        cfg = openpi_train_config.get_config(self.actor_config)
-        path = download.maybe_download(self.checkpoint_path)
-        self.checkpoint_dir = Path(path).resolve()
-        params_dir = self.checkpoint_dir / "params"
-        if not params_dir.exists():
-            raise FileNotFoundError(f"Expected OpenPI checkpoint params at {params_dir}")
-        params, dev = restore_openpi_params_on_single_gpu(params_dir, training_gpu_rank=training_gpu_rank)
-        print(f"[SteerVLA] Loaded checkpoint params on {dev}", flush=True)
-        self.policy = cfg.model.load(params)
+    return traverse_util.unflatten_dict(result, sep="/")
 
-    def get_action(self, state: Dict[str, Any]) -> np.ndarray:
-        raise NotImplementedError("Wire observation dict + policy inference for offline eval.")
 
-    def get_cot(self, state: Dict[str, Any]) -> dict:
-        raise NotImplementedError
+def _partial_params_from_preloaded_checkpoint(
+    preloaded_tree: at.Params,
+    params_shape: at.Params,
+) -> at.Params:
+    """Merge Orbax/restored weights into the train-state param spec (LoRA holes), validate, drop struct leaves."""
+    merged = _merge_openpi_checkpoint_trees(
+        preloaded_tree,
+        params_shape,
+        missing_regex=".*lora.*",
+    )
+    at.check_pytree_equality(expected=params_shape, got=merged, check_shapes=True, check_dtypes=True)
+    return traverse_util.unflatten_dict(
+        {k: v for k, v in traverse_util.flatten_dict(merged).items() if not isinstance(v, jax.ShapeDtypeStruct)}
+    )
 
-    def update(self) -> None:
-        raise NotImplementedError("Update is not supported for SteerVLA actor at this time.")
+
+@at.typecheck
+def init_train_state(
+    config: openpi_train_config.TrainConfig,
+    init_rng: at.KeyArrayLike,
+    mesh: jax.sharding.Mesh,
+    *,
+    resume: bool,
+    preloaded_partial_tree: at.Params | None = None,
+) -> tuple[training_utils.TrainState, Any]:
+    """Build OpenPI training state.
+
+    If ``preloaded_partial_tree`` is set (e.g. from :func:`restore_openpi_params_on_single_gpu`), those weights are
+    merged into the model shape and **no** ``config.weight_loader`` / disk read is used.
+    Only parameters selected by ``config.trainable_filter`` are restored; frozen params stay at init values.
+    """
+    tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
+
+    def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
+        rng, model_rng = jax.random.split(rng)
+        # initialize the model (and its parameters).
+        model = config.model.create(model_rng)
+
+        # Merge the partial params into the model.
+        if partial_params is not None:
+            graphdef, state = nnx.split(model)
+            # This will produce an error if the partial params are not a subset of the state.
+            state.replace_by_pure_dict(partial_params)
+            model = nnx.merge(graphdef, state)
+
+        params = nnx.state(model)
+        # Convert frozen params to bfloat16.
+        params = nnx_utils.state_map(params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
+
+        return training_utils.TrainState(
+            step=0,
+            params=params,
+            model_def=nnx.graphdef(model),
+            tx=tx,
+            opt_state=tx.init(params.filter(config.trainable_filter)),
+            ema_decay=config.ema_decay,
+            ema_params=None if config.ema_decay is None else params,
+        )
+
+    train_state_shape = jax.eval_shape(init, init_rng)
+    state_sharding = sharding.fsdp_sharding(train_state_shape, mesh, log=True)
+
+    if resume:
+        return train_state_shape, state_sharding
+
+    trainable_params_shape = train_state_shape.params.filter(config.trainable_filter).to_pure_dict()
+    if preloaded_partial_tree is not None:
+        partial_params = _partial_params_from_preloaded_checkpoint(preloaded_partial_tree, trainable_params_shape)
+    else:
+        partial_params = _load_weights_and_validate(config.weight_loader, trainable_params_shape)
+    replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+    # Initialize the train state and mix in the partial params.
+    train_state = jax.jit(
+        init,
+        donate_argnums=(1,),  # donate the partial params buffer.
+        in_shardings=replicated_sharding,
+        out_shardings=state_sharding,
+    )(init_rng, partial_params)
+
+    return train_state, state_sharding
+
+
+@at.typecheck
+def pi0_cot_action_flow_matching_loss_per_step(
+    model: Any,
+    rng: at.KeyArrayLike,
+    observation: _openpi_model.Observation,
+    actions: _openpi_model.Actions,
+    *,
+    train: bool = False,
+) -> jnp.ndarray:
+    """Action flow-matching term from ``Pi0CoT.compute_loss`` (shape ``(batch, action_horizon)`` only, no CoT CE)."""
+    preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+    observation = _openpi_model.preprocess_observation(preprocess_rng, observation, train=train, image_keys=CARLA_STEERVLA_IMAGE_KEYS)
+
+    batch_shape = actions.shape[:-2]
+    noise = jax.random.normal(noise_rng, actions.shape)
+    time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+    time_expanded = time[..., None, None]
+    x_t = time_expanded * noise + (1 - time_expanded) * actions
+    u_t = noise - actions
+
+    img_tokens, img_masks, img_ar = model._embed_images(observation)
+    n_img = sum(t.shape[1] for t in img_tokens)
+
+    prompt_emb = model._embed_text_tokens(observation.tokenized_prompt)
+    prompt_mask = observation.tokenized_prompt_mask
+    n_prompt = prompt_emb.shape[1]
+
+    reasoning_emb = model._embed_text_tokens(observation.tokenized_reasoning)
+    reasoning_mask = observation.tokenized_reasoning_mask
+    n_reasoning = reasoning_emb.shape[1]
+
+    subtask_emb = model._embed_text_tokens(observation.tokenized_subtask)
+    subtask_mask = observation.tokenized_subtask_mask
+    n_subtask = subtask_emb.shape[1]
+
+    prefix_tokens = jnp.concatenate(img_tokens + [prompt_emb, reasoning_emb, subtask_emb], axis=1)
+    prefix_mask = jnp.concatenate(img_masks + [prompt_mask, reasoning_mask, subtask_mask], axis=1)
+    prefix_ar = jnp.array(
+        img_ar
+        + [False] * n_prompt
+        + [True] * n_reasoning
+        + [True] * n_subtask
+    )
+
+    suffix_tokens, suffix_mask, suffix_ar_list, adarms_cond = model._embed_action_suffix(observation, x_t, time)
+    suffix_ar = jnp.array(suffix_ar_list)
+    n_action = suffix_tokens.shape[1]
+
+    attn_mask = model._build_attention_mask(
+        prefix_mask,
+        prefix_ar,
+        suffix_mask,
+        suffix_ar,
+        n_img,
+        n_prompt,
+        n_subtask,
+        n_reasoning,
+        n_action,
+    )
+
+    input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+    positions = jnp.cumsum(input_mask, axis=1) - 1
+
+    (prefix_out, suffix_out), _ = model.PaliGemma.llm(
+        [prefix_tokens, suffix_tokens],
+        mask=attn_mask,
+        positions=positions,
+        adarms_cond=[None, adarms_cond],
+    )
+
+    v_t = model.action_out_proj(suffix_out[:, -model.action_horizon :])
+    return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -354,9 +530,282 @@ def _pi0_sample_cot_only(
     )
 
 
-# ---------------------------------------------------------------------------
-# Remote HTTP actor or local Pi0-CoT CARLA actor
-# ---------------------------------------------------------------------------
+def _vla_accel_steer_from_dsrl_noise(
+    model: _openpi_model.BaseModel,
+    rng: at.KeyArrayLike,
+    openpi_observation: _openpi_model.Observation,
+    noise_dsrl: jnp.ndarray,
+    *,
+    cot_temperature: float,
+    cot_replay_reasoning: bool,
+    sample_actions_num_steps: int,
+    sample_actions_low_memory: bool,
+    sample_actions_jit_denoise_steps: bool,
+    action_horizon: int,
+    action_dim: int,
+    output_action_format: str | None,
+) -> jnp.ndarray:
+    """Map DSRL noise tensor to VLA action vector for RL losses (no device_put)."""
+    rng_cot, rng_act = jax.random.split(rng)
+    cot_out = model.sample_cot(
+        rng_cot,
+        openpi_observation,
+        temperature=cot_temperature,
+        image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        replay_reasoning=cot_replay_reasoning,
+    )
+    obs_full = dataclasses.replace(
+        openpi_observation,
+        tokenized_reasoning=cot_out["tokenized_reasoning"],
+        tokenized_reasoning_mask=cot_out["tokenized_reasoning_mask"],
+        tokenized_subtask=cot_out["tokenized_subtask"],
+        tokenized_subtask_mask=cot_out["tokenized_subtask_mask"],
+    )
+    batch_size = int(openpi_observation.state.shape[0])
+    model_ah = int(model.action_horizon)
+    model_ad = int(model.action_dim)
+    cfg_ah = min(int(action_horizon), model_ah)
+    cfg_ad = min(int(action_dim), model_ad)
+    noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
+    if noise_dsrl.ndim == 3:
+        noise_chunk = noise_dsrl[:, :cfg_ah, :cfg_ad]
+    elif int(noise_dsrl.shape[-1]) == int(action_horizon) * int(action_dim):
+        noise_chunk = noise_dsrl.reshape(batch_size, int(action_horizon), int(action_dim))[:, :cfg_ah, :cfg_ad]
+    else:
+        noise_chunk = noise_dsrl[:, None, :cfg_ad]
+        cfg_ah = 1
+    noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(noise_chunk)
+    # For RL losses, keep representation aligned with VLA action space (e.g. 4-D DELTA_XY_T_DELTA_XY_SPACE).
+    traj = model.sample_actions(
+        rng_act,
+        obs_full,
+        num_steps=int(sample_actions_num_steps),
+        noise=noise_full,
+        image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        low_memory_denoise=bool(sample_actions_low_memory),
+        jit_denoise_steps=bool(sample_actions_jit_denoise_steps),
+    )
+    out_dim = min(int(action_dim), int(model.action_dim))
+    return traj[:, 0, :out_dim].astype(jnp.float32)
+
+
+def flow_sample_with_vla(
+    model: Any,
+    rng: at.KeyArrayLike,
+    openpi_observation: _openpi_model.Observation,
+    noise_rl: jnp.ndarray,
+    *,
+    cot_temperature: float,
+    cot_replay_reasoning: bool,
+    sample_actions_num_steps: int,
+    sample_actions_low_memory: bool,
+    sample_actions_jit_denoise_steps: bool,
+    action_horizon: int,
+    action_dim: int,
+    output_action_format: str | None,
+) -> jnp.ndarray:
+    """Map DSRL noise to env actions through Pi0-CoT flow sampling (denoise / ``sample_actions``)."""
+    return _vla_accel_steer_from_dsrl_noise(
+        model,
+        rng,
+        openpi_observation,
+        noise_rl,
+        cot_temperature=cot_temperature,
+        cot_replay_reasoning=cot_replay_reasoning,
+        sample_actions_num_steps=sample_actions_num_steps,
+        sample_actions_low_memory=sample_actions_low_memory,
+        sample_actions_jit_denoise_steps=sample_actions_jit_denoise_steps,
+        action_horizon=action_horizon,
+        action_dim=action_dim,
+        output_action_format=output_action_format,
+    )
+
+
+@at.typecheck
+def train_step(
+    config: openpi_train_config.TrainConfig,
+    alpha: float,
+    noise_scale: float,
+    cot_temperature: float,
+    cot_replay_reasoning: bool,
+    sample_actions_num_steps: int,
+    sample_actions_low_memory: bool,
+    sample_actions_jit_denoise_steps: bool,
+    action_horizon: int,
+    action_dim: int,
+    output_action_format: str | None,
+    dsrl_network: TrainState,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_openpi_model.Observation, jnp.ndarray],
+) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    """OpenPI SGD step with the same objective as :meth:`DSRLAgent.actor_loss`, but actions from the VLA.
+
+    Samples noise from the (frozen) DSRL noise policy, maps it through the trainable Pi0-CoT model to env actions,
+    and minimizes ``mean(alpha * log_prob(noise|s) - min_k Q_k(s, a))``. Only OpenPI trainable params get gradients.
+    """
+    openpi_observation, observations_rl = batch
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
+
+    train_rng = jax.random.fold_in(rng, state.step)
+    rng_dsrl, rng_vla = jax.random.split(train_rng)
+
+    @at.typecheck
+    def loss_fn(
+        model: _openpi_model.BaseModel,
+        rng_vla_inner: at.KeyArrayLike,
+        openpi_obs: _openpi_model.Observation,
+        obs_rl: jnp.ndarray,
+        rng_noise: at.KeyArrayLike,
+    ):
+        obs_e, noise, log_prob = dsrl_encode_obs_sample_noise_logprob(
+            dsrl_network, noise_scale, obs_rl, rng_noise
+        )
+        actions_vla = flow_sample_with_vla(
+            model,
+            rng_vla_inner,
+            openpi_obs,
+            noise,
+            cot_temperature=cot_temperature,
+            cot_replay_reasoning=cot_replay_reasoning,
+            sample_actions_num_steps=sample_actions_num_steps,
+            sample_actions_low_memory=sample_actions_low_memory,
+            sample_actions_jit_denoise_steps=sample_actions_jit_denoise_steps,
+            action_horizon=action_horizon,
+            action_dim=action_dim,
+            output_action_format=output_action_format,
+        )
+        q = dsrl_critic_min_q(dsrl_network, obs_e, actions_vla)
+        return jnp.mean(jnp.asarray(alpha, dtype=log_prob.dtype) * log_prob - q)
+
+    diff_state = nnx.DiffState(0, config.trainable_filter)
+    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(
+        model, rng_vla, openpi_observation, observations_rl, rng_dsrl
+    )
+
+    params = state.params.filter(config.trainable_filter)
+    updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+
+    nnx.update(model, new_params)
+    new_params = nnx.state(model)
+
+    new_state = dataclasses.replace(state, step=state.step + 1, params=new_params, opt_state=new_opt_state)
+    if state.ema_decay is not None:
+        new_state = dataclasses.replace(
+            new_state,
+            ema_params=jax.tree.map(
+                lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new, state.ema_params, new_params
+            ),
+        )
+
+    kernel_params = nnx.state(
+        model,
+        nnx.All(
+            nnx.Param,
+            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+            lambda _, x: x.value.ndim > 1,
+        ),
+    )
+    info = {
+        "loss": loss,
+        "grad_norm": optax.global_norm(grads),
+        "param_norm": optax.global_norm(kernel_params),
+    }
+    return new_state, info
+
+
+@at.typecheck
+def vla_flow_only_train_step(
+    config: openpi_train_config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_openpi_model.Observation, _openpi_model.Actions],
+) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    """Single OpenPI optimizer step using only the Pi0-CoT **action flow-matching** term."""
+    observation, actions = batch
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
+
+    train_rng = jax.random.fold_in(rng, state.step)
+
+    @at.typecheck
+    def loss_fn(
+        model: _openpi_model.BaseModel,
+        rng_inner: at.KeyArrayLike,
+        obs: _openpi_model.Observation,
+        act: _openpi_model.Actions,
+    ):
+        # expand actions to the dimensions of the base pi05 model 
+        per = pi0_cot_action_flow_matching_loss_per_step(model, rng_inner, obs, act, train=True)
+        return jnp.mean(per)
+
+    diff_state = nnx.DiffState(0, config.trainable_filter)
+    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+
+    params = state.params.filter(config.trainable_filter)
+    updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+
+    nnx.update(model, new_params)
+    new_params = nnx.state(model)
+
+    new_state = dataclasses.replace(state, step=state.step + 1, params=new_params, opt_state=new_opt_state)
+    if state.ema_decay is not None:
+        new_state = dataclasses.replace(
+            new_state,
+            ema_params=jax.tree.map(
+                lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new, state.ema_params, new_params
+            ),
+        )
+
+    kernel_params = nnx.state(
+        model,
+        nnx.All(
+            nnx.Param,
+            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+            lambda _, x: x.value.ndim > 1,
+        ),
+    )
+    info = {
+        "vla_flow_loss": loss,
+        "grad_norm": optax.global_norm(grads),
+        "param_norm": optax.global_norm(kernel_params),
+    }
+    return new_state, info
+
+
+def _maybe_set_jax_default_gpu(training_gpu_rank: int) -> None:
+    if training_gpu_rank < 0:
+        return
+    try:
+        gpus = jax.devices("gpu")
+    except RuntimeError:
+        gpus = []
+    if not gpus:
+        return
+    idx = min(max(training_gpu_rank, 0), len(gpus) - 1)
+    jax.config.update("jax_default_device", gpus[idx])
+
+
+def _single_device_openpi_mesh(training_gpu_rank: int) -> tuple[jax.sharding.Mesh, jax.Device]:
+    """Create a 1x1 mesh on one GPU so params are not replicated."""
+    try:
+        gpus = jax.devices("gpu")
+    except RuntimeError:
+        gpus = []
+    if gpus:
+        idx = training_gpu_rank if training_gpu_rank >= 0 else 0
+        idx = min(max(idx, 0), len(gpus) - 1)
+        device = gpus[idx]
+    else:
+        device = jax.devices()[0]
+    mesh = jax.sharding.Mesh(
+        np.asarray([[device]], dtype=object),
+        (sharding.BATCH_AXIS, sharding.FSDP_AXIS),
+    )
+    return mesh, device
 
 
 class SteerVLAActor:
@@ -369,7 +818,8 @@ class SteerVLAActor:
     :meth:`__call__` for DSRL flow sampling (reads ``raw_obs_holder["obs"]``). Use
     :meth:`get_action` / :meth:`get_cot` with a CARLA gym observation dict passed as ``state``.
 
-    Local ``update`` does not mutate OpenPI weights (train via OpenPI / ``freeze_filter``).
+    OpenPI weights are loaded **once** from Orbax; :attr:`model` and :attr:`train_state` share the same parameters.
+    After optional :meth:`attach_dsrl`, :meth:`update` runs :func:`train_step` (DSRL-frozen actor loss through the VLA).
     """
 
     def __init__(
@@ -431,6 +881,14 @@ class SteerVLAActor:
         self.model_cfg = None
         self._jax_device = None
         self._local_ready = False
+        self.checkpoint_dir: Path | None = None
+        self._mesh: jax.sharding.Mesh | None = None
+        self._train_rng: jax.Array | None = None
+        self._train_state: training_utils.TrainState | None = None
+        self._ptrain_step: Callable[..., Any] | None = None
+        self._dsrl_network: TrainState | None = None
+        self._dsrl_alpha: float = 0.1
+        self._dsrl_noise_scale: float = 1.0
 
         if actor_url is not None:
             self._remote = RemoteActor(
@@ -451,7 +909,8 @@ class SteerVLAActor:
         if self._local_ready:
             return
 
-        assert self.actor_config is not None and self.checkpoint_path is not None
+        _maybe_set_jax_default_gpu(training_gpu_rank)
+
         self.train_cfg = openpi_train_config.get_config(self.actor_config)
         model_cfg = self.train_cfg.model
         if not isinstance(model_cfg, Pi0CoTConfig):
@@ -465,15 +924,54 @@ class SteerVLAActor:
             cot_jit_transformer_forward=self.cot_jit_transformer_forward,
             cot_replay_reasoning=self.cot_replay_reasoning,
         )
+        self.train_cfg = dataclasses.replace(self.train_cfg, model=model_cfg)
+
         ckpt_root = Path(download.maybe_download(self.checkpoint_path)).resolve()
+        self.checkpoint_dir = ckpt_root
         params_dir = ckpt_root / "params"
+        print("Params directory: ", params_dir, flush=True)
         if not params_dir.is_dir():
             raise FileNotFoundError(f"Expected OpenPI checkpoint params at {params_dir}")
-        restored, self._jax_device = restore_openpi_params_on_single_gpu(
-            params_dir, training_gpu_rank=training_gpu_rank
+
+        try:
+            gpus = jax.devices("gpu")
+        except RuntimeError:
+            gpus = []
+        if gpus:
+            idx = training_gpu_rank if training_gpu_rank >= 0 else 0
+            idx = min(max(idx, 0), len(gpus) - 1)
+            device = gpus[idx]
+        else:
+            device = jax.devices()[0]
+        self._jax_device = device
+        
+        print(f"[SteerVLA] Pi0-CoT checkpoint tensors loaded on {device}", flush=True)
+
+        self.train_cfg = dataclasses.replace(
+            self.train_cfg,
+            weight_loader=_weight_loaders.CheckpointWeightLoader(str(params_dir)),
         )
-        print(f"[SteerVLA] Pi0-CoT checkpoint loaded on {self._jax_device}", flush=True)
-        self.model = model_cfg.load(restored)
+        mesh, mesh_device = _single_device_openpi_mesh(training_gpu_rank)
+        if int(getattr(self.train_cfg, "fsdp_devices", 1)) != 1:
+            print(
+                "[SteerVLA] Overriding TrainConfig.fsdp_devices for local actor: using single-device mesh.",
+                flush=True,
+            )
+        self._mesh = mesh
+        rng = jax.random.key(self.train_cfg.seed)
+        self._train_rng, init_rng = jax.random.split(rng)
+        train_state, _train_state_sharding = init_train_state(
+            self.train_cfg,
+            init_rng,
+            mesh,
+            resume=False,
+        )
+        jax.block_until_ready(train_state)
+        self._train_state = train_state
+
+        assert self.actor_config is not None and self.checkpoint_path is not None
+
+        self.model = nnx.merge(train_state.model_def, train_state.params)
         self.model.eval()
 
         self.tokenizer = CoTPaligemmaTokenizer(
@@ -482,7 +980,51 @@ class SteerVLAActor:
             max_reasoning_len=model_cfg.max_reasoning_len,
         )
         self.model_cfg = model_cfg
+        self._refresh_ptrain_step()
         self._local_ready = True
+        print(f"[SteerVLA] Train state + Pi0-CoT module on {mesh_device}", flush=True)
+
+    def _refresh_ptrain_step(self) -> None:
+        cfg = self.train_cfg
+        if cfg is None:
+            return
+        self._ptrain_step = jax.jit(
+            functools.partial(
+                train_step,
+                cfg,
+                float(self._dsrl_alpha),
+                float(self._dsrl_noise_scale),
+                float(self.cot_temperature),
+                bool(self.cot_replay_reasoning),
+                int(self.sample_actions_num_steps),
+                bool(self.sample_actions_low_memory),
+                bool(self.sample_actions_jit_denoise_steps),
+                int(self.action_horizon),
+                int(self.action_dim),
+                self.output_action_format,
+            )
+        )
+
+    def attach_dsrl(self, agent: DSRLAgent) -> None:
+        """Attach current DSRL state so actor-side updates use fresh RL parameters."""
+        self.set_dsrl_network(agent.network)
+        self._dsrl_alpha = float(agent.config["alpha"])
+        self._dsrl_noise_scale = float(agent.config["noise_scale"])
+        self._refresh_ptrain_step()
+
+    @property
+    def train_state(self) -> training_utils.TrainState | None:
+        return self._train_state
+
+    def set_dsrl_network(self, network: TrainState) -> None:
+        """Update cached DSRL network snapshot used by :meth:`update`."""
+        self._dsrl_network = network
+
+    def apply_train_state(self, train_state: training_utils.TrainState) -> None:
+        """Apply externally-updated OpenPI state and refresh local Pi0-CoT params."""
+        self._train_state = train_state
+        self.model = nnx.merge(train_state.model_def, train_state.params)
+        self.model.eval()
 
     def _routing_for_raw(self, raw: Dict[str, Any]) -> str:
         rc = raw.get("routing_command")
@@ -531,6 +1073,40 @@ class SteerVLAActor:
         assert self.tokenizer is not None
         tok_ids, tok_mask = self.tokenizer.tokenize_prompt(prompt_text, state_pad)
 
+        # Optional CoT fields carried in raw obs holder from previous VLA inference.
+        reasoning_len = int(self.model_cfg.max_reasoning_len)
+        subtask_len = int(self.model_cfg.max_subtask_len)
+        reasoning = np.zeros((batch_size, reasoning_len), dtype=np.int32)
+        reasoning_mask = np.zeros((batch_size, reasoning_len), dtype=bool)
+        subtask = np.zeros((batch_size, subtask_len), dtype=np.int32)
+        subtask_mask = np.zeros((batch_size, subtask_len), dtype=bool)
+
+        if isinstance(raw, dict):
+            rr = raw.get("reasoning")
+            rrm = raw.get("reasoning_mask")
+            ss = raw.get("subtask")
+            ssm = raw.get("subtask_mask")
+            if rr is not None:
+                rr_arr = np.asarray(rr, dtype=np.int32).reshape(-1)
+                n = min(reasoning_len, rr_arr.size)
+                reasoning[:, :n] = rr_arr[:n]
+            if rrm is not None:
+                rrm_arr = np.asarray(rrm, dtype=bool).reshape(-1)
+                n = min(reasoning_len, rrm_arr.size)
+                reasoning_mask[:, :n] = rrm_arr[:n]
+            else:
+                reasoning_mask = reasoning != 0
+            if ss is not None:
+                ss_arr = np.asarray(ss, dtype=np.int32).reshape(-1)
+                n = min(subtask_len, ss_arr.size)
+                subtask[:, :n] = ss_arr[:n]
+            if ssm is not None:
+                ssm_arr = np.asarray(ssm, dtype=bool).reshape(-1)
+                n = min(subtask_len, ssm_arr.size)
+                subtask_mask[:, :n] = ssm_arr[:n]
+            else:
+                subtask_mask = subtask != 0
+
         # Single base camera only (see CARLA_STEERVLA_IMAGE_KEYS + Pi0CoT ``image_keys``).
         data = {
             "image": {
@@ -542,8 +1118,25 @@ class SteerVLAActor:
             "state": np.tile(state_pad[None], (batch_size, 1)),
             "tokenized_prompt": np.tile(tok_ids[None], (batch_size, 1)),
             "tokenized_prompt_mask": np.tile(tok_mask[None], (batch_size, 1)),
+            "tokenized_reasoning": reasoning,
+            "tokenized_reasoning_mask": reasoning_mask,
+            "tokenized_subtask": subtask,
+            "tokenized_subtask_mask": subtask_mask,
         }
         return _openpi_model.Observation.from_dict(data)
+
+    def _stash_cot_in_raw(self, raw: Optional[Dict[str, Any]], cot_out: dict[str, Any]) -> None:
+        """Persist latest CoT tokens/masks in raw obs dict for downstream training."""
+        if raw is None:
+            return
+        try:
+            raw["reasoning"] = np.asarray(jax.device_get(cot_out["tokenized_reasoning"][0]), dtype=np.int32)
+            raw["reasoning_mask"] = np.asarray(jax.device_get(cot_out["tokenized_reasoning_mask"][0]), dtype=bool)
+            raw["subtask"] = np.asarray(jax.device_get(cot_out["tokenized_subtask"][0]), dtype=np.int32)
+            raw["subtask_mask"] = np.asarray(jax.device_get(cot_out["tokenized_subtask_mask"][0]), dtype=bool)
+        except Exception:
+            # Keep rollout robust if CoT payload changes shape unexpectedly.
+            return
 
     def _shift_cached_action_chunk(self, action: np.ndarray, step: int) -> np.ndarray:
         flat = np.asarray(action, dtype=np.float32)
@@ -637,6 +1230,12 @@ class SteerVLAActor:
         noise_jax = jax.device_put(noise_jax, self._jax_device)
         rng_cot, rng_act = jax.random.split(rng)
         cot_out = self._sample_or_reuse_cot(rng_cot, obs_jax, batch_size)
+        # Keep latest generated CoT in raw holder (batch-1 online CARLA path).
+        if batch_size == 1:
+            if raw is not None:
+                self._stash_cot_in_raw(raw, cot_out)
+            elif self.raw_obs_holder is not None and isinstance(self.raw_obs_holder.get("obs"), dict):
+                self._stash_cot_in_raw(self.raw_obs_holder["obs"], cot_out)
         obs_full = dataclasses.replace(
             obs_jax,
             tokenized_reasoning=cot_out["tokenized_reasoning"],
@@ -768,11 +1367,31 @@ class SteerVLAActor:
 
         return jax.tree.map(_to_numpy, dict(cot_out))
 
-    def update(self) -> Optional[Any]:
-        """Remote: POST ``/update``. Local: no-op (train OpenPI separately)."""
+    def update(
+        self,
+        batch: tuple[_openpi_model.Observation, jnp.ndarray] | None = None,
+    ) -> dict[str, Any] | None:
+        """One VLA step with DSRL actor_loss. ``batch = (openpi_observation, rl_observations)``."""
         if self._remote is not None:
-            return self._remote.update()
-        return None
+            return self._remote.update(batch)
+        if batch is None:
+            return None
+        if self._dsrl_network is None:
+            raise RuntimeError("Call SteerVLAActor.attach_dsrl(DSRLAgent) before update(batch).")
+        if self._ptrain_step is None or self._train_state is None or self._mesh is None:
+            return None
+        assert self._train_rng is not None
+        with sharding.set_mesh(self._mesh):
+            new_state, info = self._ptrain_step(
+                self._dsrl_network,
+                self._train_rng,
+                self._train_state,
+                batch,
+            )
+        self._train_state = new_state
+        self.model = nnx.merge(new_state.model_def, new_state.params)
+        self.model.eval()
+        return jax.device_get(info)
 
 
 def create_steervla_pi0_cot_sample_fn(
@@ -822,7 +1441,7 @@ def create_steervla_pi0_cot_sample_fn(
         return actor(observations, noise)
 
     sample_fn.reset_action_cache = actor.reset_action_cache  # type: ignore[attr-defined]
-    return sample_fn
+    return sample_fn, actor
 
 
 def openpi_action_expert_trainable_hint(train_cfg_name: str) -> str:

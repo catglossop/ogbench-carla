@@ -110,6 +110,10 @@ EGO_STATE_IDX_THROTTLE = 16
 EGO_STATE_IDX_STEER = 17
 EGO_STATE_IDX_BRAKE = 18
 
+DEFAULT_CRASH_STUCK_SPEED_THRESHOLD = 0.1
+DEFAULT_CRASH_STUCK_STEPS = 20
+DEFAULT_CRASH_STUCK_PENALTY = -1.0
+
 
 def ego_drive_metrics_from_state_vec(state: Any) -> Dict[str, float]:
     """Speed (m/s) and last-applied CARLA ``VehicleControl`` from gym ``obs['state']``."""
@@ -402,6 +406,16 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._base_agent_config: str = ""
         self._scenario_active = False
         self._last_control = carla.VehicleControl()
+        self._crash_stuck_speed_threshold = float(
+            self.carla_config.get("crash_stuck_speed_threshold", DEFAULT_CRASH_STUCK_SPEED_THRESHOLD)
+        )
+        self._crash_stuck_steps = int(
+            self.carla_config.get("crash_stuck_steps", DEFAULT_CRASH_STUCK_STEPS)
+        )
+        self._crash_stuck_penalty = float(
+            self.carla_config.get("crash_stuck_penalty", DEFAULT_CRASH_STUCK_PENALTY)
+        )
+        self._crash_stuck_ticks = 0
 
         self.observation_space = gymnasium.spaces.Dict(
             {
@@ -567,6 +581,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         ev.manager.begin_scenario()
         self._scenario_active = True
         self._last_control = carla.VehicleControl()
+        self._crash_stuck_ticks = 0
 
     def _ego_actor(self) -> Optional[carla.Actor]:
         ev = self._evaluator
@@ -601,6 +616,23 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         if extra:
             info.update(extra)
         return info
+
+    def _collision_count(self) -> int:
+        scenario = getattr(self.evaluator, "route_scenario", None)
+        if scenario is None:
+            return 0
+        for criterion in scenario.get_criteria():
+            if getattr(criterion, "name", "") == "CollisionTest":
+                return int(getattr(criterion, "actual_value", 0))
+        return 0
+
+    def _update_crash_stuck_state(self, speed: float) -> Tuple[bool, int]:
+        collision_count = self._collision_count()
+        if collision_count > 0 and speed < self._crash_stuck_speed_threshold:
+            self._crash_stuck_ticks += 1
+        else:
+            self._crash_stuck_ticks = 0
+        return self._crash_stuck_ticks >= self._crash_stuck_steps, collision_count
 
     def reset(
         self,
@@ -701,11 +733,22 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         info = self._info_with_sensors(
             {"scenario_tree_status": getattr(tree_status, "name", str(tree_status))}
         )
+        crash_stuck, collision_count = self._update_crash_stuck_state(speed)
+        info["collision_count"] = collision_count
+        info["crash_stuck_ticks"] = self._crash_stuck_ticks
+        if crash_stuck:
+            terminated = True
+            reward += self._crash_stuck_penalty
+            info["success"] = False
+            info["termination_reason"] = "crash_stuck"
         if terminated:
-            success = info["scenario_tree_status"] == "SUCCESS"
-            reward = 1.0 if success else -1.0
-            info["success"] = success
-            self._finalize_route("Finished", "")
+            if crash_stuck:
+                self._finalize_route("Finished", "Agent crashed and got stuck")
+            else:
+                success = info["scenario_tree_status"] == "SUCCESS"
+                reward = 1.0 if success else -1.0
+                info["success"] = success
+                self._finalize_route("Finished", "")
         return self._obs_dict(), float(reward), terminated, False, info
 
     def _finalize_route(self, entry_status: str, crash_message: str) -> None:
@@ -713,6 +756,9 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             return
         config_index = self.evaluator.manager.route_index
         try:
+            print("\033[1m> Stopping the route (wrapper)\033[0m", flush=True)
+            self.evaluator.manager.stop_scenario()
+            print("\033[1m> Registering the route statistics (wrapper)\033[0m", flush=True)
             self.evaluator.statistics_manager.save_entry_status(entry_status)
             self.evaluator.statistics_manager.compute_route_statistics(
                 config_index,
@@ -720,13 +766,10 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 self.evaluator.manager.scenario_duration_game,
                 crash_message,
             )
+            self.evaluator.statistics_manager.write_statistics()
             if self._args.record:
                 self.evaluator.client.stop_recorder()
         finally:
-            try:
-                self.evaluator.manager.stop_scenario()
-            except Exception:
-                pass
             try:
                 self.evaluator._cleanup()
             except Exception:

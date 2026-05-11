@@ -50,7 +50,7 @@ def get_config():
         dict(
             enabled=True,
             # Local OpenPI inference (ignored when actor_url is set):
-            actor_config="pi05_steervla_cot_ki",
+            actor_config="pi05_steervla_cot_ki_inference",
             checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,
@@ -64,7 +64,7 @@ def get_config():
             action_dim=4,
             # Query Pi0-CoT once, then execute this many rows from the returned action chunk
             # before querying again. Set to 1 to query every env step.
-            actions_per_model_query=5,
+            actions_per_model_query=3,
             # Reuse sampled CoT reasoning/subtask for this many env actions before sampling
             # CoT again. With actions_per_model_query=5, this reuses CoT across two action chunks.
             actions_per_cot=10,

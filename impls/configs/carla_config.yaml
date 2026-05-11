@@ -17,7 +17,7 @@ traffic_manager_port: 8000
 traffic_manager_seed: 0
 debug: 0
 record: ''
-timeout: 600.0
+timeout: 600
 
 # Leaderboard agent module: defaults to ogbench.carla.leaderboard_agents.observation_only
 # (registers a small sensor suite and never produces controls; the gym wrapper drives).
@@ -31,3 +31,8 @@ gpu_rank: 0
 
 repetitions: 1
 repetition_index: 0
+
+# Terminate early when a counted collision is followed by sustained low speed.
+crash_stuck_speed_threshold: 0.1
+crash_stuck_steps: 20
+crash_stuck_penalty: -1.0
