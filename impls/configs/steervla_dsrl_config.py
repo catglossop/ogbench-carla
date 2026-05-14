@@ -37,12 +37,15 @@ def get_config():
     config.noise_scale = 1.0
     config.alpha = 0.1
     config.warmup_steps = 0
-    config.updates_per_step = 5
+    config.updates_per_step = 1
     config.buffer_capacity = 1_000
     config.image_log_curr_interval = 10
+    config.actor_action_dim = 32
+    config.action_horizon = 10
     # config.steervla = None
     # DSRL trains on ``observation_mode`` only; env step always returns both keys.
     config.observation_mode = "image"
+    config.image_keys = ("base_0_rgb",)
     # JAX RL device: ``-1`` = unset. CARLA uses ``gpu_rank`` in carla_config.yaml.
     config.training_gpu_rank = 0
 
@@ -70,15 +73,6 @@ def get_config():
             actions_per_cot=10,
             output_action_format="DELTA_XY_T_DELTA_XY_SPACE",
             sample_actions_num_steps=10,
-            sample_actions_low_memory=False,
-            sample_actions_jit_denoise_steps=False,
-            # ``Pi0CoT.sample_cot`` tuning. Disable reasoning replay for faster batch-1 online inference.
-            cot_jit_decode=False,
-            cot_jit_transformer_forward=True,
-            cot_replay_reasoning=False,
-            # Eager denoise by default (``sample_actions_low_memory=True``). For speed: set
-            # ``sample_actions_low_memory=False`` and ``sample_actions_jit_denoise_steps=True``
-            # (per-step ``nnx.jit``) or both false for outer ``nnx.jit`` (fastest, most VRAM).
             # Remote HTTP actor (leave unset or falsy for local checkpoint load):
             # actor_url="http://35.186.30.251:8000",
         )

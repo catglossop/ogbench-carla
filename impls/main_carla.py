@@ -39,7 +39,6 @@ import random
 import sys
 import time
 import traceback
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional
 
@@ -56,6 +55,13 @@ if str(_IMPLS_ROOT) not in sys.path:
 import wandb
 from absl import app, flags
 from ml_collections import config_flags
+
+import tqdm
+
+from ogbench.carla.carla_utils import ego_drive_metrics_from_state_vec
+
+from utils.datasets import ReplayBuffer
+from utils.flax_utils import save_agent
 
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
 
@@ -81,7 +87,7 @@ flags.DEFINE_string("restore_path", None, "Restore path for JAX agents.")
 flags.DEFINE_integer("restore_epoch", None, "Restore epoch.")
 
 flags.DEFINE_integer("online_steps", 1000, "Number of online environment steps to run.")
-flags.DEFINE_integer("log_interval", 100, "Logging interval (env steps).")
+flags.DEFINE_integer("log_interval", 1, "Logging interval (env steps).")
 flags.DEFINE_integer("save_interval", 100_000, "Agent-checkpoint interval (env steps).")
 flags.DEFINE_bool("save_buffer", False, "Dump the replay buffer to <save_dir>/buffer.npz at the end.")
 flags.DEFINE_string("buffer_path", None, "Optional explicit path for the saved buffer.")
@@ -124,7 +130,6 @@ def _configure_jax_training_device(training_gpu_rank: int) -> None:
     """Pin JAX default device for RL. CARLA uses ``gpu_rank`` in ``carla_config.yaml`` separately."""
     if training_gpu_rank < 0:
         return
-    import jax
 
     try:
         devs = jax.devices("gpu")
@@ -132,7 +137,7 @@ def _configure_jax_training_device(training_gpu_rank: int) -> None:
         devs = []
     if not devs:
         print(
-            "[main_carla] training_gpu_rank is set but JAX has no GPU; using default backend.",
+            "[WARNING - main_carla] training_gpu_rank is set but JAX has no GPU; using default backend.",
             flush=True,
         )
         return
@@ -156,20 +161,20 @@ def _extract_agent_obs(env, env_obs: dict, mode: str) -> np.ndarray:
         return np.asarray(env_obs["image"], dtype=np.uint8)
     raise ValueError(f"Unknown observation_mode {mode!r}; expected 'state' or 'image'.")
 
-
+# Check if valid task environment
 def _carla_env_p(name: Optional[str]) -> bool:
     if not name:
         return False
     n = name.lower()
     return n.startswith("carla") or "bench2drive" in n
 
-
+# Check wandb mode
 def _resolve_wandb_mode() -> str:
     if FLAGS.wandb_mode is not None:
         return FLAGS.wandb_mode
     return os.environ.get("WANDB_MODE", "online")
 
-
+# List routes and exit  
 def _list_routes_and_exit() -> None:
     from ogbench.carla.route_registry import list_routes
 
@@ -248,9 +253,8 @@ def _build_vla_sample_fn(
     if not steervla_cfg.get("actor_config"):
         raise ValueError("steervla.actor_config must name an OpenPI TrainConfig (e.g. pi05_steervla_cot_ki).")
 
-    from vlas.steervla import create_steervla_pi0_cot_sample_fn, openpi_action_expert_trainable_hint
+    from vlas.steervla import create_steervla_pi0_cot_sample_fn 
 
-    print(openpi_action_expert_trainable_hint(str(steervla_cfg["actor_config"])), flush=True)
     return create_steervla_pi0_cot_sample_fn(
         steervla_cfg,
         raw_carla_obs_holder,
@@ -271,13 +275,6 @@ def run_online_carla(
     raw_carla_obs_holder: dict | None = None,
     steervla_actor=None,
 ) -> None:
-    import jax
-    import tqdm
-
-    from ogbench.carla.carla_utils import ego_drive_metrics_from_state_vec
-
-    from utils.datasets import ReplayBuffer
-    from utils.flax_utils import save_agent
 
     obs_mode = str(agent_config.get("observation_mode", "state"))
 
@@ -288,31 +285,34 @@ def run_online_carla(
     image_curr_interval = int(agent_config.get("image_log_curr_interval", 10))
 
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, "train.csv"))
-
-    def _cot_fields_from_raw(raw: dict | None) -> dict[str, np.ndarray]:
-        if steervla_actor is None or getattr(steervla_actor, "model_cfg", None) is None:
-            return {}
-        rlen = int(steervla_actor.model_cfg.max_reasoning_len)
-        slen = int(steervla_actor.model_cfg.max_subtask_len)
-        out = {
-            "reasoning": np.zeros((rlen,), dtype=np.int32),
-            "reasoning_mask": np.zeros((rlen,), dtype=bool),
-            "subtask": np.zeros((slen,), dtype=np.int32),
-            "subtask_mask": np.zeros((slen,), dtype=bool),
-        }
-        if not isinstance(raw, dict):
-            return out
-        for k, dt in (
-            ("reasoning", np.int32),
-            ("reasoning_mask", bool),
-            ("subtask", np.int32),
-            ("subtask_mask", bool),
+    
+    # Get openpi fields from raw observation
+    def _openpi_fields_from_raw(raw: dict | None) -> dict[str, np.ndarray]:
+        if (
+            steervla_actor is None
+            or getattr(steervla_actor, "model_cfg", None) is None
+            or raw is None
+            or not isinstance(raw, dict)
         ):
-            if raw.get(k) is None:
-                continue
-            arr = np.asarray(raw[k], dtype=dt).reshape(-1)
-            n = min(arr.size, out[k].size)
-            out[k][:n] = arr[:n]
+            return {}
+
+        obs_struct = steervla_actor.build_observation_batch_numpy(batch_size=1, raw=raw)
+        out = {
+            "openpi_image_base_0_rgb": np.asarray(obs_struct.images["base_0_rgb"][0], dtype=np.uint8),
+            "openpi_image_mask_base_0_rgb": np.asarray(obs_struct.image_masks["base_0_rgb"][0], dtype=bool),
+            "openpi_state": np.asarray(obs_struct.state[0], dtype=np.float32),
+            "openpi_tokenized_prompt": np.asarray(obs_struct.tokenized_prompt[0], dtype=np.int32),
+            "openpi_tokenized_prompt_mask": np.asarray(obs_struct.tokenized_prompt_mask[0], dtype=bool),
+            "openpi_tokenized_reasoning": np.asarray(obs_struct.tokenized_reasoning[0], dtype=np.int32),
+            "openpi_tokenized_reasoning_mask": np.asarray(obs_struct.tokenized_reasoning_mask[0], dtype=bool),
+            "openpi_tokenized_subtask": np.asarray(obs_struct.tokenized_subtask[0], dtype=np.int32),
+            "openpi_tokenized_subtask_mask": np.asarray(obs_struct.tokenized_subtask_mask[0], dtype=bool),
+            # Keep legacy key names for CoT for backwards-compat with existing buffers.
+            "reasoning": np.asarray(obs_struct.tokenized_reasoning[0], dtype=np.int32),
+            "reasoning_mask": np.asarray(obs_struct.tokenized_reasoning_mask[0], dtype=bool),
+            "subtask": np.asarray(obs_struct.tokenized_subtask[0], dtype=np.int32),
+            "subtask_mask": np.asarray(obs_struct.tokenized_subtask_mask[0], dtype=bool),
+        }
         return out
     
     raw_obs_holder = raw_carla_obs_holder
@@ -336,25 +336,56 @@ def run_online_carla(
             step=0,
         )
 
-    action_dim = int(env.action_space.shape[0])
+    action_dim = int(agent_config.get("action_dim", 4)*agent_config.get("actions_horizon", 10))
     example_transition = dict(
         observations=np.array(obs),
         actions=np.zeros((action_dim,), dtype=np.float32),
-        action_chunked=np.zeros((action_dim,), dtype=np.float32),
         rewards=np.float32(0.0),
         next_observations=np.array(obs),
         masks=np.float32(1.0),
         terminals=np.float32(0.0),
     )
     if steervla_actor is not None:
-        cot0 = _cot_fields_from_raw(obs_raw)
-        example_transition.update(cot0)
-        example_transition.update({f"next_{k}": np.array(v) for k, v in cot0.items()})
+        openpi0 = _openpi_fields_from_raw(obs_raw)
+        example_transition.update(openpi0)
+        example_transition.update({f"next_{k}": np.array(v) for k, v in openpi0.items()})
+        
+    # Create replay buffer
     buffer = ReplayBuffer.create(example_transition, size=capacity)
-
+    
     rng = jax.random.PRNGKey(FLAGS.seed + 1)
     episode_return, episode_steps, episode_count = 0.0, 0, 0
     last_log_time = time.time()
+    episode_video_every = 40
+    episode_video_frames: list[np.ndarray] = []
+
+    def _as_video_frame(image: np.ndarray) -> np.ndarray:
+        frame = np.asarray(image)
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        return frame
+
+    def _maybe_log_episode_video(rollout_log: dict, final_frame: np.ndarray | None) -> None:
+        if not log_images:
+            return
+        frames = list(episode_video_frames)
+        if final_frame is not None:
+            frames.append(_as_video_frame(final_frame))
+        if not frames:
+            return
+        video = np.stack(frames, axis=0)
+        if video.ndim == 4:
+            # W&B expects (T, C, H, W) for videos.
+            video = np.transpose(video, (0, 3, 1, 2))
+        rollout_log["rollout/episode_video"] = wandb.Video(video, fps=10, format="mp4")
+
+    def _block_until_ready_tree(tree):
+        return jax.tree_util.tree_map(
+            lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x,
+            tree,
+        )
+
+    last_update_info = None
 
     for step in tqdm.tqdm(range(1, FLAGS.online_steps + 1), smoothing=0.1, dynamic_ncols=True):
         if raw_obs_holder is not None:
@@ -363,13 +394,13 @@ def run_online_carla(
         if step <= warmup:
             action = env.action_space.sample()
         else:
+            # [STEP 1] Sample the action from the agent
             if getattr(agent, "vla_sample_fn", None) is not None:
                 action_jax = agent.sample_actions_with_vla(obs[None], seed=sub)
             else:
                 action_jax = agent.sample_actions(obs[None], seed=sub)
+            _block_until_ready_tree(action_jax)
             action = np.asarray(action_jax[0])
-        
-        action_chunked = np.asarray(action, dtype=np.float32).reshape(-1)
 
         next_obs_raw, reward, terminated, truncated, info = env.step(action)
         if raw_obs_holder is not None:
@@ -382,26 +413,27 @@ def run_online_carla(
             {
                 "observations": np.asarray(obs),
                 "actions": action.astype(np.float32),
-                "action_chunked": action_chunked.astype(np.float32),
                 "rewards": np.float32(reward),
                 "next_observations": np.asarray(next_obs),
                 "masks": np.float32(0.0 if terminated else 1.0),
                 "terminals": np.float32(1.0 if done else 0.0),
-                **(_cot_fields_from_raw(obs_raw) if steervla_actor is not None else {}),
-                **({f"next_{k}": np.array(v) for k, v in _cot_fields_from_raw(next_obs_raw).items()} if steervla_actor is not None else {}),
+                **(_openpi_fields_from_raw(obs_raw) if steervla_actor is not None else {}),
+                **(
+                    {f"next_{k}": np.array(v) for k, v in _openpi_fields_from_raw(next_obs_raw).items()}
+                    if steervla_actor is not None
+                    else {}
+                ),
             }
         )
         obs = next_obs
         obs_raw = next_obs_raw
         episode_return += float(reward)
         episode_steps += 1
+        if log_images and episode_steps % episode_video_every == 0:
+            episode_video_frames.append(_as_video_frame(obs))
 
         step_wb = {f"rollout/{k}": v for k, v in drive_metrics.items()}
-        if log_images and image_curr_interval > 0 and step % image_curr_interval == 0:
-            step_wb["rollout/curr_obs"] = wandb.Image(
-                np.asarray(obs),
-                caption=f"env step {step}",
-            )
+        
         wandb.log(step_wb, step=step)
 
         if done:
@@ -412,11 +444,7 @@ def run_online_carla(
                 "rollout/episodes": episode_count,
                 "rollout/route": info.get("route", "?"),
             }
-            if log_images and end_img is not None:
-                rollout_log["rollout/final_obs"] = wandb.Image(
-                    end_img,
-                    caption=f"episode {episode_count} final",
-                )
+            _maybe_log_episode_video(rollout_log, end_img if log_images else None)
             wandb.log(rollout_log, step=step)
             obs_raw, _info = env.reset(seed=FLAGS.seed + episode_count)
             if raw_obs_holder is not None:
@@ -427,33 +455,29 @@ def run_online_carla(
             if reset_vla_cache is not None:
                 reset_vla_cache()
             obs = _extract_agent_obs(env, obs_raw, obs_mode)
-            if log_images:
-                wandb.log(
-                    {
-                        "rollout/start_obs": wandb.Image(
-                            np.asarray(obs),
-                            caption=f"episode {episode_count + 1} start",
-                        ),
-                    },
-                    step=step,
-                )
+            episode_video_frames = []
             episode_return, episode_steps = 0.0, 0
 
         if step > warmup and buffer.size >= batch_size:
             for _ in range(updates_per_step):
                 batch = buffer.sample(batch_size)
                 if getattr(agent, "vla_sample_fn", None) is not None:
-                    agent, update_info = agent.update_with_vla(batch)
+                    _, update_info = agent.update_with_vla(batch)
                 else:
-                    agent, update_info = agent.update(batch)
+                    _, update_info = agent.update(batch)
+                _block_until_ready_tree((agent, update_info))
+            last_update_info = update_info
 
-            if step % FLAGS.log_interval == 0:
-                metrics = {f"training/{k}": float(v) for k, v in update_info.items()}
+        if step % FLAGS.log_interval == 0:
+            metrics = {
+                "time/steps_per_sec": FLAGS.log_interval / max(time.time() - last_log_time, 1e-6),
+            }
+            if last_update_info is not None:
+                metrics.update({f"training/{k}": float(v) for k, v in last_update_info.items()})
                 metrics["training/buffer_size"] = int(buffer.size)
-                metrics["time/steps_per_sec"] = FLAGS.log_interval / max(time.time() - last_log_time, 1e-6)
-                last_log_time = time.time()
-                wandb.log(metrics, step=step)
-                train_logger.log(metrics, step=step)
+            last_log_time = time.time()
+            wandb.log(metrics, step=step)
+            train_logger.log(metrics, step=step)
 
         if step % FLAGS.save_interval == 0:
             save_agent(agent, FLAGS.save_dir, step)
@@ -545,7 +569,7 @@ def main(_):
             create_kwargs["vla_sample_fn"] = vla_sample_fn
             url = steervla_cfg.get("actor_url") if steervla_cfg else None
             if not (url and str(url).strip()):
-                create_kwargs["vla_train_state"] = steervla_actor.train_state
+                # create_kwargs["vla_train_state"] = steervla_actor.train_state
                 create_kwargs["openpi_train_config"] = steervla_actor.train_cfg
                 create_kwargs["steervla_actor"] = steervla_actor
     
