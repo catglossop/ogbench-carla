@@ -32,7 +32,7 @@ def get_config():
     config = dsrl_agent.get_config()
 
     config.lr = 3e-4
-    config.batch_size = 1
+    config.batch_size = 64
     config.flow_steps = 10
     config.noise_scale = 1.0
     config.alpha = 0.1
@@ -67,10 +67,10 @@ def get_config():
             action_dim=4,
             # Query Pi0-CoT once, then execute this many rows from the returned action chunk
             # before querying again. Set to 1 to query every env step.
-            actions_per_model_query=3,
+            actions_per_model_query=1,
             # Reuse sampled CoT reasoning/subtask for this many env actions before sampling
             # CoT again. With actions_per_model_query=5, this reuses CoT across two action chunks.
-            actions_per_cot=10,
+            actions_per_cot=1,
             output_action_format="DELTA_XY_T_DELTA_XY_SPACE",
             sample_actions_num_steps=10,
             # Remote HTTP actor (leave unset or falsy for local checkpoint load):

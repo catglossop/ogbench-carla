@@ -610,8 +610,6 @@ class DSRLAgent(flax.struct.PyTreeNode):
         """
         new_rng, rng = jax.random.split(self.rng)
         rng, c_rng, a_rng, _vla_rng = jax.random.split(rng, 4)
-
-        t_total = time.perf_counter()
         
         sv = _steervla()
         if "openpi_state" in batch and "next_openpi_state" in batch:
@@ -656,8 +654,8 @@ class DSRLAgent(flax.struct.PyTreeNode):
                 self.network, batch, actions_critic, noise_actor_sample_reshaped, grad_params, alpha, noise_scale,
             )
             aux = {
-                **{f"critic_vla/{k}": v for k, v in ci.items()},
-                **{f"actor_vla/{k}": v for k, v in ai.items()},
+                **{f"critic/{k}": v for k, v in ci.items()},
+                **{f"actor/{k}": v for k, v in ai.items()},
             }
             return c + a, aux
 
@@ -680,12 +678,6 @@ class DSRLAgent(flax.struct.PyTreeNode):
             lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x, new_network.params,
         )
 
-        t_update_total = time.perf_counter() - t_total
-        info = {
-            **info,
-            "time_ms/update_total": jnp.float32(t_update_total * 1e3),
-
-        }
 
         new_agent = self.replace(network=new_network, rng=new_rng)
         return new_agent, info

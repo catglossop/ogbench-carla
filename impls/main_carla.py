@@ -282,7 +282,6 @@ def run_online_carla(
     warmup = int(agent_config.get("warmup_steps", 1000))
     updates_per_step = int(agent_config.get("updates_per_step", 1))
     batch_size = int(agent_config.get("batch_size", 256))
-    image_curr_interval = int(agent_config.get("image_log_curr_interval", 10))
 
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, "train.csv"))
     
@@ -326,15 +325,6 @@ def run_online_carla(
         raw_obs_holder["next_obs"] = obs_raw
     obs = _extract_agent_obs(env, obs_raw, obs_mode)
     log_images = obs_mode == "image"
-    if log_images:
-        wandb.log(
-            {
-                "rollout/start_obs": wandb.Image(
-                    np.asarray(obs), caption="episode 1 start",
-                ),
-            },
-            step=0,
-        )
 
     action_dim = int(agent_config.get("action_dim", 4)*agent_config.get("actions_horizon", 10))
     example_transition = dict(
@@ -355,8 +345,11 @@ def run_online_carla(
     
     rng = jax.random.PRNGKey(FLAGS.seed + 1)
     episode_return, episode_steps, episode_count = 0.0, 0, 0
+    episode_collision_count = 0
+    episode_collision_events = 0
+    prev_collision_count = 0
     last_log_time = time.time()
-    episode_video_every = 40
+    episode_video_every = 5
     episode_video_frames: list[np.ndarray] = []
 
     def _as_video_frame(image: np.ndarray) -> np.ndarray:
@@ -365,12 +358,108 @@ def run_online_carla(
             frame = np.clip(frame, 0, 255).astype(np.uint8)
         return frame
 
-    def _maybe_log_episode_video(rollout_log: dict, final_frame: np.ndarray | None) -> None:
+    def _annotate_collision_frame(
+        frame: np.ndarray,
+        *,
+        collision_count: int,
+        collision_events: int,
+    ) -> np.ndarray:
+        annotated = np.array(frame, copy=True)
+        try:
+            import cv2  # type: ignore
+
+            h, w = annotated.shape[:2]
+            bar_h = max(24, h // 12)
+            cv2.rectangle(annotated, (0, 0), (w, bar_h), (0, 0, 255), thickness=-1)
+            label = f"COLLISION count={collision_count} events={collision_events}"
+            cv2.putText(
+                annotated,
+                label,
+                (10, max(18, bar_h - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            return annotated
+        except Exception:
+            # Fallback: mark top strip red even if cv2 text rendering is unavailable.
+            h = annotated.shape[0]
+            bar_h = max(8, h // 20)
+            annotated[:bar_h, :, :] = np.array([255, 0, 0], dtype=np.uint8)
+            return annotated
+
+    def _format_text_field(raw: dict[str, Any] | None, key: str) -> str:
+        if not isinstance(raw, dict) or key not in raw or raw.get(key) is None:
+            return ""
+        value = raw.get(key)
+        if isinstance(value, str):
+            return value
+        arr = np.asarray(value).reshape(-1)
+        if arr.size == 0:
+            return ""
+        if arr.dtype == bool:
+            return " ".join(map(str, arr.astype(np.int32)[:16].tolist()))
+        # Token ids or numeric payload fallback.
+        return " ".join(map(str, arr.astype(np.int32)[:24].tolist()))
+
+    def _annotate_text_panel(frame: np.ndarray, raw: dict[str, Any] | None) -> np.ndarray:
+        base = np.array(frame, copy=True)
+        try:
+            import cv2  # type: ignore
+
+            h, w = base.shape[:2]
+            panel_h = max(90, h // 4)
+            annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
+            annotated[:h, :, :] = base
+            # Bottom panel is already black via zeros; draw an explicit border line.
+            cv2.line(annotated, (0, h), (w - 1, h), (255, 255, 255), 1)
+
+            state = np.asarray(raw.get("state", []), dtype=np.float32).reshape(-1) if isinstance(raw, dict) else np.zeros((0,), dtype=np.float32)
+            speed = float(state[15]) if state.size > 15 else 0.0
+            routing = ""
+            if isinstance(raw, dict):
+                routing = str(raw.get("routing_command", "") or "").strip()
+            prompt = f"The current speed is {speed:.2f} m/s. {routing or 'Follow the route.'}"
+            reasoning = _format_text_field(raw, "reasoning")
+            subtask = _format_text_field(raw, "subtask")
+
+            def _clip_text(txt: str, max_chars: int = 120) -> str:
+                return txt if len(txt) <= max_chars else (txt[: max_chars - 3] + "...")
+
+            lines = [
+                f"Prompt: {_clip_text(prompt)}",
+                f"Reasoning: {_clip_text(reasoning)}",
+                f"Subtask: {_clip_text(subtask)}",
+            ]
+            y = h + 24
+            for line in lines:
+                cv2.putText(
+                    annotated,
+                    line,
+                    (10, y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+                y += 24
+            return annotated
+        except Exception:
+            return base
+
+    def _maybe_log_episode_video(
+        rollout_log: dict,
+        final_frame: np.ndarray | None,
+        final_raw: dict[str, Any] | None,
+    ) -> None:
         if not log_images:
             return
         frames = list(episode_video_frames)
         if final_frame is not None:
-            frames.append(_as_video_frame(final_frame))
+            frames.append(_annotate_text_panel(_as_video_frame(final_frame), final_raw))
         if not frames:
             return
         video = np.stack(frames, axis=0)
@@ -388,6 +477,7 @@ def run_online_carla(
     last_update_info = None
 
     for step in tqdm.tqdm(range(1, FLAGS.online_steps + 1), smoothing=0.1, dynamic_ncols=True):
+        t_sample_start = time.time()
         if raw_obs_holder is not None:
             raw_obs_holder["obs"] = obs_raw
         rng, sub = jax.random.split(rng)
@@ -401,7 +491,12 @@ def run_online_carla(
                 action_jax = agent.sample_actions(obs[None], seed=sub)
             _block_until_ready_tree(action_jax)
             action = np.asarray(action_jax[0])
+        t_sample_end = time.time()
+        
+        
+        print("[DEBUG - main_carla] Action: ", action)
 
+        t_step_start = time.time()
         next_obs_raw, reward, terminated, truncated, info = env.step(action)
         if raw_obs_holder is not None:
             raw_obs_holder["next_obs"] = next_obs_raw
@@ -425,14 +520,40 @@ def run_online_carla(
                 ),
             }
         )
+        t_step_end = time.time()
+        
+        t_log_start = time.time()
         obs = next_obs
         obs_raw = next_obs_raw
         episode_return += float(reward)
         episode_steps += 1
-        if log_images and episode_steps % episode_video_every == 0:
-            episode_video_frames.append(_as_video_frame(obs))
+        collision_count = int(info.get("collision_count", 0))
+        episode_collision_count = max(episode_collision_count, collision_count)
+        collision_delta = max(0, collision_count - prev_collision_count)
+        episode_collision_events += collision_delta
+        prev_collision_count = collision_count
+        if log_images:
+            should_sample_periodic = episode_steps % episode_video_every == 0
+            had_collision_this_step = collision_delta > 0
+            if should_sample_periodic or had_collision_this_step:
+                frame = _as_video_frame(obs)
+                frame = _annotate_text_panel(frame, next_obs_raw)
+                if had_collision_this_step:
+                    frame = _annotate_collision_frame(
+                        frame,
+                        collision_count=collision_count,
+                        collision_events=episode_collision_events,
+                    )
+                episode_video_frames.append(frame)
+        t_log_end = time.time()
 
         step_wb = {f"rollout/{k}": v for k, v in drive_metrics.items()}
+        step_wb["rollout/collision_count"] = float(collision_count)
+        step_wb["rollout/collision_events"] = float(collision_delta)
+        
+        step_wb["time/sample_time"] = t_sample_end - t_sample_start
+        step_wb["time/step_time"] = t_step_end - t_step_start
+        step_wb["time/log_time"] = t_log_end - t_log_start
         
         wandb.log(step_wb, step=step)
 
@@ -443,8 +564,15 @@ def run_online_carla(
                 "rollout/episode_steps": episode_steps,
                 "rollout/episodes": episode_count,
                 "rollout/route": info.get("route", "?"),
+                "rollout/episode_collision_count": float(episode_collision_count),
+                "rollout/episode_collision_events": float(episode_collision_events),
+                "rollout/collisions_over_episode": float(episode_collision_events) / max(float(episode_steps), 1.0),
             }
-            _maybe_log_episode_video(rollout_log, end_img if log_images else None)
+            _maybe_log_episode_video(
+                rollout_log,
+                end_img if log_images else None,
+                next_obs_raw if log_images else None,
+            )
             wandb.log(rollout_log, step=step)
             obs_raw, _info = env.reset(seed=FLAGS.seed + episode_count)
             if raw_obs_holder is not None:
@@ -457,8 +585,13 @@ def run_online_carla(
             obs = _extract_agent_obs(env, obs_raw, obs_mode)
             episode_video_frames = []
             episode_return, episode_steps = 0.0, 0
+            episode_collision_count = 0
+            episode_collision_events = 0
+            prev_collision_count = 0
 
+        update_time = 0.0
         if step > warmup and buffer.size >= batch_size:
+            t_update_start = time.time()
             for _ in range(updates_per_step):
                 batch = buffer.sample(batch_size)
                 if getattr(agent, "vla_sample_fn", None) is not None:
@@ -467,10 +600,13 @@ def run_online_carla(
                     _, update_info = agent.update(batch)
                 _block_until_ready_tree((agent, update_info))
             last_update_info = update_info
+            t_update_end = time.time()
+            update_time = t_update_end - t_update_start
 
         if step % FLAGS.log_interval == 0:
             metrics = {
                 "time/steps_per_sec": FLAGS.log_interval / max(time.time() - last_log_time, 1e-6),
+                "time/update_time": update_time,
             }
             if last_update_info is not None:
                 metrics.update({f"training/{k}": float(v) for k, v in last_update_info.items()})

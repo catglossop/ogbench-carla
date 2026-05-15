@@ -110,15 +110,10 @@ uv run python impls/main_carla.py \
   --seed=0
 ```
 
-There are a couple levers to pull to speed up inference / optimize for memory size: 
+There are a couple levers to pull to optimize the speed a bit: 
 
 - `actions_per_model_query`: int - how many actions in the action chunk to execute open loop (speed)
 - `actions_per_cot`: int - how many actions to execute before getting new CoT (speed)
-- `sample_actions_low_memory`: bool - don't use jitting for action sampling (full loop) (memory - slows down inference)
-- `sample_actions_jit_denoise_steps`: bool - jit each denoising step (speed - uses more memory)
-- `cot_jit_decode`: bool - jit logit decoding (speed - uses memory)
-- `cot_jit_transfomer_forward`: bool - jit forward pass (speed - uses more memory)
-- `cot_replay_reasoning`: bool - replay reasoning for accuracy
 
 
 

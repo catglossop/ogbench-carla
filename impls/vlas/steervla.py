@@ -107,7 +107,6 @@ def restore_openpi_params_on_single_gpu(
 # Pi0-CoT CARLA inference helpers
 # ---------------------------------------------------------------------------
 
-
 def routing_instruction_prompt(*, routing_command: str, current_speed_mps: float) -> str:
     """High-level instruction line (speed prefix matches ``SteerVLAInputs`` when ``speed_in_prompt``)."""
     rc = routing_command.strip()
@@ -120,7 +119,6 @@ def carla_state_vec_to_steervla_state(
     *,
     include_ego_history: bool,
     proprio_norm: bool,
-    pad_to_dim: int,
 ) -> np.ndarray:
     """Map CARLA ego vector (``ogbench.carla.carla_utils._ego_state_vector`` layout) to padded proprio."""
     flat_sv = np.asarray(carla_vec, dtype=np.float32).reshape(-1)
@@ -133,9 +131,7 @@ def carla_state_vec_to_steervla_state(
         proprio_norm=proprio_norm,
     )
     flat = np.asarray(normalized, dtype=np.float32).reshape(-1)
-    out = np.zeros((pad_to_dim,), dtype=np.float32)
-    out[: min(flat.size, pad_to_dim)] = flat[:pad_to_dim]
-    return out
+    return flat
 
 def _observation_has_cot_tokens(observation: _openpi_model.Observation) -> bool:
     """Whether an OpenPI observation already carries non-empty CoT tokens."""
@@ -495,12 +491,15 @@ class SteerVLAActor:
             state_vec,
             include_ego_history=self.include_ego_history,
             proprio_norm=self.proprio_norm,
-            pad_to_dim=self.model_cfg.action_dim,
         )
 
         assert self.tokenizer is not None
         tok_ids, tok_mask = self.tokenizer.tokenize_prompt(prompt_text, state_pad)
-
+        
+        valid = tok_ids[tok_mask.astype(bool)]
+        prompt_detokenized = self.tokenizer._tokenizer.decode(valid.tolist())
+        print(f"[DEBUG - steervla] Prompt text: {prompt_detokenized}")
+        
         # Optional CoT fields carried in raw obs holder from previous VLA inference.
         reasoning_len = int(self.model_cfg.max_reasoning_len)
         subtask_len = int(self.model_cfg.max_subtask_len)
@@ -659,6 +658,20 @@ class SteerVLAActor:
         
         # Either sample or reuse the CoT
         cot_out = self._sample_or_reuse_cot(rng_cot, obs_jax, batch_size)
+        
+        reason_tokens = cot_out["tokenized_reasoning"]
+        reason_mask = cot_out["tokenized_reasoning_mask"]
+        reason_valid = reason_tokens[reason_mask.astype(bool)]
+        reason_text = self.tokenizer._tokenizer.decode(reason_valid.tolist())
+        print(f"[DEBUG - steervla] Reason text: {reason_text}")
+        
+        subtask_tokens = cot_out["tokenized_subtask"]
+        subtask_mask = cot_out["tokenized_subtask_mask"]
+        subtask_valid = subtask_tokens[subtask_mask.astype(bool)]
+        subtask_text = self.tokenizer._tokenizer.decode(subtask_valid.tolist())
+        print(f"[DEBUG - steervla] Subtask text: {subtask_text}")
+        
+        
        
         # Keep latest generated CoT in raw holder (batch-1 online CARLA path).
         if batch_size == 1:
