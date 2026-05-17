@@ -99,6 +99,34 @@ from ogbench.carla.leaderboard_agents.observation_only import (
 )
 
 
+def _patch_speedometer_no_rpc() -> None:
+    """Replace SpeedometerReader.__call__ with a cache-based implementation.
+
+    The original SpeedometerReader.__call__ calls actor.get_velocity() and
+    actor.get_transform() from a background daemon thread at 1/delta_time Hz,
+    racing with the main thread's world.tick() and other CARLA RPC calls on
+    the same TCP socket.  Concurrent socket writes corrupt msgpack framing,
+    which CARLA's C++ rpclib I/O thread sees as type_error → terminate() →
+    abort.
+
+    CarlaDataProvider maintains _actor_velocity_map (a plain Python float per
+    actor, updated on the main thread by on_carla_tick() after every tick).
+    Reading it is a GIL-safe dict lookup — no CARLA RPC, no race.
+    """
+    from leaderboard.envs.sensor_interface import SpeedometerReader
+
+    def _cached_call(self: SpeedometerReader):  # type: ignore[misc]
+        try:
+            speed = CarlaDataProvider.get_velocity(self._vehicle)
+            return {"speed": float(speed) if speed is not None else 0.0}
+        except Exception:
+            return {"speed": 0.0}
+
+    SpeedometerReader.__call__ = _cached_call  # type: ignore[method-assign]
+
+
+_patch_speedometer_no_rpc()
+
 # Flat ego-state vector layout (length = 19): 3 location, 3 rotation (rpy),
 # 3 velocity, 3 angular velocity, 3 acceleration, 1 speed, 3 last-applied control.
 STATE_DIM = 19
@@ -183,10 +211,15 @@ class SteppableScenarioManager(ScenarioManager):
     control is discarded.
     """
 
+    # Run build_scenarios / spawn_parked_vehicles every this many ticks from
+    # the main thread instead of from a background thread.
+    _BUILD_SCENARIOS_INTERVAL = 20
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.pending_control: Optional[carla.VehicleControl] = None
         self.last_agent_input: Dict[str, Any] = {}
+        self._build_scenarios_tick = 0
 
     def begin_scenario(self) -> None:
         if self._scenario_thread is not None:
@@ -215,10 +248,23 @@ class SteppableScenarioManager(ScenarioManager):
         status = self.scenario_tree.status if self.scenario_tree is not None else None
         return bool(self._running), status
 
+    def build_scenarios_loop(self, debug: bool) -> None:
+        """No-op idle thread.
+
+        Scenario building is called synchronously every _BUILD_SCENARIOS_INTERVAL
+        ticks from _tick_scenario_locked (main thread) to avoid a background thread
+        sharing the CARLA RPC socket concurrently with world.tick().
+        """
+        while self._running:
+            time.sleep(1)
+
     # The following is a near-verbatim copy of the upstream _tick_scenario, with two changes:
     #   1. We always apply ``self.pending_control`` (if set) instead of the agent's output.
     #   2. We stash the agent's last input_data on ``self.last_agent_input`` for the gym wrapper.
     def _tick_scenario(self) -> None:
+        self._tick_scenario_locked()
+
+    def _tick_scenario_locked(self) -> None:
         if self._running and self.get_running_status():
             CarlaDataProvider.get_world().tick(self._timeout)
 
@@ -269,6 +315,18 @@ class SteppableScenarioManager(ScenarioManager):
                     carla.Rotation(pitch=-90),
                 )
             )
+
+            # Build/spawn dynamic scenario actors periodically in the main thread
+            # instead of via a background thread, to keep all CARLA RPC calls
+            # single-threaded and avoid concurrent socket access.
+            self._build_scenarios_tick += 1
+            if self._build_scenarios_tick >= self._BUILD_SCENARIOS_INTERVAL:
+                self._build_scenarios_tick = 0
+                try:
+                    self.scenario.build_scenarios(self.ego_vehicles[0], debug=self._debug_mode > 0)
+                    self.scenario.spawn_parked_vehicles(self.ego_vehicles[0])
+                except Exception:
+                    pass
 
 
 def _default_config_path() -> Path:
@@ -494,11 +552,21 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         )
         prev_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
         os.environ["CUDA_VISIBLE_DEVICES"] = str(self._args.gpu_rank)
+        # Force NVIDIA-only Vulkan ICD so -graphicsadapter=N maps to physical GPU N.
+        # Without this, llvmpipe and other ICDs shift the Vulkan device indices, causing
+        # UE4's render thread to select the wrong GPU or fail to initialize.
+        _NVIDIA_VK_ICD = "/usr/share/vulkan/icd.d/nvidia_icd.json"
+        prev_vk_icd = os.environ.get("VK_ICD_FILENAMES")
+        os.environ["VK_ICD_FILENAMES"] = _NVIDIA_VK_ICD
         self._evaluator = LeaderboardEvaluator(self._args, statistics_manager)
         if prev_cuda_visible_devices is not None:
             os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible_devices
         else:
             del os.environ["CUDA_VISIBLE_DEVICES"]
+        if prev_vk_icd is not None:
+            os.environ["VK_ICD_FILENAMES"] = prev_vk_icd
+        else:
+            os.environ.pop("VK_ICD_FILENAMES", None)
         self._evaluator.manager = SteppableScenarioManager(
             self._args.timeout, statistics_manager, self._args.debug
         )
@@ -526,6 +594,28 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         config.repetition_index = int(self.carla_config.get("repetition_index", 0))
         return config
 
+    def _drain_pseudo_sensors(self) -> None:
+        """Stop SpeedometerReader/OpenDriveMapReader threads before any CARLA cleanup.
+
+        These threads call get_velocity() / get_transform() / to_opendrive() over the
+        CARLA RPC socket on a timer. If the main thread makes any CARLA call while one
+        of these threads is mid-RPC, the two concurrent requests corrupt the msgpack
+        framing → clmdep_msgpack::type_error → C++ terminate() → abort.
+
+        We set _run_ps=False on every pseudo-sensor and sleep briefly to let any
+        in-progress CARLA call on the sensor thread finish before we proceed.
+        """
+        try:
+            wrapper = self._evaluator.manager._agent_wrapper
+            if wrapper is None:
+                return
+            for sensor in list(wrapper._sensors_list):
+                if sensor is not None and hasattr(sensor, "_run_ps"):
+                    sensor._run_ps = False
+            time.sleep(0.3)
+        except Exception:
+            pass
+
     def _stop_active_scenario(self) -> None:
         if not self._scenario_active or self._evaluator is None:
             return
@@ -535,9 +625,12 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         except Exception:
             print("\033[91mFailed to stop scenario in wrapper:\033[0m", flush=True)
             print(traceback.format_exc(), flush=True)
+        self._drain_pseudo_sensors()
         self._evaluator._cleanup()
         self._scenario_active = False
-        self._needs_setup_on_reset = True
+        # Do not set _needs_setup_on_reset here: we reuse the existing CARLA
+        # client/world across episodes to avoid spawning a new server (subprocess)
+        # while JAX threads are running, which triggers fork() and crashes.
 
     def _load_route_and_begin_stepping(self, config) -> None:
         from datetime import datetime
@@ -576,6 +669,9 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         args.agent_config = args.agent_config + "+" + save_name
         ev.agent_instance.setup(args.agent_config)
 
+        # Sensors were destroyed in _cleanup(); always re-register them.
+        ev.sensors = None
+        ev.sensors_initialized = False
         if not ev.sensors:
             ev.sensors = ev.agent_instance.sensors()
             track = ev.agent_instance.track
@@ -707,9 +803,11 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 self.evaluator.manager.scenario_duration_game,
                 crash_message,
             )
+            self._drain_pseudo_sensors()
             self.evaluator._cleanup()
             raise RuntimeError(f"Invalid sensors: {e}") from e
         except Exception:
+            self._drain_pseudo_sensors()
             self.evaluator._cleanup()
             raise
 
@@ -839,12 +937,16 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             if self._args.record:
                 self.evaluator.client.stop_recorder()
         finally:
+            self._drain_pseudo_sensors()
             try:
                 self.evaluator._cleanup()
             except Exception:
                 pass
             self._scenario_active = False
-            self._needs_setup_on_reset = True
+            # Reuse the existing evaluator/CARLA client on next reset rather than
+            # spawning a new server.  Calling setup() after JAX is initialized
+            # triggers subprocess.Popen (Xvfb + CarlaUE4.sh), which forks while
+            # JAX threads are live and can corrupt the msgpack RPC connection.
 
     def render(self):
         """Placeholder frame for evaluation video paths (avoid NotImplementedError)."""

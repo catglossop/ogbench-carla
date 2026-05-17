@@ -82,7 +82,7 @@ flags.DEFINE_string(
 )
 flags.DEFINE_bool("list_routes", False, "Print all known routes and exit.")
 
-flags.DEFINE_string("save_dir", "exp/", "Save directory.")
+flags.DEFINE_string("save_dir", "/raid/users/celine/carla_exps", "Save directory.")
 flags.DEFINE_string("restore_path", None, "Restore path for JAX agents.")
 flags.DEFINE_integer("restore_epoch", None, "Restore epoch.")
 
@@ -422,8 +422,8 @@ def run_online_carla(
             if isinstance(raw, dict):
                 routing = str(raw.get("routing_command", "") or "").strip()
             prompt = f"The current speed is {speed:.2f} m/s. {routing or 'Follow the route.'}"
-            reasoning = _format_text_field(raw, "reasoning")
-            subtask = _format_text_field(raw, "subtask")
+            reasoning = _format_text_field(raw, "reasoning_text") or _format_text_field(raw, "reasoning")
+            subtask = _format_text_field(raw, "subtask_text") or _format_text_field(raw, "subtask")
 
             def _clip_text(txt: str, max_chars: int = 120) -> str:
                 return txt if len(txt) <= max_chars else (txt[: max_chars - 3] + "...")
@@ -523,6 +523,7 @@ def run_online_carla(
         t_step_end = time.time()
         
         t_log_start = time.time()
+        cot_obs_raw = obs_raw  # holds reasoning_text/subtask_text stashed by VLA
         obs = next_obs
         obs_raw = next_obs_raw
         episode_return += float(reward)
@@ -537,7 +538,7 @@ def run_online_carla(
             had_collision_this_step = collision_delta > 0
             if should_sample_periodic or had_collision_this_step:
                 frame = _as_video_frame(obs)
-                frame = _annotate_text_panel(frame, next_obs_raw)
+                frame = _annotate_text_panel(frame, cot_obs_raw)
                 if had_collision_this_step:
                     frame = _annotate_collision_frame(
                         frame,
@@ -571,7 +572,7 @@ def run_online_carla(
             _maybe_log_episode_video(
                 rollout_log,
                 end_img if log_images else None,
-                next_obs_raw if log_images else None,
+                cot_obs_raw if log_images else None,
             )
             wandb.log(rollout_log, step=step)
             obs_raw, _info = env.reset(seed=FLAGS.seed + episode_count)
