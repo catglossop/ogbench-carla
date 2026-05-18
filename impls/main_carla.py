@@ -93,6 +93,12 @@ flags.DEFINE_bool(
     "Debug mode: drive with the PDM-Lite expert action instead of the RL agent. "
     "Useful to verify that expert_action values are sensible.",
 )
+flags.DEFINE_bool(
+    "expert_recover_debug",
+    False,
+    "Debug mode: roll out the SteerVLA agent for a random [70, 200] steps per episode, "
+    "then switch to the PDM-Lite expert for the remainder of the episode.",
+)
 
 flags.DEFINE_string("save_dir", "/raid/users/celine/carla_exps", "Save directory.")
 flags.DEFINE_string("restore_path", None, "Restore path for JAX agents.")
@@ -575,12 +581,19 @@ def run_online_carla(
 
     last_update_info = None
 
+    _vla_steps_budget = int(np.random.randint(70, 201)) if FLAGS.expert_recover_debug else 0
+    if FLAGS.expert_recover_debug:
+        print(f"[expert_recover_debug] episode 0: VLA for {_vla_steps_budget} steps then expert", flush=True)
+
     for step in tqdm.tqdm(range(1, FLAGS.online_steps + 1), smoothing=0.1, dynamic_ncols=True):
         t_sample_start = time.time()
         if raw_obs_holder is not None:
             raw_obs_holder["obs"] = obs_raw
         rng, sub = jax.random.split(rng)
-        if FLAGS.expert_debug or agent is None:
+        _in_expert_recovery = FLAGS.expert_recover_debug and (episode_steps >= _vla_steps_budget)
+        if FLAGS.expert_recover_debug and (episode_steps == _vla_steps_budget):
+            env.reinit_expert()
+        if FLAGS.expert_debug or _in_expert_recovery or agent is None:
             action = np.zeros(env.action_space.shape, dtype=np.float32)
         elif step <= warmup:
             action = env.action_space.sample()
@@ -597,7 +610,7 @@ def run_online_carla(
         t_sample_end = time.time()
 
         t_step_start = time.time()
-        if FLAGS.expert_debug:
+        if FLAGS.expert_debug or _in_expert_recovery:
             next_obs_raw, reward, terminated, truncated, info = env.step_expert(obs_raw)
         else:
             next_obs_raw, reward, terminated, truncated, info = env.step(action)
@@ -612,7 +625,7 @@ def run_online_carla(
         # raw_obs_holder["obs"] is still s_t here (not yet updated to s_{t+1}).
         _zero_label = np.zeros(_lang_dim, dtype=np.float32)
         _lang_text = ""
-        if FLAGS.expert_debug or agent is None:
+        if FLAGS.expert_debug or _in_expert_recovery or agent is None:
             _lang = _zero_label
             _next_lang = _zero_label
         elif _critic_feedback_mode == "none":
@@ -690,6 +703,22 @@ def run_online_carla(
         step_wb = {f"rollout/{k}": v for k, v in drive_metrics.items()}
         step_wb["rollout/collision_count"] = float(collision_count)
         step_wb["rollout/collision_events"] = float(collision_delta)
+        if "reward_total" in info:
+            step_wb["reward/total"] = float(info["reward_total"])
+            step_wb["reward/progress"] = float(info.get("reward_progress", 0.0))
+            step_wb["reward/centering"] = float(info.get("reward_centering", 0.0))
+            step_wb["reward/heading"] = float(info.get("reward_heading", 0.0))
+            step_wb["reward/terminal"] = float(info.get("reward_terminal", 0.0))
+            step_wb["reward/penalty_collision"] = float(info.get("penalty_collision", 0.0))
+            step_wb["reward/penalty_outside_route"] = float(info.get("penalty_outside_route", 0.0))
+            step_wb["reward/penalty_steer"] = float(info.get("penalty_steer", 0.0))
+            step_wb["reward/penalty_brake"] = float(info.get("penalty_brake", 0.0))
+            step_wb["reward/penalty_crash_stuck"] = float(info.get("penalty_crash_stuck", 0.0))
+            step_wb["rollout/lane_offset_m"] = float(info.get("lane_offset_m", 0.0))
+            step_wb["rollout/heading_error_rad"] = float(info.get("heading_error_rad", 0.0))
+            step_wb["rollout/speed_norm"] = float(info.get("speed_norm", 0.0))
+            step_wb["rollout/centering_factor"] = float(info.get("centering_factor", 0.0))
+            step_wb["rollout/heading_factor"] = float(info.get("heading_factor", 0.0))
 
         # Log critic feedback signal (obs_raw is already next_obs_raw here)
         if _critic_feedback_mode == "action_delta":
@@ -719,6 +748,20 @@ def run_online_carla(
                 "rollout/episode_collision_events": float(episode_collision_events),
                 "rollout/collisions_over_episode": float(episode_collision_events) / max(float(episode_steps), 1.0),
             }
+            if "reward_total" in info:
+                rollout_log["rollout/final_step_reward"] = float(info["reward_total"])
+                rollout_log["rollout/final_step_reward_progress"] = float(info.get("reward_progress", 0.0))
+                rollout_log["rollout/final_step_reward_centering"] = float(info.get("reward_centering", 0.0))
+                rollout_log["rollout/final_step_reward_heading"] = float(info.get("reward_heading", 0.0))
+                rollout_log["rollout/final_step_reward_terminal"] = float(info.get("reward_terminal", 0.0))
+                rollout_log["rollout/final_step_penalty_collision"] = float(info.get("penalty_collision", 0.0))
+                rollout_log["rollout/final_step_penalty_outside_route"] = float(info.get("penalty_outside_route", 0.0))
+                rollout_log["rollout/final_step_penalty_steer"] = float(info.get("penalty_steer", 0.0))
+                rollout_log["rollout/final_step_penalty_brake"] = float(info.get("penalty_brake", 0.0))
+                rollout_log["rollout/final_step_penalty_crash_stuck"] = float(info.get("penalty_crash_stuck", 0.0))
+                rollout_log["rollout/final_step_success"] = float(bool(info.get("success", False)))
+            if FLAGS.expert_recover_debug:
+                rollout_log["rollout/vla_steps_budget"] = float(_vla_steps_budget)
             _maybe_log_episode_video(
                 rollout_log,
                 end_img if log_images else None,
@@ -742,6 +785,12 @@ def run_online_carla(
             episode_collision_count = 0
             episode_collision_events = 0
             prev_collision_count = 0
+            if FLAGS.expert_recover_debug:
+                _vla_steps_budget = int(np.random.randint(70, 201))
+                print(
+                    f"[expert_recover_debug] episode {episode_count}: VLA for {_vla_steps_budget} steps then expert",
+                    flush=True,
+                )
 
         update_time = 0.0
         if (not FLAGS.expert_debug) and agent is not None and step > warmup and buffer.size >= batch_size:
@@ -846,7 +895,7 @@ def main(_):
     exec_cfg = _steervla_action_execution_cfg(steervla_cfg)
     if exec_cfg is not None:
         extra_carla["steervla_action_execution"] = exec_cfg
-    if FLAGS.expert_debug:
+    if FLAGS.expert_debug or FLAGS.expert_recover_debug:
         extra_carla["expert_controller"] = "simlingo_autopilot"
 
     # Leaderboard starts CARLA with subprocess (fork + exec). JAX initializes a native
@@ -866,7 +915,7 @@ def main(_):
             )
 
         raw_carla_holder: dict | None = None
-        if use_steervla_rollout or FLAGS.expert_debug:
+        if use_steervla_rollout or FLAGS.expert_debug or FLAGS.expert_recover_debug:
             raw_carla_holder = {"obs": obs_dict, "next_obs": obs_dict}
 
         steervla_actor = None

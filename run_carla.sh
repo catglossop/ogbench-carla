@@ -10,6 +10,7 @@ SEED="0"
 RUN_GROUP="Debug"
 SAVE_BUFFER="true"
 EXPERT_DEBUG="false"
+EXPERT_RECOVER_DEBUG="false"
 WANDB_MODE="${WANDB_MODE:-online}"
 
 TRAIN_GPU_RANK="2"
@@ -17,7 +18,7 @@ SIM_GPU_RANK="3"
 RENDER_ADAPTER=""
 CARLA_HOST="localhost"
 CARLA_PORT="2020"
-CARLA_STREAMING_PORT="0"
+CARLA_STREAMING_2PORT="0"
 TM_PORT="8020"
 X_DISPLAY_NUM=""
 
@@ -41,6 +42,7 @@ Options:
   --run-group NAME          W&B / experiment group. Default: Debug
   --save-buffer BOOL        true|false. Default: true
   --expert-debug BOOL       true|false. Default: false
+  --expert-recover-debug BOOL  true|false. Default: false
   --wandb-mode MODE         online|offline|disabled. Default: WANDB_MODE or offline
 
   --train-gpu N             JAX / learner GPU rank. Default: 2
@@ -82,6 +84,7 @@ while [[ $# -gt 0 ]]; do
     --run-group) RUN_GROUP="$2"; shift 2 ;;
     --save-buffer) SAVE_BUFFER="$2"; shift 2 ;;
     --expert-debug) EXPERT_DEBUG="$2"; shift 2 ;;
+    --expert-recover-debug) EXPERT_RECOVER_DEBUG="$2"; shift 2 ;;
     --wandb-mode) WANDB_MODE="$2"; shift 2 ;;
     --train-gpu) TRAIN_GPU_RANK="$2"; shift 2 ;;
     --sim-gpu) SIM_GPU_RANK="$2"; shift 2 ;;
@@ -184,7 +187,7 @@ echo "[run_carla.sh] train_mode=${TRAIN_MODE}"
 echo "[run_carla.sh] critic_mode=${CRITIC_FEEDBACK_MODE}"
 echo "[run_carla.sh] train_gpu_rank=${TRAIN_GPU_RANK} render_adapter=${SIM_GPU_RANK}"
 echo "[run_carla.sh] carla_host=${CARLA_HOST} carla_port=${CARLA_PORT} streaming_port=${CARLA_STREAMING_PORT} tm_port=${TM_PORT} x_display=:${X_DISPLAY_NUM}"
-echo "[run_carla.sh] expert_debug=${EXPERT_DEBUG} save_buffer=${SAVE_BUFFER} online_steps=${ONLINE_STEPS}"
+echo "[run_carla.sh] expert_debug=${EXPERT_DEBUG} expert_recover_debug=${EXPERT_RECOVER_DEBUG} save_buffer=${SAVE_BUFFER} online_steps=${ONLINE_STEPS}"
 echo "[run_carla.sh] temp agent config: ${AGENT_CFG_TMP}"
 echo "[run_carla.sh] temp carla config: ${CARLA_CFG_TMP}"
 
@@ -197,4 +200,5 @@ WANDB_MODE="${WANDB_MODE}" uv run python impls/main_carla.py \
   --seed="${SEED}" \
   --run_group="${RUN_GROUP}" \
   --expert_debug="${EXPERT_DEBUG}" \
+  --expert_recover_debug="${EXPERT_RECOVER_DEBUG}" \
   "${EXTRA_ARGS[@]}"

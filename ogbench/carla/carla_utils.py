@@ -148,7 +148,11 @@ DEFAULT_CRASH_STUCK_STEPS = 20
 DEFAULT_CRASH_STUCK_PENALTY = -1.0
 DEFAULT_COLLISION_EVENT_PENALTY = -5.0
 DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -5.0
-DEFAULT_MIN_SPEED_EVENT_PENALTY = -2.0
+DEFAULT_PROGRESS_REWARD_WEIGHT = 1.0
+DEFAULT_CENTERING_REWARD_WEIGHT = 0.2
+DEFAULT_HEADING_REWARD_WEIGHT = 0.2
+DEFAULT_STEER_PENALTY_WEIGHT = 0.05
+DEFAULT_BRAKE_PENALTY_WEIGHT = 0.02
 SUCCESS_BONUS = 5.0
 FAILURE_BONUS = -5.0
 
@@ -637,12 +641,23 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._outside_route_event_penalty = float(
             self.carla_config.get("outside_route_event_penalty", DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY)
         )
-        self._min_speed_event_penalty = float(
-            self.carla_config.get("min_speed_event_penalty", DEFAULT_MIN_SPEED_EVENT_PENALTY)
+        self._progress_reward_weight = float(
+            self.carla_config.get("progress_reward_weight", DEFAULT_PROGRESS_REWARD_WEIGHT)
+        )
+        self._centering_reward_weight = float(
+            self.carla_config.get("centering_reward_weight", DEFAULT_CENTERING_REWARD_WEIGHT)
+        )
+        self._heading_reward_weight = float(
+            self.carla_config.get("heading_reward_weight", DEFAULT_HEADING_REWARD_WEIGHT)
+        )
+        self._steer_penalty_weight = float(
+            self.carla_config.get("steer_penalty_weight", DEFAULT_STEER_PENALTY_WEIGHT)
+        )
+        self._brake_penalty_weight = float(
+            self.carla_config.get("brake_penalty_weight", DEFAULT_BRAKE_PENALTY_WEIGHT)
         )
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
-        self._prev_min_speed_value = 0.0
 
         self._expert_controller_kind = str(self.carla_config.get("expert_controller", "") or "").strip().lower()
         self._expert_agent: Any | None = None
@@ -925,7 +940,6 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._crash_stuck_ticks = 0
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
-        self._prev_min_speed_value = 0.0
 
     def _ego_actor(self) -> Optional[carla.Actor]:
         ev = self._evaluator
@@ -998,7 +1012,11 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             return "", _zero
 
     def _compute_expert_action(self, action_horizon: int = 10, action_dim: int = 4) -> np.ndarray:
-        """PDM-Lite expert action approximated from route waypoints + target speed."""
+        """Expert action for DAgger / critic feedback.
+
+        Prefer the live SimLingo expert's synchronized planner state when
+        available; fall back to a route-based approximation otherwise.
+        """
         out = np.zeros(action_horizon * action_dim, dtype=np.float32)
         if action_dim != 4:
             return out
@@ -1010,6 +1028,32 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             world = ev.world
             if self._cached_world_map is None:
                 self._cached_world_map = world.get_map()
+
+            live_expert = self._expert_agent
+            live_data = getattr(live_expert, "last_driving_data", None) if live_expert is not None else None
+            if isinstance(live_data, dict):
+                route_local = np.asarray(live_data.get("route", []), dtype=np.float32)
+                target_speed_live = float(live_data.get("target_speed", 0.0))
+                if route_local.ndim == 2 and route_local.shape[1] >= 2 and route_local.shape[0] >= 2:
+                    route_xy = np.asarray(route_local[:, :2], dtype=np.float32)
+                    chunk = np.zeros((action_horizon, 4), dtype=np.float32)
+                    dt = 5.0 / 20.0
+                    route_dist = np.linalg.norm(np.diff(route_xy, axis=0), axis=1)
+                    cum_d = np.concatenate(
+                        [np.zeros(1, dtype=np.float32), np.cumsum(route_dist, dtype=np.float32)],
+                        axis=0,
+                    )
+                    if float(cum_d[-1]) > 1e-3:
+                        prev_xy = np.zeros(2, dtype=np.float32)
+                        for i in range(action_horizon):
+                            s = min(target_speed_live * dt * (i + 1), float(cum_d[-1]))
+                            x_wp = float(np.interp(s, cum_d, route_xy[:, 0]))
+                            y_wp = float(np.interp(s, cum_d, route_xy[:, 1]))
+                            delta_xy = np.array([x_wp, y_wp], dtype=np.float32) - prev_xy
+                            chunk[i, :2] = delta_xy
+                            chunk[i, 2:] = delta_xy
+                            prev_xy = np.array([x_wp, y_wp], dtype=np.float32)
+                        return chunk.flatten()
 
             agent_instance = getattr(ev, "agent_instance", None)
             scenario_route = getattr(getattr(ev, "route_scenario", None), "route", None) or []
@@ -1137,6 +1181,55 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         sensors.setdefault("speed", (ts, {"speed": speed}))
         return sensors
 
+    def tick_expert(self) -> None:
+        """Run the expert agent's planning step without applying the control output.
+
+        Call this every env step during VLA rollout when expert_recover_debug is
+        active so SimLingo's GameTime delta stays bounded. Silently skips if no
+        expert agent is loaded.
+        """
+        if self._expert_agent is None:
+            return
+        try:
+            sensors = self._get_expert_input_data()
+            self._expert_agent.run_step(sensors, GameTime.get_time())
+        except Exception:
+            pass
+
+    def _reset_simlingo_autopilot_state(self, agent: Any) -> None:
+        """Clear controller history without discarding the expert's live route/planner state."""
+        speed_controller = getattr(agent, "speed_controller", None)
+        if hasattr(speed_controller, "reset_error_integral"):
+            speed_controller.reset_error_integral()
+
+        turn_controller = getattr(agent, "turn_controller", None)
+        if turn_controller is not None:
+            if hasattr(turn_controller, "_window"):
+                turn_controller._window = []
+            if hasattr(turn_controller, "error_history"):
+                turn_controller.error_history = []
+
+        if hasattr(agent, "ego_blocked_for_ticks"):
+            agent.ego_blocked_for_ticks = 0
+
+    def reinit_expert(self) -> None:
+        """Prepare the expert for takeover without discarding its synchronized route state.
+
+        During expert_recover_debug the expert is ticked in the background while
+        VLA controls the car. At handoff we want fresh controller history, but
+        rebuilding the SimLingo autopilot from scratch loses its live planner
+        progress and can immediately produce a bad takeover action.
+        """
+        if self._expert_controller_kind != "simlingo_autopilot":
+            return
+        try:
+            if self._expert_agent is None:
+                self._expert_agent = self._build_simlingo_autopilot()
+            elif getattr(self._expert_agent, "initialized", False):
+                self._reset_simlingo_autopilot_state(self._expert_agent)
+        except Exception as exc:
+            print(f"[reinit_expert] failed: {exc}", flush=True)
+
     def step_expert(self, obs_raw: dict):
         """Step the env driven by the PDM-Lite expert (SimLingo autopilot)."""
         if self._expert_agent is not None:
@@ -1158,6 +1251,93 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 self._steervla_exec_cfg["action_input_space"] = orig_space
         return self.step(np.asarray(expert_action, dtype=np.float32))
 
+    def _compute_reward_and_info(
+        self,
+        *,
+        tree_status: Any,
+        terminated: bool,
+    ) -> tuple[float, bool, Dict[str, Any]]:
+        """Shared reward/termination bookkeeping for both policy and expert stepping."""
+        ego = self._ego_actor()
+        speed = 0.0
+        if ego is not None:
+            v = ego.get_velocity()
+            speed = float(np.linalg.norm([v.x, v.y, v.z]))
+        lane_metrics = self._lane_alignment_metrics()
+        lane_offset_m = float(lane_metrics["lane_offset_m"])
+        heading_error_rad = float(lane_metrics["heading_error_rad"])
+        lane_width_m = float(lane_metrics["lane_width_m"])
+        speed_limit_mps = float(lane_metrics["speed_limit_mps"])
+        lane_half_width = max(0.5 * lane_width_m, 1e-3)
+        centering_factor = float(np.clip(1.0 - abs(lane_offset_m) / lane_half_width, 0.0, 1.0))
+        heading_factor = float(np.clip(math.cos(heading_error_rad), 0.0, 1.0))
+        speed_norm = float(np.clip(speed / max(speed_limit_mps, 1e-3), 0.0, 1.0))
+        steer_pen = self._steer_penalty_weight * abs(float(getattr(self._last_control, "steer", 0.0)))
+        brake_pen = self._brake_penalty_weight * float(getattr(self._last_control, "brake", 0.0))
+        progress_reward = self._progress_reward_weight * speed_norm * centering_factor * heading_factor
+        centering_reward = self._centering_reward_weight * centering_factor
+        heading_reward = self._heading_reward_weight * heading_factor
+
+        reward = progress_reward + centering_reward + heading_reward - steer_pen - brake_pen
+        info = self._info_with_sensors(
+            {"scenario_tree_status": getattr(tree_status, "name", str(tree_status))}
+        )
+        crash_stuck, collision_count = self._update_crash_stuck_state(speed)
+        outside_route_value, _min_speed_value = self._route_infraction_values()
+
+        collision_delta = max(0, collision_count - self._prev_collision_count)
+        outside_route_delta = max(0.0, outside_route_value - self._prev_outside_route_value)
+        self._prev_collision_count = collision_count
+        self._prev_outside_route_value = outside_route_value
+
+        collision_pen = self._collision_event_penalty * float(collision_delta)
+        outside_route_pen = self._outside_route_event_penalty * float(outside_route_delta)
+        reward += collision_pen + outside_route_pen
+
+        terminal_bonus = 0.0
+        info["collision_count"] = collision_count
+        info["crash_stuck_ticks"] = self._crash_stuck_ticks
+        info["outside_route_value"] = outside_route_value
+        info["collision_delta"] = float(collision_delta)
+        info["outside_route_delta"] = float(outside_route_delta)
+        info["lane_offset_m"] = lane_offset_m
+        info["heading_error_rad"] = heading_error_rad
+        info["lane_width_m"] = lane_width_m
+        info["speed_limit_mps"] = speed_limit_mps
+        info["speed_norm"] = speed_norm
+        info["centering_factor"] = centering_factor
+        info["heading_factor"] = heading_factor
+        info["penalty_collision"] = collision_pen
+        info["penalty_outside_route"] = outside_route_pen
+        info["penalty_steer"] = -steer_pen
+        info["penalty_brake"] = -brake_pen
+        info["reward_progress"] = progress_reward
+        info["reward_centering"] = centering_reward
+        info["reward_heading"] = heading_reward
+
+        if crash_stuck:
+            terminated = True
+            reward += self._crash_stuck_penalty
+            info["success"] = False
+            info["termination_reason"] = "crash_stuck"
+            info["penalty_crash_stuck"] = self._crash_stuck_penalty
+        else:
+            info["penalty_crash_stuck"] = 0.0
+
+        if terminated:
+            if crash_stuck:
+                self._finalize_route("Finished", "Agent crashed and got stuck")
+            else:
+                success = info["scenario_tree_status"] == "SUCCESS"
+                terminal_bonus = SUCCESS_BONUS if success else FAILURE_BONUS
+                reward += terminal_bonus
+                info["success"] = success
+                self._finalize_route("Finished", "")
+
+        info["reward_terminal"] = terminal_bonus
+        info["reward_total"] = float(reward)
+        return float(reward), bool(terminated), info
+
     def _step_with_control(self, control):
         """Apply a pre-computed VehicleControl and run one leaderboard tick."""
         self._last_control = control
@@ -1167,39 +1347,12 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         except Exception as e:
             return self._obs_dict(), -1.0, True, False, {"error": str(e)}
         terminated = not running
-        ego = self._ego_actor()
-        speed = 0.0
-        if ego is not None:
-            v = ego.get_velocity()
-            speed = float(np.linalg.norm([v.x, v.y, v.z]))
-        reward = 0.01 * speed
-        info = self._info_with_sensors({"scenario_tree_status": getattr(tree_status, "name", str(tree_status))})
-        crash_stuck, collision_count = self._update_crash_stuck_state(speed)
-        outside_route_value, min_speed_value = self._route_infraction_values()
-        collision_delta = max(0, collision_count - self._prev_collision_count)
-        outside_route_delta = max(0.0, outside_route_value - self._prev_outside_route_value)
-        min_speed_delta = max(0.0, min_speed_value - self._prev_min_speed_value)
-        self._prev_collision_count = collision_count
-        self._prev_outside_route_value = outside_route_value
-        self._prev_min_speed_value = min_speed_value
-        collision_pen = self._collision_event_penalty * float(collision_delta)
-        outside_route_pen = self._outside_route_event_penalty * float(outside_route_delta)
-        min_speed_pen = self._min_speed_event_penalty * float(min_speed_delta)
-        reward += collision_pen + outside_route_pen + min_speed_pen
-        info["collision_count"] = collision_count
-        if crash_stuck:
-            terminated = True
-            reward += self._crash_stuck_penalty
-            info["success"] = False
-            info["termination_reason"] = "crash_stuck"
-        if terminated:
-            if crash_stuck:
-                self._finalize_route("Finished", "Agent crashed and got stuck")
-            else:
-                success = info["scenario_tree_status"] == "SUCCESS"
-                reward += 1.0 if success else -1.0
-                info["success"] = success
-                self._finalize_route("Finished", "")
+        reward, terminated, info = self._compute_reward_and_info(
+            tree_status=tree_status,
+            terminated=terminated,
+        )
+        if self._expert_agent is not None:
+            self.tick_expert()
         return self._obs_dict(), float(reward), terminated, False, info
 
     def _obs_dict(self) -> Dict[str, np.ndarray]:
@@ -1258,6 +1411,56 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 min_speed_val = max(min_speed_val, value)
 
         return outside_route_val, min_speed_val
+
+    @staticmethod
+    def _wrap_angle_rad(angle: float) -> float:
+        return float((angle + math.pi) % (2.0 * math.pi) - math.pi)
+
+    def _lane_alignment_metrics(self) -> Dict[str, float]:
+        ego = self._ego_actor()
+        if ego is None:
+            return {
+                "lane_offset_m": 0.0,
+                "heading_error_rad": 0.0,
+                "lane_width_m": 3.5,
+                "speed_limit_mps": 8.0,
+            }
+        try:
+            if self._cached_world_map is None:
+                self._cached_world_map = self.evaluator.world.get_map()
+            ego_tf = ego.get_transform()
+            wp = self._cached_world_map.get_waypoint(
+                ego_tf.location,
+                project_to_road=True,
+                lane_type=carla.LaneType.Driving,
+            )
+            if wp is None:
+                raise RuntimeError("no waypoint available")
+            lane_tf = wp.transform
+            lane_yaw = math.radians(lane_tf.rotation.yaw)
+            dx = float(ego_tf.location.x - lane_tf.location.x)
+            dy = float(ego_tf.location.y - lane_tf.location.y)
+            right_x = -math.sin(lane_yaw)
+            right_y = math.cos(lane_yaw)
+            lane_offset_m = dx * right_x + dy * right_y
+            heading_error_rad = self._wrap_angle_rad(
+                math.radians(float(ego_tf.rotation.yaw - lane_tf.rotation.yaw))
+            )
+            speed_limit_mps = max(float(ego.get_speed_limit()) / 3.6, 1.0)
+            lane_width_m = max(float(getattr(wp, "lane_width", 3.5)), 1.0)
+            return {
+                "lane_offset_m": float(lane_offset_m),
+                "heading_error_rad": float(heading_error_rad),
+                "lane_width_m": float(lane_width_m),
+                "speed_limit_mps": float(speed_limit_mps),
+            }
+        except Exception:
+            return {
+                "lane_offset_m": 0.0,
+                "heading_error_rad": 0.0,
+                "lane_width_m": 3.5,
+                "speed_limit_mps": 8.0,
+            }
 
     def _update_crash_stuck_state(self, speed: float) -> Tuple[bool, int]:
         collision_count = self._collision_count()
@@ -1359,54 +1562,10 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             )
 
         terminated = not running
-        # Reward: speed shaping + explicit infraction penalties.
-        ego = self._ego_actor()
-        speed = 0.0
-        if ego is not None:
-            v = ego.get_velocity()
-            speed = float(np.linalg.norm([v.x, v.y, v.z]))
-        reward = 0.01 * speed
-        info = self._info_with_sensors(
-            {"scenario_tree_status": getattr(tree_status, "name", str(tree_status))}
+        reward, terminated, info = self._compute_reward_and_info(
+            tree_status=tree_status,
+            terminated=terminated,
         )
-        crash_stuck, collision_count = self._update_crash_stuck_state(speed)
-        outside_route_value, min_speed_value = self._route_infraction_values()
-
-        collision_delta = max(0, collision_count - self._prev_collision_count)
-        outside_route_delta = max(0.0, outside_route_value - self._prev_outside_route_value)
-        min_speed_delta = max(0.0, min_speed_value - self._prev_min_speed_value)
-        self._prev_collision_count = collision_count
-        self._prev_outside_route_value = outside_route_value
-        self._prev_min_speed_value = min_speed_value
-
-        collision_pen = self._collision_event_penalty * float(collision_delta)
-        outside_route_pen = self._outside_route_event_penalty * float(outside_route_delta)
-        min_speed_pen = self._min_speed_event_penalty * float(min_speed_delta)
-        reward += collision_pen + outside_route_pen + min_speed_pen
-
-        info["collision_count"] = collision_count
-        info["crash_stuck_ticks"] = self._crash_stuck_ticks
-        info["outside_route_value"] = outside_route_value
-        info["min_speed_value"] = min_speed_value
-        info["collision_delta"] = float(collision_delta)
-        info["outside_route_delta"] = float(outside_route_delta)
-        info["min_speed_delta"] = float(min_speed_delta)
-        info["penalty_collision"] = collision_pen
-        info["penalty_outside_route"] = outside_route_pen
-        info["penalty_min_speed"] = min_speed_pen
-        if crash_stuck:
-            terminated = True
-            reward += self._crash_stuck_penalty
-            info["success"] = False
-            info["termination_reason"] = "crash_stuck"
-        if terminated:
-            if crash_stuck:
-                self._finalize_route("Finished", "Agent crashed and got stuck")
-            else:
-                success = info["scenario_tree_status"] == "SUCCESS"
-                reward += SUCCESS_BONUS if success else FAILURE_BONUS
-                info["success"] = success
-                self._finalize_route("Finished", "")
         return self._obs_dict(), float(reward), terminated, False, info
 
     def _finalize_route(self, entry_status: str, crash_message: str) -> None:

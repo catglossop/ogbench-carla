@@ -117,6 +117,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     self.aim_wp = None  # Waypoint the expert is steering towards
     self.remaining_route = None  # Remaining route
     self.remaining_route_original = None  # Remaining original route
+    self.last_driving_data = None
     self.close_traffic_lights = []
     self.close_stop_signs = []
     self.was_at_stop_sign = False
@@ -435,6 +436,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
     driving_data = self.save(target_point, next_target_point, steer, throttle, brake, control_brake, target_speed,
                              speed_limit, tick_data, speed_reduced_by_obj)
+    self.last_driving_data = driving_data
 
     return control, driving_data
 
