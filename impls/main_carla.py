@@ -47,6 +47,12 @@ import jax
 
 from jax_agents import agents
 from utils.flax_utils import restore_agent
+from coaches.expert_label import NUM_COMMENTARY_WORDS, NUM_DELTA_COMMENTARY_WORDS
+from coaches.critic_feedback import (
+    compute_action_delta,
+    compute_action_delta_commentary,
+    critic_language_dim,
+)
 
 _IMPLS_ROOT = Path(__file__).resolve().parent
 if str(_IMPLS_ROOT) not in sys.path:
@@ -81,6 +87,12 @@ flags.DEFINE_string(
     "(bench2drive_007), or route id (1711). See --list_routes=true.",
 )
 flags.DEFINE_bool("list_routes", False, "Print all known routes and exit.")
+flags.DEFINE_bool(
+    "expert_debug",
+    False,
+    "Debug mode: drive with the PDM-Lite expert action instead of the RL agent. "
+    "Useful to verify that expert_action values are sensible.",
+)
 
 flags.DEFINE_string("save_dir", "/raid/users/celine/carla_exps", "Save directory.")
 flags.DEFINE_string("restore_path", None, "Restore path for JAX agents.")
@@ -154,12 +166,17 @@ def _configure_jax_training_device(training_gpu_rank: int) -> None:
 
 
 def _extract_agent_obs(env, env_obs: dict, mode: str) -> np.ndarray:
-    """Pick the tensor the RL agent trains on (env always exposes both keys)."""
+    """Pick the tensor the RL agent trains on (env always exposes both keys).
+
+    The language label (BOW or delta) is stored separately in the replay buffer
+    and concatenated to the encoded observation ONLY inside the critic (dsrl.py).
+    """
     if mode == "state":
         return np.asarray(env_obs["state"], dtype=np.float32)
     if mode == "image":
         return np.asarray(env_obs["image"], dtype=np.uint8)
     raise ValueError(f"Unknown observation_mode {mode!r}; expected 'state' or 'image'.")
+
 
 # Check if valid task environment
 def _carla_env_p(name: Optional[str]) -> bool:
@@ -326,6 +343,9 @@ def run_online_carla(
     obs = _extract_agent_obs(env, obs_raw, obs_mode)
     log_images = obs_mode == "image"
 
+    _critic_feedback_mode = str(agent_config.get("critic_feedback_mode", "commentary_bow"))
+    _lang_dim = critic_language_dim(agent_config)
+
     action_dim = int(agent_config.get("action_dim", 4)*agent_config.get("actions_horizon", 10))
     example_transition = dict(
         observations=np.array(obs),
@@ -334,6 +354,8 @@ def run_online_carla(
         next_observations=np.array(obs),
         masks=np.float32(1.0),
         terminals=np.float32(0.0),
+        language_label=np.zeros(_lang_dim, dtype=np.float32),
+        next_language_label=np.zeros(_lang_dim, dtype=np.float32),
     )
     if steervla_actor is not None:
         openpi0 = _openpi_fields_from_raw(obs_raw)
@@ -410,7 +432,7 @@ def run_online_carla(
             import cv2  # type: ignore
 
             h, w = base.shape[:2]
-            panel_h = max(90, h // 4)
+            panel_h = max(96, h // 4)  # 5 lines × 16px + 16px offset
             annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
             annotated[:h, :, :] = base
             # Bottom panel is already black via zeros; draw an explicit border line.
@@ -424,28 +446,41 @@ def run_online_carla(
             prompt = f"The current speed is {speed:.2f} m/s. {routing or 'Follow the route.'}"
             reasoning = _format_text_field(raw, "reasoning_text") or _format_text_field(raw, "reasoning")
             subtask = _format_text_field(raw, "subtask_text") or _format_text_field(raw, "subtask")
+            commentary = raw.get("commentary_text", "") if isinstance(raw, dict) else ""
+            expert_action_str = ""
+            if isinstance(raw, dict):
+                ea = raw.get("expert_action")
+                if ea is not None:
+                    ea = np.asarray(ea, dtype=np.float32).reshape(-1)
+                    # First step is dims 0-3: [dx_speed, dy_speed, dx_route, dy_route]
+                    first = ea[:4] if ea.size >= 4 else ea
+                    expert_action_str = " ".join(f"{v:.3f}" for v in first)
 
             def _clip_text(txt: str, max_chars: int = 120) -> str:
                 return txt if len(txt) <= max_chars else (txt[: max_chars - 3] + "...")
 
             lines = [
+                f"Expert: {_clip_text(commentary) if commentary else '?'}",
+                f"ExpertAct[0]: {expert_action_str or '?'}",
                 f"Prompt: {_clip_text(prompt)}",
                 f"Reasoning: {_clip_text(reasoning)}",
                 f"Subtask: {_clip_text(subtask)}",
             ]
-            y = h + 24
+            font_scale = 0.32
+            line_h = 16
+            y = h + line_h
             for line in lines:
                 cv2.putText(
                     annotated,
                     line,
-                    (10, y),
+                    (4, y),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
+                    font_scale,
                     (255, 255, 255),
                     1,
                     cv2.LINE_AA,
                 )
-                y += 24
+                y += line_h
             return annotated
         except Exception:
             return base
@@ -481,7 +516,9 @@ def run_online_carla(
         if raw_obs_holder is not None:
             raw_obs_holder["obs"] = obs_raw
         rng, sub = jax.random.split(rng)
-        if step <= warmup:
+        if FLAGS.expert_debug or agent is None:
+            action = np.zeros(env.action_space.shape, dtype=np.float32)
+        elif step <= warmup:
             action = env.action_space.sample()
         else:
             # [STEP 1] Sample the action from the agent
@@ -497,13 +534,37 @@ def run_online_carla(
         print("[DEBUG - main_carla] Action: ", action)
 
         t_step_start = time.time()
-        next_obs_raw, reward, terminated, truncated, info = env.step(action)
+        if FLAGS.expert_debug:
+            next_obs_raw, reward, terminated, truncated, info = env.step_expert(obs_raw)
+        else:
+            next_obs_raw, reward, terminated, truncated, info = env.step(action)
         if raw_obs_holder is not None:
             raw_obs_holder["next_obs"] = next_obs_raw
         drive_metrics = ego_drive_metrics_from_state_vec(next_obs_raw["state"])
         next_obs = _extract_agent_obs(env, next_obs_raw, obs_mode)
         done = bool(terminated or truncated)
         end_img = np.copy(next_obs) if done and log_images else None
+
+        # Compute critic language label for this transition.
+        # raw_obs_holder["obs"] is still s_t here (not yet updated to s_{t+1}).
+        _zero_label = np.zeros(_lang_dim, dtype=np.float32)
+        _lang_text = ""
+        if FLAGS.expert_debug or agent is None:
+            _lang = _zero_label
+            _next_lang = _zero_label
+        elif _critic_feedback_mode == "none":
+            _lang = _zero_label
+            _next_lang = _zero_label
+        elif _critic_feedback_mode == "action_delta":
+            _lang = compute_action_delta(obs_raw, action, agent, agent_config)
+            _next_lang = _zero_label  # bootstrap target sees zero delta (next action unknown)
+        elif _critic_feedback_mode == "delta_commentary_bow":
+            _lang_text, _lang = compute_action_delta_commentary(obs_raw, action, agent)
+            _next_lang = _zero_label  # depends on current action-vs-expert comparison only
+        else:
+            _lang = np.asarray(obs_raw.get("language_label", _zero_label), dtype=np.float32)
+            _next_lang = np.asarray(next_obs_raw.get("language_label", _zero_label), dtype=np.float32)
+
         buffer.add_transition(
             {
                 "observations": np.asarray(obs),
@@ -512,6 +573,8 @@ def run_online_carla(
                 "next_observations": np.asarray(next_obs),
                 "masks": np.float32(0.0 if terminated else 1.0),
                 "terminals": np.float32(1.0 if done else 0.0),
+                "language_label": _lang,
+                "next_language_label": _next_lang,
                 **(_openpi_fields_from_raw(obs_raw) if steervla_actor is not None else {}),
                 **(
                     {f"next_{k}": np.array(v) for k, v in _openpi_fields_from_raw(next_obs_raw).items()}
@@ -551,11 +614,22 @@ def run_online_carla(
         step_wb = {f"rollout/{k}": v for k, v in drive_metrics.items()}
         step_wb["rollout/collision_count"] = float(collision_count)
         step_wb["rollout/collision_events"] = float(collision_delta)
-        
+
+        # Log critic feedback signal (obs_raw is already next_obs_raw here)
+        if _critic_feedback_mode == "action_delta":
+            step_wb["label/action_delta_norm"] = float(np.linalg.norm(_lang))
+        elif _critic_feedback_mode == "delta_commentary_bow":
+            if _lang_text:
+                step_wb["label/commentary_delta"] = wandb.Html(f"<p>{_lang_text}</p>")
+        else:
+            _commentary = obs_raw.get("commentary_text", "") if isinstance(obs_raw, dict) else ""
+            if _commentary:
+                step_wb["label/commentary"] = wandb.Html(f"<p>{_commentary}</p>")
+
         step_wb["time/sample_time"] = t_sample_end - t_sample_start
         step_wb["time/step_time"] = t_step_end - t_step_start
         step_wb["time/log_time"] = t_log_end - t_log_start
-        
+
         wandb.log(step_wb, step=step)
 
         if done:
@@ -580,9 +654,10 @@ def run_online_carla(
                 raw_obs_holder["obs"] = obs_raw
                 raw_obs_holder["next_obs"] = obs_raw
                 
-            reset_vla_cache = getattr(getattr(agent, "vla_sample_fn", None), "reset_action_cache", None)
-            if reset_vla_cache is not None:
-                reset_vla_cache()
+            if agent is not None:
+                reset_vla_cache = getattr(getattr(agent, "vla_sample_fn", None), "reset_action_cache", None)
+                if reset_vla_cache is not None:
+                    reset_vla_cache()
             obs = _extract_agent_obs(env, obs_raw, obs_mode)
             episode_video_frames = []
             episode_return, episode_steps = 0.0, 0
@@ -591,7 +666,7 @@ def run_online_carla(
             prev_collision_count = 0
 
         update_time = 0.0
-        if step > warmup and buffer.size >= batch_size:
+        if (not FLAGS.expert_debug) and agent is not None and step > warmup and buffer.size >= batch_size:
             t_update_start = time.time()
             for _ in range(updates_per_step):
                 batch = buffer.sample(batch_size)
@@ -616,7 +691,7 @@ def run_online_carla(
             wandb.log(metrics, step=step)
             train_logger.log(metrics, step=step)
 
-        if step % FLAGS.save_interval == 0:
+        if agent is not None and step % FLAGS.save_interval == 0:
             save_agent(agent, FLAGS.save_dir, step)
 
     train_logger.close()
@@ -661,67 +736,80 @@ def main(_):
             carla_yaml = str(default_yaml)
 
     steervla_cfg = config.get("steervla", None)
+    use_steervla_rollout = bool(
+        steervla_cfg is not None and steervla_cfg.get("enabled") and not FLAGS.expert_debug
+    )
+    critic_feedback_mode = str(config.get("critic_feedback_mode", "commentary_bow"))
+    if critic_feedback_mode == "none":
+        config.language_label_dim = 0
+    elif critic_feedback_mode == "delta_commentary_bow":
+        config.language_label_dim = NUM_DELTA_COMMENTARY_WORDS
+    elif critic_feedback_mode == "commentary_bow":
+        config.language_label_dim = NUM_COMMENTARY_WORDS
     extra_carla: dict[str, Any] = {}
     exec_cfg = _steervla_action_execution_cfg(steervla_cfg)
     if exec_cfg is not None:
         extra_carla["steervla_action_execution"] = exec_cfg
+    if FLAGS.expert_debug:
+        extra_carla["expert_controller"] = "simlingo_autopilot"
 
     # Leaderboard starts CARLA with subprocess (fork + exec). JAX initializes a native
     # thread pool; forking afterward triggers the stdlib warning and can deadlock the child,
     # which often surfaces as UE4 "RenderThread" timeouts. Bring the simulator up first.
     env = _make_carla_env(carla_yaml, FLAGS.route, extra_carla_config=extra_carla or None)
-    random.seed(FLAGS.seed)
-    np.random.seed(FLAGS.seed)
-
-    obs_mode = str(config.get("observation_mode", "state"))
-    obs_dict, _info = env.reset(seed=FLAGS.seed)
-    if not isinstance(obs_dict, dict) or "state" not in obs_dict or "image" not in obs_dict:
-        raise ValueError(
-            "CARLA env must return a Dict observation with 'state' and 'image'; "
-            f"got {type(obs_dict).__name__}."
-        )
-
-    raw_carla_holder: dict | None = None
-    if steervla_cfg is not None and steervla_cfg.get("enabled"):
-        raw_carla_holder = {"obs": obs_dict, "next_obs": obs_dict}
-
-    agent_obs = _extract_agent_obs(env, obs_dict, obs_mode)
-    ex_obs = np.expand_dims(agent_obs, 0)
-    ex_actions = np.zeros((1,) + tuple(env.action_space.shape), dtype=np.float32)
-
-    _configure_jax_training_device(int(config.get("training_gpu_rank", -1)))
-
-    agent_class = agents[config["agent_name"]]
-    create_kwargs = {}
-    steervla_actor = None
-    if config["agent_name"] == "dsrl":
-        tr_rank = int(config.get("training_gpu_rank", -1))
-        vla_bundle = (
-            _build_vla_sample_fn(steervla_cfg, raw_carla_holder, training_gpu_rank=tr_rank)
-            if steervla_cfg is not None
-            else None
-        )
-        if vla_bundle is not None:
-            vla_sample_fn, steervla_actor = vla_bundle
-            create_kwargs["vla_sample_fn"] = vla_sample_fn
-            url = steervla_cfg.get("actor_url") if steervla_cfg else None
-            if not (url and str(url).strip()):
-                # create_kwargs["vla_train_state"] = steervla_actor.train_state
-                create_kwargs["openpi_train_config"] = steervla_actor.train_cfg
-                create_kwargs["steervla_actor"] = steervla_actor
-    
-
-    agent = agent_class.create(FLAGS.seed, ex_obs, ex_actions, config, **create_kwargs)
-
-    if FLAGS.restore_path is not None:
-        agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
-
-    if FLAGS.eval_only:
-        # No offline-eval pipeline yet for CARLA; do a single rollout.
-        FLAGS.online_steps = max(FLAGS.online_steps, 200)
-        FLAGS.save_buffer = FLAGS.save_buffer or False
-
     try:
+        random.seed(FLAGS.seed)
+        np.random.seed(FLAGS.seed)
+
+        obs_mode = str(config.get("observation_mode", "state"))
+        obs_dict, _info = env.reset(seed=FLAGS.seed)
+        if not isinstance(obs_dict, dict) or "state" not in obs_dict or "image" not in obs_dict:
+            raise ValueError(
+                "CARLA env must return a Dict observation with 'state' and 'image'; "
+                f"got {type(obs_dict).__name__}."
+            )
+
+        raw_carla_holder: dict | None = None
+        if use_steervla_rollout or FLAGS.expert_debug:
+            raw_carla_holder = {"obs": obs_dict, "next_obs": obs_dict}
+
+        steervla_actor = None
+        agent = None
+        if not FLAGS.expert_debug:
+            agent_obs = _extract_agent_obs(env, obs_dict, obs_mode)
+            ex_obs = np.expand_dims(agent_obs, 0)
+            ex_actions = np.zeros((1,) + tuple(env.action_space.shape), dtype=np.float32)
+
+            _configure_jax_training_device(int(config.get("training_gpu_rank", -1)))
+
+            agent_class = agents[config["agent_name"]]
+            create_kwargs = {}
+            if config["agent_name"] == "dsrl":
+                tr_rank = int(config.get("training_gpu_rank", -1))
+                vla_bundle = None
+                if use_steervla_rollout:
+                    vla_bundle = _build_vla_sample_fn(
+                        steervla_cfg, raw_carla_holder, training_gpu_rank=tr_rank
+                    )
+                if vla_bundle is not None:
+                    vla_sample_fn, steervla_actor = vla_bundle
+                    create_kwargs["vla_sample_fn"] = vla_sample_fn
+                    url = steervla_cfg.get("actor_url") if steervla_cfg else None
+                    if not (url and str(url).strip()):
+                        # create_kwargs["vla_train_state"] = steervla_actor.train_state
+                        create_kwargs["openpi_train_config"] = steervla_actor.train_cfg
+                        create_kwargs["steervla_actor"] = steervla_actor
+
+            agent = agent_class.create(FLAGS.seed, ex_obs, ex_actions, config, **create_kwargs)
+
+            if FLAGS.restore_path is not None:
+                agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
+
+        if FLAGS.eval_only:
+            # No offline-eval pipeline yet for CARLA; do a single rollout.
+            FLAGS.online_steps = max(FLAGS.online_steps, 200)
+            FLAGS.save_buffer = FLAGS.save_buffer or False
+
         run_online_carla(
             env,
             agent,

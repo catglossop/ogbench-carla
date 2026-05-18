@@ -81,12 +81,22 @@ def dsrl_encode_obs_sample_noise_logprob(
     return obs_e, noise * ns, log_prob
 
 
-def dsrl_critic_min_q(network: TrainState, obs_e: jnp.ndarray, actions: jnp.ndarray) -> jnp.ndarray:
+def dsrl_critic_min_q(network: TrainState, obs_e: jnp.ndarray, actions: jnp.ndarray, language_label=None) -> jnp.ndarray:
     """``min_k Q_k(obs_e, actions)`` with critic weights frozen; gradients flow through ``actions`` only."""
     params = jax.tree.map(jax.lax.stop_gradient, network.params)
     obs_e_sg = jax.lax.stop_gradient(obs_e)
+    if language_label is not None:
+        obs_e_sg = jnp.concatenate([obs_e_sg, jnp.asarray(language_label, dtype=jnp.float32)], axis=-1)
     qs = network.select("critic")(obs_e_sg, actions, params=params)
     return jnp.min(qs, axis=0)
+
+
+def _critic_obs_e(obs_e: jnp.ndarray, batch: dict, key: str) -> jnp.ndarray:
+    """Append language label from ``batch[key]`` to encoded observation for critic-only consumption."""
+    lang = batch.get(key)
+    if lang is None:
+        return obs_e
+    return jnp.concatenate([obs_e, jnp.asarray(lang, dtype=jnp.float32)], axis=-1)
 
 @jax.jit
 def _critic_loss_vla_pure_math(
@@ -103,12 +113,12 @@ def _critic_loss_vla_pure_math(
     critic action representation (e.g. via :meth:`DSRLAgent._as_critic_actions`).
     """
     next_obs_e = network.select("obs_encoder")(batch["next_observations"], params=network.params)
-    next_qs = network.select("target_critic")(next_obs_e, next_actions_critic)
+    next_qs = network.select("target_critic")(_critic_obs_e(next_obs_e, batch, "next_language_label"), next_actions_critic)
     next_q = jnp.min(next_qs, axis=0)
     target_q = batch["rewards"] + discount * batch["masks"] * next_q
 
     obs_e = network.select("obs_encoder")(batch["observations"], params=grad_params)
-    qs = network.select("critic")(obs_e, critic_actions, params=grad_params)
+    qs = network.select("critic")(_critic_obs_e(obs_e, batch, "language_label"), critic_actions, params=grad_params)
     critic_loss = jnp.square(qs - target_q[None]).mean()
     return critic_loss, {
         "critic_loss": critic_loss,
@@ -166,7 +176,7 @@ def _actor_loss_vla_pure_math(
     log_prob = dist.log_prob(noise_for_logprob / noise_scale)
 
     actions_sg = jax.lax.stop_gradient(actions_vla)
-    qs = network.select("critic")(obs_e, actions_sg)
+    qs = network.select("critic")(_critic_obs_e(obs_e, batch, "language_label"), actions_sg)
     q = jnp.min(qs, axis=0)
     actor_loss = (alpha * log_prob - q).mean()
     return actor_loss, {
@@ -417,7 +427,7 @@ class DSRLAgent(flax.struct.PyTreeNode):
             self.network.params, batch["next_observations"], next_noise
         )
         next_actions = self._as_critic_actions(next_actions)
-        next_qs = self.network.select("target_critic")(next_obs_e, next_actions)
+        next_qs = self.network.select("target_critic")(_critic_obs_e(next_obs_e, batch, "next_language_label"), next_actions)
         next_q = jnp.min(next_qs, axis=0)
 
         target_q = batch["rewards"] + self.config["discount"] * batch["masks"] * next_q
@@ -425,7 +435,7 @@ class DSRLAgent(flax.struct.PyTreeNode):
         obs_e = self._encode_obs(grad_params, batch["observations"])
         critic_actions = self._as_critic_actions(batch["actions"])
         qs = self.network.select("critic")(
-            obs_e, critic_actions, params=grad_params
+            _critic_obs_e(obs_e, batch, "language_label"), critic_actions, params=grad_params
         )
         critic_loss = jnp.square(qs - target_q[None]).mean()
         return critic_loss, {
@@ -455,7 +465,7 @@ class DSRLAgent(flax.struct.PyTreeNode):
         noise = noise * self.config["noise_scale"]
         # We do not want gradient through the (frozen) flow weights.
         actions = self._flow_sample(self.network.params, batch["observations"], noise)
-        qs = self.network.select("critic")(obs_e, actions)
+        qs = self.network.select("critic")(_critic_obs_e(obs_e, batch, "language_label"), actions)
         q = jnp.min(qs, axis=0)
         actor_loss = (self.config["alpha"] * log_prob - q).mean()
         return actor_loss, {
@@ -718,8 +728,14 @@ class DSRLAgent(flax.struct.PyTreeNode):
             embed_dim = int(ex_observations.shape[-1])
         else:
             embed_dim = int(tuple(config.get("image_mlp_hidden_dims", (512,)))[-1])
+        critic_feedback_mode = str(config.get("critic_feedback_mode", "commentary_bow"))
+        if critic_feedback_mode == "action_delta":
+            lang_dim = int(config.get("critic_action_dim", 4))
+        else:
+            lang_dim = int(config.get("language_label_dim", 119))
         batch_shape = ex_observations.shape[:1]
         ex_embedded = jnp.zeros(batch_shape + (embed_dim,), dtype=jnp.float32)
+        ex_critic_embedded = jnp.zeros(batch_shape + (embed_dim + lang_dim,), dtype=jnp.float32)
         ex_model_actions = jnp.zeros(batch_shape + (action_dim,), dtype=jnp.float32)
         ex_t = jnp.zeros(batch_shape + (1,), dtype=jnp.float32)
 
@@ -744,10 +760,10 @@ class DSRLAgent(flax.struct.PyTreeNode):
             "obs_encoder": (obs_encoder_def, (ex_observations,)),
             "flow": (flow_def, (ex_embedded, ex_model_actions, ex_t)),
             "noise_actor": (actor_def, (ex_embedded,)),
-            "critic": (critic_def, (ex_embedded, ex_model_actions)),
+            "critic": (critic_def, (ex_critic_embedded, ex_model_actions)),
             "target_critic": (
                 copy.deepcopy(critic_def),
-                (ex_embedded, ex_model_actions),
+                (ex_critic_embedded, ex_model_actions),
             ),
         }
         defs = {k: v[0] for k, v in networks.items()}
@@ -821,6 +837,15 @@ def get_config():
             # Critic/action/flow representation used inside DSRL when VLA is enabled.
             # ``4`` matches SteerVLA DELTA_XY_T_DELTA_XY_SPACE first-step action.
             critic_action_dim=4,
+            # Expert / delta language feedback appended to obs_e ONLY for the critic.
+            # For commentary_bow this is 119 (= COMMENTARY_VOCAB).
+            # For delta_commentary_bow it is auto-set in main_carla.py to the corrective BOW size.
+            # Ignored when critic_feedback_mode="action_delta" (lang_dim = critic_action_dim instead).
+            language_label_dim=119,
+            # "commentary_bow": expert commentary BOW.
+            # "action_delta": (critic_action_dim)-dim vector = expert first step − agent first step.
+            # "delta_commentary_bow": corrective language BOW from expert-vs-agent action delta.
+            critic_feedback_mode="commentary_bow",
         )
     )
     return config

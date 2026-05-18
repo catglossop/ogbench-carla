@@ -47,7 +47,17 @@ def get_config():
     config.observation_mode = "image"
     config.image_keys = ("base_0_rgb",)
     # JAX RL device: ``-1`` = unset. CARLA uses ``gpu_rank`` in carla_config.yaml.
-    config.training_gpu_rank = 0
+    config.training_gpu_rank = 2
+
+    # Critic feedback mode — three options:
+    #   "commentary_bow"      (default): expert commentary BOW from the SimLingo-style labeler.
+    #   "action_delta"                 : (critic_action_dim)-dim = expert first step minus agent first step.
+    #   "delta_commentary_bow"        : corrective language BOW from expert-vs-agent action delta
+    #                                   (e.g. "Adjust right. Decelerate more heavily.").
+    # To switch to action_delta, uncomment:
+    config.critic_feedback_mode = "action_delta"
+    # language_label_dim is auto-set for commentary_bow / delta_commentary_bow in main_carla.py,
+    # and critic_action_dim is used directly when mode is action_delta.
 
     config.steervla = ml_collections.ConfigDict(
         dict(

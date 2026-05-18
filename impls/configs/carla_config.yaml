@@ -12,8 +12,8 @@
 #   export CARLA_ROOT=/home/carla/carla-0-9-16
 
 host: localhost
-port: 2000
-traffic_manager_port: 8000
+port: 2001
+traffic_manager_port: 8001
 traffic_manager_seed: 0
 debug: 0
 record: ''
@@ -27,7 +27,7 @@ checkpoint: ./simulation_results.json
 debug_checkpoint: ./live_results.txt
 # CARLA UE / rendering adapter index (leaderboard subprocess). JAX RL GPU is separate:
 # set ``training_gpu_rank`` in the agent config (e.g. steervla_dsrl_config.py).
-gpu_rank: 4
+gpu_rank: 3
 
 repetitions: 1
 repetition_index: 0
