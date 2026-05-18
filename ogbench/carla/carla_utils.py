@@ -46,10 +46,14 @@ or:
 from __future__ import annotations
 
 import os
+import signal
+import socket
+import subprocess
 import sys
 import threading
 import time
 import traceback
+import math
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple, Union
@@ -92,11 +96,49 @@ from leaderboard.leaderboard_evaluator import (
     sensors_to_icons,
 )
 
+from srunner.scenariomanager.scenarioatomics.atomic_criteria import MinimumSpeedRouteTest
+from srunner.scenariomanager.traffic_events import TrafficEvent, TrafficEventType
+
 from ogbench.carla.route_registry import RouteEntry, find_route
 from ogbench.carla.leaderboard_agents.observation_only import (
     IMAGE_SHAPE_HWC,
     RGB_FRONT_CAMERA_TAG,
 )
+from ogbench.carla.expert_label import ExpertLabelComputer, NUM_COMMENTARY_WORDS, commentary_to_bow
+
+
+def _patch_minimum_speed_route_test() -> None:
+    """Fix Bench2Drive's min-speed criterion so >100% does not count as an infraction."""
+    if getattr(MinimumSpeedRouteTest, "_ogbench_patched", False):
+        return
+
+    def _patched_set_traffic_event(self):
+        if self._speed_points > 0 and self._mean_speed:
+            self._mean_speed /= self._speed_points
+            self._actor_speed /= self._speed_points
+            checkpoint_value = round(self._actor_speed / (self.RATIO * self._mean_speed) * 100, 2)
+        else:
+            checkpoint_value = 100
+
+        self._checkpoint_values.append(checkpoint_value)
+        if checkpoint_value >= self.success_value:
+            if self.test_status in ("INIT", "RUNNING"):
+                self.test_status = "SUCCESS"
+            return
+
+        self.test_status = "FAILURE"
+        self._traffic_event = TrafficEvent(TrafficEventType.MIN_SPEED_INFRACTION, GameTime.get_frame())
+        self._traffic_event.set_dict({"percentage": checkpoint_value})
+        self._traffic_event.set_message(
+            f"Average speed is {checkpoint_value}% of the surrounding traffic's one"
+        )
+        self.events.append(self._traffic_event)
+
+    MinimumSpeedRouteTest._set_traffic_event = _patched_set_traffic_event
+    MinimumSpeedRouteTest._ogbench_patched = True
+
+
+_patch_minimum_speed_route_test()
 
 
 def _patch_speedometer_no_rpc() -> None:
@@ -143,9 +185,11 @@ DEFAULT_CRASH_STUCK_STEPS = 20
 DEFAULT_CRASH_STUCK_PENALTY = -1.0
 DEFAULT_COLLISION_EVENT_PENALTY = -5.0
 DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -5.0
-DEFAULT_MIN_SPEED_EVENT_PENALTY = -2.0
+DEFAULT_OUTSIDE_ROUTE_PROGRESS_PENALTY = -1.0
 SUCCESS_BONUS = 5.0
 FAILURE_BONUS = -5.0
+DEFAULT_SPEED_REWARD_SCALE = 0.01
+DEFAULT_ROUTE_PROGRESS_REWARD_SCALE = 0.1
 
 
 def ego_drive_metrics_from_state_vec(state: Any) -> Dict[str, float]:
@@ -381,7 +425,23 @@ def carla_config_to_args(
         checkpoint=str(cfg.get("checkpoint", "./simulation_results.json")),
         debug_checkpoint=str(cfg.get("debug_checkpoint", "./live_results.txt")),
         gpu_rank=int(cfg.get("gpu_rank", 0)),
+        streaming_port=int(cfg.get("streaming_port", 0)),
+        x_display_num=int(cfg.get("x_display_num", 10 + (int(cfg.get("port", 2000)) % 90))),
+        use_cuda_visible_devices=bool(cfg.get("use_cuda_visible_devices", False)),
+        server_boot_wait_seconds=float(cfg.get("server_boot_wait_seconds", 60.0)),
     )
+
+
+def _find_free_port(starting_port: int) -> int:
+    """Return the first free localhost TCP port at or above ``starting_port``."""
+    port = int(starting_port)
+    while True:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("localhost", port))
+                return port
+        except OSError:
+            port += 1
 
 
 def run_leaderboard(args: SimpleNamespace) -> bool:
@@ -392,13 +452,14 @@ def run_leaderboard(args: SimpleNamespace) -> bool:
     statistics_manager = StatisticsManager(args.checkpoint, args.debug_checkpoint)
     
     prev_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_rank)
+    if getattr(args, "use_cuda_visible_devices", False):
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_rank)
     leaderboard_evaluator = LeaderboardEvaluator(args, statistics_manager)
-    if prev_cuda_visible_devices is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible_devices
-    else:
-        del os.environ["CUDA_VISIBLE_DEVICES"]
-    os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible_devices
+    if getattr(args, "use_cuda_visible_devices", False):
+        if prev_cuda_visible_devices is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible_devices
+        else:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
     crashed = leaderboard_evaluator.run(args)
     del leaderboard_evaluator
@@ -488,12 +549,19 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._outside_route_event_penalty = float(
             self.carla_config.get("outside_route_event_penalty", DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY)
         )
-        self._min_speed_event_penalty = float(
-            self.carla_config.get("min_speed_event_penalty", DEFAULT_MIN_SPEED_EVENT_PENALTY)
+        self._outside_route_progress_penalty = float(
+            self.carla_config.get("outside_route_progress_penalty", DEFAULT_OUTSIDE_ROUTE_PROGRESS_PENALTY)
+        )
+        self._speed_reward_scale = float(
+            self.carla_config.get("speed_reward_scale", DEFAULT_SPEED_REWARD_SCALE)
+        )
+        self._route_progress_reward_scale = float(
+            self.carla_config.get("route_progress_reward_scale", DEFAULT_ROUTE_PROGRESS_REWARD_SCALE)
         )
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
         self._prev_min_speed_value = 0.0
+        self._prev_route_completion_value = 0.0
 
         self.observation_space = gymnasium.spaces.Dict(
             {
@@ -503,10 +571,19 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 "image": gymnasium.spaces.Box(
                     low=0, high=255, shape=IMAGE_SHAPE_HWC, dtype=np.uint8
                 ),
+                "language_label": gymnasium.spaces.Box(
+                    low=0.0, high=1.0, shape=(NUM_COMMENTARY_WORDS,), dtype=np.float32
+                ),
             }
         )
+        self._label_computer = ExpertLabelComputer()
+        self._cached_world_map = None  # populated after first CARLA tick
+        self._expert_controller_kind = str(self.carla_config.get("expert_controller", "") or "").strip().lower()
+        self._expert_agent: Any | None = None
         self._steervla_exec_cfg: Optional[Dict[str, Any]] = None
         self._steervla_decoder: Any | None = None
+        self._xvfb_proc: subprocess.Popen[str] | None = None
+        self._x_display_num: int | None = None
         exec_raw = carla_config.get("steervla_action_execution")
         if isinstance(exec_raw, dict):
             need = ("output_action_format", "action_horizon", "action_dim", "action_input_space")
@@ -543,33 +620,197 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             raise RuntimeError("Call setup() before reset() or step().")
         return self._evaluator
 
+    @staticmethod
+    def _cleanup_stale_x_display_lock(display_num: int) -> None:
+        lock_path = f"/tmp/.X{display_num}-lock"
+        if not os.path.exists(lock_path):
+            return
+        try:
+            with open(lock_path) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError, ValueError, OSError):
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass
+
+    def _ensure_xvfb(self, display_num: int) -> None:
+        self._cleanup_stale_x_display_lock(display_num)
+        lock_path = f"/tmp/.X{display_num}-lock"
+        if os.path.exists(lock_path):
+            raise RuntimeError(
+                f"X display :{display_num} is already in use. Pick a different "
+                "carla_config.x_display_num / --x-display-num for concurrent runs."
+            )
+        cmd = [
+            "Xvfb",
+            f":{display_num}",
+            "-screen",
+            "0",
+            "1280x1024x24",
+            "-ac",
+            "+extension",
+            "GLX",
+            "+render",
+            "-noreset",
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+        time.sleep(1.0)
+        if proc.poll() is not None:
+            raise RuntimeError(f"Failed to start Xvfb on :{display_num}; exit code {proc.returncode}")
+        self._xvfb_proc = proc
+        self._x_display_num = display_num
+
+    def _stop_xvfb(self) -> None:
+        proc = self._xvfb_proc
+        self._xvfb_proc = None
+        display_num = self._x_display_num
+        self._x_display_num = None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        if display_num is not None:
+            self._cleanup_stale_x_display_lock(display_num)
+
+    @staticmethod
+    def _patch_leaderboard_launch() -> None:
+        if getattr(LeaderboardEvaluator, "_ogbench_isolated_launch_patch", False):
+            return
+
+        def _setup_simulation_isolated(ev_self, args):
+            ev_self.carla_path = os.environ["CARLA_ROOT"]
+            args.port = _find_free_port(args.port)
+            streaming_port = int(getattr(args, "streaming_port", 0) or 0)
+            if streaming_port <= 0:
+                streaming_port = _find_free_port(args.port + 1)
+
+            display_num = int(getattr(args, "x_display_num", 10 + (args.port % 90)))
+            env = os.environ.copy()
+            env["DISPLAY"] = f":{display_num}"
+
+            cmd_parts = [
+                os.path.join(ev_self.carla_path, "CarlaUE4.sh"),
+                "-RenderOffScreen",
+                "-nosound",
+                f"-carla-rpc-port={args.port}",
+                f"-carla-streaming-port={streaming_port}",
+                f"-graphicsadapter={args.gpu_rank}",
+            ]
+            cmd1 = " ".join(cmd_parts)
+            ev_self.server = subprocess.Popen(
+                cmd1,
+                shell=True,
+                preexec_fn=os.setsid,
+                env=env,
+            )
+            print(f"{cmd1} DISPLAY={env['DISPLAY']}", ev_self.server.returncode, flush=True)
+            import atexit
+
+            atexit.register(os.killpg, ev_self.server.pid, signal.SIGKILL)
+            time.sleep(float(getattr(args, "server_boot_wait_seconds", 60.0)))
+
+            attempts = 0
+            num_max_restarts = 20
+            while attempts < num_max_restarts:
+                try:
+                    client = carla.Client(args.host, args.port)
+                    client_timeout = args.timeout if args.timeout else 600.0
+                    client.set_timeout(client_timeout)
+
+                    settings = carla.WorldSettings(
+                        synchronous_mode=True,
+                        fixed_delta_seconds=1.0 / ev_self.frame_rate,
+                        deterministic_ragdolls=True,
+                        spectator_as_ego=False,
+                    )
+                    client.get_world().apply_settings(settings)
+                    print(f"load_world success , attempts={attempts}", flush=True)
+                    break
+                except Exception as e:
+                    print(f"load_world failed , attempts={attempts}", flush=True)
+                    print(e, flush=True)
+                    attempts += 1
+                    time.sleep(5)
+            attempts = 0
+            num_max_restarts = 40
+            while attempts < num_max_restarts:
+                try:
+                    args.traffic_manager_port = _find_free_port(args.traffic_manager_port)
+                    traffic_manager = client.get_trafficmanager(args.traffic_manager_port)
+                    traffic_manager.set_synchronous_mode(True)
+                    traffic_manager.set_hybrid_physics_mode(True)
+                    print(f"traffic_manager init success, try_time={attempts}", flush=True)
+                    break
+                except Exception as e:
+                    print(f"traffic_manager init fail, try_time={attempts}", flush=True)
+                    print(e, flush=True)
+                    attempts += 1
+                    time.sleep(5)
+            return client, client_timeout, traffic_manager
+
+        LeaderboardEvaluator._setup_simulation = _setup_simulation_isolated
+        LeaderboardEvaluator._ogbench_isolated_launch_patch = True
+
     def setup(self) -> None:
         """Instantiate ``LeaderboardEvaluator`` and swap in :class:`SteppableScenarioManager`."""
+        self._patch_leaderboard_launch()
         self._args = carla_config_to_args(self.carla_config, self.route_entry)
+        self._ensure_xvfb(int(self._args.x_display_num))
         self._base_agent_config = self._args.agent_config
         statistics_manager = StatisticsManager(
             self._args.checkpoint, self._args.debug_checkpoint
         )
         prev_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(self._args.gpu_rank)
+        if getattr(self._args, "use_cuda_visible_devices", False):
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(self._args.gpu_rank)
         # Force NVIDIA-only Vulkan ICD so -graphicsadapter=N maps to physical GPU N.
         # Without this, llvmpipe and other ICDs shift the Vulkan device indices, causing
         # UE4's render thread to select the wrong GPU or fail to initialize.
         _NVIDIA_VK_ICD = "/usr/share/vulkan/icd.d/nvidia_icd.json"
         prev_vk_icd = os.environ.get("VK_ICD_FILENAMES")
         os.environ["VK_ICD_FILENAMES"] = _NVIDIA_VK_ICD
-        self._evaluator = LeaderboardEvaluator(self._args, statistics_manager)
-        if prev_cuda_visible_devices is not None:
-            os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible_devices
-        else:
-            del os.environ["CUDA_VISIBLE_DEVICES"]
-        if prev_vk_icd is not None:
-            os.environ["VK_ICD_FILENAMES"] = prev_vk_icd
-        else:
-            os.environ.pop("VK_ICD_FILENAMES", None)
+        try:
+            self._evaluator = LeaderboardEvaluator(self._args, statistics_manager)
+        except Exception:
+            self._stop_xvfb()
+            raise
+        finally:
+            if getattr(self._args, "use_cuda_visible_devices", False):
+                if prev_cuda_visible_devices is not None:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible_devices
+                else:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            if prev_vk_icd is not None:
+                os.environ["VK_ICD_FILENAMES"] = prev_vk_icd
+            else:
+                os.environ.pop("VK_ICD_FILENAMES", None)
         self._evaluator.manager = SteppableScenarioManager(
             self._args.timeout, statistics_manager, self._args.debug
         )
+        # Register SIGTERM handler so Ctrl+C / kill signals flush the leaderboard's
+        # atexit callbacks (which kill the CARLA subprocess) before exiting.
+        # SIGABRT (from C++ terminate()) cannot be intercepted this way.
+        import signal as _signal
+        _orig_sigterm = _signal.getsignal(_signal.SIGTERM)
+
+        def _sigterm_handler(signum, frame):
+            import atexit as _atexit
+            _atexit._run_exitfuncs()  # type: ignore[attr-defined]
+            if callable(_orig_sigterm):
+                _orig_sigterm(signum, frame)
+            else:
+                raise SystemExit(0)
+
+        _signal.signal(_signal.SIGTERM, _sigterm_handler)
 
     def run_leaderboard(self) -> bool:
         """Full benchmark across all routes in the configured XML file (escape hatch)."""
@@ -631,6 +872,38 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         # Do not set _needs_setup_on_reset here: we reuse the existing CARLA
         # client/world across episodes to avoid spawning a new server (subprocess)
         # while JAX threads are running, which triggers fork() and crashes.
+
+    def _build_simlingo_autopilot(self):
+        """Instantiate SimLingo's privileged autopilot as the expert controller."""
+        try:
+            from impls.coaches.simlingo import AutoPilot
+
+            route_index = f"{self.route_entry.scenario_name}_{self.route_entry.route_id}"
+            ev = self._evaluator
+            world = ev.world
+            client = ev.client
+            ego = ev.manager.ego_vehicles[0]
+            CarlaDataProvider.set_client(client)
+            CarlaDataProvider.set_world(world)
+            CarlaDataProvider._carla_actor_pool[ego.id] = ego
+            if not hasattr(CarlaDataProvider, "active_scenarios"):
+                CarlaDataProvider.active_scenarios = []
+            try:
+                CarlaDataProvider.register_actor(ego, ego.get_transform())
+            except Exception:
+                pass
+
+            agent = AutoPilot("ogbench-simlingo-autopilot", route_index=route_index)
+            agent.setup("ogbench-simlingo-autopilot", route_index=route_index, traffic_manager=None)
+            route_scenario = getattr(self._evaluator, "route_scenario", None)
+            if route_scenario is None:
+                raise RuntimeError("route_scenario missing during SimLingo autopilot setup")
+            agent.set_global_plan(route_scenario.gps_route, route_scenario.route)
+            print("[expert] SimLingo autopilot initialized.", flush=True)
+            return agent
+        except Exception as exc:
+            print(f"[expert] SimLingo autopilot init failed: {exc}", flush=True)
+            return None
 
     def _load_route_and_begin_stepping(self, config) -> None:
         from datetime import datetime
@@ -696,12 +969,17 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         ev.manager.pending_control = None
         ev.manager.last_agent_input = {}
         ev.manager.begin_scenario()
+        self._expert_agent = None
+        if self._expert_controller_kind == "simlingo_autopilot":
+            self._expert_agent = self._build_simlingo_autopilot()
         self._scenario_active = True
         self._last_control = carla.VehicleControl()
         self._crash_stuck_ticks = 0
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
         self._prev_min_speed_value = 0.0
+        self._prev_route_completion_value = 0.0
+        self._cached_world_map = None  # refresh map cache each episode
 
     def _ego_actor(self) -> Optional[carla.Actor]:
         ev = self._evaluator
@@ -716,11 +994,281 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             return np.zeros(STATE_DIM, dtype=np.float32)
         return _ego_state_vector(ego, self._last_control)
 
+    def _compute_language_label(self, expert_action: Optional[np.ndarray] = None) -> tuple[str, np.ndarray]:
+        """Query expert commentary from live CARLA state.
+
+        Returns ``(commentary_text, bow_vector)``. Falls back to empty string
+        and zero vector on any error.
+        """
+        _zero = np.zeros(NUM_COMMENTARY_WORDS, dtype=np.float32)
+        ego = self._ego_actor()
+        if ego is None:
+            return "", _zero
+        try:
+            ev = self._evaluator
+            world = ev.world
+            if self._cached_world_map is None:
+                self._cached_world_map = world.get_map()
+            route = getattr(getattr(ev, "agent_instance", None), "_global_plan_world_coord", []) or []
+            scenario_type = self.route_entry.scenario_type
+            _, _, text, bow = self._label_computer.compute_full(
+                ego,
+                world,
+                self._cached_world_map,
+                route,
+                scenario_type=scenario_type,
+                expert_action=expert_action,
+            )
+            return text, bow
+        except Exception:
+            return "", _zero
+
+    def _compute_expert_action(self, action_horizon: int = 10, action_dim: int = 4) -> np.ndarray:
+        """PDM-Lite expert action approximated from route waypoints + target speed.
+
+        Matches the DELTA_XY_T_DELTA_XY_SPACE layout used by SteerVLA:
+        per step ``[dx_speed, dy_speed, dx_route, dy_route]`` where x is
+        forward and y is left in ego frame (simlingo/transfuser convention).
+
+        Returns a flat float32 array of shape ``(action_horizon * action_dim,)``.
+        """
+        out = np.zeros(action_horizon * action_dim, dtype=np.float32)
+        if action_dim != 4:
+            return out
+        ego = self._ego_actor()
+        if ego is None:
+            return out
+        try:
+            ev = self._evaluator
+            world = ev.world
+            if self._cached_world_map is None:
+                self._cached_world_map = world.get_map()
+
+            agent_instance = getattr(ev, "agent_instance", None)
+            scenario_route = getattr(getattr(ev, "route_scenario", None), "route", None) or []
+            route_dense = (
+                getattr(agent_instance, "org_dense_route_world_coord", None)
+                or scenario_route
+                or []
+            )
+            route_sparse = getattr(agent_instance, "_global_plan_world_coord", None) or []
+            route = route_dense or route_sparse
+
+            # Target speed from expert label computer. Parking-style routes are a special case:
+            # the generic "vehicle ahead" heuristic often latches onto the cut-in obstacle and
+            # freezes the expert at 0 m/s even though the intended behavior is to keep exiting
+            # the parking area along the planned route.
+            scenario_type = str(getattr(self.route_entry, "scenario_type", "") or "")
+            if "parking" in scenario_type.lower():
+                try:
+                    speed_limit = max(ego.get_speed_limit() / 3.6, 1.0)
+                except Exception:
+                    speed_limit = 8.33
+                target_speed = float(np.clip(speed_limit * 0.5, 3.0, 5.0))
+            else:
+                try:
+                    _, speed_ctx = self._label_computer._speed_info(ego, world, self._cached_world_map)
+                    target_speed = float(speed_ctx.get("target_speed", 0.0))
+                except Exception as _se:
+                    print(f"[expert_action] _speed_info failed: {_se}", flush=True)
+                    target_speed = 0.0
+
+            # Ego frame basis: x = forward, y = left (negative right)
+            ego_tf = ego.get_transform()
+            ego_loc = ego_tf.location
+            fwd = ego_tf.get_forward_vector()
+            right = ego_tf.get_right_vector()
+
+            def _to_ego(loc):
+                rel = loc - ego_loc
+                x_e = rel.x * fwd.x + rel.y * fwd.y
+                y_e = -(rel.x * right.x + rel.y * right.y)
+                return x_e, y_e
+
+            # Match SimLingo / SteerVLA control decoding timebase:
+            # action rows are interpreted at policy_fps = carla_fps / data_save_freq = 20 / 5 = 4 Hz.
+            dt = 5.0 / 20.0
+            chunk = np.zeros((action_horizon, 4), dtype=np.float32)
+            route_debug_source = "dense" if route_dense else ("sparse" if route_sparse else "fallback")
+
+            def _build_chunk_from_route(route_seq) -> tuple[np.ndarray, int]:
+                route_locs = [tf.location for tf, _ in route_seq if tf is not None]
+                if len(route_locs) < 2:
+                    return np.zeros((action_horizon, 4), dtype=np.float32), 0
+
+                nearest_idx = min(
+                    range(len(route_locs)),
+                    key=lambda i: route_locs[i].distance(ego_loc),
+                )
+                future_locs = route_locs[nearest_idx:]
+                if len(future_locs) < 2:
+                    return np.zeros((action_horizon, 4), dtype=np.float32), 0
+
+                cum_d = [0.0]
+                xy_ego: list[tuple[float, float]] = []
+                prev_loc = ego_loc
+                for loc in future_locs:
+                    cum_d.append(cum_d[-1] + float(loc.distance(prev_loc)))
+                    xy_ego.append(_to_ego(loc))
+                    prev_loc = loc
+
+                if cum_d[-1] < 1e-3:
+                    return np.zeros((action_horizon, 4), dtype=np.float32), 0
+
+                dists_r = np.asarray(cum_d, dtype=np.float64)
+                xs_r = np.asarray([0.0] + [xy[0] for xy in xy_ego], dtype=np.float64)
+                ys_r = np.asarray([0.0] + [xy[1] for xy in xy_ego], dtype=np.float64)
+
+                route_chunk = np.zeros((action_horizon, 4), dtype=np.float32)
+                prev_x = prev_y = 0.0
+                for i in range(action_horizon):
+                    s = min(target_speed * dt * (i + 1), float(dists_r[-1]))
+                    x_wp = float(np.interp(s, dists_r, xs_r))
+                    y_wp = float(np.interp(s, dists_r, ys_r))
+                    route_chunk[i, 0] = x_wp - prev_x
+                    route_chunk[i, 1] = y_wp - prev_y
+                    route_chunk[i, 2] = x_wp - prev_x
+                    route_chunk[i, 3] = y_wp - prev_y
+                    prev_x, prev_y = x_wp, y_wp
+                return route_chunk, len(future_locs)
+
+            if route:
+                chunk, route_pts = _build_chunk_from_route(route)
+            else:
+                route_pts = 0
+
+            if route_pts < 2:
+                curr_wp = self._cached_world_map.get_waypoint(ego_loc, project_to_road=True)
+                fallback_route: list[tuple[Any, Any]] = []
+                if curr_wp is not None:
+                    fallback_route.append((curr_wp.transform, None))
+                    for _ in range(action_horizon + 20):
+                        nxt = curr_wp.next(1.0)
+                        if not nxt:
+                            break
+                        curr_wp = nxt[0]
+                        fallback_route.append((curr_wp.transform, None))
+                chunk, route_pts = _build_chunk_from_route(fallback_route)
+                route_debug_source = "road_fallback"
+
+            print(
+                f"[expert_action] route_src={route_debug_source} route_pts={route_pts} "
+                f"route_total={len(route)} target_speed={target_speed:.2f}",
+                flush=True,
+            )
+
+            if route_pts < 2:
+                dx = target_speed * dt
+                chunk[:, 0] = dx
+                chunk[:, 2] = dx
+
+            return chunk.flatten()
+
+        except Exception as _e:
+            print(f"[expert_action] exception: {_e}", flush=True)
+            return out
+
+    def step_expert(self, obs_raw: dict):
+        """Step the env using the PDM-Lite expert action from ``obs_raw``.
+
+        The ``expert_action`` array is in physical units (metres/step) and is
+        passed directly to the waypoint decoder as ``policy_output`` space,
+        bypassing the OpenPI normalisation layer used for VLA actions.
+        """
+        if self._expert_agent is not None:
+            sensors = self._get_expert_input_data()
+            try:
+                control = self._expert_agent.run_step(sensors, GameTime.get_time())
+                return self._step_with_control(control)
+            except Exception as _ee:
+                print(f"[step_expert] SimLingo autopilot failed, falling back to expert_action: {_ee}", flush=True)
+
+        expert_action = obs_raw.get("expert_action")
+        if expert_action is None:
+            expert_action = np.zeros(self.action_space.shape, dtype=np.float32)
+        if self._steervla_exec_cfg is not None:
+            control = None
+            if self._steervla_decoder is not None:
+                try:
+                    from ogbench.carla.steervla_simlingo_control import maybe_steervla_vehicle_control
+
+                    control = maybe_steervla_vehicle_control(
+                        np.asarray(expert_action, dtype=np.float32),
+                        state_vec=self._get_state_vector(),
+                        exec_cfg=self._steervla_exec_cfg,
+                        decoder=self._steervla_decoder,
+                    )
+                except Exception as _ce:
+                    print(f"[step_expert] control decode failed: {_ce}", flush=True)
+            if control is not None:
+                print(
+                    f"[step_expert] steer={control.steer:.3f} throttle={control.throttle:.3f} brake={float(control.brake):.3f}",
+                    flush=True,
+                )
+            orig_space = self._steervla_exec_cfg.get("action_input_space", "normalized")
+            self._steervla_exec_cfg["action_input_space"] = "policy_output"
+            try:
+                return self.step(np.asarray(expert_action, dtype=np.float32))
+            finally:
+                self._steervla_exec_cfg["action_input_space"] = orig_space
+        return self.step(np.asarray(expert_action, dtype=np.float32))
+
+    def _get_expert_input_data(self) -> Dict[str, Any]:
+        """Build a minimal leaderboard-style sensor dict for local expert controllers."""
+        sensors = dict(getattr(self.evaluator.manager, "last_agent_input", None) or {})
+        if "imu" in sensors:
+            return sensors
+
+        try:
+            ego = self.evaluator.manager.ego_vehicles[0]
+        except Exception:
+            return sensors
+
+        ts = float(GameTime.get_time())
+        transform = ego.get_transform()
+        velocity = ego.get_velocity()
+        accel = ego.get_acceleration()
+        ang_vel = ego.get_angular_velocity()
+
+        speed = float(math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2))
+        gps = np.array(
+            [
+                float(transform.location.x),
+                float(transform.location.y),
+                float(transform.location.z),
+            ],
+            dtype=np.float32,
+        )
+        # SimLingo expects the raw IMU compass value; its helper converts this to
+        # CARLA yaw by subtracting 90 degrees.
+        compass = float(np.deg2rad(transform.rotation.yaw + 90.0))
+        imu = np.array(
+            [
+                float(accel.x),
+                float(accel.y),
+                float(accel.z),
+                float(ang_vel.x),
+                float(ang_vel.y),
+                float(ang_vel.z),
+                compass,
+            ],
+            dtype=np.float32,
+        )
+        sensors.setdefault("imu", (ts, imu))
+        sensors.setdefault("gps", (ts, gps))
+        sensors.setdefault("speed", (ts, {"speed": speed}))
+        return sensors
+
     def _obs_dict(self) -> Dict[str, np.ndarray]:
         sensors = getattr(self.evaluator.manager, "last_agent_input", None) or {}
+        expert_action = self._compute_expert_action()
+        commentary_text, language_label = self._compute_language_label(expert_action=expert_action)
         return {
             "state": self._get_state_vector(),
             "image": rgb_front_from_leaderboard_dict(sensors),
+            "language_label": language_label,
+            "commentary_text": commentary_text,
+            "expert_action": expert_action,
         }
 
     def _info_with_sensors(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -767,6 +1315,18 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 min_speed_val = max(min_speed_val, value)
 
         return outside_route_val, min_speed_val
+
+    def _route_completion_value(self) -> float:
+        scenario = getattr(self.evaluator, "route_scenario", None)
+        if scenario is None:
+            return 0.0
+        for criterion in scenario.get_criteria():
+            if getattr(criterion, "name", "") == "RouteCompletionTest":
+                try:
+                    return float(getattr(criterion, "actual_value", 0.0))
+                except Exception:
+                    return 0.0
+        return 0.0
 
     def _update_crash_stuck_state(self, speed: float) -> Tuple[bool, int]:
         collision_count = self._collision_count()
@@ -840,6 +1400,11 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 )
         if control is None:
             control = _action_to_control(action)
+        return self._step_with_control(control)
+
+    def _step_with_control(
+        self, control: carla.VehicleControl
+    ) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
         self._last_control = control
         self.evaluator.manager.pending_control = control
 
@@ -868,13 +1433,17 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             )
 
         terminated = not running
-        # Reward: speed shaping + explicit infraction penalties.
+        # Reward: route progress + speed shaping + bounded/event-style infractions.
         ego = self._ego_actor()
         speed = 0.0
         if ego is not None:
             v = ego.get_velocity()
             speed = float(np.linalg.norm([v.x, v.y, v.z]))
-        reward = 0.01 * speed
+        route_completion_value = self._route_completion_value()
+        route_completion_delta = max(0.0, route_completion_value - self._prev_route_completion_value)
+        reward_speed = self._speed_reward_scale * speed
+        reward_route_progress = self._route_progress_reward_scale * route_completion_delta
+        reward = reward_speed + reward_route_progress
         info = self._info_with_sensors(
             {"scenario_tree_status": getattr(tree_status, "name", str(tree_status))}
         )
@@ -883,26 +1452,31 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
 
         collision_delta = max(0, collision_count - self._prev_collision_count)
         outside_route_delta = max(0.0, outside_route_value - self._prev_outside_route_value)
-        min_speed_delta = max(0.0, min_speed_value - self._prev_min_speed_value)
+        outside_route_onset = float(self._prev_outside_route_value <= 0.0 and outside_route_value > 0.0)
         self._prev_collision_count = collision_count
         self._prev_outside_route_value = outside_route_value
         self._prev_min_speed_value = min_speed_value
+        self._prev_route_completion_value = route_completion_value
 
         collision_pen = self._collision_event_penalty * float(collision_delta)
-        outside_route_pen = self._outside_route_event_penalty * float(outside_route_delta)
-        min_speed_pen = self._min_speed_event_penalty * float(min_speed_delta)
-        reward += collision_pen + outside_route_pen + min_speed_pen
+        outside_route_pen = self._outside_route_event_penalty * outside_route_onset
+        outside_route_progress_pen = self._outside_route_progress_penalty * float(outside_route_delta > 0.0)
+        reward += collision_pen + outside_route_pen + outside_route_progress_pen
 
         info["collision_count"] = collision_count
         info["crash_stuck_ticks"] = self._crash_stuck_ticks
+        info["route_completion_value"] = route_completion_value
+        info["route_completion_delta"] = float(route_completion_delta)
         info["outside_route_value"] = outside_route_value
         info["min_speed_value"] = min_speed_value
         info["collision_delta"] = float(collision_delta)
         info["outside_route_delta"] = float(outside_route_delta)
-        info["min_speed_delta"] = float(min_speed_delta)
+        info["outside_route_onset"] = outside_route_onset
         info["penalty_collision"] = collision_pen
         info["penalty_outside_route"] = outside_route_pen
-        info["penalty_min_speed"] = min_speed_pen
+        info["penalty_outside_route_progress"] = outside_route_progress_pen
+        info["reward_speed"] = reward_speed
+        info["reward_route_progress"] = reward_route_progress
         if crash_stuck:
             terminated = True
             reward += self._crash_stuck_penalty
@@ -963,6 +1537,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                     pass
                 self._evaluator = None
                 self._args = None
+        self._stop_xvfb()
         super().close()
 
 
