@@ -46,6 +46,7 @@ or:
 from __future__ import annotations
 
 import atexit
+import math
 import os
 import signal
 import socket
@@ -643,6 +644,15 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._prev_outside_route_value = 0.0
         self._prev_min_speed_value = 0.0
 
+        self._expert_controller_kind = str(self.carla_config.get("expert_controller", "") or "").strip().lower()
+        self._expert_agent: Any | None = None
+        self._cached_world_map: Any | None = None
+        try:
+            from coaches.expert_label import ExpertLabelComputer
+            self._label_computer = ExpertLabelComputer()
+        except Exception:
+            self._label_computer = None
+
         self.observation_space = gymnasium.spaces.Dict(
             {
                 "state": gymnasium.spaces.Box(
@@ -906,6 +916,10 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         ev.manager.pending_control = None
         ev.manager.last_agent_input = {}
         ev.manager.begin_scenario()
+        self._expert_agent = None
+        if self._expert_controller_kind == "simlingo_autopilot":
+            self._expert_agent = self._build_simlingo_autopilot()
+        self._cached_world_map = None
         self._scenario_active = True
         self._last_control = carla.VehicleControl()
         self._crash_stuck_ticks = 0
@@ -926,11 +940,278 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             return np.zeros(STATE_DIM, dtype=np.float32)
         return _ego_state_vector(ego, self._last_control)
 
+    def _build_simlingo_autopilot(self):
+        """Instantiate SimLingo's privileged autopilot as the expert controller."""
+        try:
+            from coaches.simlingo import AutoPilot
+            route_index = f"{self.route_entry.scenario_name}_{self.route_entry.route_id}"
+            ev = self._evaluator
+            world = ev.world
+            client = ev.client
+            ego = ev.manager.ego_vehicles[0]
+            CarlaDataProvider.set_client(client)
+            CarlaDataProvider.set_world(world)
+            CarlaDataProvider._carla_actor_pool[ego.id] = ego
+            if not hasattr(CarlaDataProvider, "active_scenarios"):
+                CarlaDataProvider.active_scenarios = []
+            try:
+                CarlaDataProvider.register_actor(ego, ego.get_transform())
+            except Exception:
+                pass
+            agent = AutoPilot("ogbench-simlingo-autopilot", route_index=route_index)
+            agent.setup("ogbench-simlingo-autopilot", route_index=route_index, traffic_manager=None)
+            route_scenario = getattr(self._evaluator, "route_scenario", None)
+            if route_scenario is None:
+                raise RuntimeError("route_scenario missing during SimLingo autopilot setup")
+            agent.set_global_plan(route_scenario.gps_route, route_scenario.route)
+            print("[expert] SimLingo autopilot initialized.", flush=True)
+            return agent
+        except Exception as exc:
+            print(f"[expert] SimLingo autopilot init failed: {exc}", flush=True)
+            return None
+
+    def _compute_language_label(self, expert_action=None):
+        """Query expert commentary from live CARLA state."""
+        try:
+            from coaches.expert_label import NUM_COMMENTARY_WORDS
+            _zero = np.zeros(NUM_COMMENTARY_WORDS, dtype=np.float32)
+        except Exception:
+            return "", np.zeros(0, dtype=np.float32)
+        if self._label_computer is None:
+            return "", _zero
+        ego = self._ego_actor()
+        if ego is None:
+            return "", _zero
+        try:
+            ev = self._evaluator
+            world = ev.world
+            if self._cached_world_map is None:
+                self._cached_world_map = world.get_map()
+            route = getattr(getattr(ev, "agent_instance", None), "_global_plan_world_coord", []) or []
+            scenario_type = self.route_entry.scenario_type
+            _, _, text, bow = self._label_computer.compute_full(
+                ego, world, self._cached_world_map, route,
+                scenario_type=scenario_type, expert_action=expert_action,
+            )
+            return text, bow
+        except Exception:
+            return "", _zero
+
+    def _compute_expert_action(self, action_horizon: int = 10, action_dim: int = 4) -> np.ndarray:
+        """PDM-Lite expert action approximated from route waypoints + target speed."""
+        out = np.zeros(action_horizon * action_dim, dtype=np.float32)
+        if action_dim != 4:
+            return out
+        ego = self._ego_actor()
+        if ego is None:
+            return out
+        try:
+            ev = self._evaluator
+            world = ev.world
+            if self._cached_world_map is None:
+                self._cached_world_map = world.get_map()
+
+            agent_instance = getattr(ev, "agent_instance", None)
+            scenario_route = getattr(getattr(ev, "route_scenario", None), "route", None) or []
+            route_dense = (
+                getattr(agent_instance, "org_dense_route_world_coord", None)
+                or scenario_route
+                or []
+            )
+            route_sparse = getattr(agent_instance, "_global_plan_world_coord", None) or []
+            route = route_dense or route_sparse
+
+            scenario_type = str(getattr(self.route_entry, "scenario_type", "") or "")
+            if "parking" in scenario_type.lower():
+                try:
+                    speed_limit = max(ego.get_speed_limit() / 3.6, 1.0)
+                except Exception:
+                    speed_limit = 8.33
+                target_speed = float(np.clip(speed_limit * 0.5, 3.0, 5.0))
+            else:
+                try:
+                    if self._label_computer is not None:
+                        _, speed_ctx = self._label_computer._speed_info(ego, world, self._cached_world_map)
+                        target_speed = float(speed_ctx.get("target_speed", 0.0))
+                    else:
+                        target_speed = 0.0
+                except Exception as _se:
+                    print(f"[expert_action] _speed_info failed: {_se}", flush=True)
+                    target_speed = 0.0
+
+            ego_tf = ego.get_transform()
+            ego_loc = ego_tf.location
+            fwd = ego_tf.get_forward_vector()
+            right = ego_tf.get_right_vector()
+
+            def _to_ego(loc):
+                rel = loc - ego_loc
+                x_e = rel.x * fwd.x + rel.y * fwd.y
+                y_e = -(rel.x * right.x + rel.y * right.y)
+                return x_e, y_e
+
+            dt = 5.0 / 20.0
+            chunk = np.zeros((action_horizon, 4), dtype=np.float32)
+
+            def _build_chunk_from_route(route_seq):
+                route_locs = [tf.location for tf, _ in route_seq if tf is not None]
+                if len(route_locs) < 2:
+                    return np.zeros((action_horizon, 4), dtype=np.float32), 0
+                nearest_idx = min(range(len(route_locs)), key=lambda i: route_locs[i].distance(ego_loc))
+                future_locs = route_locs[nearest_idx:]
+                if len(future_locs) < 2:
+                    return np.zeros((action_horizon, 4), dtype=np.float32), 0
+                cum_d = [0.0]
+                xy_ego = []
+                prev_loc = ego_loc
+                for loc in future_locs:
+                    cum_d.append(cum_d[-1] + float(loc.distance(prev_loc)))
+                    xy_ego.append(_to_ego(loc))
+                    prev_loc = loc
+                if cum_d[-1] < 1e-3:
+                    return np.zeros((action_horizon, 4), dtype=np.float32), 0
+                dists_r = np.asarray(cum_d, dtype=np.float64)
+                xs_r = np.asarray([0.0] + [xy[0] for xy in xy_ego], dtype=np.float64)
+                ys_r = np.asarray([0.0] + [xy[1] for xy in xy_ego], dtype=np.float64)
+                route_chunk = np.zeros((action_horizon, 4), dtype=np.float32)
+                prev_x = prev_y = 0.0
+                for i in range(action_horizon):
+                    s = min(target_speed * dt * (i + 1), float(dists_r[-1]))
+                    x_wp = float(np.interp(s, dists_r, xs_r))
+                    y_wp = float(np.interp(s, dists_r, ys_r))
+                    route_chunk[i, 0] = x_wp - prev_x
+                    route_chunk[i, 1] = y_wp - prev_y
+                    route_chunk[i, 2] = x_wp - prev_x
+                    route_chunk[i, 3] = y_wp - prev_y
+                    prev_x, prev_y = x_wp, y_wp
+                return route_chunk, len(future_locs)
+
+            if route:
+                chunk, route_pts = _build_chunk_from_route(route)
+            else:
+                route_pts = 0
+
+            if route_pts < 2:
+                curr_wp = self._cached_world_map.get_waypoint(ego_loc, project_to_road=True)
+                fallback_route = []
+                if curr_wp is not None:
+                    fallback_route.append((curr_wp.transform, None))
+                    for _ in range(action_horizon + 20):
+                        nxt = curr_wp.next(1.0)
+                        if not nxt:
+                            break
+                        curr_wp = nxt[0]
+                        fallback_route.append((curr_wp.transform, None))
+                chunk, route_pts = _build_chunk_from_route(fallback_route)
+
+            if route_pts < 2:
+                dx = target_speed * dt
+                chunk[:, 0] = dx
+                chunk[:, 2] = dx
+
+            return chunk.flatten()
+        except Exception as _e:
+            print(f"[expert_action] exception: {_e}", flush=True)
+            return out
+
+    def _get_expert_input_data(self) -> Dict[str, Any]:
+        """Build a minimal leaderboard-style sensor dict for the expert agent."""
+        sensors = dict(getattr(self.evaluator.manager, "last_agent_input", None) or {})
+        if "imu" in sensors:
+            return sensors
+        try:
+            ego = self.evaluator.manager.ego_vehicles[0]
+        except Exception:
+            return sensors
+        ts = float(GameTime.get_time())
+        transform = ego.get_transform()
+        velocity = ego.get_velocity()
+        accel = ego.get_acceleration()
+        ang_vel = ego.get_angular_velocity()
+        speed = float(math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2))
+        gps = np.array([float(transform.location.x), float(transform.location.y), float(transform.location.z)], dtype=np.float32)
+        compass = float(np.deg2rad(transform.rotation.yaw + 90.0))
+        imu = np.array([float(accel.x), float(accel.y), float(accel.z), float(ang_vel.x), float(ang_vel.y), float(ang_vel.z), compass], dtype=np.float32)
+        sensors.setdefault("imu", (ts, imu))
+        sensors.setdefault("gps", (ts, gps))
+        sensors.setdefault("speed", (ts, {"speed": speed}))
+        return sensors
+
+    def step_expert(self, obs_raw: dict):
+        """Step the env driven by the PDM-Lite expert (SimLingo autopilot)."""
+        if self._expert_agent is not None:
+            sensors = self._get_expert_input_data()
+            try:
+                control = self._expert_agent.run_step(sensors, GameTime.get_time())
+                return self._step_with_control(control)
+            except Exception as _ee:
+                print(f"[step_expert] SimLingo autopilot failed: {_ee}", flush=True)
+        expert_action = obs_raw.get("expert_action")
+        if expert_action is None:
+            expert_action = np.zeros(self.action_space.shape, dtype=np.float32)
+        if self._steervla_exec_cfg is not None:
+            orig_space = self._steervla_exec_cfg.get("action_input_space", "normalized")
+            self._steervla_exec_cfg["action_input_space"] = "policy_output"
+            try:
+                return self.step(np.asarray(expert_action, dtype=np.float32))
+            finally:
+                self._steervla_exec_cfg["action_input_space"] = orig_space
+        return self.step(np.asarray(expert_action, dtype=np.float32))
+
+    def _step_with_control(self, control):
+        """Apply a pre-computed VehicleControl and run one leaderboard tick."""
+        self._last_control = control
+        self.evaluator.manager.pending_control = control
+        try:
+            running, tree_status = self.evaluator.manager.step_once()
+        except Exception as e:
+            return self._obs_dict(), -1.0, True, False, {"error": str(e)}
+        terminated = not running
+        ego = self._ego_actor()
+        speed = 0.0
+        if ego is not None:
+            v = ego.get_velocity()
+            speed = float(np.linalg.norm([v.x, v.y, v.z]))
+        reward = 0.01 * speed
+        info = self._info_with_sensors({"scenario_tree_status": getattr(tree_status, "name", str(tree_status))})
+        crash_stuck, collision_count = self._update_crash_stuck_state(speed)
+        outside_route_value, min_speed_value = self._route_infraction_values()
+        collision_delta = max(0, collision_count - self._prev_collision_count)
+        outside_route_delta = max(0.0, outside_route_value - self._prev_outside_route_value)
+        min_speed_delta = max(0.0, min_speed_value - self._prev_min_speed_value)
+        self._prev_collision_count = collision_count
+        self._prev_outside_route_value = outside_route_value
+        self._prev_min_speed_value = min_speed_value
+        collision_pen = self._collision_event_penalty * float(collision_delta)
+        outside_route_pen = self._outside_route_event_penalty * float(outside_route_delta)
+        min_speed_pen = self._min_speed_event_penalty * float(min_speed_delta)
+        reward += collision_pen + outside_route_pen + min_speed_pen
+        info["collision_count"] = collision_count
+        if crash_stuck:
+            terminated = True
+            reward += self._crash_stuck_penalty
+            info["success"] = False
+            info["termination_reason"] = "crash_stuck"
+        if terminated:
+            if crash_stuck:
+                self._finalize_route("Finished", "Agent crashed and got stuck")
+            else:
+                success = info["scenario_tree_status"] == "SUCCESS"
+                reward += 1.0 if success else -1.0
+                info["success"] = success
+                self._finalize_route("Finished", "")
+        return self._obs_dict(), float(reward), terminated, False, info
+
     def _obs_dict(self) -> Dict[str, np.ndarray]:
         sensors = getattr(self.evaluator.manager, "last_agent_input", None) or {}
+        expert_action = self._compute_expert_action()
+        commentary_text, language_label = self._compute_language_label(expert_action=expert_action)
         return {
             "state": self._get_state_vector(),
             "image": rgb_front_from_leaderboard_dict(sensors),
+            "language_label": language_label,
+            "commentary_text": commentary_text,
+            "expert_action": expert_action,
         }
 
     def _info_with_sensors(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

@@ -595,9 +595,6 @@ def run_online_carla(
             _block_until_ready_tree(action_jax)
             action = np.asarray(action_jax[0])
         t_sample_end = time.time()
-        
-        
-        print("[DEBUG - main_carla] Action: ", action)
 
         t_step_start = time.time()
         if FLAGS.expert_debug:
@@ -658,7 +655,6 @@ def run_online_carla(
         
         t_log_start = time.time()
         cot_obs_raw = dict(obs_raw)  # holds reasoning_text/subtask_text stashed by VLA
-        cot_obs_raw["expert_action"] = replay_action  # debug: show expert/replay action in video overlay
         obs = next_obs
         obs_raw = next_obs_raw
         episode_return += float(reward)
