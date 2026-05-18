@@ -7,6 +7,7 @@ import numpy as np
 from coaches.expert_label import (
     NUM_COMMENTARY_WORDS,
     NUM_DELTA_COMMENTARY_WORDS,
+    collision_override_delta_commentary,
     delta_commentary_from_critic_actions,
 )
 
@@ -40,6 +41,13 @@ def compute_action_delta(
 
         expert_first = np.asarray(agent._as_critic_actions(jnp.array(np.asarray(expert_raw).reshape(1, -1))))[0]
         agent_first = np.asarray(agent._as_critic_actions(jnp.array(action_flat.reshape(1, -1))))[0]
+        collision_active = bool(obs_raw.get("_collision_active_private", False))
+        agent_forward = float(agent_first[0]) if agent_first.shape[0] > 0 else 0.0
+        agent_speed = float(np.linalg.norm(agent_first[:2])) if agent_first.shape[0] >= 2 else 0.0
+        if collision_active and (agent_forward > 0.05 or agent_speed > 0.10):
+            # Override the nominal expert target with a "stop pushing" target.
+            target = np.zeros_like(agent_first, dtype=np.float32)
+            return (target - agent_first).astype(np.float32)
         return (expert_first - agent_first).astype(np.float32)
     except Exception as e:
         print(f"[action_delta] failed: {e}", flush=True)
@@ -63,6 +71,14 @@ def compute_action_delta_commentary(
             agent._as_critic_actions(jnp.array(np.asarray(expert_raw).reshape(1, -1)))
         )[0]
         agent_first = np.asarray(agent._as_critic_actions(jnp.array(action_flat.reshape(1, -1))))[0]
+        collision_active = bool(obs_raw.get("_collision_active_private", False))
+        # Heuristic "throttling" test in critic-action space: positive forward
+        # speed target means the policy is trying to keep moving into contact.
+        agent_forward = float(agent_first[0]) if agent_first.shape[0] > 0 else 0.0
+        agent_speed = float(np.linalg.norm(agent_first[:2])) if agent_first.shape[0] >= 2 else 0.0
+        if collision_active and (agent_forward > 0.05 or agent_speed > 0.10):
+            text, bow = collision_override_delta_commentary()
+            return text, bow.astype(np.float32)
         text, bow = delta_commentary_from_critic_actions(expert_first, agent_first)
         return text, bow.astype(np.float32)
     except Exception as e:

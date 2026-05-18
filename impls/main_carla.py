@@ -344,6 +344,7 @@ def run_online_carla(
     log_images = obs_mode == "image"
 
     _critic_feedback_mode = str(agent_config.get("critic_feedback_mode", "commentary_bow"))
+    _online_training_mode = str(agent_config.get("online_training_mode", "rl")).strip().lower()
     _lang_dim = critic_language_dim(agent_config)
 
     action_dim = int(agent_config.get("action_dim", 4)*agent_config.get("actions_horizon", 10))
@@ -373,6 +374,8 @@ def run_online_carla(
     last_log_time = time.time()
     episode_video_every = 5
     episode_video_frames: list[np.ndarray] = []
+    last_video_reward: float = 0.0
+    last_video_critic_text: str = ""
 
     def _as_video_frame(image: np.ndarray) -> np.ndarray:
         frame = np.asarray(image)
@@ -412,6 +415,33 @@ def run_online_carla(
             annotated[:bar_h, :, :] = np.array([255, 0, 0], dtype=np.uint8)
             return annotated
 
+    def _annotate_reward_corner(frame: np.ndarray, reward_value: float) -> np.ndarray:
+        annotated = np.array(frame, copy=True)
+        try:
+            import cv2  # type: ignore
+
+            label = f"r={reward_value:+.3f}"
+            (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            pad = 6
+            x0, y0 = 6, 6
+            x1 = x0 + tw + 2 * pad
+            y1 = y0 + th + baseline + 2 * pad
+            cv2.rectangle(annotated, (x0, y0), (x1, y1), (0, 0, 0), thickness=-1)
+            cv2.rectangle(annotated, (x0, y0), (x1, y1), (255, 255, 255), thickness=1)
+            cv2.putText(
+                annotated,
+                label,
+                (x0 + pad, y1 - baseline - pad),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            return annotated
+        except Exception:
+            return annotated
+
     def _format_text_field(raw: dict[str, Any] | None, key: str) -> str:
         if not isinstance(raw, dict) or key not in raw or raw.get(key) is None:
             return ""
@@ -426,7 +456,32 @@ def run_online_carla(
         # Token ids or numeric payload fallback.
         return " ".join(map(str, arr.astype(np.int32)[:24].tolist()))
 
-    def _annotate_text_panel(frame: np.ndarray, raw: dict[str, Any] | None) -> np.ndarray:
+    def _critic_input_text(
+        critic_mode: str,
+        critic_label: np.ndarray,
+        critic_text: str,
+        raw: dict[str, Any] | None,
+    ) -> str:
+        if critic_mode == "none":
+            return "none"
+        if critic_mode == "action_delta":
+            arr = np.asarray(critic_label, dtype=np.float32).reshape(-1)
+            if arr.size == 0:
+                return "[]"
+            show = " ".join(f"{v:+.3f}" for v in arr[:8])
+            return show if arr.size <= 8 else f"{show} ..."
+        if critic_mode == "delta_commentary_bow":
+            return critic_text or "?"
+        commentary = raw.get("commentary_text", "") if isinstance(raw, dict) else ""
+        return str(commentary or "?")
+
+    def _annotate_text_panel(
+        frame: np.ndarray,
+        raw: dict[str, Any] | None,
+        *,
+        reward_value: float,
+        critic_text: str,
+    ) -> np.ndarray:
         base = np.array(frame, copy=True)
         try:
             import cv2  # type: ignore
@@ -434,7 +489,7 @@ def run_online_carla(
             h, w = base.shape[:2]
             panel_h = max(96, h // 4)  # 5 lines × 16px + 16px offset
             annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
-            annotated[:h, :, :] = base
+            annotated[:h, :, :] = _annotate_reward_corner(base, reward_value)
             # Bottom panel is already black via zeros; draw an explicit border line.
             cv2.line(annotated, (0, h), (w - 1, h), (255, 255, 255), 1)
 
@@ -446,7 +501,6 @@ def run_online_carla(
             prompt = f"The current speed is {speed:.2f} m/s. {routing or 'Follow the route.'}"
             reasoning = _format_text_field(raw, "reasoning_text") or _format_text_field(raw, "reasoning")
             subtask = _format_text_field(raw, "subtask_text") or _format_text_field(raw, "subtask")
-            commentary = raw.get("commentary_text", "") if isinstance(raw, dict) else ""
             expert_action_str = ""
             if isinstance(raw, dict):
                 ea = raw.get("expert_action")
@@ -460,7 +514,7 @@ def run_online_carla(
                 return txt if len(txt) <= max_chars else (txt[: max_chars - 3] + "...")
 
             lines = [
-                f"Expert: {_clip_text(commentary) if commentary else '?'}",
+                f"Expert: {_clip_text(critic_text) if critic_text else '?'}",
                 f"ExpertAct[0]: {expert_action_str or '?'}",
                 f"Prompt: {_clip_text(prompt)}",
                 f"Reasoning: {_clip_text(reasoning)}",
@@ -489,12 +543,22 @@ def run_online_carla(
         rollout_log: dict,
         final_frame: np.ndarray | None,
         final_raw: dict[str, Any] | None,
+        *,
+        final_reward: float,
+        final_critic_text: str,
     ) -> None:
         if not log_images:
             return
         frames = list(episode_video_frames)
         if final_frame is not None:
-            frames.append(_annotate_text_panel(_as_video_frame(final_frame), final_raw))
+            frames.append(
+                _annotate_text_panel(
+                    _as_video_frame(final_frame),
+                    final_raw,
+                    reward_value=final_reward,
+                    critic_text=final_critic_text,
+                )
+            )
         if not frames:
             return
         video = np.stack(frames, axis=0)
@@ -524,6 +588,8 @@ def run_online_carla(
             # [STEP 1] Sample the action from the agent
             if getattr(agent, "vla_sample_fn", None) is not None:
                 action_jax = agent.sample_actions_with_vla(obs[None], seed=sub)
+            elif _online_training_mode == "dagger" and hasattr(agent, "sample_actions_dagger"):
+                action_jax = agent.sample_actions_dagger(obs[None])
             else:
                 action_jax = agent.sample_actions(obs[None], seed=sub)
             _block_until_ready_tree(action_jax)
@@ -564,11 +630,16 @@ def run_online_carla(
         else:
             _lang = np.asarray(obs_raw.get("language_label", _zero_label), dtype=np.float32)
             _next_lang = np.asarray(next_obs_raw.get("language_label", _zero_label), dtype=np.float32)
+        _critic_text_for_video = _critic_input_text(_critic_feedback_mode, _lang, _lang_text, obs_raw)
+
+        replay_action = action.astype(np.float32)
+        if _online_training_mode == "dagger" and not FLAGS.expert_debug:
+            replay_action = np.asarray(obs_raw.get("expert_action", replay_action), dtype=np.float32)
 
         buffer.add_transition(
             {
                 "observations": np.asarray(obs),
-                "actions": action.astype(np.float32),
+                "actions": replay_action,
                 "rewards": np.float32(reward),
                 "next_observations": np.asarray(next_obs),
                 "masks": np.float32(0.0 if terminated else 1.0),
@@ -601,14 +672,22 @@ def run_online_carla(
             had_collision_this_step = collision_delta > 0
             if should_sample_periodic or had_collision_this_step:
                 frame = _as_video_frame(obs)
-                frame = _annotate_text_panel(frame, cot_obs_raw)
+                frame = _annotate_text_panel(
+                    frame,
+                    cot_obs_raw,
+                    reward_value=float(reward),
+                    critic_text=_critic_text_for_video,
+                )
                 if had_collision_this_step:
                     frame = _annotate_collision_frame(
                         frame,
                         collision_count=collision_count,
                         collision_events=episode_collision_events,
                     )
+                    frame = _annotate_reward_corner(frame, float(reward))
                 episode_video_frames.append(frame)
+        last_video_reward = float(reward)
+        last_video_critic_text = _critic_text_for_video
         t_log_end = time.time()
 
         step_wb = {f"rollout/{k}": v for k, v in drive_metrics.items()}
@@ -647,6 +726,8 @@ def run_online_carla(
                 rollout_log,
                 end_img if log_images else None,
                 cot_obs_raw if log_images else None,
+                final_reward=last_video_reward,
+                final_critic_text=last_video_critic_text,
             )
             wandb.log(rollout_log, step=step)
             obs_raw, _info = env.reset(seed=FLAGS.seed + episode_count)
@@ -670,7 +751,9 @@ def run_online_carla(
             t_update_start = time.time()
             for _ in range(updates_per_step):
                 batch = buffer.sample(batch_size)
-                if getattr(agent, "vla_sample_fn", None) is not None:
+                if _online_training_mode == "dagger":
+                    _, update_info = agent.update_dagger(batch)
+                elif getattr(agent, "vla_sample_fn", None) is not None:
                     _, update_info = agent.update_with_vla(batch)
                 else:
                     _, update_info = agent.update(batch)
@@ -736,9 +819,25 @@ def main(_):
             carla_yaml = str(default_yaml)
 
     steervla_cfg = config.get("steervla", None)
+    online_training_mode = str(config.get("online_training_mode", "rl")).strip().lower()
+    if online_training_mode not in {"rl", "dagger"}:
+        raise ValueError(
+            f"Unsupported online_training_mode={online_training_mode!r}; expected 'rl' or 'dagger'."
+        )
     use_steervla_rollout = bool(
         steervla_cfg is not None and steervla_cfg.get("enabled") and not FLAGS.expert_debug
     )
+    if online_training_mode == "dagger":
+        if use_steervla_rollout:
+            print(
+                "[main_carla] DAgger mode: rolling out SteerVLA and training the internal flow policy with relabeled expert actions.",
+                flush=True,
+            )
+        else:
+            print(
+                "[main_carla] DAgger mode requested but SteerVLA rollout is disabled; falling back to learner rollout for data collection.",
+                flush=True,
+            )
     critic_feedback_mode = str(config.get("critic_feedback_mode", "commentary_bow"))
     if critic_feedback_mode == "none":
         config.language_label_dim = 0

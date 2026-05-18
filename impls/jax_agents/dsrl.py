@@ -417,6 +417,13 @@ class DSRLAgent(flax.struct.PyTreeNode):
         noise = noise * self.config["noise_scale"]
         return jnp.asarray(self.vla_sample_fn(observations, noise))
 
+    @jax.jit
+    def sample_actions_dagger(self, observations):
+        """Deterministic rollout policy for DAgger: BC flow from zero noise."""
+        batch = observations.shape[0]
+        noise = jnp.zeros((batch, int(self.config["action_horizon"]) * int(self.config["actor_action_dim"])), dtype=jnp.float32)
+        return self._flow_sample(self.network.params, observations, noise)
+
     # ----- losses --------------------------------------------------------- #
 
     def critic_loss(self, batch, grad_params, rng):
@@ -611,6 +618,18 @@ class DSRLAgent(flax.struct.PyTreeNode):
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network)
+        return self.replace(network=new_network, rng=new_rng), info
+
+    @jax.jit
+    def update_dagger(self, batch):
+        """Online imitation update for DAgger: optimize only the BC flow loss."""
+        new_rng, rng = jax.random.split(self.rng)
+
+        def loss_fn(grad_params):
+            loss, info = self.flow_loss(batch, grad_params, rng)
+            return loss, {f"dagger/{k}": v for k, v in info.items()}
+
+        new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         return self.replace(network=new_network, rng=new_rng), info
 
     def update_with_vla(self, batch):
@@ -846,6 +865,10 @@ def get_config():
             # "action_delta": (critic_action_dim)-dim vector = expert first step − agent first step.
             # "delta_commentary_bow": corrective language BOW from expert-vs-agent action delta.
             critic_feedback_mode="commentary_bow",
+            # Online training regime.
+            # "rl": standard DSRL online RL updates.
+            # "dagger": collect on-policy states, store expert actions, and train with flow imitation only.
+            online_training_mode="rl",
         )
     )
     return config

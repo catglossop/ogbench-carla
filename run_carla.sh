@@ -9,7 +9,7 @@ ONLINE_STEPS="50000"
 SEED="0"
 RUN_GROUP="Debug"
 SAVE_BUFFER="true"
-EXPERT_DEBUG="true"
+EXPERT_DEBUG="false"
 WANDB_MODE="${WANDB_MODE:-online}"
 
 TRAIN_GPU_RANK="2"
@@ -22,6 +22,7 @@ TM_PORT="8020"
 X_DISPLAY_NUM=""
 
 CRITIC_MODE="delta"
+TRAIN_MODE="dagger"
 
 BASE_AGENT_CFG="impls/configs/steervla_dsrl_config.py"
 BASE_CARLA_CFG="impls/configs/carla_config.yaml"
@@ -59,6 +60,8 @@ Options:
                               expert-lang  -> language on expert action
                             Default: delta
 
+  --train-mode MODE         rl|dagger. Default: rl
+
   --agent-config PATH       Base agent config. Default: impls/configs/steervla_dsrl_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
   -h, --help                Show this help
@@ -67,6 +70,7 @@ Examples:
   bash run_carla.sh --critic-mode delta-lang --train-gpu 0 --sim-gpu 4
   bash run_carla.sh --route parking-cut-in-001 --carla-port 2002 --carla-streaming-port 2003 --tm-port 8002 --x-display-num 12
   bash run_carla.sh --critic-mode none --expert-debug true --save-buffer false
+  bash run_carla.sh --train-mode dagger --critic-mode delta-lang
 EOF
 }
 
@@ -88,6 +92,7 @@ while [[ $# -gt 0 ]]; do
     --tm-port) TM_PORT="$2"; shift 2 ;;
     --x-display-num) X_DISPLAY_NUM="$2"; shift 2 ;;
     --critic-mode) CRITIC_MODE="$2"; shift 2 ;;
+    --train-mode) TRAIN_MODE="$2"; shift 2 ;;
     --agent-config) BASE_AGENT_CFG="$2"; shift 2 ;;
     --carla-config) BASE_CARLA_CFG="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -108,6 +113,15 @@ case "$CRITIC_MODE" in
   *)
     echo "Invalid --critic-mode: $CRITIC_MODE" >&2
     echo "Expected one of: none, delta, delta-lang, expert-lang" >&2
+    exit 2
+    ;;
+esac
+
+case "$TRAIN_MODE" in
+  rl|dagger) ;;
+  *)
+    echo "Invalid --train-mode: $TRAIN_MODE" >&2
+    echo "Expected one of: rl, dagger" >&2
     exit 2
     ;;
 esac
@@ -143,6 +157,7 @@ def get_config():
     config = _BASE_GET_CONFIG()
     config.training_gpu_rank = ${TRAIN_GPU_RANK}
     config.critic_feedback_mode = "${CRITIC_FEEDBACK_MODE}"
+    config.online_training_mode = "${TRAIN_MODE}"
     if config.critic_feedback_mode == "none":
         config.language_label_dim = 0
     return config
@@ -165,6 +180,7 @@ Path(r"${CARLA_CFG_TMP}").write_text(yaml.safe_dump(cfg, sort_keys=False))
 EOF
 
 echo "[run_carla.sh] route=${ROUTE}"
+echo "[run_carla.sh] train_mode=${TRAIN_MODE}"
 echo "[run_carla.sh] critic_mode=${CRITIC_FEEDBACK_MODE}"
 echo "[run_carla.sh] train_gpu_rank=${TRAIN_GPU_RANK} render_adapter=${SIM_GPU_RANK}"
 echo "[run_carla.sh] carla_host=${CARLA_HOST} carla_port=${CARLA_PORT} streaming_port=${CARLA_STREAMING_PORT} tm_port=${TM_PORT} x_display=:${X_DISPLAY_NUM}"

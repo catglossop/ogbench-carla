@@ -56,6 +56,10 @@ def get_config():
     #                                   (e.g. "Adjust right. Decelerate more heavily.").
     # To switch to action_delta, uncomment:
     config.critic_feedback_mode = "action_delta"
+    # Online training regime:
+    #   "rl"     : standard DSRL online RL
+    #   "dagger" : on-policy data aggregation with expert actions as supervision
+    config.online_training_mode = "rl"
     # language_label_dim is auto-set for commentary_bow / delta_commentary_bow in main_carla.py,
     # and critic_action_dim is used directly when mode is action_delta.
 

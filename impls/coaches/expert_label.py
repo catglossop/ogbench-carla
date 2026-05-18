@@ -79,6 +79,7 @@ _WORD_TO_IDX: dict[str, int] = {w: i for i, w in enumerate(COMMENTARY_VOCAB)}
 DELTA_COMMENTARY_VOCAB: list[str] = [
     "accelerate",
     "adjust",
+    "brake",
     "current",
     "decelerate",
     "follow",
@@ -171,6 +172,12 @@ def delta_commentary_from_critic_actions(
     text = f"{route_text} {speed_text}".replace("..", ".").strip()
     if not text.endswith("."):
         text += "."
+    return text, delta_commentary_to_bow(text)
+
+
+def collision_override_delta_commentary() -> tuple[str, np.ndarray]:
+    """Forced corrective commentary while the agent is pushing during contact."""
+    text = "Brake more heavily."
     return text, delta_commentary_to_bow(text)
 
 
