@@ -391,18 +391,26 @@ def run_online_carla(
             return annotated
 
     def _format_text_field(raw: dict[str, Any] | None, key: str) -> str:
+        
         if not isinstance(raw, dict) or key not in raw or raw.get(key) is None:
             return ""
         value = raw.get(key)
+        
         if isinstance(value, str):
             return value
-        arr = np.asarray(value).reshape(-1)
-        if arr.size == 0:
-            return ""
-        if arr.dtype == bool:
-            return " ".join(map(str, arr.astype(np.int32)[:16].tolist()))
-        # Token ids or numeric payload fallback.
-        return " ".join(map(str, arr.astype(np.int32)[:24].tolist()))
+        
+        if isinstance(value, bool):
+            return " ".join(map(str, value.astype(np.int32)[:16].tolist()))
+        # Otherwise
+        else:
+            mask = mask if mask is not None else raw.get(f"{key}_mask")
+        
+            valid = value[mask.astype(bool)]
+        
+            # convert to string
+            valid_text = steervla_actor.tokenizer._tokenizer.decode(valid.tolist())
+            
+            return valid_text
 
     def _annotate_text_panel(frame: np.ndarray, raw: dict[str, Any] | None) -> np.ndarray:
         base = np.array(frame, copy=True)
@@ -422,6 +430,9 @@ def run_online_carla(
             if isinstance(raw, dict):
                 routing = str(raw.get("routing_command", "") or "").strip()
             prompt = f"The current speed is {speed:.2f} m/s. {routing or 'Follow the route.'}"
+            reasoning_raw = raw.get("reasoning")
+            reasoning_mask = raw.get("reasoning_mask")
+            reasoning = _format_text_field(reasoning_raw, reasoning_mask)
             reasoning = _format_text_field(raw, "reasoning")
             subtask = _format_text_field(raw, "subtask")
 
@@ -498,6 +509,7 @@ def run_online_carla(
 
         t_step_start = time.time()
         next_obs_raw, reward, terminated, truncated, info = env.step(action)
+
         if raw_obs_holder is not None:
             raw_obs_holder["next_obs"] = next_obs_raw
         drive_metrics = ego_drive_metrics_from_state_vec(next_obs_raw["state"])
@@ -537,7 +549,7 @@ def run_online_carla(
             had_collision_this_step = collision_delta > 0
             if should_sample_periodic or had_collision_this_step:
                 frame = _as_video_frame(obs)
-                frame = _annotate_text_panel(frame, next_obs_raw)
+                frame = _annotate_text_panel(frame, raw_obs_holder["obs"])
                 if had_collision_this_step:
                     frame = _annotate_collision_frame(
                         frame,
@@ -571,7 +583,7 @@ def run_online_carla(
             _maybe_log_episode_video(
                 rollout_log,
                 end_img if log_images else None,
-                next_obs_raw if log_images else None,
+                raw_obs_holder["obs"] if log_images else None,
             )
             wandb.log(rollout_log, step=step)
             obs_raw, _info = env.reset(seed=FLAGS.seed + episode_count)

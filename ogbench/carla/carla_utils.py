@@ -116,6 +116,7 @@ DEFAULT_CRASH_STUCK_PENALTY = -1.0
 DEFAULT_COLLISION_EVENT_PENALTY = -5.0
 DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -5.0
 DEFAULT_MIN_SPEED_EVENT_PENALTY = -2.0
+DEFAULT_ROUTE_COMPLETION_BONUS = 20.0
 SUCCESS_BONUS = 5.0
 FAILURE_BONUS = -5.0
 
@@ -410,9 +411,6 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._args: Optional[SimpleNamespace] = None
         self._base_agent_config: str = ""
         self._scenario_active = False
-        # Rebuild evaluator after any `_cleanup()` to avoid partially-cleaned
-        # leaderboard state carrying across episode resets (can drop traffic actors).
-        self._needs_setup_on_reset = False
         self._last_control = carla.VehicleControl()
         self._crash_stuck_speed_threshold = float(
             self.carla_config.get("crash_stuck_speed_threshold", DEFAULT_CRASH_STUCK_SPEED_THRESHOLD)
@@ -433,9 +431,13 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._min_speed_event_penalty = float(
             self.carla_config.get("min_speed_event_penalty", DEFAULT_MIN_SPEED_EVENT_PENALTY)
         )
+        self._route_completion_bonus = float(
+            self.carla_config.get("route_completion_bonus", DEFAULT_ROUTE_COMPLETION_BONUS)
+        )
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
         self._prev_min_speed_value = 0.0
+        self._prev_route_completion_value = 0.0
 
         self.observation_space = gymnasium.spaces.Dict(
             {
@@ -532,12 +534,16 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         try:
             print("\033[1m> Stopping the route (wrapper)\033[0m", flush=True)
             self._evaluator.manager.stop_scenario()
+            # Reset world/TM modes before tearing down route actors. This helps ensure
+            # background traffic can be respawned correctly on the next route load.
+            self._evaluator._reset_world_settings()
         except Exception:
             print("\033[91mFailed to stop scenario in wrapper:\033[0m", flush=True)
             print(traceback.format_exc(), flush=True)
+        # Important: cleanup route actors/sensors/agent between episodes so
+        # NPCs and criteria are rebuilt on the next load_scenario().
         self._evaluator._cleanup()
         self._scenario_active = False
-        self._needs_setup_on_reset = True
 
     def _load_route_and_begin_stepping(self, config) -> None:
         from datetime import datetime
@@ -556,6 +562,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             route_name, scenario_name, weather_id, save_name, town_name, config.index
         )
 
+        # Force a clean scenario-init mode for each route reload.
+        CarlaDataProvider.set_runtime_init_mode(False)
         ev._load_and_wait_for_world(args, config.town)
         ev.route_scenario = RouteScenario(world=ev.world, config=config, debug_mode=args.debug)
         ev.statistics_manager.set_scenario(ev.route_scenario)
@@ -606,6 +614,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
         self._prev_min_speed_value = 0.0
+        self._prev_route_completion_value = 0.0
 
     def _ego_actor(self) -> Optional[carla.Actor]:
         ev = self._evaluator
@@ -672,6 +681,19 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
 
         return outside_route_val, min_speed_val
 
+    def _route_completion_value(self) -> float:
+        """Return cumulative route completion percentage from route criteria (0..100)."""
+        scenario = getattr(self.evaluator, "route_scenario", None)
+        if scenario is None:
+            return 0.0
+        for criterion in scenario.get_criteria():
+            if str(getattr(criterion, "name", "")) == "RouteCompletionTest":
+                try:
+                    return float(getattr(criterion, "actual_value", 0.0))
+                except Exception:
+                    return 0.0
+        return 0.0
+
     def _update_crash_stuck_state(self, speed: float) -> Tuple[bool, int]:
         collision_count = self._collision_count()
         if collision_count > 0 and speed < self._crash_stuck_speed_threshold:
@@ -689,9 +711,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         if options:
             seed = options.get("seed", seed)
         super().reset(seed=seed)
-        if self._evaluator is None or self._needs_setup_on_reset:
+        if self._evaluator is None:
             self.setup()
-            self._needs_setup_on_reset = False
 
         self._stop_active_scenario()
 
@@ -782,6 +803,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         )
         crash_stuck, collision_count = self._update_crash_stuck_state(speed)
         outside_route_value, min_speed_value = self._route_infraction_values()
+        route_completion_value = self._route_completion_value()
 
         collision_delta = max(0, collision_count - self._prev_collision_count)
         outside_route_delta = max(0.0, outside_route_value - self._prev_outside_route_value)
@@ -789,22 +811,26 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._prev_collision_count = collision_count
         self._prev_outside_route_value = outside_route_value
         self._prev_min_speed_value = min_speed_value
+        self._prev_route_completion_value = route_completion_value
 
         collision_pen = self._collision_event_penalty * float(collision_delta)
         outside_route_pen = self._outside_route_event_penalty * float(outside_route_delta)
         min_speed_pen = self._min_speed_event_penalty * float(min_speed_delta)
-        reward += collision_pen + outside_route_pen + min_speed_pen
+        route_completion_bonus = self._route_completion_bonus * float(route_completion_value) / 100.0
+        reward += collision_pen + outside_route_pen + min_speed_pen + route_completion_bonus
 
         info["collision_count"] = collision_count
         info["crash_stuck_ticks"] = self._crash_stuck_ticks
         info["outside_route_value"] = outside_route_value
         info["min_speed_value"] = min_speed_value
+        info["route_completion_value"] = route_completion_value
         info["collision_delta"] = float(collision_delta)
         info["outside_route_delta"] = float(outside_route_delta)
         info["min_speed_delta"] = float(min_speed_delta)
         info["penalty_collision"] = collision_pen
         info["penalty_outside_route"] = outside_route_pen
         info["penalty_min_speed"] = min_speed_pen
+        info["bonus_route_completion"] = route_completion_bonus
         if crash_stuck:
             terminated = True
             reward += self._crash_stuck_penalty
@@ -839,12 +865,13 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             if self._args.record:
                 self.evaluator.client.stop_recorder()
         finally:
+            # Keep evaluator process alive (no re-setup/fork), but cleanup route
+            # resources so the next reset starts from a fresh scenario state.
             try:
                 self.evaluator._cleanup()
             except Exception:
                 pass
             self._scenario_active = False
-            self._needs_setup_on_reset = True
 
     def render(self):
         """Placeholder frame for evaluation video paths (avoid NotImplementedError)."""
