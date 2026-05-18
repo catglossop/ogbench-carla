@@ -657,7 +657,8 @@ def run_online_carla(
         t_step_end = time.time()
         
         t_log_start = time.time()
-        cot_obs_raw = obs_raw  # holds reasoning_text/subtask_text stashed by VLA
+        cot_obs_raw = dict(obs_raw)  # holds reasoning_text/subtask_text stashed by VLA
+        cot_obs_raw["expert_action"] = replay_action  # debug: show expert/replay action in video overlay
         obs = next_obs
         obs_raw = next_obs_raw
         episode_return += float(reward)

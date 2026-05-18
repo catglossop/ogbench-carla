@@ -10,12 +10,21 @@ pkill -f 'Xvfb :30'
 pkill -f 'CarlaUE4.*12020'
 
 ./run_carla.sh \
-    --train-gpu 0 \
-    --render-adapter 3 \
-    --carla-port 12067 \
-    --carla-streaming-port 12061 \
-    --tm-port 18010 \
-    --x-display-num 32
+    --train-gpu 2 \
+    --render-adapter 4 \
+    --carla-port 12045 \
+    --carla-streaming-port 12091 \
+    --tm-port 18019 \
+    --x-display-num 30
+
+
+./run_carla.sh \
+    --train-gpu 1 \
+    --render-adapter 7 \
+    --carla-port 12087 \
+    --carla-streaming-port 12081 \
+    --tm-port 18080 \
+    --x-display-num 34
 
 
     

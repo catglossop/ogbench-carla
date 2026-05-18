@@ -421,7 +421,8 @@ class DSRLAgent(flax.struct.PyTreeNode):
     def sample_actions_dagger(self, observations):
         """Deterministic rollout policy for DAgger: BC flow from zero noise."""
         batch = observations.shape[0]
-        noise = jnp.zeros((batch, int(self.config["action_horizon"]) * int(self.config["actor_action_dim"])), dtype=jnp.float32)
+        flow_action_dim = int(self.config.get("critic_action_dim", self.config["actor_action_dim"]))
+        noise = jnp.zeros((batch, flow_action_dim), dtype=jnp.float32)
         return self._flow_sample(self.network.params, observations, noise)
 
     # ----- losses --------------------------------------------------------- #
