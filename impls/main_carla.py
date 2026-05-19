@@ -681,6 +681,9 @@ def run_online_carla(
             next_obs_raw, reward, terminated, truncated, info = env.step_expert(obs_raw)
         else:
             next_obs_raw, reward, terminated, truncated, info = env.step(action)
+            # Keep SimLingo warm: populates last_driving_data for live_expert labels
+            # and pre-initializes the autopilot at the correct position for clean takeover
+            env.tick_expert()
         if raw_obs_holder is not None:
             raw_obs_holder["next_obs"] = next_obs_raw
         drive_metrics = ego_drive_metrics_from_state_vec(next_obs_raw["state"])

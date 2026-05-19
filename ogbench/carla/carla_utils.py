@@ -1579,10 +1579,6 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             tree_status=tree_status,
             terminated=terminated,
         )
-        # Tick expert BEFORE _obs_dict() so last_driving_data reflects the current step.
-        # Mirrors the old _step_with_control auto-tick removed in 2c0ffa4.
-        if self._expert_agent is not None:
-            self.tick_expert()
         return self._obs_dict(), float(reward), terminated, False, info
 
     def _finalize_route(self, entry_status: str, crash_message: str) -> None:
