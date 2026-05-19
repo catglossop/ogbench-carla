@@ -429,7 +429,14 @@ class SteerVLAActor:
         self._direct_dagger_opt_state = None
         self._direct_dagger_loss_grad_fn = None
         self._direct_dagger_update_fn = None
+        self._direct_dagger_full_update_fn_with_kv = None
         self._direct_dagger_update_counter = 0
+        # Persistent state-parameterized JIT functions (created once, never recreated).
+        # _infer_state is updated in-place on each refresh so inference always uses
+        # current weights without triggering XLA recompilation.
+        self._infer_state = None
+        self._persistent_jit_sample_actions = None
+        self._persistent_jit_sample_cot = None
 
         if actor_url is not None:
             self._remote = RemoteActor(
@@ -490,23 +497,39 @@ class SteerVLAActor:
         self._local_ready = True
 
     def _refresh_compiled_inference_fns(self) -> None:
+        """Initialize or refresh inference JIT functions.
+
+        On the first call, creates persistent state-parameterised JIT functions so that
+        subsequent weight updates (via ``_maybe_refresh_direct_dagger_inference``) only
+        update ``self._infer_state`` without creating new ``jax.jit`` objects. This avoids
+        XLA recompilation every ``direct_dagger_inference_refresh_interval`` steps.
+        """
         assert self.model is not None
-        self._sample_actions = nnx_utils.module_jit(
-            self.model.sample_actions,
-            static_argnames=(
-                "num_steps",
-                "image_keys",
-            ),
-        )
-        self._sample_cot = nnx_utils.module_jit(
-            self.model.sample_cot,
-            static_argnames=(
-                "temperature",
-                "max_subtask_len",
-                "max_reasoning_len",
-                "image_keys",
-            ),
-        )
+        graphdef, state = nnx.split(self.model)
+        self._infer_state = state
+
+        if self._persistent_jit_sample_actions is None:
+            # Created once. ``state`` is a dynamic arg, so different weight values never
+            # trigger recompilation.
+            def _sa_fn(state, rng, obs, *, noise=None, image_keys=CARLA_STEERVLA_IMAGE_KEYS, num_steps=10):
+                model = nnx.merge(graphdef, state)
+                return model.sample_actions(rng, obs, noise=noise, image_keys=image_keys, num_steps=num_steps)
+
+            def _sc_fn(state, rng, obs, *, temperature=0.0, max_subtask_len=None, max_reasoning_len=None, image_keys=CARLA_STEERVLA_IMAGE_KEYS):
+                model = nnx.merge(graphdef, state)
+                return model.sample_cot(rng, obs, temperature=temperature, max_subtask_len=max_subtask_len, max_reasoning_len=max_reasoning_len, image_keys=image_keys)
+
+            self._persistent_jit_sample_actions = jax.jit(
+                _sa_fn, static_argnames=("num_steps", "image_keys")
+            )
+            self._persistent_jit_sample_cot = jax.jit(
+                _sc_fn, static_argnames=("temperature", "max_subtask_len", "max_reasoning_len", "image_keys")
+            )
+
+        # Wrappers read self._infer_state at call time, so refreshing the state
+        # propagates updated weights without touching the JIT objects.
+        self._sample_actions = lambda *a, **kw: self._persistent_jit_sample_actions(self._infer_state, *a, **kw)
+        self._sample_cot = lambda *a, **kw: self._persistent_jit_sample_cot(self._infer_state, *a, **kw)
 
     def _ensure_direct_dagger_trainer(self) -> None:
         if self._remote is not None:
@@ -572,6 +595,21 @@ class SteerVLAActor:
             return new_trainable_state, new_opt_state, loss_value, grad_norm
 
         self._direct_dagger_update_fn = jax.jit(update_fn)
+
+        # Suffix-only update: prefix KV cache is precomputed OUTSIDE this jit so the
+        # compiled XLA graph covers only the tiny action head (not SigLIP + PaLI-3B).
+        # This cuts initial compilation from ~minutes to seconds and keeps the dispatch fast.
+        def full_update_fn_with_kv(trainable_state, opt_state, obs_proc, kv_cache, prefix_mask, prefix_mask_no_reasoning, target_actions, step_rng):
+            loss_value, grads = jax.value_and_grad(loss_fn)(
+                trainable_state, obs_proc, kv_cache, prefix_mask, prefix_mask_no_reasoning, target_actions, step_rng
+            )
+            updates, new_opt_state = tx.update(grads, opt_state, trainable_state)
+            new_trainable_state = optax.apply_updates(trainable_state, updates)
+            grad_sq = sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(grads))
+            grad_norm = jnp.sqrt(grad_sq)
+            return new_trainable_state, new_opt_state, loss_value, grad_norm
+
+        self._direct_dagger_full_update_fn_with_kv = jax.jit(full_update_fn_with_kv)
         if self._train_rng is None:
             self._train_rng = jax.random.PRNGKey(0)
 
@@ -665,11 +703,18 @@ class SteerVLAActor:
     def _maybe_refresh_direct_dagger_inference(self, *, force: bool = False) -> None:
         if self._direct_dagger_graphdef is None or self._direct_dagger_frozen_state is None or self._direct_dagger_trainable_state is None:
             return
+
+        full_state = nnx.State.merge(self._direct_dagger_trainable_state, self._direct_dagger_frozen_state)
+
+        # Always propagate updated action-head weights to inference (no recompilation:
+        # the persistent JIT functions read self._infer_state dynamically at call time).
+        if self._infer_state is not None:
+            self._infer_state = full_state
+
+        # Rebuild self.model only at the configured interval (used by non-jitted code paths).
         if (not force) and (self._direct_dagger_update_counter % int(self.direct_dagger_inference_refresh_interval) != 0):
             return
-        full_state = nnx.State.merge(self._direct_dagger_trainable_state, self._direct_dagger_frozen_state)
         self.model = nnx.merge(self._direct_dagger_graphdef, full_state)
-        self._refresh_compiled_inference_fns()
     
     def flow_sample(self, rng, openpi_observation, input_noise):
         
@@ -989,6 +1034,7 @@ class SteerVLAActor:
         assert self._direct_dagger_opt_state is not None
         assert self._direct_dagger_loss_grad_fn is not None
         assert self._direct_dagger_update_fn is not None
+        assert self._direct_dagger_full_update_fn_with_kv is not None
 
         expert_flat = np.asarray(batch["actions"], dtype=np.float32)
         normalized_flat = _normalize_action_chunk_numpy(
@@ -1016,15 +1062,31 @@ class SteerVLAActor:
             obs = openpi_observation_from_replay_batch(batch)
             target_actions = jnp.asarray(target_actions_np, dtype=jnp.float32)
             self._train_rng, step_rng = jax.random.split(self._train_rng)
+
+            # Compute prefix KV cache OUTSIDE the jitted training function so the jit
+            # graph only covers the action-head suffix (tiny), not SigLIP + PaLI-3B.
+            # This shrinks the XLA program to compile from the full VLM to just the
+            # action head, cutting initial compilation from ~minutes to seconds.
+            prefix_model = nnx.merge(
+                graphdef,
+                nnx.State.merge(self._direct_dagger_trainable_state, frozen_state),
+            )
+            obs_proc, kv_cache, prefix_mask, prefix_mask_no_reasoning = self._build_frozen_prefix_cache(
+                prefix_model, obs
+            )
+
             (
                 new_trainable_state,
                 new_opt_state,
                 loss_value,
                 grad_norm,
-            ) = self._direct_dagger_update_fn(
+            ) = self._direct_dagger_full_update_fn_with_kv(
                 self._direct_dagger_trainable_state,
                 self._direct_dagger_opt_state,
-                obs,
+                obs_proc,
+                kv_cache,
+                prefix_mask,
+                prefix_mask_no_reasoning,
                 target_actions,
                 step_rng,
             )
