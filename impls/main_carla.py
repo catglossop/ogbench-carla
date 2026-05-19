@@ -965,7 +965,7 @@ def main(_):
     exec_cfg = _steervla_action_execution_cfg(steervla_cfg)
     if exec_cfg is not None:
         extra_carla["steervla_action_execution"] = exec_cfg
-    if FLAGS.expert_debug or FLAGS.expert_recover_debug:
+    if FLAGS.expert_debug or FLAGS.expert_recover_debug or online_training_mode == "dagger_direct":
         extra_carla["expert_controller"] = "simlingo_autopilot"
 
     # Leaderboard starts CARLA with subprocess (fork + exec). JAX initializes a native
