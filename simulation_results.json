@@ -4,8 +4,8 @@
         "progress": [],
         "records": []
     },
-    "entry_status": "Started",
-    "eligible": false,
+    "entry_status": "Finished",
+    "eligible": true,
     "sensors": [
         "carla_camera",
         "carla_gnss",

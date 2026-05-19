@@ -1352,7 +1352,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         info["reward_total"] = float(reward)
         return float(reward), bool(terminated), info
 
-    def _step_with_control(self, control):
+    def _step_with_control(self, control, *, tick_expert_after: bool = False):
         """Apply a pre-computed VehicleControl and run one leaderboard tick."""
         self._last_control = control
         self.evaluator.manager.pending_control = control
@@ -1365,7 +1365,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             tree_status=tree_status,
             terminated=terminated,
         )
-        if self._expert_agent is not None:
+        if tick_expert_after and self._expert_agent is not None:
             self.tick_expert()
         return self._obs_dict(), float(reward), terminated, False, info
 
