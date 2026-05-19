@@ -633,6 +633,14 @@ class DSRLAgent(flax.struct.PyTreeNode):
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         return self.replace(network=new_network, rng=new_rng), info
 
+    def update_dagger_direct(self, batch):
+        """Direct DAgger update on the SteerVLA action head, keeping DSRL unchanged."""
+        new_rng, _ = jax.random.split(self.rng)
+        if self.steervla_actor is None:
+            return self.replace(rng=new_rng), {"dagger_direct/skipped_no_steervla_actor": 1.0}
+        info = self.steervla_actor.update_dagger_direct(batch)
+        return self.replace(rng=new_rng), info
+
     def update_with_vla(self, batch):
         """Flax critic + noise actor update with eager VLA forwards and a jitted gradient core.
 

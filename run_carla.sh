@@ -23,7 +23,7 @@ TM_PORT="8020"
 X_DISPLAY_NUM=""
 
 CRITIC_MODE="delta"
-TRAIN_MODE="dagger"
+TRAIN_MODE="rl"
 
 BASE_AGENT_CFG="impls/configs/steervla_dsrl_config.py"
 BASE_CARLA_CFG="impls/configs/carla_config.yaml"
@@ -62,7 +62,7 @@ Options:
                               expert-lang  -> language on expert action
                             Default: delta
 
-  --train-mode MODE         rl|dagger. Default: rl
+  --train-mode MODE         rl|dagger|dagger_direct. Default: dagger
 
   --agent-config PATH       Base agent config. Default: impls/configs/steervla_dsrl_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
@@ -73,6 +73,7 @@ Examples:
   bash run_carla.sh --route parking-cut-in-001 --carla-port 2002 --carla-streaming-port 2003 --tm-port 8002 --x-display-num 12
   bash run_carla.sh --critic-mode none --expert-debug true --save-buffer false
   bash run_carla.sh --train-mode dagger --critic-mode delta-lang
+  bash run_carla.sh --train-mode dagger_direct --critic-mode delta-lang
 EOF
 }
 
@@ -121,10 +122,10 @@ case "$CRITIC_MODE" in
 esac
 
 case "$TRAIN_MODE" in
-  rl|dagger) ;;
+  rl|dagger|dagger_direct) ;;
   *)
     echo "Invalid --train-mode: $TRAIN_MODE" >&2
-    echo "Expected one of: rl, dagger" >&2
+    echo "Expected one of: rl, dagger, dagger_direct" >&2
     exit 2
     ;;
 esac

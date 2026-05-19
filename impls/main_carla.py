@@ -318,9 +318,14 @@ def run_online_carla(
         ):
             return {}
 
+        from openpi.shared import image_tools as openpi_image_tools
+
         obs_struct = steervla_actor.build_observation_batch_numpy(batch_size=1, raw=raw)
+        base_image = np.asarray(obs_struct.images["base_0_rgb"][0], dtype=np.uint8)
+        if base_image.shape[:2] != (224, 224):
+            base_image = np.asarray(openpi_image_tools.resize_with_pad(base_image, 224, 224), dtype=np.uint8)
         out = {
-            "openpi_image_base_0_rgb": np.asarray(obs_struct.images["base_0_rgb"][0], dtype=np.uint8),
+            "openpi_image_base_0_rgb": base_image,
             "openpi_image_mask_base_0_rgb": np.asarray(obs_struct.image_masks["base_0_rgb"][0], dtype=bool),
             "openpi_state": np.asarray(obs_struct.state[0], dtype=np.float32),
             "openpi_tokenized_prompt": np.asarray(obs_struct.tokenized_prompt[0], dtype=np.int32),
@@ -336,6 +341,66 @@ def run_online_carla(
             "subtask_mask": np.asarray(obs_struct.tokenized_subtask_mask[0], dtype=bool),
         }
         return out
+
+    def _maybe_log_vla_action_support(step: int, raw: dict | None) -> dict[str, Any]:
+        if steervla_actor is None or raw is None or not isinstance(raw, dict):
+            return {}
+        interval = int(agent_config.get("steervla_debug_action_dist_interval", 0))
+        num_samples = int(agent_config.get("steervla_debug_action_dist_num_samples", 32))
+        if interval <= 0 or step % interval != 0 or num_samples <= 1:
+            return {}
+        expert_action = raw.get("expert_action")
+        if expert_action is None:
+            return {}
+        try:
+            sampled = steervla_actor.sample_action_distribution(raw, num_samples=num_samples, seed=step)
+            if not sampled or "policy_output" not in sampled:
+                return {}
+            expert_flat = np.asarray(expert_action, dtype=np.float32).reshape(-1)
+            samples = np.asarray(sampled["policy_output"], dtype=np.float32)
+            zero_sample = np.asarray(sampled["zero_policy_output"], dtype=np.float32).reshape(-1)
+            if samples.ndim != 2 or samples.shape[1] != expert_flat.size:
+                return {}
+
+            diff = samples - expert_flat[None, :]
+            l2 = np.linalg.norm(diff, axis=1)
+            nearest = int(np.argmin(l2))
+            first = min(4, expert_flat.size)
+            metrics: dict[str, Any] = {
+                "debug_action_support/expert_min_l2": float(np.min(l2)),
+                "debug_action_support/expert_mean_l2": float(np.mean(l2)),
+                "debug_action_support/expert_zero_l2": float(np.linalg.norm(zero_sample - expert_flat)),
+            }
+            for i in range(first):
+                metrics[f"debug_action_support/expert_first_{i}"] = float(expert_flat[i])
+                metrics[f"debug_action_support/sample_mean_first_{i}"] = float(np.mean(samples[:, i]))
+                metrics[f"debug_action_support/sample_std_first_{i}"] = float(np.std(samples[:, i]))
+                metrics[f"debug_action_support/sample_nearest_first_{i}"] = float(samples[nearest, i])
+                metrics[f"debug_action_support/zero_first_{i}"] = float(zero_sample[i])
+
+            try:
+                import matplotlib.pyplot as plt
+
+                fig, axes = plt.subplots(2, 2, figsize=(10, 6))
+                axes = np.asarray(axes).reshape(-1)
+                for i in range(4):
+                    ax = axes[i]
+                    if i < expert_flat.size:
+                        ax.hist(samples[:, i], bins=20, color="steelblue", alpha=0.85)
+                        ax.axvline(float(expert_flat[i]), color="crimson", linewidth=2)
+                        ax.axvline(float(zero_sample[i]), color="darkgreen", linewidth=2, linestyle="--")
+                        ax.set_title(f"first-step dim {i}")
+                    else:
+                        ax.axis("off")
+                fig.tight_layout()
+                metrics["debug_action_support/first_step_hist"] = wandb.Image(fig)
+                plt.close(fig)
+            except Exception:
+                pass
+            return metrics
+        except Exception as exc:
+            print(f"[vla_action_support] failed: {exc}", flush=True)
+            return {}
     
     raw_obs_holder = raw_carla_obs_holder
 
@@ -603,7 +668,7 @@ def run_online_carla(
             # [STEP 1] Sample the action from the agent
             if getattr(agent, "vla_sample_fn", None) is not None:
                 action_jax = agent.sample_actions_with_vla(obs[None], seed=sub)
-            elif _online_training_mode == "dagger" and hasattr(agent, "sample_actions_dagger"):
+            elif _online_training_mode in {"dagger", "dagger_direct"} and hasattr(agent, "sample_actions_dagger"):
                 action_jax = agent.sample_actions_dagger(obs[None])
             else:
                 action_jax = agent.sample_actions(obs[None], seed=sub)
@@ -645,7 +710,7 @@ def run_online_carla(
         _critic_text_for_video = _critic_input_text(_critic_feedback_mode, _lang, _lang_text, obs_raw)
 
         replay_action = action.astype(np.float32)
-        if _online_training_mode == "dagger" and not FLAGS.expert_debug:
+        if _online_training_mode in {"dagger", "dagger_direct"} and not FLAGS.expert_debug:
             replay_action = np.asarray(obs_raw.get("expert_action", replay_action), dtype=np.float32)
 
         buffer.add_transition(
@@ -705,6 +770,7 @@ def run_online_carla(
         step_wb = {f"rollout/{k}": v for k, v in drive_metrics.items()}
         step_wb["rollout/collision_count"] = float(collision_count)
         step_wb["rollout/collision_events"] = float(collision_delta)
+        step_wb.update(_maybe_log_vla_action_support(step, obs_raw))
         if "reward_total" in info:
             step_wb["reward/total"] = float(info["reward_total"])
             step_wb["reward/progress"] = float(info.get("reward_progress", 0.0))
@@ -801,6 +867,8 @@ def run_online_carla(
                 batch = buffer.sample(batch_size)
                 if _online_training_mode == "dagger":
                     _, update_info = agent.update_dagger(batch)
+                elif _online_training_mode == "dagger_direct":
+                    _, update_info = agent.update_dagger_direct(batch)
                 elif getattr(agent, "vla_sample_fn", None) is not None:
                     _, update_info = agent.update_with_vla(batch)
                 else:
@@ -868,17 +936,17 @@ def main(_):
 
     steervla_cfg = config.get("steervla", None)
     online_training_mode = str(config.get("online_training_mode", "rl")).strip().lower()
-    if online_training_mode not in {"rl", "dagger"}:
+    if online_training_mode not in {"rl", "dagger", "dagger_direct"}:
         raise ValueError(
-            f"Unsupported online_training_mode={online_training_mode!r}; expected 'rl' or 'dagger'."
+            f"Unsupported online_training_mode={online_training_mode!r}; expected 'rl', 'dagger', or 'dagger_direct'."
         )
     use_steervla_rollout = bool(
         steervla_cfg is not None and steervla_cfg.get("enabled") and not FLAGS.expert_debug
     )
-    if online_training_mode == "dagger":
+    if online_training_mode in {"dagger", "dagger_direct"}:
         if use_steervla_rollout:
             print(
-                "[main_carla] DAgger mode: rolling out SteerVLA and training the internal flow policy with relabeled expert actions.",
+                "[main_carla] DAgger mode: rolling out SteerVLA with expert relabels.",
                 flush=True,
             )
         else:

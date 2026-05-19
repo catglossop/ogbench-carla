@@ -655,6 +655,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         )
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
+        self._last_expert_action_source: str | None = None
 
         self._expert_controller_kind = str(self.carla_config.get("expert_controller", "") or "").strip().lower()
         self._expert_agent: Any | None = None
@@ -942,6 +943,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._crash_stuck_ticks = 0
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
+        self._last_expert_action_source = None
 
     def _ego_actor(self) -> Optional[carla.Actor]:
         ev = self._evaluator
@@ -1019,6 +1021,11 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         Prefer the live SimLingo expert's synchronized planner state when
         available; fall back to a route-based approximation otherwise.
         """
+        def _log_source(source: str) -> None:
+            if self._last_expert_action_source != source:
+                print(f"[expert_action] source={source}", flush=True)
+                self._last_expert_action_source = source
+
         out = np.zeros(action_horizon * action_dim, dtype=np.float32)
         if action_dim != 4:
             return out
@@ -1055,6 +1062,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                             chunk[i, :2] = delta_xy
                             chunk[i, 2:] = delta_xy
                             prev_xy = np.array([x_wp, y_wp], dtype=np.float32)
+                        _log_source("live_expert")
                         return chunk.flatten()
 
             agent_instance = getattr(ev, "agent_instance", None)
@@ -1137,6 +1145,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             else:
                 route_pts = 0
 
+            source = "route_fallback"
             if route_pts < 2:
                 curr_wp = self._cached_world_map.get_waypoint(ego_loc, project_to_road=True)
                 fallback_route = []
@@ -1149,12 +1158,15 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                         curr_wp = nxt[0]
                         fallback_route.append((curr_wp.transform, None))
                 chunk, route_pts = _build_chunk_from_route(fallback_route)
+                source = "lane_waypoint_fallback"
 
             if route_pts < 2:
                 dx = target_speed * dt
                 chunk[:, 0] = dx
                 chunk[:, 2] = dx
+                source = "straight_line_fallback"
 
+            _log_source(source)
             return chunk.flatten()
         except Exception as _e:
             print(f"[expert_action] exception: {_e}", flush=True)

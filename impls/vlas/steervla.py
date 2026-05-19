@@ -37,6 +37,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, MutableMapping, Optional
 
+import einops
 from numpy.ma import innerproduct
 
 import flax.nnx as nnx
@@ -47,6 +48,7 @@ import numpy as np
 import optax
 
 from openpi.models import model as _openpi_model
+from openpi.models import pi0 as _openpi_pi0
 from openpi.models.pi0_config import Pi0CoTConfig
 from openpi.models.tokenizer import CoTPaligemmaTokenizer
 from openpi.policies import steervla_policy as sv_policy
@@ -65,6 +67,81 @@ from impls.vlas.utils import RemoteActor
 
 # Only the front camera for OpenPI preprocess + SigLIP (skip zero-padded wrist streams).
 CARLA_STEERVLA_IMAGE_KEYS: tuple[str, ...] = ("base_0_rgb",)
+
+
+def _denormalize_action_chunk_numpy(
+    actions: np.ndarray,
+    *,
+    action_horizon: int,
+    action_dim: int,
+    output_action_format: str,
+) -> np.ndarray:
+    arr = np.asarray(actions, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected batched flat action chunks, got shape {arr.shape}.")
+    chunks = arr.reshape(arr.shape[0], action_horizon, action_dim)
+    from openpi.visualizing.steervla_visualization import denormalize_actions
+
+    denorm = denormalize_actions(chunks, action_dim, output_action_format)
+    return np.asarray(denorm, dtype=np.float32).reshape(arr.shape[0], action_horizon * action_dim)
+
+
+def _normalize_action_chunk_numpy(
+    actions: np.ndarray,
+    *,
+    action_horizon: int,
+    action_dim: int,
+    output_action_format: str,
+) -> np.ndarray:
+    arr = np.asarray(actions, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected batched flat action chunks, got shape {arr.shape}.")
+    chunks = arr.reshape(arr.shape[0], action_horizon, action_dim).copy()
+    fmt = str(output_action_format or "").upper()
+    if fmt == "DELTA_SPEED_T_DELTA_COURSE_T_DELTA_COURSE_SPACE":
+        chunks[..., 0] /= 10.0
+        chunks[..., 1] /= 180.0
+        if action_dim > 2:
+            chunks[..., 2] /= 180.0
+    elif fmt == "DELTA_XY_T_DELTA_XY_SPACE":
+        chunks[..., :2] /= 7.0
+    elif fmt == "DELTA_XY_T_DELTA_COURSE_SPACE":
+        chunks[..., :2] /= 7.0
+        if action_dim > 2:
+            chunks[..., 2] /= 180.0
+    else:
+        raise ValueError(f"Unsupported output_action_format for normalization: {output_action_format!r}")
+    return chunks.reshape(arr.shape[0], action_horizon * action_dim)
+
+
+def _pad_action_chunk_to_model_numpy(
+    actions: np.ndarray,
+    *,
+    src_action_horizon: int,
+    src_action_dim: int,
+    dst_action_horizon: int,
+    dst_action_dim: int,
+) -> np.ndarray:
+    arr = np.asarray(actions, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected batched flat action chunks, got shape {arr.shape}.")
+    src = arr.reshape(arr.shape[0], src_action_horizon, src_action_dim)
+    dst = np.zeros((arr.shape[0], dst_action_horizon, dst_action_dim), dtype=np.float32)
+    copy_h = min(int(src_action_horizon), int(dst_action_horizon))
+    copy_d = min(int(src_action_dim), int(dst_action_dim))
+    dst[:, :copy_h, :copy_d] = src[:, :copy_h, :copy_d]
+    return dst
+
+
+def _slice_replay_batch(batch: dict[str, Any], start: int, end: int) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in batch.items():
+        shape = getattr(value, "shape", None)
+        if shape is not None and len(shape) >= 1 and int(shape[0]) >= end:
+            out[key] = value[start:end]
+        else:
+            out[key] = value
+    return out
 
 
 def restore_openpi_params_on_single_gpu(
@@ -205,9 +282,25 @@ def openpi_observation_from_replay_batch(
     state = jnp.asarray(_get("openpi_state"), dtype=jnp.float32)
     prompt = jnp.asarray(_get("openpi_tokenized_prompt"), dtype=jnp.int32)
     prompt_mask = jnp.asarray(_get("openpi_tokenized_prompt_mask"), dtype=bool)
-    image = jnp.asarray(_get("openpi_image_base_0_rgb"), dtype=jnp.uint8)
-    image_mask_src = _get("openpi_image_mask_base_0_rgb")
-    image_mask = jnp.asarray(image_mask_src if image_mask_src is not None else jnp.ones((state.shape[0],), dtype=bool), dtype=bool)
+    base_image = jnp.asarray(_get("openpi_image_base_0_rgb"), dtype=jnp.uint8)
+    batch_size = int(state.shape[0])
+
+    images: dict[str, jax.Array] = {}
+    image_masks: dict[str, jax.Array] = {}
+    for image_key in _openpi_model.IMAGE_KEYS:
+        image_src = _get(f"openpi_image_{image_key}")
+        if image_src is None:
+            image = jnp.zeros_like(base_image)
+            image_mask = jnp.zeros((batch_size,), dtype=bool)
+        else:
+            image = jnp.asarray(image_src, dtype=jnp.uint8)
+            image_mask_src = _get(f"openpi_image_mask_{image_key}")
+            image_mask = jnp.asarray(
+                image_mask_src if image_mask_src is not None else jnp.ones((batch_size,), dtype=bool),
+                dtype=bool,
+            )
+        images[image_key] = image
+        image_masks[image_key] = image_mask
 
     reasoning = jnp.asarray(
         _get("openpi_tokenized_reasoning", "reasoning"),
@@ -232,12 +325,8 @@ def openpi_observation_from_replay_batch(
     )
 
     data = {
-        "image": {
-            "base_0_rgb": image,
-        },
-        "image_mask": {
-            "base_0_rgb": image_mask,
-        },
+        "image": images,
+        "image_mask": image_masks,
         "state": state,
         "tokenized_prompt": prompt,
         "tokenized_prompt_mask": prompt_mask,
@@ -294,6 +383,8 @@ class SteerVLAActor:
         sample_actions_num_steps: int = 10,
         training_gpu_rank: int = -1,
         return_normalized_action_chunk: bool = False,
+        direct_dagger_microbatch_size: int = 1,
+        direct_dagger_inference_refresh_interval: int = 16,
     ) -> None:
         self.actor_url = actor_url
         self._remote: Optional[RemoteActor] = None
@@ -312,6 +403,8 @@ class SteerVLAActor:
         self.actions_per_cot = max(1, int(actions_per_cot))
         self.sample_actions_num_steps = int(sample_actions_num_steps)
         self.return_normalized_action_chunk = bool(return_normalized_action_chunk)
+        self.direct_dagger_microbatch_size = max(1, int(direct_dagger_microbatch_size))
+        self.direct_dagger_inference_refresh_interval = max(1, int(direct_dagger_inference_refresh_interval))
         self._call_counter = 0
         self._cached_action_chunk: np.ndarray | None = None
         self._cached_action_step = 0
@@ -328,6 +421,15 @@ class SteerVLAActor:
         self._mesh: jax.sharding.Mesh | None = None
         self._train_rng: jax.Array | None = None
         self._train_state: training_utils.TrainState | None = None
+        self._direct_dagger_cfg = None
+        self._direct_dagger_graphdef = None
+        self._direct_dagger_frozen_state = None
+        self._direct_dagger_trainable_state = None
+        self._direct_dagger_tx = None
+        self._direct_dagger_opt_state = None
+        self._direct_dagger_loss_grad_fn = None
+        self._direct_dagger_update_fn = None
+        self._direct_dagger_update_counter = 0
 
         if actor_url is not None:
             self._remote = RemoteActor(
@@ -384,6 +486,11 @@ class SteerVLAActor:
             max_reasoning_len=model_cfg.max_reasoning_len,
         )
         self.model_cfg = model_cfg
+        self._refresh_compiled_inference_fns()
+        self._local_ready = True
+
+    def _refresh_compiled_inference_fns(self) -> None:
+        assert self.model is not None
         self._sample_actions = nnx_utils.module_jit(
             self.model.sample_actions,
             static_argnames=(
@@ -400,8 +507,169 @@ class SteerVLAActor:
                 "image_keys",
             ),
         )
-        
-        self._local_ready = True
+
+    def _ensure_direct_dagger_trainer(self) -> None:
+        if self._remote is not None:
+            raise RuntimeError("Direct DAgger updates are not supported in remote SteerVLAActor mode.")
+        if self.model is None or self.train_cfg is None:
+            raise RuntimeError("Local SteerVLA model is not initialized.")
+        if self._direct_dagger_graphdef is not None:
+            return
+
+        direct_cfg = dataclasses.replace(
+            self.train_cfg,
+            freeze_filter=nnx.Not(nnx_utils.PathRegex(".*(action_out_proj|time_mlp).*")),
+            ema_decay=None,
+        )
+        graphdef, full_state = nnx.split(self.model)
+        trainable_state = full_state.filter(direct_cfg.trainable_filter)
+        frozen_state = full_state.filter(nnx.Not(direct_cfg.trainable_filter))
+        tx = _optimizer.create_optimizer(direct_cfg.optimizer, direct_cfg.lr_schedule)
+        opt_state = tx.init(trainable_state)
+
+        self._direct_dagger_cfg = direct_cfg
+        self._direct_dagger_graphdef = graphdef
+        self._direct_dagger_frozen_state = frozen_state
+        self._direct_dagger_trainable_state = trainable_state
+        self._direct_dagger_tx = tx
+        self._direct_dagger_opt_state = opt_state
+
+        def loss_fn(trainable_state, obs, kv_cache, prefix_mask, prefix_mask_no_reasoning, target_actions, step_rng):
+            full_state = nnx.State.merge(trainable_state, frozen_state)
+            model = nnx.merge(graphdef, full_state)
+            return self._suffix_only_direct_dagger_loss(
+                model,
+                obs,
+                kv_cache,
+                prefix_mask,
+                prefix_mask_no_reasoning,
+                target_actions,
+                step_rng,
+            )
+
+        self._direct_dagger_loss_grad_fn = jax.jit(jax.value_and_grad(loss_fn))
+
+        def update_fn(trainable_state, opt_state, obs, target_actions, step_rng):
+            def loss_from_state(ts):
+                full_state = nnx.State.merge(ts, frozen_state)
+                model = nnx.merge(graphdef, full_state)
+                obs_proc, kv_cache, prefix_mask, prefix_mask_no_reasoning = self._build_frozen_prefix_cache(model, obs)
+                return self._suffix_only_direct_dagger_loss(
+                    model,
+                    obs_proc,
+                    kv_cache,
+                    prefix_mask,
+                    prefix_mask_no_reasoning,
+                    target_actions,
+                    step_rng,
+                )
+
+            loss_value, grads = jax.value_and_grad(loss_from_state)(trainable_state)
+            updates, new_opt_state = tx.update(grads, opt_state, trainable_state)
+            new_trainable_state = optax.apply_updates(trainable_state, updates)
+            grad_sq = sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(grads))
+            grad_norm = jnp.sqrt(grad_sq)
+            return new_trainable_state, new_opt_state, loss_value, grad_norm
+
+        self._direct_dagger_update_fn = jax.jit(update_fn)
+        if self._train_rng is None:
+            self._train_rng = jax.random.PRNGKey(0)
+
+    def _build_frozen_prefix_cache(
+        self,
+        model,
+        observation: _openpi_model.Observation,
+    ) -> tuple[_openpi_model.Observation, Any, jax.Array, jax.Array]:
+        """Precompute frozen prefix KV/cache for suffix-only action-head training."""
+        observation = _openpi_model.preprocess_observation(
+            None,
+            observation,
+            train=False,
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+
+        img_tokens, img_masks, img_ar = model._embed_images(observation)
+        n_img = sum(t.shape[1] for t in img_tokens)
+
+        prompt_emb = model._embed_text_tokens(observation.tokenized_prompt)
+        prompt_mask = observation.tokenized_prompt_mask
+        n_prompt = prompt_emb.shape[1]
+
+        reasoning_emb = model._embed_text_tokens(observation.tokenized_reasoning)
+        reasoning_mask = observation.tokenized_reasoning_mask
+        n_reasoning = reasoning_emb.shape[1]
+
+        subtask_emb = model._embed_text_tokens(observation.tokenized_subtask)
+        subtask_mask = observation.tokenized_subtask_mask
+        n_subtask = subtask_emb.shape[1]
+
+        prefix_tokens = jnp.concatenate(img_tokens + [prompt_emb, reasoning_emb, subtask_emb], axis=1)
+        prefix_mask = jnp.concatenate(img_masks + [prompt_mask, reasoning_mask, subtask_mask], axis=1)
+        prefix_ar = jnp.array(img_ar + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask)
+
+        prefix_attn_mask = _openpi_pi0.make_attn_mask(prefix_mask, prefix_ar)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = model.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        reasoning_start = n_img + n_prompt
+        reasoning_end = reasoning_start + n_reasoning
+        prefix_len = prefix_mask.shape[1]
+        col_is_reasoning = (jnp.arange(prefix_len) >= reasoning_start) & (jnp.arange(prefix_len) < reasoning_end)
+        prefix_mask_no_reasoning = prefix_mask & ~col_is_reasoning[None, :]
+
+        return (
+            observation,
+            jax.tree.map(jax.lax.stop_gradient, kv_cache),
+            jax.lax.stop_gradient(prefix_mask),
+            jax.lax.stop_gradient(prefix_mask_no_reasoning),
+        )
+
+    def _suffix_only_direct_dagger_loss(
+        self,
+        model,
+        observation: _openpi_model.Observation,
+        kv_cache: Any,
+        prefix_mask: jax.Array,
+        prefix_mask_no_reasoning: jax.Array,
+        target_actions: jax.Array,
+        step_rng: jax.Array,
+    ) -> jax.Array:
+        """Action flow-matching loss under a frozen prefix KV cache."""
+        noise_rng, time_rng = jax.random.split(step_rng)
+        noise = jax.random.normal(noise_rng, target_actions.shape)
+        batch_shape = target_actions.shape[:-2]
+        time = jax.random.beta(time_rng, 1.5, 1.0, batch_shape) * 0.999 + 0.001
+        time_expanded = time[..., None, None]
+        x_t = time_expanded * noise + (1.0 - time_expanded) * target_actions
+        u_t = noise - target_actions
+
+        suffix_tokens, suffix_mask, suffix_ar_list, adarms_cond = model._embed_action_suffix(
+            observation, x_t, time
+        )
+        suffix_ar = jnp.array(suffix_ar_list)
+        suffix_attn_mask = _openpi_pi0.make_attn_mask(suffix_mask, suffix_ar)
+        action_to_prefix = einops.repeat(prefix_mask_no_reasoning, "b p -> b s p", s=suffix_tokens.shape[1])
+        full_attn_mask = jnp.concatenate([action_to_prefix, suffix_attn_mask], axis=-1)
+        positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+
+        (_, suffix_out), _ = model.PaliGemma.llm(
+            [None, suffix_tokens],
+            mask=full_attn_mask,
+            positions=positions,
+            kv_cache=kv_cache,
+            adarms_cond=[None, adarms_cond],
+        )
+        v_t = model.action_out_proj(suffix_out[:, -model.action_horizon :])
+        return jnp.mean(jnp.square(v_t - u_t))
+
+    def _maybe_refresh_direct_dagger_inference(self, *, force: bool = False) -> None:
+        if self._direct_dagger_graphdef is None or self._direct_dagger_frozen_state is None or self._direct_dagger_trainable_state is None:
+            return
+        if (not force) and (self._direct_dagger_update_counter % int(self.direct_dagger_inference_refresh_interval) != 0):
+            return
+        full_state = nnx.State.merge(self._direct_dagger_trainable_state, self._direct_dagger_frozen_state)
+        self.model = nnx.merge(self._direct_dagger_graphdef, full_state)
+        self._refresh_compiled_inference_fns()
     
     def flow_sample(self, rng, openpi_observation, input_noise):
         
@@ -639,6 +907,201 @@ class SteerVLAActor:
         self._cached_cot = None
         self._cached_cot_actions_used = 0
 
+    def sample_action_distribution(
+        self,
+        raw: Dict[str, Any],
+        *,
+        num_samples: int = 32,
+        seed: int | None = None,
+    ) -> dict[str, np.ndarray] | None:
+        """Sample the frozen Pi action expert on one observation for support diagnostics.
+
+        Returns both normalized OpenPI chunks and ``policy_output`` chunks so they can
+        be compared directly to CARLA ``expert_action`` labels.
+        """
+        if self._remote is not None:
+            return None
+        assert self.model is not None and self._jax_device is not None
+
+        saved_action_chunk = self._cached_action_chunk
+        saved_action_step = self._cached_action_step
+        saved_cot = self._cached_cot
+        saved_cot_actions_used = self._cached_cot_actions_used
+        saved_counter = self._call_counter
+        try:
+            if seed is None:
+                self._call_counter += 1
+                seed = self._call_counter
+            rng = jax.random.PRNGKey(int(seed))
+            rng_noise, rng_zero = jax.random.split(rng)
+            noise = jax.random.normal(
+                rng_noise,
+                (int(num_samples), int(self.action_horizon), int(self.action_dim)),
+                dtype=jnp.float32,
+            )
+            zero_noise = jnp.zeros((1, int(self.action_horizon), int(self.action_dim)), dtype=jnp.float32)
+
+            sampled_norm = self._forward_pi0(int(num_samples), noise, raw=raw, rng=rng_noise, force_accel_steer=False)
+            zero_norm = self._forward_pi0(1, zero_noise, raw=raw, rng=rng_zero, force_accel_steer=False)
+
+            sampled_norm_np = np.asarray(jax.device_get(sampled_norm), dtype=np.float32)
+            zero_norm_np = np.asarray(jax.device_get(zero_norm), dtype=np.float32)
+            sampled_policy = _denormalize_action_chunk_numpy(
+                sampled_norm_np,
+                action_horizon=int(self.action_horizon),
+                action_dim=int(self.action_dim),
+                output_action_format=str(self.output_action_format or "DELTA_XY_T_DELTA_XY_SPACE"),
+            )
+            zero_policy = _denormalize_action_chunk_numpy(
+                zero_norm_np,
+                action_horizon=int(self.action_horizon),
+                action_dim=int(self.action_dim),
+                output_action_format=str(self.output_action_format or "DELTA_XY_T_DELTA_XY_SPACE"),
+            )
+            return {
+                "normalized": sampled_norm_np,
+                "policy_output": sampled_policy,
+                "zero_normalized": zero_norm_np,
+                "zero_policy_output": zero_policy,
+            }
+        finally:
+            self._cached_action_chunk = saved_action_chunk
+            self._cached_action_step = saved_action_step
+            self._cached_cot = saved_cot
+            self._cached_cot_actions_used = saved_cot_actions_used
+            self._call_counter = saved_counter
+
+    def update_dagger_direct(self, batch: dict[str, Any]) -> dict[str, float]:
+        """Train the Pi action expert directly on replayed expert chunks.
+
+        This keeps the VLM backbone frozen and updates only ``action_out_proj`` and
+        ``time_mlp*`` parameters, matching the OpenPI action-expert-only fine-tuning
+        pattern used in ``steervla-pi``.
+        """
+        if self._remote is not None:
+            return {"dagger_direct/skipped_remote_actor": 1.0}
+        self._ensure_direct_dagger_trainer()
+        assert self.model is not None
+        assert self._direct_dagger_graphdef is not None
+        assert self._direct_dagger_frozen_state is not None
+        assert self._direct_dagger_trainable_state is not None
+        assert self._direct_dagger_tx is not None
+        assert self._direct_dagger_opt_state is not None
+        assert self._direct_dagger_loss_grad_fn is not None
+        assert self._direct_dagger_update_fn is not None
+
+        expert_flat = np.asarray(batch["actions"], dtype=np.float32)
+        normalized_flat = _normalize_action_chunk_numpy(
+            expert_flat,
+            action_horizon=int(self.action_horizon),
+            action_dim=int(self.action_dim),
+            output_action_format=str(self.output_action_format or "DELTA_XY_T_DELTA_XY_SPACE"),
+        )
+        target_actions_np = _pad_action_chunk_to_model_numpy(
+            normalized_flat,
+            src_action_horizon=int(self.action_horizon),
+            src_action_dim=int(self.action_dim),
+            dst_action_horizon=int(self.model.action_horizon),
+            dst_action_dim=int(self.model.action_dim),
+        )
+        if self._train_rng is None:
+            self._train_rng = jax.random.PRNGKey(0)
+        frozen_state = self._direct_dagger_frozen_state
+        graphdef = self._direct_dagger_graphdef
+
+        batch_size = int(expert_flat.shape[0])
+        microbatch_size = max(1, int(self.direct_dagger_microbatch_size))
+
+        if microbatch_size >= batch_size:
+            obs = openpi_observation_from_replay_batch(batch)
+            target_actions = jnp.asarray(target_actions_np, dtype=jnp.float32)
+            self._train_rng, step_rng = jax.random.split(self._train_rng)
+            (
+                new_trainable_state,
+                new_opt_state,
+                loss_value,
+                grad_norm,
+            ) = self._direct_dagger_update_fn(
+                self._direct_dagger_trainable_state,
+                self._direct_dagger_opt_state,
+                obs,
+                target_actions,
+                step_rng,
+            )
+            self._direct_dagger_trainable_state = new_trainable_state
+            self._direct_dagger_opt_state = new_opt_state
+            self._direct_dagger_update_counter += 1
+            self._maybe_refresh_direct_dagger_inference()
+
+            return {
+                "dagger_direct/loss": float(jax.device_get(loss_value)),
+                "dagger_direct/grad_norm": float(jax.device_get(grad_norm)),
+                "dagger_direct/microbatch_size": float(microbatch_size),
+            }
+
+        accum_grads = None
+        loss_sum = 0.0
+        seen = 0
+
+        for start in range(0, batch_size, microbatch_size):
+            end = min(start + microbatch_size, batch_size)
+            mb = end - start
+            mb_batch = _slice_replay_batch(batch, start, end)
+            obs = openpi_observation_from_replay_batch(mb_batch)
+            prefix_model = nnx.merge(
+                graphdef,
+                nnx.State.merge(self._direct_dagger_trainable_state, frozen_state),
+            )
+            obs, kv_cache, prefix_mask, prefix_mask_no_reasoning = self._build_frozen_prefix_cache(prefix_model, obs)
+            target_actions = jnp.asarray(target_actions_np[start:end], dtype=jnp.float32)
+            self._train_rng, step_rng = jax.random.split(self._train_rng)
+            loss_value_mb, grads_mb = self._direct_dagger_loss_grad_fn(
+                self._direct_dagger_trainable_state,
+                obs,
+                kv_cache,
+                prefix_mask,
+                prefix_mask_no_reasoning,
+                target_actions,
+                step_rng,
+            )
+            weight = float(mb) / float(batch_size)
+            loss_sum += float(jax.device_get(loss_value_mb)) * mb
+            grads_mb = jax.tree_util.tree_map(lambda g: g * weight, grads_mb)
+            if accum_grads is None:
+                accum_grads = grads_mb
+            else:
+                accum_grads = jax.tree_util.tree_map(lambda a, b: a + b, accum_grads, grads_mb)
+            seen += mb
+
+        if accum_grads is None or seen <= 0:
+            return {"dagger_direct/skipped_empty_batch": 1.0}
+
+        updates, new_opt_state = self._direct_dagger_tx.update(
+            accum_grads, self._direct_dagger_opt_state, self._direct_dagger_trainable_state
+        )
+        new_trainable_state = optax.apply_updates(self._direct_dagger_trainable_state, updates)
+
+        self._direct_dagger_trainable_state = new_trainable_state
+        self._direct_dagger_opt_state = new_opt_state
+        self._direct_dagger_update_counter += 1
+        self._maybe_refresh_direct_dagger_inference()
+
+        grad_leaves = jax.tree_util.tree_leaves(accum_grads)
+        if grad_leaves:
+            grad_norm = float(
+                np.sqrt(
+                    sum(float(np.sum(np.square(np.asarray(jax.device_get(g), dtype=np.float32)))) for g in grad_leaves)
+                )
+            )
+        else:
+            grad_norm = 0.0
+
+        return {
+            "dagger_direct/loss": float(loss_sum / float(seen)),
+            "dagger_direct/grad_norm": grad_norm,
+            "dagger_direct/microbatch_size": float(microbatch_size),
+        }
+
     def _forward_pi0(
         self,
         batch_size: int,
@@ -843,6 +1306,8 @@ def create_steervla_pi0_cot_sample_fn(
         sample_actions_num_steps=int(steervla_cfg.get("sample_actions_num_steps", 10)),
         training_gpu_rank=int(srank),
         return_normalized_action_chunk=bool(steervla_cfg.get("use_pi_action_chunk_for_env", True)),
+        direct_dagger_microbatch_size=int(steervla_cfg.get("direct_dagger_microbatch_size", 1)),
+        direct_dagger_inference_refresh_interval=int(steervla_cfg.get("direct_dagger_inference_refresh_interval", 16)),
     )
 
     if url_clean:

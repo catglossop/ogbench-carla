@@ -1,0 +1,54 @@
+{
+    "_checkpoint": {
+        "global_record": {},
+        "progress": [],
+        "records": [
+            {
+                "index": 0,
+                "route_id": "RouteScenario_1711_rep0",
+                "scenario_name": "ParkingCutIn_1",
+                "weather_id": "15",
+                "save_name": "RouteScenario_1711_rep0_Town12_ParkingCutIn_1_15_05_18_23_45_07",
+                "status": "Failed - Agent crashed and got stuck",
+                "num_infractions": 1,
+                "infractions": {
+                    "collisions_layout": [
+                        "Agent collided against object with type=traffic.traffic_light and id=78976 at (x=-491.618, y=3698.069, z=365.537)"
+                    ],
+                    "collisions_pedestrian": [],
+                    "collisions_vehicle": [],
+                    "red_light": [],
+                    "stop_infraction": [],
+                    "outside_route_lanes": [],
+                    "min_speed_infractions": [],
+                    "yield_emergency_vehicle_infractions": [],
+                    "scenario_timeouts": [],
+                    "route_dev": [],
+                    "vehicle_blocked": [],
+                    "route_timeout": []
+                },
+                "scores": {
+                    "score_route": 1.6,
+                    "score_penalty": 0.65,
+                    "score_composed": 1.04
+                },
+                "meta": {
+                    "route_length": 133.138,
+                    "duration_game": 12.2,
+                    "duration_system": 424.389
+                },
+                "town_name": "Town12"
+            }
+        ]
+    },
+    "entry_status": "Finished",
+    "eligible": true,
+    "sensors": [
+        "carla_camera",
+        "carla_gnss",
+        "carla_imu",
+        "carla_speedometer"
+    ],
+    "values": [],
+    "labels": []
+}

@@ -48,6 +48,8 @@ def get_config():
     config.image_keys = ("base_0_rgb",)
     # JAX RL device: ``-1`` = unset. CARLA uses ``gpu_rank`` in carla_config.yaml.
     config.training_gpu_rank = 2
+    config.steervla_debug_action_dist_interval = 100
+    config.steervla_debug_action_dist_num_samples = 32
 
     # Critic feedback mode — three options:
     #   "commentary_bow"      (default): expert commentary BOW from the SimLingo-style labeler.
@@ -58,7 +60,8 @@ def get_config():
     config.critic_feedback_mode = "action_delta"
     # Online training regime:
     #   "rl"     : standard DSRL online RL
-    #   "dagger" : on-policy data aggregation with expert actions as supervision
+    #   "dagger" : on-policy data aggregation with expert actions as supervision for the DSRL BC flow
+    #   "dagger_direct" : on-policy data aggregation with direct supervision on the Pi action head only
     config.online_training_mode = "rl"
     # language_label_dim is auto-set for commentary_bow / delta_commentary_bow in main_carla.py,
     # and critic_action_dim is used directly when mode is action_delta.
@@ -68,7 +71,7 @@ def get_config():
             enabled=True,
             # Local OpenPI inference (ignored when actor_url is set):
             actor_config="pi05_steervla_cot_ki_inference",
-            checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning_20260512_144250/50000",
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,
             include_ego_history=False,
@@ -87,6 +90,10 @@ def get_config():
             actions_per_cot=1,
             output_action_format="DELTA_XY_T_DELTA_XY_SPACE",
             sample_actions_num_steps=10,
+            # Head-only OpenPI backward still retains full-model activations; keep this tiny.
+            direct_dagger_microbatch_size=64,
+            # Rebuild rollout inference wrappers only every N direct updates.
+            direct_dagger_inference_refresh_interval=16,
             # Remote HTTP actor (leave unset or falsy for local checkpoint load):
             # actor_url="http://35.186.30.251:8000",
         )
