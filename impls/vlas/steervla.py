@@ -557,10 +557,16 @@ class SteerVLAActor:
         if raw is None:
             return
         try:
-            raw["reasoning"] = np.asarray(jax.device_get(cot_out["tokenized_reasoning"][0]), dtype=np.int32)
-            raw["reasoning_mask"] = np.asarray(jax.device_get(cot_out["tokenized_reasoning_mask"][0]), dtype=bool)
-            raw["subtask"] = np.asarray(jax.device_get(cot_out["tokenized_subtask"][0]), dtype=np.int32)
-            raw["subtask_mask"] = np.asarray(jax.device_get(cot_out["tokenized_subtask_mask"][0]), dtype=bool)
+            reason_tokens = np.asarray(jax.device_get(cot_out["tokenized_reasoning"][0]), dtype=np.int32)
+            reason_mask = np.asarray(jax.device_get(cot_out["tokenized_reasoning_mask"][0]), dtype=bool)
+            subtask_tokens = np.asarray(jax.device_get(cot_out["tokenized_subtask"][0]), dtype=np.int32)
+            subtask_mask = np.asarray(jax.device_get(cot_out["tokenized_subtask_mask"][0]), dtype=bool)
+            raw["reasoning"] = reason_tokens
+            raw["reasoning_mask"] = reason_mask
+            raw["subtask"] = subtask_tokens
+            raw["subtask_mask"] = subtask_mask
+            raw["reasoning_text"] = self.tokenizer._tokenizer.decode(reason_tokens[reason_mask].tolist())
+            raw["subtask_text"] = self.tokenizer._tokenizer.decode(subtask_tokens[subtask_mask].tolist())
         except Exception:
             # Keep rollout robust if CoT payload changes shape unexpectedly.
             return

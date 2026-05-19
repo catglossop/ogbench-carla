@@ -12,8 +12,8 @@
 #   export CARLA_ROOT=/home/carla/carla-0-9-16
 
 host: localhost
-port: 2000
-traffic_manager_port: 8000
+port: 2001
+traffic_manager_port: 8001
 traffic_manager_seed: 0
 debug: 0
 record: ''
