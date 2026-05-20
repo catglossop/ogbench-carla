@@ -144,7 +144,7 @@ def _observation_has_cot_tokens(observation: _openpi_model.Observation) -> bool:
 
 
 def with_replay_cot_tokens(
-    openpi_observation: _openpi_model.Observation,
+openpi_observation: _openpi_model.Observation,
     replay_batch: dict[str, Any],
     *,
     prefix: str = "",

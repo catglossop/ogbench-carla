@@ -39,8 +39,8 @@ def compute_action_delta(
     try:
         import jax.numpy as jnp
 
-        expert_first = np.asarray(agent._as_critic_actions(jnp.array(np.asarray(expert_raw).reshape(1, -1))))[0]
-        agent_first = np.asarray(agent._as_critic_actions(jnp.array(action_flat.reshape(1, -1))))[0]
+        expert_first = np.asarray(agent._env_action_first_step(jnp.array(np.asarray(expert_raw).reshape(1, -1))))[0]
+        agent_first = np.asarray(agent._env_action_first_step(jnp.array(action_flat.reshape(1, -1))))[0]
         collision_active = bool(obs_raw.get("_collision_active_private", False))
         agent_forward = float(agent_first[0]) if agent_first.shape[0] > 0 else 0.0
         agent_speed = float(np.linalg.norm(agent_first[:2])) if agent_first.shape[0] >= 2 else 0.0
@@ -68,9 +68,9 @@ def compute_action_delta_commentary(
         import jax.numpy as jnp
 
         expert_first = np.asarray(
-            agent._as_critic_actions(jnp.array(np.asarray(expert_raw).reshape(1, -1)))
+            agent._env_action_first_step(jnp.array(np.asarray(expert_raw).reshape(1, -1)))
         )[0]
-        agent_first = np.asarray(agent._as_critic_actions(jnp.array(action_flat.reshape(1, -1))))[0]
+        agent_first = np.asarray(agent._env_action_first_step(jnp.array(action_flat.reshape(1, -1))))[0]
         collision_active = bool(obs_raw.get("_collision_active_private", False))
         # Heuristic "throttling" test in critic-action space: positive forward
         # speed target means the policy is trying to keep moving into contact.

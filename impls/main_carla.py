@@ -10,6 +10,9 @@ Three calling patterns:
        --online_steps=5000 \\
        --save_buffer=true
 
+   Set ``warmup_steps`` in the agent config to run the policy without RL updates
+   while prefilling the replay buffer (default 500 in ``steervla_dsrl_config.py``).
+
    ``--route`` accepts any of three name styles:
      * scenario-name kebab    (e.g. ``parking-cut-in-001``)
      * file basename           (e.g. ``bench2drive_007``)
@@ -100,7 +103,8 @@ flags.DEFINE_bool(
     "then switch to the PDM-Lite expert for the remainder of the episode.",
 )
 
-flags.DEFINE_string("save_dir", "/raid/users/celine/carla_exps", "Save directory.")
+# flags.DEFINE_string("save_dir", "/raid/users/celine/carla_exps", "Save directory.")
+flags.DEFINE_string("save_dir", "/home/carla/exps", "Save directory.")
 flags.DEFINE_string("restore_path", None, "Restore path for JAX agents.")
 flags.DEFINE_integer("restore_epoch", None, "Restore epoch.")
 
@@ -307,6 +311,9 @@ def run_online_carla(
     batch_size = int(agent_config.get("batch_size", 256))
 
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, "train.csv"))
+    if warmup > 0 and agent is not None and not FLAGS.expert_debug:
+        policy_src = "rollout policy (no RL updates)"
+        print(f"[main_carla] warmup: {warmup} steps using {policy_src}", flush=True)
     
     # Get openpi fields from raw observation
     def _openpi_fields_from_raw(raw: dict | None) -> dict[str, np.ndarray]:
@@ -353,7 +360,10 @@ def run_online_carla(
     _online_training_mode = str(agent_config.get("online_training_mode", "rl")).strip().lower()
     _lang_dim = critic_language_dim(agent_config)
 
-    action_dim = int(agent_config.get("action_dim", 4)*agent_config.get("actions_horizon", 10))
+    steervla_cfg = agent_config.get("steervla") or {}
+    env_ah = int(steervla_cfg.get("action_horizon", agent_config.get("vla_action_horizon", 10)))
+    env_ad = int(steervla_cfg.get("action_dim", agent_config.get("vla_action_dim", 4)))
+    action_dim = env_ah * env_ad
     example_transition = dict(
         observations=np.array(obs),
         actions=np.zeros((action_dim,), dtype=np.float32),
@@ -583,6 +593,14 @@ def run_online_carla(
 
     last_update_info = None
 
+    def _sample_agent_action(subkey):
+        """Rollout policy (SteerVLA VLA path, DAgger, or DSRL flow); used in warmup and RL phases."""
+        if getattr(agent, "vla_sample_fn", None) is not None:
+            return agent.sample_actions_with_vla(obs[None], seed=subkey)
+        if _online_training_mode == "dagger" and hasattr(agent, "sample_actions_dagger"):
+            return agent.sample_actions_dagger(obs[None])
+        return agent.sample_actions(obs[None], seed=subkey)
+
     _vla_steps_budget = int(np.random.randint(70, 201)) if FLAGS.expert_recover_debug else 0
     if FLAGS.expert_recover_debug:
         print(f"[expert_recover_debug] episode 0: VLA for {_vla_steps_budget} steps then expert", flush=True)
@@ -595,18 +613,11 @@ def run_online_carla(
         _in_expert_recovery = FLAGS.expert_recover_debug and (episode_steps >= _vla_steps_budget)
         if FLAGS.expert_recover_debug and (episode_steps == _vla_steps_budget):
             env.reinit_expert()
+        in_warmup = warmup > 0 and step <= warmup
         if FLAGS.expert_debug or _in_expert_recovery or agent is None:
             action = np.zeros(env.action_space.shape, dtype=np.float32)
-        elif step <= warmup:
-            action = env.action_space.sample()
         else:
-            # [STEP 1] Sample the action from the agent
-            if getattr(agent, "vla_sample_fn", None) is not None:
-                action_jax = agent.sample_actions_with_vla(obs[None], seed=sub)
-            elif _online_training_mode == "dagger" and hasattr(agent, "sample_actions_dagger"):
-                action_jax = agent.sample_actions_dagger(obs[None])
-            else:
-                action_jax = agent.sample_actions(obs[None], seed=sub)
+            action_jax = _sample_agent_action(sub)
             _block_until_ready_tree(action_jax)
             action = np.asarray(action_jax[0])
         t_sample_end = time.time()
@@ -736,6 +747,7 @@ def run_online_carla(
         step_wb["time/sample_time"] = t_sample_end - t_sample_start
         step_wb["time/step_time"] = t_step_end - t_step_start
         step_wb["time/log_time"] = t_log_end - t_log_start
+        step_wb["training/in_warmup"] = float(in_warmup)
 
         wandb.log(step_wb, step=step)
 
@@ -795,7 +807,12 @@ def run_online_carla(
                 )
 
         update_time = 0.0
-        if (not FLAGS.expert_debug) and agent is not None and step > warmup and buffer.size >= batch_size:
+        if (
+            (not FLAGS.expert_debug)
+            and agent is not None
+            and not in_warmup
+            and buffer.size >= batch_size
+        ):
             t_update_start = time.time()
             for _ in range(updates_per_step):
                 batch = buffer.sample(batch_size)
