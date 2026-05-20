@@ -36,10 +36,16 @@ def get_config():
     config.flow_steps = 10
     config.noise_scale = 1.0
     config.alpha = 0.1
+    # Collect transitions with the rollout policy (SteerVLA / DSRL) but skip RL updates.
     config.warmup_steps = 0
+    # If True, use env.action_space.sample() during warmup instead of the policy.
+    config.warmup_use_random_actions = False
     config.updates_per_step = 1
     config.buffer_capacity = 1_000
     config.image_log_curr_interval = 10
+    config.critic_action_dim = 4
+    config.vla_action_dim = 4
+    config.vla_action_horizon = 10
     config.actor_action_dim = 32
     config.action_horizon = 10
     # config.steervla = None
@@ -47,17 +53,14 @@ def get_config():
     config.observation_mode = "image"
     config.image_keys = ("base_0_rgb",)
     # JAX RL device: ``-1`` = unset. CARLA uses ``gpu_rank`` in carla_config.yaml.
-    config.training_gpu_rank = 2
-    config.steervla_debug_action_dist_interval = 100
-    config.steervla_debug_action_dist_num_samples = 32
-
+    config.training_gpu_rank = 0
     # Critic feedback mode — three options:
     #   "commentary_bow"      (default): expert commentary BOW from the SimLingo-style labeler.
     #   "action_delta"                 : (critic_action_dim)-dim = expert first step minus agent first step.
     #   "delta_commentary_bow"        : corrective language BOW from expert-vs-agent action delta
     #                                   (e.g. "Adjust right. Decelerate more heavily.").
     # To switch to action_delta, uncomment:
-    config.critic_feedback_mode = "action_delta"
+    # config.critic_feedback_mode = "action_delta"
     # Online training regime:
     #   "rl"          : standard DSRL online RL
     #   "dagger"      : on-policy data aggregation with expert actions as supervision for the DSRL BC flow
@@ -74,7 +77,8 @@ def get_config():
             enabled=True,
             # Local OpenPI inference (ignored when actor_url is set):
             actor_config="pi05_steervla_cot_ki_inference",
-            checkpoint="gs://cat-logs/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning_20260512_144250/70000",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
+            # checkpoint="gs://cat-logs/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning_20260512_144250/50000",
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,
             include_ego_history=False,

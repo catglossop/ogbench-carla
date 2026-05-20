@@ -62,23 +62,23 @@ def _steervla():
     return steervla_mod
 
 
-def dsrl_encode_obs_sample_noise_logprob(
-    network: TrainState,
-    noise_scale: jnp.ndarray | float | int,
-    observations: jnp.ndarray,
-    rng: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Encode observations and sample noise + log-prob from the **noise actor** (DSRL).
+# def dsrl_encode_obs_sample_noise_logprob(
+#     network: TrainState,
+#     noise_scale: jnp.ndarray | float | int,
+#     observations: jnp.ndarray,
+#     rng: jnp.ndarray,
+# ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+#     """Encode observations and sample noise + log-prob from the **noise actor** (DSRL).
 
-    DSRL params are treated as constants (no gradients). Matches :meth:`DSRLAgent.actor_loss`
-    sampling, without integrating the BC flow.
-    """
-    params = jax.tree.map(jax.lax.stop_gradient, network.params)
-    obs_e = network.select("obs_encoder")(observations, params=params)
-    dist = network.select("noise_actor")(obs_e, params=params)
-    noise, log_prob = dist.sample_and_log_prob(seed=rng)
-    ns = jnp.asarray(noise_scale, dtype=noise.dtype)
-    return obs_e, noise * ns, log_prob
+#     DSRL params are treated as constants (no gradients). Matches :meth:`DSRLAgent.actor_loss`
+#     sampling, without integrating the BC flow.
+#     """
+#     params = jax.tree.map(jax.lax.stop_gradient, network.params)
+#     obs_e = network.select("obs_encoder")(observations, params=params)
+#     dist = network.select("noise_actor")(obs_e, params=params)
+#     noise, log_prob = dist.sample_and_log_prob(seed=rng)
+#     ns = jnp.asarray(noise_scale, dtype=noise.dtype)
+#     return obs_e, noise * ns, log_prob
 
 
 def dsrl_critic_min_q(network: TrainState, obs_e: jnp.ndarray, actions: jnp.ndarray, language_label=None) -> jnp.ndarray:
@@ -87,7 +87,7 @@ def dsrl_critic_min_q(network: TrainState, obs_e: jnp.ndarray, actions: jnp.ndar
     obs_e_sg = jax.lax.stop_gradient(obs_e)
     if language_label is not None:
         obs_e_sg = jnp.concatenate([obs_e_sg, jnp.asarray(language_label, dtype=jnp.float32)], axis=-1)
-    qs = network.select("critic")(obs_e_sg, actions, params=params)
+    qs = network.select("noise_critic")(obs_e_sg, actions, params=params)
     return jnp.min(qs, axis=0)
 
 
@@ -109,8 +109,8 @@ def _critic_loss_vla_pure_math(
 ):
     """Pure DSRL critic math: target-Q bootstrap + critic MSE, no VLA model access.
 
-    ``next_actions_critic`` and ``critic_actions`` must already be projected to the
-    critic action representation (e.g. via :meth:`DSRLAgent._as_critic_actions`).
+    ``next_actions_critic`` and ``critic_actions`` must already be clipped to the env
+    action layout (e.g. via :meth:`DSRLAgent._clip_actions_to_env`).
     """
     next_obs_e = network.select("obs_encoder")(batch["next_observations"], params=network.params)
     next_qs = network.select("target_critic")(_critic_obs_e(next_obs_e, batch, "next_language_label"), next_actions_critic)
@@ -126,6 +126,61 @@ def _critic_loss_vla_pure_math(
         "q_max": qs.max(),
         "q_min": qs.min(),
         "target_q": target_q.mean(),
+    }
+
+
+@jax.jit
+def _noise_critic_loss_vla_pure_math(
+    network: TrainState,
+    batch: dict,
+    vla_actions: jnp.ndarray,
+    noise_actions: jnp.ndarray,
+    grad_params,
+):
+    """Distill ``noise_critic(s, z)`` toward ``critic(s, VLA(s, z))`` at the same state."""
+    obs_e = network.select("obs_encoder")(batch["observations"], params=grad_params)
+    noise_qs = network.select("noise_critic")(
+        _critic_obs_e(obs_e, batch, "language_label"), noise_actions, params=grad_params,
+    )
+    actions_sg = jax.lax.stop_gradient(vla_actions)
+    target_qs = network.select("critic")(
+        _critic_obs_e(obs_e, batch, "language_label"), actions_sg,
+    )
+    noise_q = jnp.min(noise_qs, axis=0)
+    target_q = jnp.min(target_qs, axis=0)
+    noise_critic_loss = jnp.square(noise_q - jax.lax.stop_gradient(target_q)).mean()
+    return noise_critic_loss, {
+        "noise_critic_loss": noise_critic_loss,
+        "noise_q_values": noise_q.mean(),
+        "q_values": target_q.mean(),
+    }
+
+
+@jax.jit
+def _noise_actor_loss_vla_pure_math(
+    network: TrainState,
+    batch: dict,
+    grad_params,
+    rng_noise: jnp.ndarray,
+    alpha: jnp.ndarray,
+    noise_scale: jnp.ndarray,
+):
+    """SAC-style noise actor loss using ``noise_critic`` Q-values."""
+    noise_actions = _vla_forward_prepare_actor_noise(
+        network, batch["observations"], rng_noise, noise_scale,
+    )
+    obs_e = network.select("obs_encoder")(batch["observations"], params=grad_params)
+    dist = network.select("noise_actor")(obs_e, params=grad_params)
+    log_prob = dist.log_prob(noise_actions / noise_scale)
+    qs = network.select("noise_critic")(
+        _critic_obs_e(obs_e, batch, "language_label"), noise_actions,
+    )
+    q = jnp.min(qs, axis=0)
+    actor_loss = (alpha * log_prob - q).mean()
+    return actor_loss, {
+        "noise_actor_loss": actor_loss,
+        "noise_log_prob": log_prob.mean(),
+        "q_for_noise_actor": q.mean(),
     }
 
 
@@ -153,61 +208,15 @@ def _apply_grads_pure(network: TrainState, grads):
     )
     return new_network, stats
 
-
-@jax.jit
-def _actor_loss_vla_pure_math(
-    network: TrainState,
-    batch: dict,
-    actions_vla: jnp.ndarray,
-    noise_for_logprob: jnp.ndarray,
-    grad_params,
-    alpha: jnp.ndarray,
-    noise_scale: jnp.ndarray,
-):
-    """Pure DSRL actor math given a precomputed VLA action.
-
-    ``actions_vla`` is treated as a constant input (stop_gradient): the gradient through the VLA
-    is dropped on purpose so we can keep the heavy Pi0-CoT forward eager. ``noise_for_logprob``
-    is the noise that the VLA was conditioned on; we re-evaluate ``log_prob`` here under
-    ``grad_params`` so the noise actor still gets a gradient for the entropy term.
-    """
-    obs_e = network.select("obs_encoder")(batch["observations"], params=grad_params)
-    dist = network.select("noise_actor")(obs_e, params=grad_params)
-    log_prob = dist.log_prob(noise_for_logprob / noise_scale)
-
-    actions_sg = jax.lax.stop_gradient(actions_vla)
-    qs = network.select("critic")(_critic_obs_e(obs_e, batch, "language_label"), actions_sg)
-    q = jnp.min(qs, axis=0)
-    actor_loss = (alpha * log_prob - q).mean()
-    return actor_loss, {
-        "actor_loss": actor_loss,
-        "noise_log_prob": log_prob.mean(),
-        "q_for_actor": q.mean(),
-    }
-
-
-@jax.jit
-def _vla_forward_prepare_critic_noise(
-    network: TrainState,
-    batch: dict,
-    rng_noise: jnp.ndarray,
-    noise_scale: jnp.ndarray,
-) -> jnp.ndarray:
-    """Pure JAX prep for critic VLA forward: sample frozen policy noise on next observations."""
-    next_obs_e_frozen = network.select("obs_encoder")(batch["next_observations"], params=network.params)
-    next_dist = network.select("noise_actor")(next_obs_e_frozen)
-    return next_dist.sample(seed=rng_noise) * noise_scale
-
-
 @jax.jit
 def _vla_forward_prepare_actor_noise(
     network: TrainState,
-    batch: dict,
+    observations: jnp.ndarray,
     rng_noise: jnp.ndarray,
     noise_scale: jnp.ndarray,
 ) -> jnp.ndarray:
     """Pure JAX prep for actor VLA forward: sample frozen policy noise on current observations."""
-    obs_e_frozen = network.select("obs_encoder")(batch["observations"], params=network.params)
+    obs_e_frozen = network.select("obs_encoder")(observations, params=network.params)
     dist_frozen = network.select("noise_actor")(obs_e_frozen)
     return dist_frozen.sample(seed=rng_noise) * noise_scale
 
@@ -333,27 +342,83 @@ class DSRLAgent(flax.struct.PyTreeNode):
             output_action_format=c.get("vla_output_action_format") or "DELTA_XY_T_DELTA_XY_SPACE",
         )
 
-    def _as_critic_actions(self, actions: jnp.ndarray) -> jnp.ndarray:
-        """Project actions into the critic representation (default: first-step 4-D VLA action)."""
-        x = jnp.asarray(actions, dtype=jnp.float32)
-        target_dim = int(self.config.get("critic_action_dim", x.shape[-1]))
-        if x.shape[-1] == target_dim:
-            return x
+    def _model_action_horizon(self) -> int:
+        """Horizon for Pi0 / noise actor (``action_horizon``)."""
+        return int(self.config.get("action_horizon", self.config.get("vla_action_horizon", 10)))
 
-        # Replay may store flattened chunk actions (H * D). Project to first-step D-dim action for critic.
+    def _model_action_dim(self) -> int:
+        """Per-step dim for noise / Pi0 actions (``actor_action_dim``)."""
+        return int(self.config.get("actor_action_dim", PI05_ACTION_DIM))
+
+    def _env_action_horizon(self) -> int:
+        """Horizon for env rollout and action critic (``vla_action_horizon``)."""
+        return int(self.config.get("vla_action_horizon", self.config.get("action_horizon", 10)))
+
+    def _env_action_dim(self) -> int:
+        """Per-step dim for env rollout and action critic (``vla_action_dim``)."""
+        return int(self.config.get("vla_action_dim", 4))
+
+    def _flat_noise_dim(self) -> int:
+        return self._model_action_horizon() * self._model_action_dim()
+
+    def _flat_env_action_dim(self) -> int:
+        return self._env_action_horizon() * self._env_action_dim()
+
+    def _as_flat_noise(self, noise: jnp.ndarray) -> jnp.ndarray:
+        """Flatten noise to ``(B, action_horizon * actor_action_dim)``."""
+        x = jnp.asarray(noise, dtype=jnp.float32)
+        flat_dim = self._flat_noise_dim()
+        if x.ndim == 3:
+            ah = self._model_action_horizon()
+            ad = self._model_action_dim()
+            return x[:, :ah, :ad].reshape(x.shape[0], flat_dim)
+        if x.ndim == 2 and x.shape[-1] == flat_dim:
+            return x
+        raise ValueError(
+            f"Cannot map noise shape {tuple(x.shape)} to flat noise dim {flat_dim} "
+            f"(action_horizon={self._model_action_horizon()}, actor_action_dim={self._model_action_dim()})."
+        )
+
+    def _as_noise_chunk(self, noise: jnp.ndarray) -> jnp.ndarray:
+        """Reshape noise to ``(B, action_horizon, actor_action_dim)``."""
+        flat = self._as_flat_noise(noise)
+        return flat.reshape(flat.shape[0], self._model_action_horizon(), self._model_action_dim())
+
+    def _clip_actions_to_env(self, actions: jnp.ndarray) -> jnp.ndarray:
+        """Clip model / Pi0 actions to flat env layout ``(B, vla_action_horizon * vla_action_dim)``."""
+        x = jnp.asarray(actions, dtype=jnp.float32)
+        ah = self._env_action_horizon()
+        ad = self._env_action_dim()
+        flat_env = ah * ad
+
+        if x.ndim == 3:
+            return x[:, :ah, :ad].reshape(x.shape[0], flat_env)
         if x.ndim == 2:
-            ah = int(self.config.get("vla_action_horizon", 10))
-            ad = int(self.config.get("vla_action_dim", 4))
-            if x.shape[-1] == ah * ad:
-                chunk = x.reshape(x.shape[0], ah, ad)
-                return chunk[:, 0, :target_dim]
-        elif x.ndim == 3:
-            return x[:, 0, :target_dim]
+            if x.shape[-1] == flat_env:
+                return x
+            model_flat = self._flat_noise_dim()
+            if x.shape[-1] == model_flat:
+                chunk = x.reshape(x.shape[0], self._model_action_horizon(), self._model_action_dim())
+                return chunk[:, :ah, :ad].reshape(x.shape[0], flat_env)
+            if x.shape[-1] == ah * self._model_action_dim():
+                chunk = x.reshape(x.shape[0], ah, self._model_action_dim())
+                return chunk[:, :, :ad].reshape(x.shape[0], flat_env)
 
         raise ValueError(
-            f"Cannot map actions shape {tuple(x.shape)} to critic_action_dim={target_dim}. "
-            "Check vla_action_horizon/vla_action_dim or disable chunk actions for env."
+            f"Cannot clip actions shape {tuple(x.shape)} to env flat dim {flat_env} "
+            f"(vla_action_horizon={ah}, vla_action_dim={ad})."
         )
+
+    def _env_action_first_step(self, actions: jnp.ndarray) -> jnp.ndarray:
+        """First env step ``(B, vla_action_dim)`` for action-delta critic feedback."""
+        flat = self._clip_actions_to_env(actions)
+        ah = self._env_action_horizon()
+        ad = self._env_action_dim()
+        return flat.reshape(flat.shape[0], ah, ad)[:, 0, :]
+
+    def _as_critic_actions(self, actions: jnp.ndarray) -> jnp.ndarray:
+        """Alias for :meth:`_clip_actions_to_env` (full env chunk, not first step only)."""
+        return self._clip_actions_to_env(actions)
 
     def _as_openpi_actions(self, actions: jnp.ndarray) -> jnp.ndarray:
         """Convert replay/env action tensors to OpenPI action shape ``[B, H, D]``."""
@@ -421,29 +486,24 @@ class DSRLAgent(flax.struct.PyTreeNode):
     def sample_actions_dagger(self, observations):
         """Deterministic rollout policy for DAgger: BC flow from zero noise."""
         batch = observations.shape[0]
-        flow_action_dim = int(self.config.get("critic_action_dim", self.config["actor_action_dim"]))
-        noise = jnp.zeros((batch, flow_action_dim), dtype=jnp.float32)
+        noise = jnp.zeros((batch, self._flat_env_action_dim()), dtype=jnp.float32)
         return self._flow_sample(self.network.params, observations, noise)
 
     # ----- losses --------------------------------------------------------- #
 
-    def critic_loss(self, batch, grad_params, rng):
-        next_obs_e = self._encode_obs(self.network.params, batch["next_observations"])
-        next_dist = self.network.select("noise_actor")(next_obs_e)
-        next_noise = next_dist.sample(seed=rng) * self.config["noise_scale"]
-        next_actions = self._flow_sample(
-            self.network.params, batch["next_observations"], next_noise
-        )
-        next_actions = self._as_critic_actions(next_actions)
-        next_qs = self.network.select("target_critic")(_critic_obs_e(next_obs_e, batch, "next_language_label"), next_actions)
-        next_q = jnp.min(next_qs, axis=0)
-
-        target_q = batch["rewards"] + self.config["discount"] * batch["masks"] * next_q
-
+    # Noise critic loss (distill Q(s, z) toward Q(s, a_env) at the same state).
+    def noise_critic_loss(self, batch, grad_params, rng):
         obs_e = self._encode_obs(grad_params, batch["observations"])
-        critic_actions = self._as_critic_actions(batch["actions"])
-        qs = self.network.select("critic")(
-            _critic_obs_e(obs_e, batch, "language_label"), critic_actions, params=grad_params
+        dist = self.network.select("noise_actor")(obs_e)
+        noise_flat = self._as_flat_noise(dist.sample(seed=rng) * self.config["noise_scale"])
+        env_actions = self._clip_actions_to_env(batch["actions"])
+        target_qs = self.network.select("critic")(
+            _critic_obs_e(obs_e, batch, "language_label"), env_actions,
+        )
+        target_q = jnp.min(target_qs, axis=0)
+
+        qs = self.network.select("noise_critic")(
+            _critic_obs_e(obs_e, batch, "language_label"), noise_flat, params=grad_params
         )
         critic_loss = jnp.square(qs - target_q[None]).mean()
         return critic_loss, {
@@ -453,9 +513,9 @@ class DSRLAgent(flax.struct.PyTreeNode):
             "q_min": qs.min(),
             "target_q": target_q.mean(),
         }
-
+        
     def flow_loss(self, batch, grad_params, rng):
-        actions = self._as_critic_actions(batch["actions"])
+        actions = self._clip_actions_to_env(batch["actions"])
         x_0 = jax.random.normal(rng, actions.shape) * self.config["noise_scale"]
         rng_t = jax.random.fold_in(rng, 1)
         t = jax.random.uniform(rng_t, actions.shape[:-1] + (1,))
@@ -471,9 +531,10 @@ class DSRLAgent(flax.struct.PyTreeNode):
         dist = self.network.select("noise_actor")(obs_e, params=grad_params)
         noise, log_prob = dist.sample_and_log_prob(seed=rng)
         noise = noise * self.config["noise_scale"]
-        # We do not want gradient through the (frozen) flow weights.
-        actions = self._flow_sample(self.network.params, batch["observations"], noise)
-        qs = self.network.select("critic")(_critic_obs_e(obs_e, batch, "language_label"), actions)
+        noise_flat = self._as_flat_noise(noise)
+        qs = self.network.select("noise_critic")(
+            _critic_obs_e(obs_e, batch, "language_label"), noise_flat,
+        )
         q = jnp.min(qs, axis=0)
         actor_loss = (self.config["alpha"] * log_prob - q).mean()
         return actor_loss, {
@@ -482,125 +543,144 @@ class DSRLAgent(flax.struct.PyTreeNode):
             "q_for_actor": q.mean(),
         }
         
-    def _vla_forward_for_critic(self, batch, rng):
-        """Eager VLA forward used by the critic bootstrap target. No gradient w.r.t. ``grad_params``."""
-        sv = _steervla()
+    def _vla_forward(self, observations, openpi_observations, rng, noise=None):
         rng_n, rng_act = jax.random.split(rng)
-        noise_scale = jnp.asarray(self.config["noise_scale"], dtype=jnp.float32)
-        next_noise = _vla_forward_prepare_critic_noise(
-            self.network, batch, rng_n, noise_scale,
-        )
-        next_noise = next_noise.reshape(batch["observations"].shape[0], self.config["action_horizon"], self.config["actor_action_dim"])
-        next_openpi_observation = self._as_jax_pytree(batch["next_openpi_observation"])
-        # We need to increase the dimension of the noise to match the action dimension
+        if noise is None:
+            noise_scale = jnp.asarray(self.config["noise_scale"], dtype=jnp.float32)
+            noise = _vla_forward_prepare_actor_noise(
+                self.network, observations, rng_n, noise_scale,
+            )
+        noise_chunk = self._as_noise_chunk(noise)
+        next_openpi_observation = self._as_jax_pytree(openpi_observations)
         next_actions = self.steervla_actor._sample_actions(
             rng_act,
             next_openpi_observation,
-            noise=next_noise,
+            noise=noise_chunk,
             image_keys=tuple(self.config.get("image_keys", ("base_0_rgb",))),
             num_steps=int(self.config.get("flow_steps", 10)),
         )
 
-        return jax.lax.stop_gradient(self._as_critic_actions(next_actions))
+        return jax.lax.stop_gradient(self._clip_actions_to_env(next_actions))
 
     def _vla_forward_for_actor(self, batch, rng):
-        """Eager VLA forward used by the actor loss; returns ``(actions_for_critic, noise_used)``."""
-        sv = _steervla()
         rng_a, rng_act = jax.random.split(rng)
         noise_scale = jnp.asarray(self.config["noise_scale"], dtype=jnp.float32)
-        t0 = time.perf_counter()
         noise = _vla_forward_prepare_actor_noise(
-            self.network, batch, rng_a, noise_scale,
+            self.network, batch["observations"], rng_a, noise_scale,
         )
-        noise = noise.reshape(batch["observations"].shape[0], self.config["action_horizon"], self.config["actor_action_dim"])
+        noise_flat = self._as_flat_noise(noise)
         openpi_observation = self._as_jax_pytree(batch["openpi_observation"])
 
         actions = self.steervla_actor._sample_actions(
             rng_act,
             openpi_observation,
-            noise=noise,
+            noise=self._as_noise_chunk(noise_flat),
             image_keys=tuple(self.config.get("image_keys", ("base_0_rgb",))),
             num_steps=int(self.config.get("flow_steps", 10)),
         )
-        return self._as_critic_actions(actions), jax.lax.stop_gradient(noise)
+        return self._clip_actions_to_env(actions), jax.lax.stop_gradient(noise_flat)
+
+    def noise_critic_loss_vla(self, batch, grad_params, rng):
+        """Distill ``noise_critic(s, z)`` toward ``critic(s, VLA(s, z))``."""
+        rng, noise_rng, vla_rng = jax.random.split(rng, 3)
+        batch_size = batch["observations"].shape[0]
+        noise_scale = jnp.asarray(self.config["noise_scale"], dtype=jnp.float32)
+        noise_actions = (
+            jax.random.normal(noise_rng, (batch_size, self._flat_noise_dim()))
+            * noise_scale
+        )
+        vla_actions = self._vla_forward(
+            batch["observations"], batch["openpi_observation"], vla_rng, noise=noise_actions,
+        )
+        return _noise_critic_loss_vla_pure_math(
+            self.network, batch, vla_actions, noise_actions, grad_params,
+        )
+
+    def noise_actor_loss_vla(self, batch, grad_params, rng):
+        """SAC-style noise actor loss using ``noise_critic`` Q-values."""
+        alpha = jnp.asarray(self.config["alpha"], dtype=jnp.float32)
+        noise_scale = jnp.asarray(self.config["noise_scale"], dtype=jnp.float32)
+        return _noise_actor_loss_vla_pure_math(
+            self.network, batch, grad_params, rng, alpha, noise_scale,
+        )
 
     def critic_loss_vla(self, batch, grad_params, rng):
         """Critic loss with bootstrap target from a frozen VLA action sample.
 
         VLA forward (CoT + flow-matching) is executed eagerly; only the surrounding DSRL math
-        (target-Q, MSE) is jitted via :func:`_critic_loss_vla_pure_math`. ``grad_params`` does
-        not propagate through the VLA in the original code either (frozen action mapper for the
-        target), so this is a behavior-preserving split.
+        (target-Q, MSE) is jitted via :func:`_critic_loss_vla_pure_math`.
         """
-        next_actions_critic = self._vla_forward_for_critic(batch, rng)
-        critic_actions = self._as_critic_actions(batch["actions"])
+        next_actions = self._vla_forward(
+            batch["next_observations"], batch["next_openpi_observation"], rng,
+        )
+        critic_actions = self._clip_actions_to_env(batch["actions"])
         discount = jnp.asarray(self.config["discount"], dtype=jnp.float32)
         return _critic_loss_vla_pure_math(
-            self.network,
-            batch,
-            next_actions_critic,
-            critic_actions,
-            grad_params,
-            discount,
+            self.network, batch, next_actions, critic_actions, grad_params, discount,
         )
 
-    def actor_loss_vla(self, batch, grad_params, rng):
-        """Actor loss with a VLA action sampled eagerly outside the gradient trace.
-
-        Trade-off vs. the original implementation: gradient does NOT flow through the VLA back
-        into the noise actor (i.e., the reparameterization ``∂Q/∂a · ∂a/∂z`` term is dropped).
-        The noise actor still gets gradient via (i) the entropy term ``alpha * log_prob`` and
-        (ii) the encoder→critic path. This is the standard way to integrate a frozen,
-        non-fully-differentiable action mapper (Pi0-CoT has non-traceable CoT decoding).
-        """
-        actions_critic, noise = self._vla_forward_for_actor(batch, rng)
+    def total_loss_vla(self, batch, grad_params, rng=None, vla_cache=None):
+        """Sum of VLA-path losses; ``update_with_vla`` passes precomputed ``vla_cache``."""
+        rng = rng if rng is not None else self.rng
+        rng, nc_rng, na_rng, c_rng = jax.random.split(rng, 4)
+        discount = jnp.asarray(self.config["discount"], dtype=jnp.float32)
         alpha = jnp.asarray(self.config["alpha"], dtype=jnp.float32)
         noise_scale = jnp.asarray(self.config["noise_scale"], dtype=jnp.float32)
-        return _actor_loss_vla_pure_math(
-            self.network,
-            batch,
-            actions_critic,
-            noise,
-            grad_params,
-            alpha,
-            noise_scale,
-        )
+        critic_actions = self._clip_actions_to_env(batch["actions"])
 
-    def total_loss_vla(self, batch, grad_params, rng=None):
-        """Sum of VLA-path losses (logging); optimization uses :meth:`update_with_vla` (two optimizers)."""
-        rng = rng if rng is not None else self.rng
-        rng, c_rng, a_rng, f_rng = jax.random.split(rng, 4)
-
-        c_loss, c_info = self.critic_loss_vla(batch, grad_params, c_rng)
-        a_loss, a_info = self.actor_loss_vla(batch, grad_params, a_rng)
+        if vla_cache is not None:
+            nc_loss, nc_info = _noise_critic_loss_vla_pure_math(
+                self.network,
+                batch,
+                vla_cache["vla_actions_nc"],
+                vla_cache["noise_actions"],
+                grad_params,
+            )
+            na_loss, na_info = _noise_actor_loss_vla_pure_math(
+                self.network, batch, grad_params, na_rng, alpha, noise_scale,
+            )
+            c_loss, c_info = _critic_loss_vla_pure_math(
+                self.network,
+                batch,
+                vla_cache["next_actions_critic"],
+                critic_actions,
+                grad_params,
+                discount,
+            )
+        else:
+            nc_loss, nc_info = self.noise_critic_loss_vla(batch, grad_params, nc_rng)
+            na_loss, na_info = self.noise_actor_loss_vla(batch, grad_params, na_rng)
+            c_loss, c_info = self.critic_loss_vla(batch, grad_params, c_rng)
         
         info = {}
+        for k, v in nc_info.items():
+            info[f"noise_critic_vla/{k}"] = v
+        for k, v in na_info.items():
+            info[f"noise_actor_vla/{k}"] = v
         for k, v in c_info.items():
-            info[f"critic_vla/{k}"] = v
-        for k, v in a_info.items():
-            info[f"actor_vla/{k}"] = v
-        combined = c_loss + a_loss
+            info[f"critic/{k}"] = v
+        combined = nc_loss + na_loss + c_loss
         info["total_loss_vla"] = combined
-        info["flax_loss_vla"] = c_loss + a_loss
+        info["flax_loss_vla"] = nc_loss + na_loss + c_loss
+        info["noise_critic_loss_vla"] = nc_loss
+        info["noise_actor_loss_vla"] = na_loss
+        info["critic_loss_vla"] = c_loss
         return combined, info
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
         info = {}
         rng = rng if rng is not None else self.rng
-        rng, c_rng, f_rng, a_rng = jax.random.split(rng, 4)
+        rng, nc_rng, a_rng = jax.random.split(rng, 3)
 
-        c_loss, c_info = self.critic_loss(batch, grad_params, c_rng)
-        for k, v in c_info.items():
-            info[f"critic/{k}"] = v
-        f_loss, f_info = self.flow_loss(batch, grad_params, f_rng)
-        for k, v in f_info.items():
-            info[f"flow/{k}"] = v
+        nc_loss, nc_info = self.noise_critic_loss(batch, grad_params, nc_rng)
+        for k, v in nc_info.items():
+            info[f"noise_critic/{k}"] = v
         a_loss, a_info = self.actor_loss(batch, grad_params, a_rng)
         for k, v in a_info.items():
-            info[f"actor/{k}"] = v
+            info[f"noise_actor/{k}"] = v
 
-        return c_loss + f_loss + a_loss, info
+        return nc_loss + a_loss, info
 
     def target_update(self, network):
         new_target = jax.tree_util.tree_map(
@@ -633,6 +713,8 @@ class DSRLAgent(flax.struct.PyTreeNode):
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         return self.replace(network=new_network, rng=new_rng), info
 
+    def _prepare_vla_batch(self, batch):
+        """Attach ``openpi_observation`` / ``next_openpi_observation`` to a replay batch."""
     def update_dagger_direct(self, batch):
         """Direct DAgger update on the SteerVLA action head, keeping DSRL unchanged."""
         new_rng, _ = jax.random.split(self.rng)
@@ -740,51 +822,45 @@ class DSRLAgent(flax.struct.PyTreeNode):
         batch = dict(batch)
         batch["openpi_observation"] = self._as_jax_pytree(openpi_observation)
         batch["next_openpi_observation"] = self._as_jax_pytree(next_openpi_observation)
+        return batch
 
-        next_actions_critic = self._vla_forward_for_critic(batch, c_rng)
-        actions_critic, noise_actor_sample = self._vla_forward_for_actor(batch, a_rng)
-
-        discount = jnp.asarray(self.config["discount"], dtype=jnp.float32)
-        alpha = jnp.asarray(self.config["alpha"], dtype=jnp.float32)
+    def _precompute_vla_loss_cache(self, batch, rng):
+        """Eager VLA forwards consumed by :meth:`total_loss_vla` inside ``update_with_vla``."""
+        rng, nc_rng, c_rng = jax.random.split(rng, 3)
+        batch_size = batch["observations"].shape[0]
         noise_scale = jnp.asarray(self.config["noise_scale"], dtype=jnp.float32)
-        critic_actions = self._as_critic_actions(batch["actions"])
 
-        def loss_pure(grad_params):
-            c, ci = _critic_loss_vla_pure_math(
-                self.network, batch, next_actions_critic, critic_actions, grad_params, discount,
-            )
-            noise_actor_sample_reshaped = noise_actor_sample.reshape(batch["observations"].shape[0], self.config["action_horizon"]*self.config["actor_action_dim"])
-            a, ai = _actor_loss_vla_pure_math(
-                self.network, batch, actions_critic, noise_actor_sample_reshaped, grad_params, alpha, noise_scale,
-            )
-            aux = {
-                **{f"critic/{k}": v for k, v in ci.items()},
-                **{f"actor/{k}": v for k, v in ai.items()},
-            }
-            return c + a, aux
-
-        (loss_value, info), grads = jax.value_and_grad(loss_pure, has_aux=True)(self.network.params)
-        
-        # Force compute to finish so we measure compute, not dispatch.
-        jax.tree_util.tree_map(
-            lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x, grads,
+        next_actions = self._vla_forward(
+            batch["next_observations"], batch["next_openpi_observation"], c_rng,
         )
 
-        new_network, grad_stats = _apply_grads_pure(self.network, grads)
-        jax.tree_util.tree_map(
-            lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x, new_network.params,
+        nc_rng, vla_rng = jax.random.split(nc_rng)
+        noise_actions = (
+            jax.random.normal(nc_rng, (batch_size, self._flat_noise_dim()))
+            * noise_scale
         )
-        info = {**info, **grad_stats}
+        vla_actions_nc = self._vla_forward(
+            batch["observations"], batch["openpi_observation"], vla_rng, noise=noise_actions,
+        )
 
+        return {
+            "next_actions_critic": next_actions,
+            "noise_actions": noise_actions,
+            "vla_actions_nc": vla_actions_nc,
+        }
+
+    def update_with_vla(self, batch):
+        """Flax update via :meth:`total_loss_vla` with eager VLA forwards and a jitted gradient core."""
+        new_rng, rng = jax.random.split(self.rng)
+        batch = self._prepare_vla_batch(batch)
+        vla_cache = self._precompute_vla_loss_cache(batch, rng)
+
+        def loss_fn(grad_params):
+            return self.total_loss_vla(batch, grad_params, rng=rng, vla_cache=vla_cache)
+
+        new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network)
-        # target_update mutates the dict; force a sync via params again.
-        jax.tree_util.tree_map(
-            lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x, new_network.params,
-        )
-
-
-        new_agent = self.replace(network=new_network, rng=new_rng)
-        return new_agent, info
+        return self.replace(network=new_network, rng=new_rng), info
 
     # ----- construction --------------------------------------------------- #
 
@@ -807,9 +883,13 @@ class DSRLAgent(flax.struct.PyTreeNode):
             raise ValueError(f"observation_mode must be 'state' or 'image', got {obs_mode!r}")
 
         if vla_sample_fn is not None:
-            action_dim = int(config.get("critic_action_dim", 2))
+            env_action_dim = int(config.get("vla_action_dim", 4)) * int(
+                config.get("vla_action_horizon", config.get("action_horizon", 10))
+            )
+            noise_action_dim = int(config["actor_action_dim"]) * int(config["action_horizon"])
         else:
-            action_dim = ex_actions.shape[-1]
+            env_action_dim = ex_actions.shape[-1]
+            noise_action_dim = env_action_dim
         obs_encoder_def = CarlaObservationEncoder(
             observation_mode=obs_mode,
             impala_width=int(config.get("image_impala_width", 1)),
@@ -830,34 +910,41 @@ class DSRLAgent(flax.struct.PyTreeNode):
         batch_shape = ex_observations.shape[:1]
         ex_embedded = jnp.zeros(batch_shape + (embed_dim,), dtype=jnp.float32)
         ex_critic_embedded = jnp.zeros(batch_shape + (embed_dim + lang_dim,), dtype=jnp.float32)
-        ex_model_actions = jnp.zeros(batch_shape + (action_dim,), dtype=jnp.float32)
+        ex_env_actions = jnp.zeros(batch_shape + (env_action_dim,), dtype=jnp.float32)
+        ex_noise_actions = jnp.zeros(batch_shape + (noise_action_dim,), dtype=jnp.float32)
         ex_t = jnp.zeros(batch_shape + (1,), dtype=jnp.float32)
 
         # BC flow-matching head must stay a Flax module: init calls ``flow(enc, x_t, t)``.
         # OpenPI SteerVLA hooks only via ``vla_sample_fn`` (see ``sample_actions_with_vla``).
         flow_def = FlowActor(
             hidden_dims=tuple(config["flow_hidden_dims"]),
-            action_dim=action_dim,
+            action_dim=env_action_dim,
             layer_norm=config["layer_norm"],
         )
         actor_def = NoiseActor(
             hidden_dims=tuple(config["actor_hidden_dims"]),
-            action_dim=config["actor_action_dim"]*config["action_horizon"],
+            action_dim=noise_action_dim,
+        )
+        noise_critic_def = Critic(
+            hidden_dims=tuple(config["critic_hidden_dims"]),
+            layer_norm=config["layer_norm"],
+            ensemble_size=config["critic_ensemble"],
         )
         critic_def = Critic(
             hidden_dims=tuple(config["critic_hidden_dims"]),
             layer_norm=config["layer_norm"],
             ensemble_size=config["critic_ensemble"],
         )
-
         networks = {
             "obs_encoder": (obs_encoder_def, (ex_observations,)),
-            "flow": (flow_def, (ex_embedded, ex_model_actions, ex_t)),
+            "flow": (flow_def, (ex_embedded, ex_env_actions, ex_t)),
             "noise_actor": (actor_def, (ex_embedded,)),
-            "critic": (critic_def, (ex_critic_embedded, ex_model_actions)),
+            "noise_critic": (noise_critic_def, (ex_critic_embedded, ex_noise_actions)),
+
+            "critic": (critic_def, (ex_critic_embedded, ex_env_actions)),
             "target_critic": (
                 copy.deepcopy(critic_def),
-                (ex_critic_embedded, ex_model_actions),
+                (ex_critic_embedded, ex_env_actions),
             ),
         }
         defs = {k: v[0] for k, v in networks.items()}
@@ -908,6 +995,7 @@ def get_config():
             image_impala_num_blocks=2,
             image_mlp_hidden_dims=(512,),
             # Online-loop knobs (used by main_carla.py, not by the agent itself).
+            # Env steps with policy rollouts but no RL updates (see main_carla.run_online_carla).
             warmup_steps=1000,
             updates_per_step=1,
             buffer_capacity=100_000,
@@ -928,8 +1016,11 @@ def get_config():
             vla_action_horizon=10,
             vla_action_dim=4,
             vla_output_action_format="DELTA_XY_T_DELTA_XY_SPACE",
-            # Critic/action/flow representation used inside DSRL when VLA is enabled.
-            # ``4`` matches SteerVLA DELTA_XY_T_DELTA_XY_SPACE first-step action.
+            # Pi0 / noise-actor space (``actor_action_dim`` × ``action_horizon``).
+            actor_action_dim=32,
+            action_horizon=10,
+            # Env rollout + action critic space (``vla_action_dim`` × ``vla_action_horizon``).
+            # ``critic_action_dim`` is the per-step env dim (used by action-delta feedback).
             critic_action_dim=4,
             # Expert / delta language feedback appended to obs_e ONLY for the critic.
             # For commentary_bow this is 119 (= COMMENTARY_VOCAB).
