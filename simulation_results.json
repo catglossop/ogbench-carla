@@ -2,51 +2,7 @@
     "_checkpoint": {
         "global_record": {},
         "progress": [],
-        "records": [
-            {
-                "index": 0,
-                "route_id": "RouteScenario_1711_rep0",
-                "scenario_name": "ParkingCutIn_1",
-                "weather_id": "15",
-                "save_name": "RouteScenario_1711_rep0_Town12_ParkingCutIn_1_15_05_19_02_11_09",
-                "status": "Failed - Agent crashed and got stuck",
-                "num_infractions": 7,
-                "infractions": {
-                    "collisions_layout": [
-                        "Agent collided against object with type=static.prop.mesh and id=3744 at (x=-498.259, y=3654.406, z=364.581)"
-                    ],
-                    "collisions_pedestrian": [],
-                    "collisions_vehicle": [],
-                    "red_light": [],
-                    "stop_infraction": [],
-                    "outside_route_lanes": [],
-                    "min_speed_infractions": [
-                        "Average speed is 165.74% of the surrounding traffic's one",
-                        "Average speed is 102.95% of the surrounding traffic's one",
-                        "Average speed is 158.66% of the surrounding traffic's one",
-                        "Average speed is 178.27% of the surrounding traffic's one",
-                        "Average speed is 149.48% of the surrounding traffic's one",
-                        "Average speed is 148.07% of the surrounding traffic's one"
-                    ],
-                    "yield_emergency_vehicle_infractions": [],
-                    "scenario_timeouts": [],
-                    "route_dev": [],
-                    "vehicle_blocked": [],
-                    "route_timeout": []
-                },
-                "scores": {
-                    "score_route": 32.4,
-                    "score_penalty": 0.65,
-                    "score_composed": 21.06
-                },
-                "meta": {
-                    "route_length": 133.138,
-                    "duration_game": 8.25,
-                    "duration_system": 245.29
-                },
-                "town_name": "Town12"
-            }
-        ]
+        "records": []
     },
     "entry_status": "Finished",
     "eligible": true,

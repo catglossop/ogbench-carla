@@ -62,7 +62,7 @@ Options:
                               expert-lang  -> language on expert action
                             Default: delta
 
-  --train-mode MODE         rl|dagger|dagger_direct. Default: dagger
+  --train-mode MODE         rl|dagger|dagger_direct|sac_direct. Default: dagger
 
   --agent-config PATH       Base agent config. Default: impls/configs/steervla_dsrl_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
@@ -74,6 +74,7 @@ Examples:
   bash run_carla.sh --critic-mode none --expert-debug true --save-buffer false
   bash run_carla.sh --train-mode dagger --critic-mode delta-lang
   bash run_carla.sh --train-mode dagger_direct --critic-mode delta-lang
+  bash run_carla.sh --train-mode sac_direct --critic-mode delta
 EOF
 }
 
@@ -122,10 +123,10 @@ case "$CRITIC_MODE" in
 esac
 
 case "$TRAIN_MODE" in
-  rl|dagger|dagger_direct) ;;
+  rl|dagger|dagger_direct|sac_direct) ;;
   *)
     echo "Invalid --train-mode: $TRAIN_MODE" >&2
-    echo "Expected one of: rl, dagger, dagger_direct" >&2
+    echo "Expected one of: rl, dagger, dagger_direct, sac_direct" >&2
     exit 2
     ;;
 esac

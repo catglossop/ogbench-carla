@@ -35,3 +35,7 @@ repetition_index: 0
 crash_stuck_speed_threshold: 0.1
 crash_stuck_steps: 20
 crash_stuck_penalty: -1.0
+
+# CaRL-style soft penalties.
+speeding_infraction: false
+comfort_infraction: false

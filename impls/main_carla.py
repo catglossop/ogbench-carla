@@ -776,20 +776,18 @@ def run_online_carla(
         step_wb.update(_maybe_log_vla_action_support(step, obs_raw))
         if "reward_total" in info:
             step_wb["reward/total"] = float(info["reward_total"])
-            step_wb["reward/progress"] = float(info.get("reward_progress", 0.0))
-            step_wb["reward/centering"] = float(info.get("reward_centering", 0.0))
-            step_wb["reward/heading"] = float(info.get("reward_heading", 0.0))
             step_wb["reward/terminal"] = float(info.get("reward_terminal", 0.0))
-            step_wb["reward/penalty_collision"] = float(info.get("penalty_collision", 0.0))
-            step_wb["reward/penalty_outside_route"] = float(info.get("penalty_outside_route", 0.0))
-            step_wb["reward/penalty_steer"] = float(info.get("penalty_steer", 0.0))
-            step_wb["reward/penalty_brake"] = float(info.get("penalty_brake", 0.0))
-            step_wb["reward/penalty_crash_stuck"] = float(info.get("penalty_crash_stuck", 0.0))
+            step_wb["rollout/route_completion"] = float(info.get("route_completion", 0.0))
+            step_wb["rollout/route_completion_delta"] = float(info.get("route_completion_delta", 0.0))
+            step_wb["rollout/termination_reason"] = str(info.get("termination_reason", ""))
+            step_wb["reward/soft_penalty_outside_lanes"] = float(info.get("soft_penalty_outside_lanes", 1.0))
+            step_wb["reward/soft_penalty_lane_center"] = float(info.get("soft_penalty_lane_center", 1.0))
+            step_wb["reward/soft_penalty_speeding"] = float(info.get("soft_penalty_speeding", 1.0))
+            step_wb["reward/soft_penalty_ttc"] = float(info.get("soft_penalty_ttc", 1.0))
+            step_wb["reward/soft_penalty_comfort"] = float(info.get("soft_penalty_comfort", 1.0))
+            step_wb["reward/soft_penalty_product"] = float(info.get("soft_penalty_product", 1.0))
             step_wb["rollout/lane_offset_m"] = float(info.get("lane_offset_m", 0.0))
             step_wb["rollout/heading_error_rad"] = float(info.get("heading_error_rad", 0.0))
-            step_wb["rollout/speed_norm"] = float(info.get("speed_norm", 0.0))
-            step_wb["rollout/centering_factor"] = float(info.get("centering_factor", 0.0))
-            step_wb["rollout/heading_factor"] = float(info.get("heading_factor", 0.0))
 
         # Log critic feedback signal (obs_raw is already next_obs_raw here)
         if _critic_feedback_mode == "action_delta":
@@ -821,15 +819,16 @@ def run_online_carla(
             }
             if "reward_total" in info:
                 rollout_log["rollout/final_step_reward"] = float(info["reward_total"])
-                rollout_log["rollout/final_step_reward_progress"] = float(info.get("reward_progress", 0.0))
-                rollout_log["rollout/final_step_reward_centering"] = float(info.get("reward_centering", 0.0))
-                rollout_log["rollout/final_step_reward_heading"] = float(info.get("reward_heading", 0.0))
                 rollout_log["rollout/final_step_reward_terminal"] = float(info.get("reward_terminal", 0.0))
-                rollout_log["rollout/final_step_penalty_collision"] = float(info.get("penalty_collision", 0.0))
-                rollout_log["rollout/final_step_penalty_outside_route"] = float(info.get("penalty_outside_route", 0.0))
-                rollout_log["rollout/final_step_penalty_steer"] = float(info.get("penalty_steer", 0.0))
-                rollout_log["rollout/final_step_penalty_brake"] = float(info.get("penalty_brake", 0.0))
-                rollout_log["rollout/final_step_penalty_crash_stuck"] = float(info.get("penalty_crash_stuck", 0.0))
+                rollout_log["rollout/route_completion"] = float(info.get("route_completion", 0.0))
+                rollout_log["rollout/route_completion_delta"] = float(info.get("route_completion_delta", 0.0))
+                rollout_log["rollout/termination_reason"] = str(info.get("termination_reason", ""))
+                rollout_log["reward/soft_penalty_outside_lanes"] = float(info.get("soft_penalty_outside_lanes", 1.0))
+                rollout_log["reward/soft_penalty_lane_center"] = float(info.get("soft_penalty_lane_center", 1.0))
+                rollout_log["reward/soft_penalty_speeding"] = float(info.get("soft_penalty_speeding", 1.0))
+                rollout_log["reward/soft_penalty_ttc"] = float(info.get("soft_penalty_ttc", 1.0))
+                rollout_log["reward/soft_penalty_comfort"] = float(info.get("soft_penalty_comfort", 1.0))
+                rollout_log["reward/soft_penalty_product"] = float(info.get("soft_penalty_product", 1.0))
                 rollout_log["rollout/final_step_success"] = float(bool(info.get("success", False)))
             if FLAGS.expert_recover_debug:
                 rollout_log["rollout/vla_steps_budget"] = float(_vla_steps_budget)
@@ -872,6 +871,8 @@ def run_online_carla(
                     _, update_info = agent.update_dagger(batch)
                 elif _online_training_mode == "dagger_direct":
                     _, update_info = agent.update_dagger_direct(batch)
+                elif _online_training_mode == "sac_direct":
+                    _, update_info = agent.update_sac_direct(batch)
                 elif getattr(agent, "vla_sample_fn", None) is not None:
                     _, update_info = agent.update_with_vla(batch)
                 else:
@@ -939,9 +940,10 @@ def main(_):
 
     steervla_cfg = config.get("steervla", None)
     online_training_mode = str(config.get("online_training_mode", "rl")).strip().lower()
-    if online_training_mode not in {"rl", "dagger", "dagger_direct"}:
+    if online_training_mode not in {"rl", "dagger", "dagger_direct", "sac_direct"}:
         raise ValueError(
-            f"Unsupported online_training_mode={online_training_mode!r}; expected 'rl', 'dagger', or 'dagger_direct'."
+            f"Unsupported online_training_mode={online_training_mode!r}; "
+            "expected 'rl', 'dagger', 'dagger_direct', or 'sac_direct'."
         )
     use_steervla_rollout = bool(
         steervla_cfg is not None and steervla_cfg.get("enabled") and not FLAGS.expert_debug
@@ -957,6 +959,11 @@ def main(_):
                 "[main_carla] DAgger mode requested but SteerVLA rollout is disabled; falling back to learner rollout for data collection.",
                 flush=True,
             )
+    if online_training_mode == "sac_direct":
+        print(
+            "[main_carla] SAC direct mode: training Pi0 action head with Q-gradient from DSRL critic.",
+            flush=True,
+        )
     critic_feedback_mode = str(config.get("critic_feedback_mode", "commentary_bow"))
     if critic_feedback_mode == "none":
         config.language_label_dim = 0

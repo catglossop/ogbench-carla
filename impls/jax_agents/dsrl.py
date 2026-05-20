@@ -641,6 +641,72 @@ class DSRLAgent(flax.struct.PyTreeNode):
         info = self.steervla_actor.update_dagger_direct(batch)
         return self.replace(rng=new_rng), info
 
+    @jax.jit
+    def _update_critic_only(self, batch):
+        """Jitted critic-only update (used by update_sac_direct).
+
+        Uses zero noise for the BC-flow bootstrap target so the flow is called
+        with the correct critic_action_dim (4), not the 320-dim noise-actor output.
+        """
+        new_rng, rng = jax.random.split(self.rng)
+
+        def loss_fn(grad_params):
+            next_obs_e = self._encode_obs(self.network.params, batch["next_observations"])
+            # Zero noise → deterministic BC-flow action at correct critic_action_dim
+            next_noise = jnp.zeros(
+                (batch["next_observations"].shape[0], int(self.config["critic_action_dim"])),
+                dtype=jnp.float32,
+            )
+            next_actions = self._flow_sample(self.network.params, batch["next_observations"], next_noise)
+            next_actions = self._as_critic_actions(next_actions)
+            next_qs = self.network.select("target_critic")(
+                _critic_obs_e(next_obs_e, batch, "next_language_label"), next_actions
+            )
+            next_q = jnp.min(next_qs, axis=0)
+            target_q = batch["rewards"] + self.config["discount"] * batch["masks"] * next_q
+
+            obs_e = self._encode_obs(grad_params, batch["observations"])
+            critic_actions = self._as_critic_actions(batch["actions"])
+            qs = self.network.select("critic")(
+                _critic_obs_e(obs_e, batch, "language_label"), critic_actions, params=grad_params
+            )
+            critic_loss = jnp.square(qs - target_q[None]).mean()
+            info = {
+                f"critic/{k}": v
+                for k, v in {
+                    "critic_loss": critic_loss,
+                    "q_mean": qs.mean(),
+                    "q_max": qs.max(),
+                    "q_min": qs.min(),
+                    "target_q": target_q.mean(),
+                }.items()
+            }
+            return critic_loss, info
+
+        new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
+        self.target_update(new_network)
+        return self.replace(network=new_network, rng=new_rng), info
+
+    def update_sac_direct(self, batch):
+        """SAC direct: update DSRL critic then train the Pi0 action head with Q-gradient.
+
+        The DSRL critic is updated first (standard TD learning) to provide meaningful
+        Q-values. The Pi0 action head (action_out_proj + time_mlp) is then updated to
+        maximize Q(s, a) where a is approximated via a single-step Euler from noise.
+        """
+        new_self, critic_info = self._update_critic_only(batch)
+
+        if new_self.steervla_actor is None:
+            return new_self, {**critic_info, "sac_direct/skipped_no_steervla_actor": 1.0}
+
+        pi0_info = new_self.steervla_actor.update_sac_direct(
+            batch,
+            dsrl_network=new_self.network,
+            alpha=float(new_self.config.get("alpha", 0.1)),
+            critic_action_dim=int(new_self.config.get("critic_action_dim", 4)),
+        )
+        return new_self, {**critic_info, **pi0_info}
+
     def update_with_vla(self, batch):
         """Flax critic + noise actor update with eager VLA forwards and a jitted gradient core.
 

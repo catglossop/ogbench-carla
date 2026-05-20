@@ -146,15 +146,23 @@ EGO_STATE_IDX_BRAKE = 18
 DEFAULT_CRASH_STUCK_SPEED_THRESHOLD = 0.1
 DEFAULT_CRASH_STUCK_STEPS = 20
 DEFAULT_CRASH_STUCK_PENALTY = -1.0
-DEFAULT_COLLISION_EVENT_PENALTY = -5.0
-DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -5.0
-DEFAULT_PROGRESS_REWARD_WEIGHT = 1.0
-DEFAULT_CENTERING_REWARD_WEIGHT = 0.2
-DEFAULT_HEADING_REWARD_WEIGHT = 0.2
-DEFAULT_STEER_PENALTY_WEIGHT = 0.05
-DEFAULT_BRAKE_PENALTY_WEIGHT = 0.02
-SUCCESS_BONUS = 5.0
-FAILURE_BONUS = -5.0
+CARLA_FPS = 20.0
+REWARD_TTC_PERSIST_STEPS = 500
+REWARD_COMFORT_PERSIST_STEPS = 500
+REWARD_BLOCKED_SPEED_THRESHOLD_MPS = 0.1
+REWARD_BLOCKED_TIME_SECONDS = 90.0
+REWARD_TTC_FORECAST_SECONDS = 1.0
+REWARD_TTC_INTERVAL_SECONDS = 0.2
+REWARD_SPEEDING_MARGIN_KMH = 8.0
+COMFORT_THRESHOLDS = {
+    "longitudinal_acceleration_min": -20.0,
+    "longitudinal_acceleration_max": 10.0,
+    "lateral_acceleration_abs": 9.0,
+    "absolute_jerk_abs": 30.0,
+    "longitudinal_jerk_abs": 30.0,
+    "yaw_rate_abs": 1.0,
+    "yaw_acceleration_abs": 3.0,
+}
 
 
 def _find_free_port(starting_port: int) -> int:
@@ -632,29 +640,36 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             self.carla_config.get("crash_stuck_penalty", DEFAULT_CRASH_STUCK_PENALTY)
         )
         self._crash_stuck_ticks = 0
-        self._collision_event_penalty = float(
-            self.carla_config.get("collision_event_penalty", DEFAULT_COLLISION_EVENT_PENALTY)
+        self._blocked_ticks = 0
+        self._blocked_steps = int(
+            self.carla_config.get(
+                "reward_blocked_steps",
+                round(REWARD_BLOCKED_TIME_SECONDS * CARLA_FPS),
+            )
         )
-        self._outside_route_event_penalty = float(
-            self.carla_config.get("outside_route_event_penalty", DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY)
-        )
-        self._progress_reward_weight = float(
-            self.carla_config.get("progress_reward_weight", DEFAULT_PROGRESS_REWARD_WEIGHT)
-        )
-        self._centering_reward_weight = float(
-            self.carla_config.get("centering_reward_weight", DEFAULT_CENTERING_REWARD_WEIGHT)
-        )
-        self._heading_reward_weight = float(
-            self.carla_config.get("heading_reward_weight", DEFAULT_HEADING_REWARD_WEIGHT)
-        )
-        self._steer_penalty_weight = float(
-            self.carla_config.get("steer_penalty_weight", DEFAULT_STEER_PENALTY_WEIGHT)
-        )
-        self._brake_penalty_weight = float(
-            self.carla_config.get("brake_penalty_weight", DEFAULT_BRAKE_PENALTY_WEIGHT)
-        )
-        self._prev_collision_count = 0
-        self._prev_outside_route_value = 0.0
+        self._use_leave_route_done = bool(self.carla_config.get("use_leave_route_done", False))
+        self._min_thresh_lat_dist = float(self.carla_config.get("min_thresh_lat_dist", 2.0))
+        self._terminal_reward = float(self.carla_config.get("terminal_reward", 0.0))
+        self._use_perc_progress = bool(self.carla_config.get("use_perc_progress", True))
+        self._speeding_infraction = bool(self.carla_config.get("speeding_infraction", False))
+        self._comfort_infraction = bool(self.carla_config.get("comfort_infraction", False))
+        self._route_progress_xyz: Optional[np.ndarray] = None
+        self._route_progress_s: Optional[np.ndarray] = None
+        self._route_total_distance_m = 0.0
+        self._route_progress_index = 0
+        self._route_transforms: list[Any] = []
+        self._route_completion_accum_perc: list[float] = []
+        self._route_completion_index = 0
+        self._last_route_completion = 0.0
+        self._in_route_current_index = 0
+        self._in_route_out_route_distance = 0.0
+        self._in_route_safe = True
+        self._in_route_accum_meters: list[float] = []
+        self._ttc_penalty_ticks = 0
+        self._comfort_penalty_ticks = 0
+        self._comfort_penalty_factor = 1.0
+        self._prev_ego_accel_world: Optional[np.ndarray] = None
+        self._prev_ego_yaw_rate = 0.0
         self._last_expert_action_source: str | None = None
 
         self._expert_controller_kind = str(self.carla_config.get("expert_controller", "") or "").strip().lower()
@@ -941,8 +956,13 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._scenario_active = True
         self._last_control = carla.VehicleControl()
         self._crash_stuck_ticks = 0
-        self._prev_collision_count = 0
-        self._prev_outside_route_value = 0.0
+        self._blocked_ticks = 0
+        self._ttc_penalty_ticks = 0
+        self._comfort_penalty_ticks = 0
+        self._comfort_penalty_factor = 1.0
+        self._prev_ego_accel_world = None
+        self._prev_ego_yaw_rate = 0.0
+        self._init_route_progress_cache()
         self._last_expert_action_source = None
 
     def _ego_actor(self) -> Optional[carla.Actor]:
@@ -1277,78 +1297,94 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         if ego is not None:
             v = ego.get_velocity()
             speed = float(np.linalg.norm([v.x, v.y, v.z]))
+        criteria = self._criteria_snapshot()
         lane_metrics = self._lane_alignment_metrics()
-        lane_offset_m = float(lane_metrics["lane_offset_m"])
-        heading_error_rad = float(lane_metrics["heading_error_rad"])
-        lane_width_m = float(lane_metrics["lane_width_m"])
-        speed_limit_mps = float(lane_metrics["speed_limit_mps"])
-        lane_half_width = max(0.5 * lane_width_m, 1e-3)
-        centering_factor = float(np.clip(1.0 - abs(lane_offset_m) / lane_half_width, 0.0, 1.0))
-        heading_factor = float(np.clip(math.cos(heading_error_rad), 0.0, 1.0))
-        speed_norm = float(np.clip(speed / max(speed_limit_mps, 1e-3), 0.0, 1.0))
-        steer_pen = self._steer_penalty_weight * abs(float(getattr(self._last_control, "steer", 0.0)))
-        brake_pen = self._brake_penalty_weight * float(getattr(self._last_control, "brake", 0.0))
-        progress_reward = self._progress_reward_weight * speed_norm * centering_factor * heading_factor
-        centering_reward = self._centering_reward_weight * centering_factor
-        heading_reward = self._heading_reward_weight * heading_factor
+        route_completion = self._route_completion_percent(criteria)
+        route_completion_delta = max(0.0, route_completion - self._last_route_completion)
+        self._last_route_completion = route_completion
 
-        reward = progress_reward + centering_reward + heading_reward - steer_pen - brake_pen
+        soft_penalties = self._soft_penalty_state(
+            lane_metrics=lane_metrics,
+            speed_mps=speed,
+        )
+        terminal_state = self._terminal_state(
+            criteria=criteria,
+            lane_metrics=lane_metrics,
+            speed_mps=speed,
+            route_completion=route_completion,
+            base_terminated=terminated,
+        )
+        progress_reward = route_completion_delta
+        if soft_penalties["outside_lanes"]:
+            progress_reward = 0.0
+        else:
+            if soft_penalties["overspeed_kmh"] > 0.0:
+                progress_reward *= soft_penalties["speeding_factor"]
+            if soft_penalties["ttc_factor"] < 1.0:
+                progress_reward *= soft_penalties["ttc_factor"]
+            if soft_penalties["comfort_factor"] < 1.0:
+                progress_reward *= soft_penalties["comfort_factor"]
+        if self._use_perc_progress:
+            progress_reward *= soft_penalties["lane_center_factor"]
+        reward = progress_reward + terminal_state["terminal_reward"]
         info = self._info_with_sensors(
             {"scenario_tree_status": getattr(tree_status, "name", str(tree_status))}
         )
-        crash_stuck, collision_count = self._update_crash_stuck_state(speed)
-        outside_route_value, _min_speed_value = self._route_infraction_values()
-
-        collision_delta = max(0, collision_count - self._prev_collision_count)
-        outside_route_delta = max(0.0, outside_route_value - self._prev_outside_route_value)
-        self._prev_collision_count = collision_count
-        self._prev_outside_route_value = outside_route_value
-
-        collision_pen = self._collision_event_penalty * float(collision_delta)
-        outside_route_pen = self._outside_route_event_penalty * float(outside_route_delta)
-        reward += collision_pen + outside_route_pen
-
-        terminal_bonus = 0.0
-        info["collision_count"] = collision_count
-        info["crash_stuck_ticks"] = self._crash_stuck_ticks
-        info["outside_route_value"] = outside_route_value
-        info["collision_delta"] = float(collision_delta)
-        info["outside_route_delta"] = float(outside_route_delta)
-        info["lane_offset_m"] = lane_offset_m
-        info["heading_error_rad"] = heading_error_rad
-        info["lane_width_m"] = lane_width_m
-        info["speed_limit_mps"] = speed_limit_mps
-        info["speed_norm"] = speed_norm
-        info["centering_factor"] = centering_factor
-        info["heading_factor"] = heading_factor
-        info["penalty_collision"] = collision_pen
-        info["penalty_outside_route"] = outside_route_pen
-        info["penalty_steer"] = -steer_pen
-        info["penalty_brake"] = -brake_pen
-        info["reward_progress"] = progress_reward
-        info["reward_centering"] = centering_reward
-        info["reward_heading"] = heading_reward
-
-        if crash_stuck:
-            terminated = True
-            reward += self._crash_stuck_penalty
-            info["success"] = False
-            info["termination_reason"] = "crash_stuck"
-            info["penalty_crash_stuck"] = self._crash_stuck_penalty
-        else:
-            info["penalty_crash_stuck"] = 0.0
+        info["collision_count"] = self._collision_count()
+        info["blocked_ticks"] = self._blocked_ticks
+        info["lane_offset_m"] = float(lane_metrics["lane_offset_m"])
+        info["heading_error_rad"] = float(lane_metrics["heading_error_rad"])
+        info["lane_width_m"] = float(lane_metrics["lane_width_m"])
+        info["speed_limit_mps"] = float(lane_metrics["speed_limit_mps"])
+        info["route_completion"] = float(route_completion)
+        info["route_completion_delta"] = float(route_completion_delta)
+        info["progress_reward"] = float(progress_reward)
+        info["soft_penalty_product"] = float(soft_penalties["penalty_product"])
+        info["soft_penalty_outside_lanes"] = float(soft_penalties["outside_lanes_factor"])
+        info["soft_penalty_lane_center"] = float(soft_penalties["lane_center_factor"])
+        info["soft_penalty_speeding"] = float(soft_penalties["speeding_factor"])
+        info["soft_penalty_ttc"] = float(soft_penalties["ttc_factor"])
+        info["soft_penalty_comfort"] = float(soft_penalties["comfort_factor"])
+        info["outside_lanes"] = bool(soft_penalties["outside_lanes"])
+        info["overspeed_kmh"] = float(soft_penalties["overspeed_kmh"])
+        info["ttc_violated_now"] = bool(soft_penalties["ttc_violated_now"])
+        info["comfort_violated_now"] = bool(soft_penalties["comfort_violated_now"])
+        info["comfort_violations"] = list(soft_penalties["comfort_metrics"]["violations"])
+        info["comfort_metrics"] = {
+            k: v for k, v in soft_penalties["comfort_metrics"].items() if k != "violations"
+        }
+        info["terminal_reward"] = float(terminal_state["terminal_reward"])
+        info["collision"] = bool(terminal_state["collision"])
+        info["off_road"] = bool(terminal_state["off_road"])
+        info["run_red_light"] = bool(terminal_state["run_red_light"])
+        info["run_stop_sign"] = bool(terminal_state["run_stop_sign"])
+        info["route_deviation"] = bool(terminal_state["route_deviation"])
+        info["route_deviation_distance_m"] = float(terminal_state["route_deviation_distance_m"])
+        info["blocked"] = bool(terminal_state["blocked"])
+        info["left_route"] = bool(terminal_state["left_route"])
+        info["in_route_ok"] = bool(terminal_state["in_route_ok"])
+        info["route_completed"] = bool(terminal_state["route_completed"])
+        terminated = bool(terminal_state["terminated"])
+        info["success"] = bool(terminal_state["success"])
+        info["termination_reason"] = str(terminal_state["termination_reason"])
 
         if terminated:
-            if crash_stuck:
-                self._finalize_route("Finished", "Agent crashed and got stuck")
-            else:
-                success = info["scenario_tree_status"] == "SUCCESS"
-                terminal_bonus = SUCCESS_BONUS if success else FAILURE_BONUS
-                reward += terminal_bonus
-                info["success"] = success
-                self._finalize_route("Finished", "")
+            crash_message = ""
+            if terminal_state["termination_reason"] == "collision":
+                crash_message = "Collision"
+            elif terminal_state["termination_reason"] == "run_red_light":
+                crash_message = "RunningRedLight"
+            elif terminal_state["termination_reason"] == "run_stop_sign":
+                crash_message = "RunningStop"
+            elif terminal_state["termination_reason"] == "off_road":
+                crash_message = "OffRoad"
+            elif terminal_state["termination_reason"] == "route_deviation":
+                crash_message = "RouteDeviation"
+            elif terminal_state["termination_reason"] == "blocked":
+                crash_message = "Blocked"
+            self._finalize_route("Finished", crash_message)
 
-        info["reward_terminal"] = terminal_bonus
+        info["reward_terminal"] = float(terminal_state["terminal_reward"])
         info["reward_total"] = float(reward)
         return float(reward), bool(terminated), info
 
@@ -1395,6 +1431,64 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             info.update(extra)
         return info
 
+    def _criteria_snapshot(self) -> list[dict[str, Any]]:
+        scenario = getattr(self.evaluator, "route_scenario", None)
+        if scenario is None:
+            return []
+        out: list[dict[str, Any]] = []
+        for criterion in scenario.get_criteria():
+            name = str(getattr(criterion, "name", "") or "")
+            try:
+                value = float(getattr(criterion, "actual_value", 0.0))
+            except Exception:
+                value = 0.0
+            status = str(
+                getattr(
+                    criterion,
+                    "test_status",
+                    getattr(criterion, "status", ""),
+                )
+                or ""
+            )
+            out.append(
+                {
+                    "name": name,
+                    "name_lower": name.lower(),
+                    "value": value,
+                    "status": status.lower(),
+                }
+            )
+        return out
+
+    @staticmethod
+    def _criterion_matches(name_lower: str, token_groups: tuple[tuple[str, ...], ...]) -> bool:
+        return any(all(token in name_lower for token in group) for group in token_groups)
+
+    def _criterion_value(
+        self,
+        criteria: list[dict[str, Any]],
+        token_groups: tuple[tuple[str, ...], ...],
+    ) -> float:
+        value = 0.0
+        for criterion in criteria:
+            if self._criterion_matches(criterion["name_lower"], token_groups):
+                value = max(value, float(criterion["value"]))
+        return value
+
+    def _criterion_triggered(
+        self,
+        criteria: list[dict[str, Any]],
+        token_groups: tuple[tuple[str, ...], ...],
+    ) -> bool:
+        for criterion in criteria:
+            if not self._criterion_matches(criterion["name_lower"], token_groups):
+                continue
+            if criterion["value"] > 0.0:
+                return True
+            if any(tag in criterion["status"] for tag in ("fail", "failure", "invalid")):
+                return True
+        return False
+
     def _collision_count(self) -> int:
         scenario = getattr(self.evaluator, "route_scenario", None)
         if scenario is None:
@@ -1404,33 +1498,32 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 return int(getattr(criterion, "actual_value", 0))
         return 0
 
-    def _route_infraction_values(self) -> Tuple[float, float]:
-        """Return cumulative infraction values for outside-route and minimum-speed criteria."""
-        scenario = getattr(self.evaluator, "route_scenario", None)
-        if scenario is None:
-            return 0.0, 0.0
-
-        outside_route_val = 0.0
-        min_speed_val = 0.0
-        for criterion in scenario.get_criteria():
-            name = str(getattr(criterion, "name", "")).lower()
-            try:
-                value = float(getattr(criterion, "actual_value", 0.0))
-            except Exception:
-                value = 0.0
-
-            if ("outside" in name and ("route" in name or "lane" in name)) or ("off" in name and "route" in name):
-                outside_route_val = max(outside_route_val, value)
-            if "minspeed" in name or ("minimum" in name and "speed" in name):
-                min_speed_val = max(min_speed_val, value)
-
-        return outside_route_val, min_speed_val
-
     @staticmethod
     def _wrap_angle_rad(angle: float) -> float:
         return float((angle + math.pi) % (2.0 * math.pi) - math.pi)
 
-    def _lane_alignment_metrics(self) -> Dict[str, float]:
+    def _world_map(self):
+        if self._cached_world_map is None:
+            self._cached_world_map = self.evaluator.world.get_map()
+        return self._cached_world_map
+
+    def _waypoint_at_location(
+        self,
+        location: carla.Location,
+        *,
+        project_to_road: bool,
+        lane_type: carla.LaneType,
+    ):
+        try:
+            return self._world_map().get_waypoint(
+                location,
+                project_to_road=project_to_road,
+                lane_type=lane_type,
+            )
+        except Exception:
+            return None
+
+    def _lane_alignment_metrics(self) -> Dict[str, Any]:
         ego = self._ego_actor()
         if ego is None:
             return {
@@ -1438,19 +1531,25 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 "heading_error_rad": 0.0,
                 "lane_width_m": 3.5,
                 "speed_limit_mps": 8.0,
+                "is_junction": False,
+                "driving_waypoint": None,
+                "any_waypoint": None,
             }
         try:
-            if self._cached_world_map is None:
-                self._cached_world_map = self.evaluator.world.get_map()
             ego_tf = ego.get_transform()
-            wp = self._cached_world_map.get_waypoint(
+            driving_wp = self._waypoint_at_location(
                 ego_tf.location,
                 project_to_road=True,
                 lane_type=carla.LaneType.Driving,
             )
-            if wp is None:
+            any_wp = self._waypoint_at_location(
+                ego_tf.location,
+                project_to_road=False,
+                lane_type=carla.LaneType.Any,
+            )
+            if driving_wp is None:
                 raise RuntimeError("no waypoint available")
-            lane_tf = wp.transform
+            lane_tf = driving_wp.transform
             lane_yaw = math.radians(lane_tf.rotation.yaw)
             dx = float(ego_tf.location.x - lane_tf.location.x)
             dy = float(ego_tf.location.y - lane_tf.location.y)
@@ -1461,12 +1560,15 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 math.radians(float(ego_tf.rotation.yaw - lane_tf.rotation.yaw))
             )
             speed_limit_mps = max(float(ego.get_speed_limit()) / 3.6, 1.0)
-            lane_width_m = max(float(getattr(wp, "lane_width", 3.5)), 1.0)
+            lane_width_m = max(float(getattr(driving_wp, "lane_width", 3.5)), 1.0)
             return {
                 "lane_offset_m": float(lane_offset_m),
                 "heading_error_rad": float(heading_error_rad),
                 "lane_width_m": float(lane_width_m),
                 "speed_limit_mps": float(speed_limit_mps),
+                "is_junction": bool(getattr(driving_wp, "is_junction", False)),
+                "driving_waypoint": driving_wp,
+                "any_waypoint": any_wp,
             }
         except Exception:
             return {
@@ -1474,7 +1576,518 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 "heading_error_rad": 0.0,
                 "lane_width_m": 3.5,
                 "speed_limit_mps": 8.0,
+                "is_junction": False,
+                "driving_waypoint": None,
+                "any_waypoint": None,
             }
+
+    def _init_route_progress_cache(self) -> None:
+        ev = self._evaluator
+        route = getattr(getattr(ev, "route_scenario", None), "route", None) or []
+        self._route_transforms = [
+            route_item[0] if isinstance(route_item, (tuple, list)) and route_item else route_item
+            for route_item in route
+        ]
+        xyz: list[list[float]] = []
+        for transform in self._route_transforms:
+            loc = getattr(transform, "location", None)
+            if loc is None:
+                continue
+            xyz.append([float(loc.x), float(loc.y), float(loc.z)])
+        if len(xyz) < 2:
+            self._route_progress_xyz = None
+            self._route_progress_s = None
+            self._route_total_distance_m = 0.0
+            self._route_progress_index = 0
+            self._route_completion_accum_perc = []
+            self._route_completion_index = 0
+            self._last_route_completion = 0.0
+            self._in_route_current_index = 0
+            self._in_route_out_route_distance = 0.0
+            self._in_route_safe = True
+            self._in_route_accum_meters = []
+            return
+
+        route_xyz = np.asarray(xyz, dtype=np.float32)
+        seg = np.linalg.norm(route_xyz[1:] - route_xyz[:-1], axis=1)
+        route_s = np.concatenate(
+            [np.zeros(1, dtype=np.float32), np.cumsum(seg, dtype=np.float32)],
+            axis=0,
+        )
+        self._route_progress_xyz = route_xyz
+        self._route_progress_s = route_s
+        self._route_total_distance_m = float(max(route_s[-1], 1e-6))
+        self._route_progress_index = 0
+        self._route_completion_accum_perc = (
+            (100.0 * route_s / self._route_total_distance_m).astype(np.float32).tolist()
+        )
+        self._route_completion_index = 0
+        self._last_route_completion = 0.0
+        self._in_route_current_index = 0
+        self._in_route_out_route_distance = 0.0
+        self._in_route_safe = True
+        self._in_route_accum_meters = route_s.astype(np.float32).tolist()
+
+    def _route_completion_percent(self, criteria: list[dict[str, Any]]) -> float:
+        criterion_value = self._criterion_value(
+            criteria,
+            (("route", "completion"), ("route", "completed")),
+        )
+        if criterion_value > 0.0:
+            return float(np.clip(criterion_value, 0.0, 100.0))
+
+        ego = self._ego_actor()
+        if ego is None or not self._route_transforms or not self._route_completion_accum_perc:
+            return self._last_route_completion
+
+        location = ego.get_transform().location
+        route_length = len(self._route_transforms)
+        for index in range(
+            self._route_completion_index,
+            min(self._route_completion_index + 3, route_length),
+        ):
+            route_transform = self._route_transforms[index]
+            route_location = route_transform.location
+            wp_dir = route_transform.get_forward_vector()
+            wp_veh = location - route_location
+            if wp_veh.dot(wp_dir) > 0:
+                self._route_completion_index = index
+        return float(round(self._route_completion_accum_perc[self._route_completion_index], 2))
+
+    def _route_deviation_distance(self) -> float:
+        ego = self._ego_actor()
+        if ego is None or self._route_progress_xyz is None:
+            return 0.0
+        loc = ego.get_location()
+        pos = np.array([float(loc.x), float(loc.y), float(loc.z)], dtype=np.float32)
+        search_start = max(0, self._route_progress_index - 20)
+        search_end = min(self._route_progress_xyz.shape[0], self._route_progress_index + 200)
+        route_xyz = self._route_progress_xyz[search_start:search_end]
+        if route_xyz.shape[0] == 0:
+            return 0.0
+        return float(np.min(np.linalg.norm(route_xyz - pos[None, :], axis=1)))
+
+    def _closest_route_lateral_distance(self) -> float:
+        ego = self._ego_actor()
+        if ego is None or not self._route_transforms:
+            return 0.0
+        ego_tf = ego.get_transform()
+        pos = np.array([float(ego_tf.location.x), float(ego_tf.location.y)], dtype=np.float32)
+        if len(self._route_transforms) > 1:
+            close_point_global = np.array(
+                [
+                    self._route_transforms[0].location.x,
+                    self._route_transforms[0].location.y,
+                ],
+                dtype=np.float32,
+            )
+            next_point_global = np.array(
+                [
+                    self._route_transforms[1].location.x,
+                    self._route_transforms[1].location.y,
+                ],
+                dtype=np.float32,
+            )
+            distance = next_point_global - close_point_global
+            if float(np.linalg.norm(distance)) < 0.1:
+                yaw_route = self._route_transforms[0].rotation.yaw
+            else:
+                yaw_route = np.rad2deg(np.arctan2(distance[1], distance[0]))
+        else:
+            close_point_global = np.array(
+                [
+                    self._route_transforms[0].location.x,
+                    self._route_transforms[0].location.y,
+                ],
+                dtype=np.float32,
+            )
+            yaw_route = self._route_transforms[0].rotation.yaw
+
+        dx = pos[0] - close_point_global[0]
+        dy = pos[1] - close_point_global[1]
+        yaw_rad = math.radians(float(yaw_route))
+        lat = -dx * math.sin(yaw_rad) + dy * math.cos(yaw_rad)
+        return float(abs(lat))
+
+    def _in_route_ok(self) -> bool:
+        ego = self._ego_actor()
+        if ego is None or not self._route_transforms or not self._in_route_accum_meters:
+            return True
+
+        location = ego.get_location()
+        shortest_distance = float("inf")
+        closest_index = -1
+        route_length = len(self._route_transforms)
+
+        for index in range(
+            self._in_route_current_index,
+            min(self._in_route_current_index + 6, route_length),
+        ):
+            ref_location = self._route_transforms[index].location
+            distance = math.sqrt((location.x - ref_location.x) ** 2 + (location.y - ref_location.y) ** 2)
+            if distance <= shortest_distance:
+                closest_index = index
+                shortest_distance = distance
+
+        if closest_index == -1 or shortest_distance == float("inf"):
+            return True
+
+        off_route = True
+        if shortest_distance < 30.0:
+            off_route = False
+            self._in_route_safe = bool(shortest_distance < 15.0)
+
+        if self._in_route_current_index != closest_index:
+            new_dist = self._in_route_accum_meters[closest_index] - self._in_route_accum_meters[self._in_route_current_index]
+            if not self._in_route_safe:
+                self._in_route_out_route_distance += new_dist
+                out_route_percentage = 100.0 * self._in_route_out_route_distance / max(self._in_route_accum_meters[-1], 1e-6)
+                if out_route_percentage > 30.0:
+                    off_route = True
+            self._in_route_current_index = closest_index
+
+        return not off_route
+
+    @staticmethod
+    def _vehicle_frame_components(
+        vector_world: np.ndarray,
+        transform: carla.Transform,
+    ) -> tuple[float, float]:
+        forward = transform.get_forward_vector()
+        right = transform.get_right_vector()
+        long_comp = (
+            float(vector_world[0]) * forward.x
+            + float(vector_world[1]) * forward.y
+            + float(vector_world[2]) * forward.z
+        )
+        lat_comp = (
+            float(vector_world[0]) * right.x
+            + float(vector_world[1]) * right.y
+            + float(vector_world[2]) * right.z
+        )
+        return long_comp, lat_comp
+
+    def _compute_comfort_metrics(self) -> Dict[str, Any]:
+        ego = self._ego_actor()
+        if ego is None:
+            return {
+                "violations": [],
+                "factor": 1.0,
+                "longitudinal_acceleration": 0.0,
+                "lateral_acceleration": 0.0,
+                "absolute_jerk": 0.0,
+                "longitudinal_jerk": 0.0,
+                "yaw_rate": 0.0,
+                "yaw_acceleration": 0.0,
+            }
+
+        transform = ego.get_transform()
+        accel = ego.get_acceleration()
+        accel_world = np.array([float(accel.x), float(accel.y), float(accel.z)], dtype=np.float32)
+        long_acc, lat_acc = self._vehicle_frame_components(accel_world, transform)
+
+        yaw_rate = math.radians(float(ego.get_angular_velocity().z))
+        dt = 1.0 / CARLA_FPS
+        if self._prev_ego_accel_world is None:
+            jerk_world = np.zeros(3, dtype=np.float32)
+            yaw_accel = 0.0
+        else:
+            jerk_world = (accel_world - self._prev_ego_accel_world) / dt
+            yaw_accel = (yaw_rate - self._prev_ego_yaw_rate) / dt
+        long_jerk, _ = self._vehicle_frame_components(jerk_world, transform)
+        abs_jerk = float(np.linalg.norm(jerk_world))
+
+        self._prev_ego_accel_world = accel_world
+        self._prev_ego_yaw_rate = yaw_rate
+
+        violations: list[str] = []
+        if long_acc < COMFORT_THRESHOLDS["longitudinal_acceleration_min"] or long_acc > COMFORT_THRESHOLDS["longitudinal_acceleration_max"]:
+            violations.append("longitudinal_acceleration")
+        if abs(lat_acc) > COMFORT_THRESHOLDS["lateral_acceleration_abs"]:
+            violations.append("lateral_acceleration")
+        if abs(abs_jerk) > COMFORT_THRESHOLDS["absolute_jerk_abs"]:
+            violations.append("absolute_jerk")
+        if abs(long_jerk) > COMFORT_THRESHOLDS["longitudinal_jerk_abs"]:
+            violations.append("longitudinal_jerk")
+        if abs(yaw_rate) > COMFORT_THRESHOLDS["yaw_rate_abs"]:
+            violations.append("yaw_rate")
+        if abs(yaw_accel) > COMFORT_THRESHOLDS["yaw_acceleration_abs"]:
+            violations.append("yaw_acceleration")
+
+        factor = 1.0 - 0.5 * (len(violations) / 6.0)
+        return {
+            "violations": violations,
+            "factor": float(np.clip(factor, 0.0, 1.0)),
+            "longitudinal_acceleration": float(long_acc),
+            "lateral_acceleration": float(lat_acc),
+            "absolute_jerk": float(abs_jerk),
+            "longitudinal_jerk": float(long_jerk),
+            "yaw_rate": float(yaw_rate),
+            "yaw_acceleration": float(yaw_accel),
+        }
+
+    @staticmethod
+    def _bbox_at_prediction_step(actor: carla.Actor, step_seconds: float) -> Optional[carla.BoundingBox]:
+        try:
+            transform = actor.get_transform()
+            bbox = actor.bounding_box
+            velocity = actor.get_velocity()
+            angular_velocity = actor.get_angular_velocity()
+            transform.location = carla.Location(
+                x=float(transform.location.x + velocity.x * step_seconds),
+                y=float(transform.location.y + velocity.y * step_seconds),
+                z=float(transform.location.z + velocity.z * step_seconds),
+            )
+            transform.rotation = carla.Rotation(
+                pitch=float(transform.rotation.pitch + angular_velocity.x * step_seconds),
+                yaw=float(transform.rotation.yaw + angular_velocity.z * step_seconds),
+                roll=float(transform.rotation.roll + angular_velocity.y * step_seconds),
+            )
+            world_bbox = carla.BoundingBox(transform.transform(bbox.location), bbox.extent)
+            world_bbox.rotation = transform.rotation
+            return world_bbox
+        except Exception:
+            return None
+
+    @staticmethod
+    def _dot_product(vec1, vec2) -> float:
+        return float(vec1.x * vec2.x + vec1.y * vec2.y + vec1.z * vec2.z)
+
+    @staticmethod
+    def _cross_product(vec1, vec2):
+        return carla.Vector3D(
+            x=vec1.y * vec2.z - vec1.z * vec2.y,
+            y=vec1.z * vec2.x - vec1.x * vec2.z,
+            z=vec1.x * vec2.y - vec1.y * vec2.x,
+        )
+
+    @classmethod
+    def _has_separating_plane(cls, rel_pos, plane_normal, obb1, obb2) -> bool:
+        projection_distance = abs(cls._dot_product(rel_pos, plane_normal))
+        obb1_projection = (
+            abs(cls._dot_product(obb1.rotation.get_forward_vector() * obb1.extent.x, plane_normal))
+            + abs(cls._dot_product(obb1.rotation.get_right_vector() * obb1.extent.y, plane_normal))
+            + abs(cls._dot_product(obb1.rotation.get_up_vector() * obb1.extent.z, plane_normal))
+        )
+        obb2_projection = (
+            abs(cls._dot_product(obb2.rotation.get_forward_vector() * obb2.extent.x, plane_normal))
+            + abs(cls._dot_product(obb2.rotation.get_right_vector() * obb2.extent.y, plane_normal))
+            + abs(cls._dot_product(obb2.rotation.get_up_vector() * obb2.extent.z, plane_normal))
+        )
+        return projection_distance > obb1_projection + obb2_projection
+
+    @classmethod
+    def _obb_intersects(cls, obb1, obb2) -> bool:
+        rel_pos = obb2.location - obb1.location
+        axes = [
+            obb1.rotation.get_forward_vector(),
+            obb1.rotation.get_right_vector(),
+            obb1.rotation.get_up_vector(),
+            obb2.rotation.get_forward_vector(),
+            obb2.rotation.get_right_vector(),
+            obb2.rotation.get_up_vector(),
+        ]
+        axes.extend(
+            [
+                cls._cross_product(a1, a2)
+                for a1 in axes[:3]
+                for a2 in axes[3:]
+            ]
+        )
+        for axis in axes:
+            if abs(axis.x) < 1e-6 and abs(axis.y) < 1e-6 and abs(axis.z) < 1e-6:
+                continue
+            if cls._has_separating_plane(rel_pos, axis, obb1, obb2):
+                return False
+        return True
+
+    def _ttc_violation(self) -> bool:
+        ego = self._ego_actor()
+        if ego is None:
+            return False
+        try:
+            actors = self.evaluator.world.get_actors()
+        except Exception:
+            return False
+        horizon_steps = int(round(REWARD_TTC_FORECAST_SECONDS / REWARD_TTC_INTERVAL_SECONDS))
+        relevant_actors = [
+            actor
+            for actor in actors
+            if actor.id != ego.id and actor.is_alive and (
+                "vehicle" in actor.type_id or "walker" in actor.type_id
+            )
+        ]
+        for step_idx in range(1, horizon_steps + 1):
+            t = step_idx * REWARD_TTC_INTERVAL_SECONDS
+            ego_bbox = self._bbox_at_prediction_step(ego, t)
+            if ego_bbox is None:
+                return False
+            for actor in relevant_actors:
+                actor_bbox = self._bbox_at_prediction_step(actor, t)
+                if actor_bbox is None:
+                    continue
+                if self._obb_intersects(ego_bbox, actor_bbox):
+                    return True
+        return False
+
+    def _outside_lane_soft_violation(self, lane_metrics: Dict[str, Any]) -> bool:
+        any_wp = lane_metrics.get("any_waypoint")
+        driving_wp = lane_metrics.get("driving_waypoint")
+        if any_wp is not None and getattr(any_wp, "lane_type", None) == carla.LaneType.Sidewalk:
+            return True
+        if driving_wp is None:
+            return False
+        if bool(getattr(driving_wp, "is_junction", False)):
+            return False
+        return abs(float(lane_metrics["heading_error_rad"])) > (0.5 * math.pi)
+
+    def _offroad_terminal_violation(self, lane_metrics: Dict[str, Any], criteria: list[dict[str, Any]]) -> bool:
+        if self._criterion_triggered(
+            criteria,
+            (("off", "road"), ("outside", "road"), ("outside", "drivable")),
+        ):
+            return True
+        any_wp = lane_metrics.get("any_waypoint")
+        if any_wp is None:
+            return True
+        lane_type = getattr(any_wp, "lane_type", None)
+        return lane_type == carla.LaneType.NONE
+
+    def _soft_penalty_state(
+        self,
+        *,
+        lane_metrics: Dict[str, Any],
+        speed_mps: float,
+    ) -> Dict[str, Any]:
+        lane_width_m = float(lane_metrics["lane_width_m"])
+        lane_half_width = max(0.5 * lane_width_m, 1e-3)
+        lane_center_factor = 1.0
+        if not bool(lane_metrics.get("is_junction", False)):
+            lane_center_factor = float(
+                np.clip(1.0 - abs(float(lane_metrics["lane_offset_m"])) / lane_half_width, 0.0, 1.0)
+            )
+
+        outside_lanes = self._outside_lane_soft_violation(lane_metrics)
+        outside_lanes_factor = 0.0 if outside_lanes else 1.0
+
+        speed_limit_mps = max(float(lane_metrics["speed_limit_mps"]), 1e-3)
+        if self._speeding_infraction:
+            overspeed_kmh = max(0.0, (speed_mps - speed_limit_mps) * 3.6)
+            speeding_factor = float(np.clip(1.0 - overspeed_kmh / REWARD_SPEEDING_MARGIN_KMH, 0.0, 1.0))
+        else:
+            overspeed_kmh = 0.0
+            speeding_factor = 1.0
+
+        ttc_violated_now = self._ttc_violation()
+        if ttc_violated_now:
+            self._ttc_penalty_ticks = REWARD_TTC_PERSIST_STEPS
+        ttc_active = self._ttc_penalty_ticks > 0
+        ttc_factor = 0.5 if ttc_active else 1.0
+        if self._ttc_penalty_ticks > 0:
+            self._ttc_penalty_ticks -= 1
+
+        comfort_metrics = self._compute_comfort_metrics()
+        if self._comfort_infraction:
+            comfort_violated_now = len(comfort_metrics["violations"]) > 0
+            if comfort_violated_now:
+                self._comfort_penalty_ticks = REWARD_COMFORT_PERSIST_STEPS
+                self._comfort_penalty_factor = float(comfort_metrics["factor"])
+            comfort_active = self._comfort_penalty_ticks > 0
+            comfort_factor = self._comfort_penalty_factor if comfort_active else 1.0
+            if self._comfort_penalty_ticks > 0:
+                self._comfort_penalty_ticks -= 1
+        else:
+            comfort_violated_now = False
+            comfort_factor = 1.0
+
+        penalty_product = (
+            outside_lanes_factor
+            * lane_center_factor
+            * speeding_factor
+            * ttc_factor
+            * comfort_factor
+        )
+        return {
+            "outside_lanes": outside_lanes,
+            "outside_lanes_factor": float(outside_lanes_factor),
+            "lane_center_factor": float(lane_center_factor),
+            "speeding_factor": float(speeding_factor),
+            "overspeed_kmh": float(overspeed_kmh),
+            "ttc_violated_now": bool(ttc_violated_now),
+            "ttc_factor": float(ttc_factor),
+            "comfort_violated_now": bool(comfort_violated_now),
+            "comfort_factor": float(comfort_factor),
+            "penalty_product": float(penalty_product),
+            "comfort_metrics": comfort_metrics,
+        }
+
+    def _terminal_state(
+        self,
+        *,
+        criteria: list[dict[str, Any]],
+        lane_metrics: Dict[str, Any],
+        speed_mps: float,
+        route_completion: float,
+        base_terminated: bool,
+    ) -> Dict[str, Any]:
+        collision = self._collision_count() > 0
+        offroad = self._offroad_terminal_violation(lane_metrics, criteria)
+        run_red_light = self._criterion_triggered(
+            criteria,
+            (("red", "light"), ("running", "red"), ("run", "red"), ("traffic", "light")),
+        )
+        run_stop_sign = self._criterion_triggered(
+            criteria,
+            (("stop", "sign"), ("running", "stop"), ("run", "stop")),
+        )
+        route_deviation_distance = self._route_deviation_distance()
+        left_route = self._use_leave_route_done and (self._closest_route_lateral_distance() > self._min_thresh_lat_dist)
+        in_route_ok = self._in_route_ok()
+        route_deviation = bool(left_route or (not in_route_ok))
+        if speed_mps < REWARD_BLOCKED_SPEED_THRESHOLD_MPS:
+            self._blocked_ticks += 1
+        else:
+            self._blocked_ticks = 0
+        blocked = self._blocked_ticks >= self._blocked_steps
+
+        termination_reason = ""
+        route_completed = route_completion >= 99.9
+        for name, triggered in (
+            ("collision", collision),
+            ("off_road", offroad),
+            ("run_red_light", run_red_light),
+            ("run_stop_sign", run_stop_sign),
+            ("route_deviation", route_deviation),
+            ("blocked", blocked),
+        ):
+            if triggered:
+                termination_reason = name
+                break
+
+        hard_infraction = bool(termination_reason)
+        success = bool(route_completed and not hard_infraction)
+        terminated = bool(base_terminated or hard_infraction or route_completed)
+        if terminated and not termination_reason and success:
+            termination_reason = "success"
+        elif terminated and not termination_reason:
+            termination_reason = "scenario_end"
+
+        return {
+            "terminated": terminated,
+            "success": bool(success),
+            "termination_reason": termination_reason,
+            "terminal_reward": float(self._terminal_reward if termination_reason and termination_reason != "success" else 0.0),
+            "collision": bool(collision),
+            "off_road": bool(offroad),
+            "run_red_light": bool(run_red_light),
+            "run_stop_sign": bool(run_stop_sign),
+            "route_deviation": bool(route_deviation),
+            "route_deviation_distance_m": float(route_deviation_distance),
+            "blocked": bool(blocked),
+            "left_route": bool(left_route),
+            "in_route_ok": bool(in_route_ok),
+            "route_completed": bool(route_completed),
+        }
 
     def _update_crash_stuck_state(self, speed: float) -> Tuple[bool, int]:
         collision_count = self._collision_count()

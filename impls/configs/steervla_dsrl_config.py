@@ -59,9 +59,12 @@ def get_config():
     # To switch to action_delta, uncomment:
     config.critic_feedback_mode = "action_delta"
     # Online training regime:
-    #   "rl"     : standard DSRL online RL
-    #   "dagger" : on-policy data aggregation with expert actions as supervision for the DSRL BC flow
-    #   "dagger_direct" : on-policy data aggregation with direct supervision on the Pi action head only
+    #   "rl"          : standard DSRL online RL
+    #   "dagger"      : on-policy data aggregation with expert actions as supervision for the DSRL BC flow
+    #   "dagger_direct" : expert imitation directly on the Pi action head (action_out_proj + time_mlp)
+    #   "sac_direct"  : SAC on the Pi action head — DSRL critic is updated each step, then
+    #                   action_out_proj + time_mlp are trained to maximize Q(s, a) where a is
+    #                   a single-step Euler approximation: a = clip(noise + v_θ(s, noise, 0), -1, 1)
     config.online_training_mode = "rl"
     # language_label_dim is auto-set for commentary_bow / delta_commentary_bow in main_carla.py,
     # and critic_action_dim is used directly when mode is action_delta.
@@ -71,7 +74,7 @@ def get_config():
             enabled=True,
             # Local OpenPI inference (ignored when actor_url is set):
             actor_config="pi05_steervla_cot_ki_inference",
-            checkpoint="gs://cat-logs/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning_20260512_144250/50000",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning_20260512_144250/70000",
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,
             include_ego_history=False,
