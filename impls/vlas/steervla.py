@@ -741,8 +741,13 @@ class SteerVLAActor:
         cfg_ah = min(int(self.action_horizon), model_ah)
         cfg_ad = min(int(self.action_dim), model_ad)
         noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
+        full_chunk = None
         if input_noise.ndim == 3:
             noise_chunk = input_noise[:, :cfg_ah, :cfg_ad]
+        elif int(input_noise.shape[-1]) == model_ah * model_ad:
+            # Full Pi0 chunk from DSRL noise actor (actor_action_dim * action_horizon):
+            # reshape directly so every dim/timestep gets noise (training uses N(0,I) over (B,H,D)).
+            full_chunk = input_noise.reshape(batch_size, model_ah, model_ad).astype(jnp.float32)
         elif int(input_noise.shape[-1]) == int(self.action_horizon) * int(self.action_dim):
             noise_chunk = input_noise.reshape(batch_size, int(self.action_horizon), int(self.action_dim))[:, :cfg_ah, :cfg_ad]
         elif int(input_noise.shape[-1]) == model_ad:
@@ -751,7 +756,10 @@ class SteerVLAActor:
         else:
             noise_chunk = input_noise[:, None, :cfg_ad]
             cfg_ah = 1
-        noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(noise_chunk)
+        if full_chunk is not None:
+            noise_full = full_chunk
+        else:
+            noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(noise_chunk)
         
         # Sample the actions
         traj = self._sample_actions(
@@ -1169,7 +1177,12 @@ class SteerVLAActor:
             "dagger_direct/microbatch_size": float(microbatch_size),
         }
 
-    def _ensure_direct_sac_trainer(self, dsrl_apply_fn, critic_action_dim: int = 4) -> None:
+    def _ensure_direct_sac_trainer(
+        self,
+        dsrl_apply_fn,
+        env_action_horizon: int,
+        env_action_dim: int,
+    ) -> None:
         """Create the jitted SAC actor update for the Pi0 action head.
 
         Reuses the DAgger direct trainer's optimizer and trainable parameters
@@ -1177,7 +1190,8 @@ class SteerVLAActor:
 
         Args:
             dsrl_apply_fn: ``dsrl_network.apply_fn`` — fixed for a given architecture.
-            critic_action_dim: Number of action dims fed to the DSRL critic (default 4).
+            env_action_horizon: Env action horizon (matches DSRL critic input).
+            env_action_dim: Per-step env action dim (matches DSRL critic input).
         """
         if self._remote is not None:
             raise RuntimeError("Direct SAC updates are not supported in remote SteerVLAActor mode.")
@@ -1237,10 +1251,14 @@ class SteerVLAActor:
 
                 # Single-step Euler approximation of the flow-sampled action
                 action_full = jnp.clip(noise + v_t, -1.0, 1.0)  # [B, H, D]
-                action_critic = action_full[:, 0, :critic_action_dim]  # [B, critic_action_dim]
+                # Match what the DSRL critic was trained on: full env chunk, flat.
+                batch_size = action_full.shape[0]
+                action_env = action_full[:, :env_action_horizon, :env_action_dim].reshape(
+                    batch_size, env_action_horizon * env_action_dim
+                )
 
-                # Q from frozen DSRL critic; gradient flows only through action_critic → v_t
-                qs = dsrl_apply_fn({"params": dsrl_params_sg}, obs_e_sg, action_critic, name="critic")
+                # Q from frozen DSRL critic; gradient flows only through action_env → v_t
+                qs = dsrl_apply_fn({"params": dsrl_params_sg}, obs_e_sg, action_env, name="critic")
                 q = jnp.min(qs, axis=0)
                 loss = -q.mean()
                 return loss, {
@@ -1264,24 +1282,32 @@ class SteerVLAActor:
         batch: dict[str, Any],
         dsrl_network: Any,
         alpha: float = 0.1,
-        critic_action_dim: int = 4,
+        env_action_horizon: int = 10,
+        env_action_dim: int = 4,
     ) -> dict[str, float]:
         """SAC actor update directly on the Pi0 action head.
 
         Trains action_out_proj + time_mlp to maximize Q(s, a) from the DSRL critic.
         The action ``a`` is approximated via one Euler step at t=0:
-            a = clip(noise + v_θ(s, noise, 0), -1, 1), noise ~ N(0, I).
+            a = clip(noise + v_θ(s, noise, 0), -1, 1), noise ~ N(0, I),
+        then sliced to ``(env_action_horizon, env_action_dim)`` and flattened to match
+        the layout the DSRL critic was trained on.
 
         Args:
             batch: Replay buffer batch with ``openpi_*`` observation fields.
             dsrl_network: Current DSRL ``TrainState`` (provides critic Q-values).
             alpha: SAC temperature (reserved for future entropy term; currently unused).
-            critic_action_dim: Number of action dims for the DSRL critic.
+            env_action_horizon: Env action horizon (DSRL critic action input layout).
+            env_action_dim: Env per-step action dim (DSRL critic action input layout).
         """
         if self._remote is not None:
             return {"sac_direct/skipped_remote_actor": 1.0}
 
-        self._ensure_direct_sac_trainer(dsrl_network.apply_fn, critic_action_dim=critic_action_dim)
+        self._ensure_direct_sac_trainer(
+            dsrl_network.apply_fn,
+            env_action_horizon=env_action_horizon,
+            env_action_dim=env_action_dim,
+        )
 
         assert self._direct_dagger_trainable_state is not None
         assert self._direct_dagger_opt_state is not None
@@ -1405,8 +1431,13 @@ class SteerVLAActor:
         cfg_ah = min(int(self.action_horizon), model_ah)
         cfg_ad = min(int(self.action_dim), model_ad)
         noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
+        full_chunk = None
         if noise_jax.ndim == 3:
             noise_chunk = noise_jax[:, :cfg_ah, :cfg_ad]
+        elif int(noise_jax.shape[-1]) == model_ah * model_ad:
+            # Full Pi0 chunk from DSRL noise actor (actor_action_dim * action_horizon):
+            # reshape directly so every dim/timestep gets noise (training uses N(0,I) over (B,H,D)).
+            full_chunk = noise_jax.reshape(batch_size, model_ah, model_ad).astype(jnp.float32)
         elif int(noise_jax.shape[-1]) == int(self.action_horizon) * int(self.action_dim):
             noise_chunk = noise_jax.reshape(batch_size, int(self.action_horizon), int(self.action_dim))[
                 :, :cfg_ah, :cfg_ad
@@ -1419,7 +1450,10 @@ class SteerVLAActor:
         else:
             noise_chunk = noise_jax[:, None, :cfg_ad]
             cfg_ah = 1
-        noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(noise_chunk)
+        if full_chunk is not None:
+            noise_full = full_chunk
+        else:
+            noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(noise_chunk)
         
         # Sample the actions
         if self.return_normalized_action_chunk and not force_accel_steer:

@@ -49,12 +49,14 @@ import numpy as np
 import jax
 
 from jax_agents import agents
+from jax_agents.sac_residual import SACResidualAgent
 from utils.flax_utils import restore_agent
 from coaches.expert_label import NUM_COMMENTARY_WORDS, NUM_DELTA_COMMENTARY_WORDS
 from coaches.critic_feedback import (
     compute_action_delta,
     compute_action_delta_commentary,
     critic_language_dim,
+    denormalize_action_chunk,
 )
 
 _IMPLS_ROOT = Path(__file__).resolve().parent
@@ -103,8 +105,8 @@ flags.DEFINE_bool(
     "then switch to the PDM-Lite expert for the remainder of the episode.",
 )
 
-# flags.DEFINE_string("save_dir", "/raid/users/celine/carla_exps", "Save directory.")
-flags.DEFINE_string("save_dir", "/home/carla/exps", "Save directory.")
+flags.DEFINE_string("save_dir", "/raid/users/celine/carla_exps", "Save directory.")
+#flags.DEFINE_string("save_dir", "/home/carla/exps", "Save directory.")
 flags.DEFINE_string("restore_path", None, "Restore path for JAX agents.")
 flags.DEFINE_integer("restore_epoch", None, "Restore epoch.")
 
@@ -429,6 +431,20 @@ def run_online_carla(
     env_ah = int(steervla_cfg.get("action_horizon", agent_config.get("vla_action_horizon", 10)))
     env_ad = int(steervla_cfg.get("action_dim", agent_config.get("vla_action_dim", 4)))
     action_dim = env_ah * env_ad
+
+    # If the agent's executed action is in Pi0 normalized model space, denormalize
+    # it to env units before any side-by-side comparison with the expert (which is
+    # always stored in env units). Otherwise the delta / MSE are off by ~7x for
+    # DELTA_XY formats and bias the critic-feedback labels.
+    _exec_cfg = _steervla_action_execution_cfg(steervla_cfg)
+    if _exec_cfg is not None and _exec_cfg.get("action_input_space") == "normalized":
+        _agent_action_denorm_kwargs: dict[str, Any] | None = {
+            "action_horizon": int(_exec_cfg["action_horizon"]),
+            "action_dim": int(_exec_cfg["action_dim"]),
+            "output_action_format": str(_exec_cfg["output_action_format"]),
+        }
+    else:
+        _agent_action_denorm_kwargs = None
     example_transition = dict(
         observations=np.array(obs),
         actions=np.zeros((action_dim,), dtype=np.float32),
@@ -439,6 +455,10 @@ def run_online_carla(
         language_label=np.zeros(_lang_dim, dtype=np.float32),
         next_language_label=np.zeros(_lang_dim, dtype=np.float32),
     )
+    if _online_training_mode in {"sac_residual", "dagger_residual"}:
+        # Base Pi0 action used at rollout time; residual = stored action - base.
+        # (In dagger_residual the residual is supervised toward expert - base.)
+        example_transition["base_actions"] = np.zeros((action_dim,), dtype=np.float32)
     if steervla_actor is not None:
         openpi0 = _openpi_fields_from_raw(obs_raw)
         example_transition.update(openpi0)
@@ -570,7 +590,7 @@ def run_online_carla(
             import cv2  # type: ignore
 
             h, w = base.shape[:2]
-            panel_h = max(96, h // 4)  # 5 lines × 16px + 16px offset
+            panel_h = max(112, h // 4)  # 6 lines × 16px + 16px offset
             annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
             annotated[:h, :, :] = _annotate_reward_corner(base, reward_value)
             # Bottom panel is already black via zeros; draw an explicit border line.
@@ -585,6 +605,7 @@ def run_online_carla(
             reasoning = _format_text_field(raw, "reasoning_text") or _format_text_field(raw, "reasoning")
             subtask = _format_text_field(raw, "subtask_text") or _format_text_field(raw, "subtask")
             expert_action_str = ""
+            agent_action_str = ""
             if isinstance(raw, dict):
                 ea = raw.get("expert_action")
                 if ea is not None:
@@ -592,6 +613,11 @@ def run_online_carla(
                     # First step is dims 0-3: [dx_speed, dy_speed, dx_route, dy_route]
                     first = ea[:4] if ea.size >= 4 else ea
                     expert_action_str = " ".join(f"{v:.3f}" for v in first)
+                aa = raw.get("agent_action")
+                if aa is not None:
+                    aa = np.asarray(aa, dtype=np.float32).reshape(-1)
+                    first = aa[:4] if aa.size >= 4 else aa
+                    agent_action_str = " ".join(f"{v:.3f}" for v in first)
 
             def _clip_text(txt: str, max_chars: int = 120) -> str:
                 return txt if len(txt) <= max_chars else (txt[: max_chars - 3] + "...")
@@ -599,6 +625,7 @@ def run_online_carla(
             lines = [
                 f"Expert: {_clip_text(critic_text) if critic_text else '?'}",
                 f"ExpertAct[0]: {expert_action_str or '?'}",
+                f"AgentAct[0]:  {agent_action_str or '?'}",
                 f"Prompt: {_clip_text(prompt)}",
                 f"Reasoning: {_clip_text(reasoning)}",
                 f"Subtask: {_clip_text(subtask)}",
@@ -659,12 +686,26 @@ def run_online_carla(
     last_update_info = None
 
     def _sample_agent_action(subkey):
-        """Rollout policy (SteerVLA VLA path, DAgger, or DSRL flow); used in warmup and RL phases."""
-        if getattr(agent, "vla_sample_fn", None) is not None:
-            return agent.sample_actions_with_vla(obs[None], seed=subkey)
+        """Rollout policy (SteerVLA VLA path, DAgger, or DSRL flow); used in warmup and RL phases.
+
+        Returns ``(action, base_action)``. ``base_action`` is the un-residualized
+        Pi0 action chunk for ``sac_residual`` mode; ``None`` otherwise.
+        """
+        # Direct-action-head modes train the VLA action head with raw N(0,I) noise and
+        # never touch the DSRL noise actor; the rollout must match (skip noise actor).
+        if _online_training_mode in {"dagger_direct", "sac_direct"} and hasattr(agent, "sample_actions_vla_direct"):
+            return agent.sample_actions_vla_direct(obs[None], seed=subkey), None
+        if _online_training_mode in {"sac_residual", "dagger_residual"} and hasattr(agent, "sample_actions_sac_residual"):
+            # Match rollout to the training objective:
+            # - SAC residual explores stochastically.
+            # - DAgger residual executes the deterministic mean residual that its MSE loss trains.
+            temperature = 0.0 if _online_training_mode == "dagger_residual" else 1.0
+            return agent.sample_actions_sac_residual(obs[None], seed=subkey, temperature=temperature)
         if _online_training_mode == "dagger" and hasattr(agent, "sample_actions_dagger"):
-            return agent.sample_actions_dagger(obs[None])
-        return agent.sample_actions(obs[None], seed=subkey)
+            return agent.sample_actions_dagger(obs[None]), None
+        if getattr(agent, "vla_sample_fn", None) is not None:
+            return agent.sample_actions_with_vla(obs[None], seed=subkey), None
+        return agent.sample_actions(obs[None], seed=subkey), None
 
     _vla_steps_budget = int(np.random.randint(70, 201)) if FLAGS.expert_recover_debug else 0
     if FLAGS.expert_recover_debug:
@@ -679,12 +720,15 @@ def run_online_carla(
         if FLAGS.expert_recover_debug and (episode_steps == _vla_steps_budget):
             env.reinit_expert()
         in_warmup = warmup > 0 and step <= warmup
+        base_action_np: np.ndarray | None = None
         if FLAGS.expert_debug or _in_expert_recovery or agent is None:
             action = np.zeros(env.action_space.shape, dtype=np.float32)
         else:
-            action_jax = _sample_agent_action(sub)
-            _block_until_ready_tree(action_jax)
+            action_jax, base_action_jax = _sample_agent_action(sub)
+            _block_until_ready_tree((action_jax, base_action_jax))
             action = np.asarray(action_jax[0])
+            if base_action_jax is not None:
+                base_action_np = np.asarray(base_action_jax[0], dtype=np.float32)
         t_sample_end = time.time()
 
         t_step_start = time.time()
@@ -713,10 +757,16 @@ def run_online_carla(
             _lang = _zero_label
             _next_lang = _zero_label
         elif _critic_feedback_mode == "action_delta":
-            _lang = compute_action_delta(obs_raw, action, agent, agent_config)
+            _lang = compute_action_delta(
+                obs_raw, action, agent, agent_config,
+                denormalize_kwargs=_agent_action_denorm_kwargs,
+            )
             _next_lang = _zero_label  # bootstrap target sees zero delta (next action unknown)
         elif _critic_feedback_mode == "delta_commentary_bow":
-            _lang_text, _lang = compute_action_delta_commentary(obs_raw, action, agent)
+            _lang_text, _lang = compute_action_delta_commentary(
+                obs_raw, action, agent,
+                denormalize_kwargs=_agent_action_denorm_kwargs,
+            )
             _next_lang = _zero_label  # depends on current action-vs-expert comparison only
         else:
             _lang = np.asarray(obs_raw.get("language_label", _zero_label), dtype=np.float32)
@@ -724,9 +774,55 @@ def run_online_carla(
         _critic_text_for_video = _critic_input_text(_critic_feedback_mode, _lang, _lang_text, obs_raw)
 
         replay_action = action.astype(np.float32)
-        if _online_training_mode in {"dagger", "dagger_direct"} and not FLAGS.expert_debug:
+        if _online_training_mode in {"dagger", "dagger_direct", "dagger_residual"} and not FLAGS.expert_debug:
             replay_action = np.asarray(obs_raw.get("expert_action", replay_action), dtype=np.float32)
 
+        # Convert executed/base actions to env units so we can compare/log against
+        # the expert (which is always in env units). Pi0 outputs are in normalized
+        # model space when ``action_input_space="normalized"`` is set on the env.
+        _action_flat_env = np.asarray(action, dtype=np.float32).reshape(-1)
+        _base_flat_env = (
+            np.asarray(base_action_np, dtype=np.float32).reshape(-1)
+            if base_action_np is not None
+            else None
+        )
+        if _agent_action_denorm_kwargs is not None:
+            _expected_size = (
+                int(_agent_action_denorm_kwargs["action_horizon"])
+                * int(_agent_action_denorm_kwargs["action_dim"])
+            )
+            if _action_flat_env.size == _expected_size:
+                _action_flat_env = denormalize_action_chunk(
+                    _action_flat_env, **_agent_action_denorm_kwargs,
+                )
+            if _base_flat_env is not None and _base_flat_env.size == _expected_size:
+                _base_flat_env = denormalize_action_chunk(
+                    _base_flat_env, **_agent_action_denorm_kwargs,
+                )
+
+        # MSE between the actions and the expert label for the *current* state.
+        # ``obs_raw`` here is still the state we acted on (it is reassigned to
+        # ``next_obs_raw`` further below).
+        expert_mse_metrics: dict[str, float] = {}
+        _expert_action_raw = obs_raw.get("expert_action") if isinstance(obs_raw, dict) else None
+        if _expert_action_raw is not None and not FLAGS.expert_debug:
+            _expert_flat = np.asarray(_expert_action_raw, dtype=np.float32).reshape(-1)
+            if _action_flat_env.shape == _expert_flat.shape:
+                expert_mse_metrics["rollout/mse_action_to_expert"] = float(
+                    np.mean(np.square(_action_flat_env - _expert_flat))
+                )
+            if _base_flat_env is not None and _base_flat_env.shape == _expert_flat.shape:
+                expert_mse_metrics["rollout/mse_base_to_expert"] = float(
+                    np.mean(np.square(_base_flat_env - _expert_flat))
+                )
+
+        residual_fields: dict[str, np.ndarray] = {}
+        if _online_training_mode in {"sac_residual", "dagger_residual"}:
+            # If the agent path was skipped (warmup with no agent, expert override),
+            # fall back to the stored action so the residual = 0 implicitly.
+            residual_fields["base_actions"] = (
+                base_action_np if base_action_np is not None else replay_action
+            )
         buffer.add_transition(
             {
                 "observations": np.asarray(obs),
@@ -737,6 +833,7 @@ def run_online_carla(
                 "terminals": np.float32(1.0 if done else 0.0),
                 "language_label": _lang,
                 "next_language_label": _next_lang,
+                **residual_fields,
                 **(_openpi_fields_from_raw(obs_raw) if steervla_actor is not None else {}),
                 **(
                     {f"next_{k}": np.array(v) for k, v in _openpi_fields_from_raw(next_obs_raw).items()}
@@ -749,6 +846,9 @@ def run_online_carla(
         
         t_log_start = time.time()
         cot_obs_raw = dict(obs_raw)  # holds reasoning_text/subtask_text stashed by VLA
+        # Stash the executed agent action (env units) for the video text panel so
+        # AgentAct[0] is directly comparable to ExpertAct[0].
+        cot_obs_raw["agent_action"] = _action_flat_env
         obs = next_obs
         obs_raw = next_obs_raw
         episode_return += float(reward)
@@ -815,6 +915,7 @@ def run_online_carla(
         step_wb["time/step_time"] = t_step_end - t_step_start
         step_wb["time/log_time"] = t_log_end - t_log_start
         step_wb["training/in_warmup"] = float(in_warmup)
+        step_wb.update(expert_mse_metrics)
 
         wandb.log(step_wb, step=step)
 
@@ -890,6 +991,10 @@ def run_online_carla(
                     _, update_info = agent.update_dagger_direct(batch)
                 elif _online_training_mode == "sac_direct":
                     _, update_info = agent.update_sac_direct(batch)
+                elif _online_training_mode == "sac_residual":
+                    agent, update_info = agent.update_sac_residual(batch)
+                elif _online_training_mode == "dagger_residual":
+                    agent, update_info = agent.update_dagger_residual(batch)
                 elif getattr(agent, "vla_sample_fn", None) is not None:
                     _, update_info = agent.update_with_vla(batch)
                 else:
@@ -936,7 +1041,7 @@ def main(_):
 
     config = FLAGS.agent
 
-    exp_name = get_exp_name(FLAGS.seed)
+    exp_name = os.environ.get("WANDB_RUN_NAME", get_exp_name(FLAGS.seed))
     setup_wandb(project="OGBench-CARLA", group=FLAGS.run_group, name=exp_name, mode=wandb_mode)
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
@@ -957,10 +1062,11 @@ def main(_):
 
     steervla_cfg = config.get("steervla", None)
     online_training_mode = str(config.get("online_training_mode", "rl")).strip().lower()
-    if online_training_mode not in {"rl", "dagger", "dagger_direct", "sac_direct"}:
+    _VALID_TRAIN_MODES = {"rl", "dagger", "dagger_direct", "sac_direct", "sac_residual", "dagger_residual"}
+    if online_training_mode not in _VALID_TRAIN_MODES:
         raise ValueError(
             f"Unsupported online_training_mode={online_training_mode!r}; "
-            "expected 'rl', 'dagger', 'dagger_direct', or 'sac_direct'."
+            f"expected one of {sorted(_VALID_TRAIN_MODES)}."
         )
     use_steervla_rollout = bool(
         steervla_cfg is not None and steervla_cfg.get("enabled") and not FLAGS.expert_debug
@@ -979,6 +1085,18 @@ def main(_):
     if online_training_mode == "sac_direct":
         print(
             "[main_carla] SAC direct mode: training Pi0 action head with Q-gradient from DSRL critic.",
+            flush=True,
+        )
+    if online_training_mode == "sac_residual":
+        print(
+            "[main_carla] SAC residual mode: Pi0 frozen; small residual MLP trained via "
+            "Q-gradient from DSRL critic.",
+            flush=True,
+        )
+    if online_training_mode == "dagger_residual":
+        print(
+            "[main_carla] DAgger residual mode: Pi0 frozen; small residual MLP supervised "
+            "via MSE toward expert action.",
             flush=True,
         )
     critic_feedback_mode = str(config.get("critic_feedback_mode", "commentary_bow"))
@@ -1043,6 +1161,25 @@ def main(_):
                         create_kwargs["steervla_actor"] = steervla_actor
 
             agent = agent_class.create(FLAGS.seed, ex_obs, ex_actions, config, **create_kwargs)
+
+            if online_training_mode in {"sac_residual", "dagger_residual"}:
+                if config["agent_name"] != "dsrl":
+                    raise ValueError(
+                        f"{online_training_mode} mode requires agent_name='dsrl'."
+                    )
+                if steervla_actor is None:
+                    raise ValueError(
+                        f"{online_training_mode} mode requires SteerVLA rollout (frozen Pi0 base policy)."
+                    )
+                obs_mode_cfg = str(config.get("observation_mode", "state"))
+                if obs_mode_cfg == "state":
+                    embed_dim = int(ex_obs.shape[-1])
+                else:
+                    embed_dim = int(tuple(config.get("image_mlp_hidden_dims", (512,)))[-1])
+                sac_residual_agent = SACResidualAgent.create(
+                    FLAGS.seed, ex_obs, ex_actions, config, embed_dim=embed_dim,
+                )
+                agent = agent.attach_sac_residual(sac_residual_agent)
 
             if FLAGS.restore_path is not None:
                 agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)

@@ -323,6 +323,7 @@ class DSRLAgent(flax.struct.PyTreeNode):
     # vla_train_state: Any = nonpytree_field()  # OpenPI ``training_utils.TrainState`` for :meth:`update_with_vla`
     openpi_train_config: Any = nonpytree_field()  # ``openpi.training.config.TrainConfig`` for VLA flow step
     steervla_actor: Any = nonpytree_field()  # Optional attached local ``SteerVLAActor`` instance
+    sac_residual_agent: Any = None  # Optional ``jax_agents.sac_residual.SACResidualAgent`` (pytree)
 
     @staticmethod
     def _as_jax_pytree(x):
@@ -488,6 +489,23 @@ class DSRLAgent(flax.struct.PyTreeNode):
         batch = observations.shape[0]
         noise = jnp.zeros((batch, self._flat_env_action_dim()), dtype=jnp.float32)
         return self._flow_sample(self.network.params, observations, noise)
+
+    def sample_actions_vla_direct(self, observations, seed=None):
+        """Rollout for DAgger-direct / SAC-direct: VLA action head with raw Gaussian noise.
+
+        The DSRL noise actor is intentionally skipped — it's only used by DSRL, which
+        operates in noise space. Direct-action-head training (DAgger-direct, SAC-direct)
+        sees ``N(0, I)`` noise over Pi0 chunk shape (B, model_ah, model_ad) during the
+        loss; sampling matches that exactly so the action head doesn't see an OOD input.
+        """
+        if self.vla_sample_fn is None:
+            raise RuntimeError(
+                "sample_actions_vla_direct requires a SteerVLA vla_sample_fn; "
+                "configure steervla in the agent config or fall back to sample_actions_dagger."
+            )
+        seed = seed if seed is not None else self.rng
+        noise = jax.random.normal(seed, (observations.shape[0], self._flat_noise_dim()))
+        return jnp.asarray(self.vla_sample_fn(observations, noise))
 
     # ----- losses --------------------------------------------------------- #
 
@@ -715,88 +733,6 @@ class DSRLAgent(flax.struct.PyTreeNode):
 
     def _prepare_vla_batch(self, batch):
         """Attach ``openpi_observation`` / ``next_openpi_observation`` to a replay batch."""
-    def update_dagger_direct(self, batch):
-        """Direct DAgger update on the SteerVLA action head, keeping DSRL unchanged."""
-        new_rng, _ = jax.random.split(self.rng)
-        if self.steervla_actor is None:
-            return self.replace(rng=new_rng), {"dagger_direct/skipped_no_steervla_actor": 1.0}
-        info = self.steervla_actor.update_dagger_direct(batch)
-        return self.replace(rng=new_rng), info
-
-    @jax.jit
-    def _update_critic_only(self, batch):
-        """Jitted critic-only update (used by update_sac_direct).
-
-        Uses zero noise for the BC-flow bootstrap target so the flow is called
-        with the correct critic_action_dim (4), not the 320-dim noise-actor output.
-        """
-        new_rng, rng = jax.random.split(self.rng)
-
-        def loss_fn(grad_params):
-            next_obs_e = self._encode_obs(self.network.params, batch["next_observations"])
-            # Zero noise → deterministic BC-flow action at correct critic_action_dim
-            next_noise = jnp.zeros(
-                (batch["next_observations"].shape[0], int(self.config["critic_action_dim"])),
-                dtype=jnp.float32,
-            )
-            next_actions = self._flow_sample(self.network.params, batch["next_observations"], next_noise)
-            next_actions = self._as_critic_actions(next_actions)
-            next_qs = self.network.select("target_critic")(
-                _critic_obs_e(next_obs_e, batch, "next_language_label"), next_actions
-            )
-            next_q = jnp.min(next_qs, axis=0)
-            target_q = batch["rewards"] + self.config["discount"] * batch["masks"] * next_q
-
-            obs_e = self._encode_obs(grad_params, batch["observations"])
-            critic_actions = self._as_critic_actions(batch["actions"])
-            qs = self.network.select("critic")(
-                _critic_obs_e(obs_e, batch, "language_label"), critic_actions, params=grad_params
-            )
-            critic_loss = jnp.square(qs - target_q[None]).mean()
-            info = {
-                f"critic/{k}": v
-                for k, v in {
-                    "critic_loss": critic_loss,
-                    "q_mean": qs.mean(),
-                    "q_max": qs.max(),
-                    "q_min": qs.min(),
-                    "target_q": target_q.mean(),
-                }.items()
-            }
-            return critic_loss, info
-
-        new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
-        self.target_update(new_network)
-        return self.replace(network=new_network, rng=new_rng), info
-
-    def update_sac_direct(self, batch):
-        """SAC direct: update DSRL critic then train the Pi0 action head with Q-gradient.
-
-        The DSRL critic is updated first (standard TD learning) to provide meaningful
-        Q-values. The Pi0 action head (action_out_proj + time_mlp) is then updated to
-        maximize Q(s, a) where a is approximated via a single-step Euler from noise.
-        """
-        new_self, critic_info = self._update_critic_only(batch)
-
-        if new_self.steervla_actor is None:
-            return new_self, {**critic_info, "sac_direct/skipped_no_steervla_actor": 1.0}
-
-        pi0_info = new_self.steervla_actor.update_sac_direct(
-            batch,
-            dsrl_network=new_self.network,
-            alpha=float(new_self.config.get("alpha", 0.1)),
-            critic_action_dim=int(new_self.config.get("critic_action_dim", 4)),
-        )
-        return new_self, {**critic_info, **pi0_info}
-
-    def update_with_vla(self, batch):
-        """Flax critic + noise actor update with eager VLA forwards and a jitted gradient core.
-
-        Profile metrics returned in ``info`` (in ms, summed across the whole update step):
-        """
-        new_rng, rng = jax.random.split(self.rng)
-        rng, c_rng, a_rng, _vla_rng = jax.random.split(rng, 4)
-        
         sv = _steervla()
         if "openpi_state" in batch and "next_openpi_state" in batch:
             openpi_observation = sv.openpi_observation_from_replay_batch(batch)
@@ -823,6 +759,225 @@ class DSRLAgent(flax.struct.PyTreeNode):
         batch["openpi_observation"] = self._as_jax_pytree(openpi_observation)
         batch["next_openpi_observation"] = self._as_jax_pytree(next_openpi_observation)
         return batch
+
+    def update_dagger_direct(self, batch):
+        """Direct DAgger update on the SteerVLA action head, keeping DSRL unchanged."""
+        new_rng, _ = jax.random.split(self.rng)
+        if self.steervla_actor is None:
+            return self.replace(rng=new_rng), {"dagger_direct/skipped_no_steervla_actor": 1.0}
+        info = self.steervla_actor.update_dagger_direct(batch)
+        return self.replace(rng=new_rng), info
+
+    def _update_critic_only(self, batch, next_actions):
+        """Critic-only update for SAC direct.
+
+        ``next_actions`` is the bootstrap action a' at s' (env-layout flat); it must
+        be computed eagerly outside this jitted core because for SAC direct it comes
+        from the VLA action head (heavy, not jit-friendly). Using the trainable VLA
+        keeps critic and actor consistent — the BC flow is unused in SAC direct mode.
+        """
+        new_rng, rng = jax.random.split(self.rng)
+        critic_actions = self._clip_actions_to_env(batch["actions"])
+        discount = jnp.asarray(self.config["discount"], dtype=jnp.float32)
+
+        def loss_fn(grad_params):
+            loss, info = _critic_loss_vla_pure_math(
+                self.network, batch, next_actions, critic_actions, grad_params, discount,
+            )
+            return loss, {f"critic/{k}": v for k, v in info.items()}
+
+        new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
+        self.target_update(new_network)
+        return self.replace(network=new_network, rng=new_rng), info
+
+    def update_sac_direct(self, batch):
+        """SAC direct: update DSRL critic then train the Pi0 action head with Q-gradient.
+
+        The DSRL critic is updated first (TD learning bootstrapped from the VLA action
+        head at s'). The Pi0 action head (action_out_proj + time_mlp) is then updated to
+        maximize Q(s, a) where a is approximated via a single-step Euler from noise.
+        """
+        new_rng, rng = jax.random.split(self.rng)
+        if self.steervla_actor is None:
+            return self.replace(rng=new_rng), {"sac_direct/skipped_no_steervla_actor": 1.0}
+
+        batch = self._prepare_vla_batch(batch)
+        next_actions = self._vla_forward(
+            batch["next_observations"], batch["next_openpi_observation"], rng,
+        )
+        new_self, critic_info = self._update_critic_only(batch, next_actions)
+
+        if new_self.steervla_actor is None:
+            return new_self, {**critic_info, "sac_direct/skipped_no_steervla_actor": 1.0}
+
+        pi0_info = new_self.steervla_actor.update_sac_direct(
+            batch,
+            dsrl_network=new_self.network,
+            alpha=float(new_self.config.get("alpha", 0.1)),
+            env_action_horizon=new_self._env_action_horizon(),
+            env_action_dim=new_self._env_action_dim(),
+        )
+        return new_self, {**critic_info, **pi0_info}
+
+    # ----- sac_residual --------------------------------------------------- #
+
+    def attach_sac_residual(self, sac_residual_agent):
+        """Attach a :class:`jax_agents.sac_residual.SACResidualAgent` sub-agent."""
+        return self.replace(sac_residual_agent=sac_residual_agent)
+
+    def _critic_obs_e_with_lang(self, obs_e, lang):
+        """Append ``lang`` to ``obs_e`` if present (matches ``_critic_obs_e``)."""
+        if lang is None:
+            return obs_e
+        return jnp.concatenate([obs_e, jnp.asarray(lang, dtype=jnp.float32)], axis=-1)
+
+    def sample_actions_sac_residual(self, observations, seed=None, temperature=1.0):
+        """Rollout for SAC-residual / DAgger-residual: ``clip(base + residual * scale, -1, 1)``.
+
+        Returns ``(action, base_action)`` so the caller can store the base in
+        the replay buffer alongside the executed action.
+        """
+        if self.vla_sample_fn is None:
+            raise RuntimeError(
+                "sample_actions_sac_residual requires a SteerVLA vla_sample_fn."
+            )
+        if self.sac_residual_agent is None:
+            raise RuntimeError(
+                "sample_actions_sac_residual requires an attached sac_residual_agent."
+            )
+        seed = seed if seed is not None else self.rng
+        seed_b, seed_r = jax.random.split(seed)
+        noise = jax.random.normal(seed_b, (observations.shape[0], self._flat_noise_dim()))
+        base_action = jnp.asarray(self.vla_sample_fn(observations, noise))
+        base_action = self._clip_actions_to_env(base_action)
+        obs_e = self.network.select("obs_encoder")(observations)
+        action, _residual = self.sac_residual_agent.sample_actions_residual(
+            obs_e,
+            base_action,
+            seed=seed_r,
+            temperature=temperature,
+        )
+        return action, base_action
+
+    def update_sac_residual(self, batch):
+        """SAC update with a residual actor on top of the frozen Pi0 base.
+
+        Steps (mirrors :meth:`update_sac_direct`):
+
+        1. Compute ``base_next = Pi0(s')`` (eager VLA forward).
+        2. Compute ``next_action = clip(base_next + residual(obs_e', base_next) * scale, -1, 1)``.
+        3. Update the DSRL critic with TD target bootstrapped from ``next_action``.
+        4. Update the residual MLP by maximizing ``Q(s, clip(base_stored + residual(obs_e, base_stored) * scale))``.
+
+        Requires ``batch`` to contain ``base_actions`` — the base Pi0 action that
+        was used during rollout (stored separately by ``main_carla.py``).
+        """
+        new_rng, rng = jax.random.split(self.rng)
+        if self.steervla_actor is None or self.sac_residual_agent is None:
+            return self.replace(rng=new_rng), {"sac_residual/skipped_no_subagent": 1.0}
+        if "base_actions" not in batch:
+            return self.replace(rng=new_rng), {"sac_residual/skipped_no_base_actions": 1.0}
+
+        batch = self._prepare_vla_batch(batch)
+        rng_base, rng_res = jax.random.split(rng)
+
+        # 1-2. Bootstrap action for the critic TD target.
+        base_next = self._vla_forward(
+            batch["next_observations"], batch["next_openpi_observation"], rng_base,
+        )
+        next_obs_e_sg = jax.lax.stop_gradient(
+            self.network.select("obs_encoder")(batch["next_observations"])
+        )
+        next_action, _ = self.sac_residual_agent.sample_actions_residual(
+            next_obs_e_sg, base_next, seed=rng_res,
+        )
+        next_action = jax.lax.stop_gradient(self._clip_actions_to_env(next_action))
+
+        # 3. Critic update with bootstrapped target.
+        new_self, critic_info = self._update_critic_only(batch, next_action)
+
+        # 4. Residual actor update via Q-gradient.
+        obs_e_sg = jax.lax.stop_gradient(
+            new_self.network.select("obs_encoder")(batch["observations"])
+        )
+        critic_obs_e_sg = new_self._critic_obs_e_with_lang(
+            obs_e_sg, batch.get("language_label")
+        )
+        base_action = new_self._clip_actions_to_env(
+            jnp.asarray(batch["base_actions"], dtype=jnp.float32)
+        )
+        new_residual, residual_info = new_self.sac_residual_agent.update_actor(
+            obs_e_sg=obs_e_sg,
+            base_action=base_action,
+            critic_obs_e_sg=critic_obs_e_sg,
+            dsrl_network=new_self.network,
+        )
+        new_self = new_self.replace(sac_residual_agent=new_residual, rng=new_rng)
+        return new_self, {
+            **critic_info,
+            **{f"sac_residual/{k}": v for k, v in residual_info.items()},
+        }
+
+    def update_dagger_residual(self, batch):
+        """DAgger update for the residual actor: MSE toward the expert.
+
+        Mirrors :meth:`update_sac_residual` minus the critic update — no Q is
+        used, only MSE between ``clip(base + residual * scale)`` and the expert
+        action stored as ``batch["actions"]``. The base Pi0 action lives in
+        ``batch["base_actions"]``.
+
+        Config flag ``dagger_residual_train_obs_encoder`` (default False): when
+        True, the same MSE loss also drives DSRL's ``obs_encoder`` (so the image
+        CNN learns features useful for predicting the residual). Useful when
+        training ``dagger_residual`` from scratch with ``observation_mode=image``
+        — without it the obs encoder stays at random initialization.
+        """
+        new_rng, _ = jax.random.split(self.rng)
+        if self.sac_residual_agent is None:
+            return self.replace(rng=new_rng), {"dagger_residual/skipped_no_subagent": 1.0}
+        if "base_actions" not in batch:
+            return self.replace(rng=new_rng), {"dagger_residual/skipped_no_base_actions": 1.0}
+
+        base_action = self._clip_actions_to_env(
+            jnp.asarray(batch["base_actions"], dtype=jnp.float32)
+        )
+        expert_action = self._clip_actions_to_env(
+            jnp.asarray(batch["actions"], dtype=jnp.float32)
+        )
+
+        if bool(self.config.get("dagger_residual_train_obs_encoder", False)):
+            # Joint update: gradient flows into DSRL.obs_encoder too.
+            from jax_agents.sac_residual import _joint_dagger_apply_step
+
+            scale = jnp.asarray(
+                float(self.sac_residual_agent._scale()), dtype=jnp.float32,
+            )
+            new_dsrl_network, new_residual_network, info = _joint_dagger_apply_step(
+                self.network,
+                self.sac_residual_agent.network,
+                batch["observations"],
+                base_action,
+                expert_action,
+                scale,
+            )
+            new_residual = self.sac_residual_agent.replace(network=new_residual_network)
+            new_self = self.replace(
+                network=new_dsrl_network,
+                sac_residual_agent=new_residual,
+                rng=new_rng,
+            )
+            return new_self, {f"dagger_residual/{k}": v for k, v in info.items()}
+
+        obs_e_sg = jax.lax.stop_gradient(
+            self.network.select("obs_encoder")(batch["observations"])
+        )
+        new_residual, residual_info = self.sac_residual_agent.update_actor_dagger(
+            obs_e_sg=obs_e_sg,
+            base_action=base_action,
+            expert_action=expert_action,
+        )
+        new_self = self.replace(sac_residual_agent=new_residual, rng=new_rng)
+        return new_self, {f"dagger_residual/{k}": v for k, v in residual_info.items()}
 
     def _precompute_vla_loss_cache(self, batch, rng):
         """Eager VLA forwards consumed by :meth:`total_loss_vla` inside ``update_with_vla``."""
@@ -1035,6 +1190,11 @@ def get_config():
             # "rl": standard DSRL online RL updates.
             # "dagger": collect on-policy states, store expert actions, and train with flow imitation only.
             online_training_mode="rl",
+            # When ``online_training_mode="dagger_residual"`` and this is True, the
+            # DAgger MSE gradient also updates DSRL's ``obs_encoder`` (image CNN).
+            # Otherwise only the residual MLP is updated and the encoder stays at
+            # whatever it was initialized / restored to.
+            dagger_residual_train_obs_encoder=False,
         )
     )
     return config

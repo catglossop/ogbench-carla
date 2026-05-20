@@ -24,6 +24,7 @@ X_DISPLAY_NUM=""
 
 CRITIC_MODE="delta"
 TRAIN_MODE="rl"
+DAGGER_RESIDUAL_TRAIN_OBS_ENCODER="false"
 
 BASE_AGENT_CFG="impls/configs/steervla_dsrl_config.py"
 BASE_CARLA_CFG="impls/configs/carla_config.yaml"
@@ -62,7 +63,8 @@ Options:
                               expert-lang  -> language on expert action
                             Default: delta
 
-  --train-mode MODE         rl|dagger|dagger_direct|sac_direct. Default: dagger
+  --train-mode MODE         rl|dagger|dagger_direct|sac_direct|sac_residual|dagger_residual. Default: dagger
+  --train-obs-encoder BOOL  true|false. Sets agent.dagger_residual_train_obs_encoder. Default: false
 
   --agent-config PATH       Base agent config. Default: impls/configs/steervla_dsrl_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
@@ -75,6 +77,8 @@ Examples:
   bash run_carla.sh --train-mode dagger --critic-mode delta-lang
   bash run_carla.sh --train-mode dagger_direct --critic-mode delta-lang
   bash run_carla.sh --train-mode sac_direct --critic-mode delta
+  bash run_carla.sh --train-mode sac_residual --critic-mode delta
+  bash run_carla.sh --train-mode dagger_residual --critic-mode delta
 EOF
 }
 
@@ -98,6 +102,7 @@ while [[ $# -gt 0 ]]; do
     --x-display-num) X_DISPLAY_NUM="$2"; shift 2 ;;
     --critic-mode) CRITIC_MODE="$2"; shift 2 ;;
     --train-mode) TRAIN_MODE="$2"; shift 2 ;;
+    --train-obs-encoder) DAGGER_RESIDUAL_TRAIN_OBS_ENCODER="$2"; shift 2 ;;
     --agent-config) BASE_AGENT_CFG="$2"; shift 2 ;;
     --carla-config) BASE_CARLA_CFG="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -123,10 +128,19 @@ case "$CRITIC_MODE" in
 esac
 
 case "$TRAIN_MODE" in
-  rl|dagger|dagger_direct|sac_direct) ;;
+  rl|dagger|dagger_direct|sac_direct|sac_residual|dagger_residual) ;;
   *)
     echo "Invalid --train-mode: $TRAIN_MODE" >&2
-    echo "Expected one of: rl, dagger, dagger_direct, sac_direct" >&2
+    echo "Expected one of: rl, dagger, dagger_direct, sac_direct, sac_residual, dagger_residual" >&2
+    exit 2
+    ;;
+esac
+
+case "$DAGGER_RESIDUAL_TRAIN_OBS_ENCODER" in
+  true|false) ;;
+  *)
+    echo "Invalid --train-obs-encoder: $DAGGER_RESIDUAL_TRAIN_OBS_ENCODER" >&2
+    echo "Expected one of: true, false" >&2
     exit 2
     ;;
 esac
@@ -150,6 +164,8 @@ if [[ -n "$RENDER_ADAPTER" ]]; then
   SIM_GPU_RANK="$RENDER_ADAPTER"
 fi
 
+WANDB_RUN_NAME="${TRAIN_MODE}_${CRITIC_MODE}_$(date +%Y%m%d_%H%M%S)"
+
 cat > "$AGENT_CFG_TMP" <<EOF
 from pathlib import Path
 import runpy
@@ -163,6 +179,7 @@ def get_config():
     config.training_gpu_rank = ${TRAIN_GPU_RANK}
     config.critic_feedback_mode = "${CRITIC_FEEDBACK_MODE}"
     config.online_training_mode = "${TRAIN_MODE}"
+    config.dagger_residual_train_obs_encoder = ${DAGGER_RESIDUAL_TRAIN_OBS_ENCODER^}
     if config.critic_feedback_mode == "none":
         config.language_label_dim = 0
     return config
@@ -186,14 +203,16 @@ EOF
 
 echo "[run_carla.sh] route=${ROUTE}"
 echo "[run_carla.sh] train_mode=${TRAIN_MODE}"
-echo "[run_carla.sh] critic_mode=${CRITIC_FEEDBACK_MODE}"
+echo "[run_carla.sh] critic_mode=${CRITIC_MODE}"
+echo "[run_carla.sh] train_obs_encoder=${DAGGER_RESIDUAL_TRAIN_OBS_ENCODER}"
+echo "[run_carla.sh] wandb_run_name=${WANDB_RUN_NAME}"
 echo "[run_carla.sh] train_gpu_rank=${TRAIN_GPU_RANK} render_adapter=${SIM_GPU_RANK}"
 echo "[run_carla.sh] carla_host=${CARLA_HOST} carla_port=${CARLA_PORT} streaming_port=${CARLA_STREAMING_PORT} tm_port=${TM_PORT} x_display=:${X_DISPLAY_NUM}"
 echo "[run_carla.sh] expert_debug=${EXPERT_DEBUG} expert_recover_debug=${EXPERT_RECOVER_DEBUG} save_buffer=${SAVE_BUFFER} online_steps=${ONLINE_STEPS}"
 echo "[run_carla.sh] temp agent config: ${AGENT_CFG_TMP}"
 echo "[run_carla.sh] temp carla config: ${CARLA_CFG_TMP}"
 
-WANDB_MODE="${WANDB_MODE}" uv run python impls/main_carla.py \
+WANDB_MODE="${WANDB_MODE}" WANDB_RUN_NAME="${WANDB_RUN_NAME}" uv run python impls/main_carla.py \
   --agent="${AGENT_CFG_TMP}" \
   --carla_config="${CARLA_CFG_TMP}" \
   --route="${ROUTE}" \
