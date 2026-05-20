@@ -483,25 +483,18 @@ class DSRLAgent(flax.struct.PyTreeNode):
         noise = noise * self.config["noise_scale"]
         return jnp.asarray(self.vla_sample_fn(observations, noise))
 
-    @jax.jit
-    def sample_actions_dagger(self, observations):
-        """Deterministic rollout policy for DAgger: BC flow from zero noise."""
-        batch = observations.shape[0]
-        noise = jnp.zeros((batch, self._flat_env_action_dim()), dtype=jnp.float32)
-        return self._flow_sample(self.network.params, observations, noise)
-
     def sample_actions_vla_direct(self, observations, seed=None):
-        """Rollout for DAgger-direct / SAC-direct: VLA action head with raw Gaussian noise.
+        """Rollout for DAgger-direct: VLA action head with raw Gaussian noise.
 
         The DSRL noise actor is intentionally skipped — it's only used by DSRL, which
-        operates in noise space. Direct-action-head training (DAgger-direct, SAC-direct)
-        sees ``N(0, I)`` noise over Pi0 chunk shape (B, model_ah, model_ad) during the
+        operates in noise space. Direct-action-head training sees ``N(0, I)`` noise
+        over Pi0 chunk shape ``(B, model_ah, model_ad)`` during the
         loss; sampling matches that exactly so the action head doesn't see an OOD input.
         """
         if self.vla_sample_fn is None:
             raise RuntimeError(
                 "sample_actions_vla_direct requires a SteerVLA vla_sample_fn; "
-                "configure steervla in the agent config or fall back to sample_actions_dagger."
+                "configure steervla in the agent config."
             )
         seed = seed if seed is not None else self.rng
         noise = jax.random.normal(seed, (observations.shape[0], self._flat_noise_dim()))
@@ -719,18 +712,6 @@ class DSRLAgent(flax.struct.PyTreeNode):
         self.target_update(new_network)
         return self.replace(network=new_network, rng=new_rng), info
 
-    @jax.jit
-    def update_dagger(self, batch):
-        """Online imitation update for DAgger: optimize only the BC flow loss."""
-        new_rng, rng = jax.random.split(self.rng)
-
-        def loss_fn(grad_params):
-            loss, info = self.flow_loss(batch, grad_params, rng)
-            return loss, {f"dagger/{k}": v for k, v in info.items()}
-
-        new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
-        return self.replace(network=new_network, rng=new_rng), info
-
     def _prepare_vla_batch(self, batch):
         """Attach ``openpi_observation`` / ``next_openpi_observation`` to a replay batch."""
         sv = _steervla()
@@ -769,12 +750,11 @@ class DSRLAgent(flax.struct.PyTreeNode):
         return self.replace(rng=new_rng), info
 
     def _update_critic_only(self, batch, next_actions):
-        """Critic-only update for SAC direct.
+        """Critic-only update for residual SAC / shared VLA-backed actor paths.
 
         ``next_actions`` is the bootstrap action a' at s' (env-layout flat); it must
-        be computed eagerly outside this jitted core because for SAC direct it comes
-        from the VLA action head (heavy, not jit-friendly). Using the trainable VLA
-        keeps critic and actor consistent — the BC flow is unused in SAC direct mode.
+        be computed eagerly outside this jitted core because it may come from a
+        heavy VLA-backed policy path that is not jit-friendly.
         """
         new_rng, rng = jax.random.split(self.rng)
         critic_actions = self._clip_actions_to_env(batch["actions"])
@@ -789,35 +769,6 @@ class DSRLAgent(flax.struct.PyTreeNode):
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network)
         return self.replace(network=new_network, rng=new_rng), info
-
-    def update_sac_direct(self, batch):
-        """SAC direct: update DSRL critic then train the Pi0 action head with Q-gradient.
-
-        The DSRL critic is updated first (TD learning bootstrapped from the VLA action
-        head at s'). The Pi0 action head (action_out_proj + time_mlp) is then updated to
-        maximize Q(s, a) where a is approximated via a single-step Euler from noise.
-        """
-        new_rng, rng = jax.random.split(self.rng)
-        if self.steervla_actor is None:
-            return self.replace(rng=new_rng), {"sac_direct/skipped_no_steervla_actor": 1.0}
-
-        batch = self._prepare_vla_batch(batch)
-        next_actions = self._vla_forward(
-            batch["next_observations"], batch["next_openpi_observation"], rng,
-        )
-        new_self, critic_info = self._update_critic_only(batch, next_actions)
-
-        if new_self.steervla_actor is None:
-            return new_self, {**critic_info, "sac_direct/skipped_no_steervla_actor": 1.0}
-
-        pi0_info = new_self.steervla_actor.update_sac_direct(
-            batch,
-            dsrl_network=new_self.network,
-            alpha=float(new_self.config.get("alpha", 0.1)),
-            env_action_horizon=new_self._env_action_horizon(),
-            env_action_dim=new_self._env_action_dim(),
-        )
-        return new_self, {**critic_info, **pi0_info}
 
     # ----- sac_residual --------------------------------------------------- #
 
@@ -862,7 +813,7 @@ class DSRLAgent(flax.struct.PyTreeNode):
     def update_sac_residual(self, batch):
         """SAC update with a residual actor on top of the frozen Pi0 base.
 
-        Steps (mirrors :meth:`update_sac_direct`):
+        Steps:
 
         1. Compute ``base_next = Pi0(s')`` (eager VLA forward).
         2. Compute ``next_action = clip(base_next + residual(obs_e', base_next) * scale, -1, 1)``.
@@ -1188,7 +1139,6 @@ def get_config():
             critic_feedback_mode="commentary_bow",
             # Online training regime.
             # "rl": standard DSRL online RL updates.
-            # "dagger": collect on-policy states, store expert actions, and train with flow imitation only.
             online_training_mode="rl",
             # When ``online_training_mode="dagger_residual"`` and this is True, the
             # DAgger MSE gradient also updates DSRL's ``obs_encoder`` (image CNN).

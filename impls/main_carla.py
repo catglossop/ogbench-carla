@@ -693,7 +693,7 @@ def run_online_carla(
         """
         # Direct-action-head modes train the VLA action head with raw N(0,I) noise and
         # never touch the DSRL noise actor; the rollout must match (skip noise actor).
-        if _online_training_mode in {"dagger_direct", "sac_direct"} and hasattr(agent, "sample_actions_vla_direct"):
+        if _online_training_mode == "dagger_direct" and hasattr(agent, "sample_actions_vla_direct"):
             return agent.sample_actions_vla_direct(obs[None], seed=subkey), None
         if _online_training_mode in {"sac_residual", "dagger_residual"} and hasattr(agent, "sample_actions_sac_residual"):
             # Match rollout to the training objective:
@@ -701,8 +701,6 @@ def run_online_carla(
             # - DAgger residual executes the deterministic mean residual that its MSE loss trains.
             temperature = 0.0 if _online_training_mode == "dagger_residual" else 1.0
             return agent.sample_actions_sac_residual(obs[None], seed=subkey, temperature=temperature)
-        if _online_training_mode == "dagger" and hasattr(agent, "sample_actions_dagger"):
-            return agent.sample_actions_dagger(obs[None]), None
         if getattr(agent, "vla_sample_fn", None) is not None:
             return agent.sample_actions_with_vla(obs[None], seed=subkey), None
         return agent.sample_actions(obs[None], seed=subkey), None
@@ -774,7 +772,7 @@ def run_online_carla(
         _critic_text_for_video = _critic_input_text(_critic_feedback_mode, _lang, _lang_text, obs_raw)
 
         replay_action = action.astype(np.float32)
-        if _online_training_mode in {"dagger", "dagger_direct", "dagger_residual"} and not FLAGS.expert_debug:
+        if _online_training_mode in {"dagger_direct", "dagger_residual"} and not FLAGS.expert_debug:
             replay_action = np.asarray(obs_raw.get("expert_action", replay_action), dtype=np.float32)
 
         # Convert executed/base actions to env units so we can compare/log against
@@ -985,12 +983,8 @@ def run_online_carla(
             t_update_start = time.time()
             for _ in range(updates_per_step):
                 batch = buffer.sample(batch_size)
-                if _online_training_mode == "dagger":
-                    _, update_info = agent.update_dagger(batch)
-                elif _online_training_mode == "dagger_direct":
+                if _online_training_mode == "dagger_direct":
                     _, update_info = agent.update_dagger_direct(batch)
-                elif _online_training_mode == "sac_direct":
-                    _, update_info = agent.update_sac_direct(batch)
                 elif _online_training_mode == "sac_residual":
                     agent, update_info = agent.update_sac_residual(batch)
                 elif _online_training_mode == "dagger_residual":
@@ -1062,7 +1056,7 @@ def main(_):
 
     steervla_cfg = config.get("steervla", None)
     online_training_mode = str(config.get("online_training_mode", "rl")).strip().lower()
-    _VALID_TRAIN_MODES = {"rl", "dagger", "dagger_direct", "sac_direct", "sac_residual", "dagger_residual"}
+    _VALID_TRAIN_MODES = {"rl", "dagger_direct", "sac_residual", "dagger_residual"}
     if online_training_mode not in _VALID_TRAIN_MODES:
         raise ValueError(
             f"Unsupported online_training_mode={online_training_mode!r}; "
@@ -1071,7 +1065,7 @@ def main(_):
     use_steervla_rollout = bool(
         steervla_cfg is not None and steervla_cfg.get("enabled") and not FLAGS.expert_debug
     )
-    if online_training_mode in {"dagger", "dagger_direct"}:
+    if online_training_mode == "dagger_direct":
         if use_steervla_rollout:
             print(
                 "[main_carla] DAgger mode: rolling out SteerVLA with expert relabels.",
@@ -1082,11 +1076,6 @@ def main(_):
                 "[main_carla] DAgger mode requested but SteerVLA rollout is disabled; falling back to learner rollout for data collection.",
                 flush=True,
             )
-    if online_training_mode == "sac_direct":
-        print(
-            "[main_carla] SAC direct mode: training Pi0 action head with Q-gradient from DSRL critic.",
-            flush=True,
-        )
     if online_training_mode == "sac_residual":
         print(
             "[main_carla] SAC residual mode: Pi0 frozen; small residual MLP trained via "
