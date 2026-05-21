@@ -106,15 +106,22 @@ def _critic_loss_vla_pure_math(
     critic_actions: jnp.ndarray,
     grad_params,
     discount: jnp.ndarray,
+    next_log_pi=None,
+    alpha=None,
 ):
     """Pure DSRL critic math: target-Q bootstrap + critic MSE, no VLA model access.
 
     ``next_actions_critic`` and ``critic_actions`` must already be clipped to the env
     action layout (e.g. via :meth:`DSRLAgent._clip_actions_to_env`).
+
+    When ``next_log_pi`` and ``alpha`` are provided (residual SAC path), the soft
+    Bellman target subtracts the entropy bonus: ``min_Q(s',a') - alpha * log_pi(a'|s')``.
     """
     next_obs_e = network.select("obs_encoder")(batch["next_observations"], params=network.params)
     next_qs = network.select("target_critic")(_critic_obs_e(next_obs_e, batch, "next_language_label"), next_actions_critic)
     next_q = jnp.min(next_qs, axis=0)
+    if next_log_pi is not None and alpha is not None:
+        next_q = next_q - alpha * next_log_pi
     target_q = batch["rewards"] + discount * batch["masks"] * next_q
 
     obs_e = network.select("obs_encoder")(batch["observations"], params=grad_params)
@@ -749,12 +756,15 @@ class DSRLAgent(flax.struct.PyTreeNode):
         info = self.steervla_actor.update_dagger_direct(batch)
         return self.replace(rng=new_rng), info
 
-    def _update_critic_only(self, batch, next_actions):
+    def _update_critic_only(self, batch, next_actions, next_log_pi=None, alpha=None):
         """Critic-only update for residual SAC / shared VLA-backed actor paths.
 
         ``next_actions`` is the bootstrap action a' at s' (env-layout flat); it must
         be computed eagerly outside this jitted core because it may come from a
         heavy VLA-backed policy path that is not jit-friendly.
+
+        ``next_log_pi`` and ``alpha`` are optional; when provided (residual SAC path)
+        the soft Bellman target includes the entropy bonus.
         """
         new_rng, rng = jax.random.split(self.rng)
         critic_actions = self._clip_actions_to_env(batch["actions"])
@@ -763,6 +773,7 @@ class DSRLAgent(flax.struct.PyTreeNode):
         def loss_fn(grad_params):
             loss, info = _critic_loss_vla_pure_math(
                 self.network, batch, next_actions, critic_actions, grad_params, discount,
+                next_log_pi=next_log_pi, alpha=alpha,
             )
             return loss, {f"critic/{k}": v for k, v in info.items()}
 
@@ -856,7 +867,7 @@ class DSRLAgent(flax.struct.PyTreeNode):
         batch = self._prepare_vla_batch(batch)
         rng_base, rng_res = jax.random.split(rng)
 
-        # 1-2. Bootstrap action for the critic TD target.
+        # 1-2. Bootstrap action + log_prob for the critic TD target.
         base_next = self._vla_forward(
             batch["next_observations"], batch["next_openpi_observation"], rng_base,
         )
@@ -866,13 +877,15 @@ class DSRLAgent(flax.struct.PyTreeNode):
                 batch["next_openpi_observation"],
             )
         )
-        next_action, _ = self.sac_residual_agent.sample_actions_residual(
+        next_action, _, next_log_pi = self.sac_residual_agent.sample_actions_and_log_prob_residual(
             next_obs_e_sg, base_next, seed=rng_res,
         )
         next_action = jax.lax.stop_gradient(self._clip_actions_to_env(next_action))
+        next_log_pi = jax.lax.stop_gradient(next_log_pi)
+        alpha = jnp.asarray(self.sac_residual_agent._alpha(), dtype=jnp.float32)
 
-        # 3. Critic update with bootstrapped target.
-        new_self, critic_info = self._update_critic_only(batch, next_action)
+        # 3. Critic update with soft Bellman target (subtracts entropy bonus).
+        new_self, critic_info = self._update_critic_only(batch, next_action, next_log_pi=next_log_pi, alpha=alpha)
 
         # 4. Residual actor update via Q-gradient.
         obs_e_sg = jax.lax.stop_gradient(

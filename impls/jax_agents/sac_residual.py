@@ -47,7 +47,7 @@ class ResidualActor(nn.Module):
 
     hidden_dims: tuple
     action_dim: int
-    log_std_min: float = -5.0
+    log_std_min: float = -20.0
     log_std_max: float = 2.0
     layer_norm: bool = False
 
@@ -57,7 +57,10 @@ class ResidualActor(nn.Module):
         x = MLP(self.hidden_dims, activate_final=True, layer_norm=self.layer_norm)(x)
         mean = nn.Dense(self.action_dim, kernel_init=default_init(0.01))(x)
         log_std = nn.Dense(self.action_dim, kernel_init=default_init(0.01))(x)
-        log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
+        # Tanh-based soft clamping (SpinUp / Denis Yarats) — keeps gradients flowing
+        # even when log_std is very small; hard clip would kill gradients at the boundary.
+        log_std = jnp.tanh(log_std)
+        log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (log_std + 1)
         base = distrax.MultivariateNormalDiag(
             loc=mean, scale_diag=jnp.exp(log_std) * temperature
         )
@@ -83,6 +86,23 @@ def _sample_action_jit(
     residual_norm = dist.sample(seed=seed)
     residual = residual_norm * scale
     return jnp.clip(base_action + residual, -1.0, 1.0), residual
+
+
+@jax.jit
+def _sample_and_log_prob_jit(
+    network: TrainState,
+    obs_e: jnp.ndarray,
+    base_action: jnp.ndarray,
+    seed: jnp.ndarray,
+    temperature: jnp.ndarray,
+    scale: jnp.ndarray,
+):
+    """Sample and return ``(action, residual, log_prob)`` for use in SAC TD targets."""
+    dist = network.select("residual_actor")(obs_e, base_action, temperature=temperature)
+    residual_norm, log_prob = dist.sample_and_log_prob(seed=seed)
+    residual = residual_norm * scale
+    action = jnp.clip(base_action + residual, -1.0, 1.0)
+    return action, residual, log_prob
 
 
 @jax.jit
@@ -249,6 +269,13 @@ class SACResidualAgent(flax.struct.PyTreeNode):
         temp = jnp.asarray(temperature, dtype=jnp.float32)
         return _sample_action_jit(self.network, obs_e, base_action, seed, temp, scale)
 
+    def sample_actions_and_log_prob_residual(self, obs_e, base_action, seed=None, temperature=1.0):
+        """Return ``(action, residual, log_prob)`` — used to compute the entropy term in the SAC TD target."""
+        seed = seed if seed is not None else self.rng
+        scale = jnp.asarray(self._scale(), dtype=jnp.float32)
+        temp = jnp.asarray(temperature, dtype=jnp.float32)
+        return _sample_and_log_prob_jit(self.network, obs_e, base_action, seed, temp, scale)
+
     # ----- training ------------------------------------------------------- #
 
     def update_actor(
@@ -387,7 +414,7 @@ def get_config():
             residual_actor_hidden_dims=(256, 256),
             residual_action_scale=0.1,
             residual_alpha=0.1,
-            residual_log_std_min=-5.0,
+            residual_log_std_min=-20.0,
             residual_log_std_max=2.0,
             residual_layer_norm=False,
             layer_norm=False,

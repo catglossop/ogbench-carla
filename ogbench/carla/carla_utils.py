@@ -1481,6 +1481,28 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 return int(getattr(criterion, "actual_value", 0))
         return 0
 
+    def _route_infraction_values(self) -> Tuple[float, float]:
+        """Return cumulative infraction values for outside-route and minimum-speed criteria."""
+        scenario = getattr(self.evaluator, "route_scenario", None)
+        if scenario is None:
+            return 0.0, 0.0
+
+        outside_route_val = 0.0
+        min_speed_val = 0.0
+        for criterion in scenario.get_criteria():
+            name = str(getattr(criterion, "name", "")).lower()
+            try:
+                value = float(getattr(criterion, "actual_value", 0.0))
+            except Exception:
+                value = 0.0
+
+            if ("outside" in name and ("route" in name or "lane" in name)) or ("off" in name and "route" in name):
+                outside_route_val = max(outside_route_val, value)
+            if "minspeed" in name or ("minimum" in name and "speed" in name):
+                min_speed_val = max(min_speed_val, value)
+
+        return outside_route_val, min_speed_val
+
     @staticmethod
     def _wrap_angle_rad(angle: float) -> float:
         return float((angle + math.pi) % (2.0 * math.pi) - math.pi)
