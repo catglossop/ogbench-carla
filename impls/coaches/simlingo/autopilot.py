@@ -351,6 +351,18 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     self.remaining_route_original = self._waypoint_planner.original_route_points[self._waypoint_planner.route_index:][
         self.config.tf_first_checkpoint_distance:][::self.config.points_per_meter]
 
+    # Log speed limit sources for debugging
+    carla_speed_limit = self._vehicle.get_speed_limit() / 3.6  # CARLA API: km/h -> m/s
+    if not hasattr(self, '_speed_limit_log_step'):
+      self._speed_limit_log_step = 0
+    if self._speed_limit_log_step % 20 == 0:
+      print(
+          f"[speed_limit] npy={speed_limit*3.6:.1f} km/h  carla={carla_speed_limit*3.6:.1f} km/h"
+          f"  diff={( speed_limit - carla_speed_limit)*3.6:+.1f} km/h",
+          flush=True,
+      )
+    self._speed_limit_log_step += 1
+
     # Get the current speed and target speed
     ego_speed = tick_data["speed"]
     target_speed = min(speed_limit * self.config.ratio_target_speed_limit, 72. / 3.6)  # merge the two last speed bins

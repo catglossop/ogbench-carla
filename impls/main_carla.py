@@ -47,6 +47,7 @@ from typing import Any, Optional
 
 import numpy as np
 import jax
+import jax.numpy as jnp
 
 from jax_agents import agents
 from jax_agents.sac_residual import SACResidualAgent
@@ -438,6 +439,7 @@ def run_online_carla(
     _critic_feedback_mode = str(agent_config.get("critic_feedback_mode", "commentary_bow"))
     _online_training_mode = str(agent_config.get("online_training_mode", "rl")).strip().lower()
     _lang_dim = critic_language_dim(agent_config)
+    _residual_warmup = int(agent_config.get("residual_warmup_steps", 0))
 
     steervla_cfg = agent_config.get("steervla") or {}
     env_ah = int(steervla_cfg.get("action_horizon", agent_config.get("vla_action_horizon", 10)))
@@ -471,6 +473,10 @@ def run_online_carla(
         # Base Pi0 action used at rollout time; residual = stored action - base.
         # (In dagger_residual the residual is supervised toward expert - base.)
         example_transition["base_actions"] = np.zeros((action_dim,), dtype=np.float32)
+    if _online_training_mode == "sac_residual":
+        # Pi0(next_obs) computed at rollout time so the SAC critic update does not
+        # need to re-run Pi0 inference for every training batch.
+        example_transition["base_next_actions"] = np.zeros((action_dim,), dtype=np.float32)
     if steervla_actor is not None:
         openpi0 = _openpi_fields_from_raw(obs_raw)
         example_transition.update(openpi0)
@@ -480,6 +486,41 @@ def run_online_carla(
     buffer = ReplayBuffer.create(example_transition, size=capacity)
     
     rng = jax.random.PRNGKey(FLAGS.seed + 1)
+
+    def _sample_base_action_at(obs_np: np.ndarray, obs_raw_: dict) -> np.ndarray | None:
+        """Run Pi0 on an arbitrary obs to get its base action (for base_next_actions).
+
+        Temporarily swaps raw_obs_holder so the VLA sample fn sees the right image/state.
+        Bypasses the action chunk cache so it never corrupts the rollout cache.
+        """
+        if (
+            agent is None
+            or _online_training_mode != "sac_residual"
+            or raw_obs_holder is None
+            or not hasattr(agent, "vla_sample_fn")
+            or agent.vla_sample_fn is None
+        ):
+            return None
+        saved = raw_obs_holder.get("obs")
+        raw_obs_holder["obs"] = obs_raw_
+        try:
+            rng_bn = jax.random.PRNGKey(int(np.random.randint(0, 2**30)))
+            noise = jax.random.normal(rng_bn, (1, agent._flat_noise_dim()))
+            # Call the underlying _forward_pi0 path directly when possible to skip
+            # the chunk cache; otherwise fall back to the public sample fn.
+            vla_actor = getattr(agent.vla_sample_fn, "__self__", None)
+            if vla_actor is not None and hasattr(vla_actor, "_forward_pi0"):
+                base_jax = vla_actor._forward_pi0(1, noise, raw=None)
+            else:
+                base_jax = jnp.asarray(agent.vla_sample_fn(obs_np[None], noise))
+            base_jax = agent._clip_actions_to_env(base_jax)
+            return np.asarray(base_jax[0], dtype=np.float32)
+        except Exception as _e:
+            print(f"[base_next] failed: {_e}", flush=True)
+            return None
+        finally:
+            raw_obs_holder["obs"] = saved
+
     episode_return, episode_steps, episode_count = 0.0, 0, 0
     episode_collision_count = 0
     episode_collision_events = 0
@@ -716,13 +757,19 @@ def run_online_carla(
         """Rollout policy (SteerVLA VLA path, DAgger, or DSRL flow); used in warmup and RL phases.
 
         Returns ``(action, base_action)``. ``base_action`` is the un-residualized
-        Pi0 action chunk for ``sac_residual`` mode; ``None`` otherwise.
+        Pi0 action chunk for ``sac_residual`` / ``dagger_residual`` mode; ``None`` otherwise.
         """
-        # Direct-action-head modes train the VLA action head with raw N(0,I) noise and
-        # never touch the DSRL noise actor; the rollout must match (skip noise actor).
         if _online_training_mode == "dagger_direct" and hasattr(agent, "sample_actions_vla_direct"):
             return agent.sample_actions_vla_direct(obs[None], seed=subkey), None
         if _online_training_mode in {"sac_residual", "dagger_residual"} and hasattr(agent, "sample_actions_sac_residual"):
+            if step <= _residual_warmup:
+                # During warmup execute pure Pi0 with zero residual so random-init
+                # MLP weights don't corrupt the base policy's driving quality.
+                noise = jax.random.normal(subkey, (1, agent._flat_noise_dim()))
+                base = agent._clip_actions_to_env(
+                    jnp.asarray(agent.vla_sample_fn(obs[None], noise))
+                )
+                return base, base
             # Match rollout to the training objective:
             # - SAC residual explores stochastically.
             # - DAgger residual executes the deterministic mean residual that its MSE loss trains.
@@ -801,6 +848,14 @@ def run_online_carla(
         replay_action = action.astype(np.float32)
         if _online_training_mode in {"dagger_direct", "dagger_residual"} and not FLAGS.expert_debug:
             replay_action = np.asarray(obs_raw.get("expert_action", replay_action), dtype=np.float32)
+            if _online_training_mode == "dagger_residual" and _agent_action_denorm_kwargs is not None:
+                # expert_action is in physical env units (delta-xy meters); base_actions
+                # are in Pi0 normalized space (divided by 7 for DELTA_XY format).
+                # Normalize expert to the same space so the MSE loss gradient is correct.
+                from vlas.steervla import _normalize_action_chunk_numpy
+                replay_action = _normalize_action_chunk_numpy(
+                    replay_action[None], **_agent_action_denorm_kwargs
+                )[0]
 
         # Convert executed/base actions to env units so we can compare/log against
         # the expert (which is always in env units). Pi0 outputs are in normalized
@@ -847,6 +902,15 @@ def run_online_carla(
             # fall back to the stored action so the residual = 0 implicitly.
             residual_fields["base_actions"] = (
                 base_action_np if base_action_np is not None else replay_action
+            )
+        if _online_training_mode == "sac_residual":
+            # Compute Pi0(next_obs) now at rollout time so the SAC training update
+            # can look up base_next_actions from the batch without re-running Pi0
+            # inference for every gradient step (eliminates VLA call from the hot path).
+            _base_next = _sample_base_action_at(next_obs, next_obs_raw)
+            residual_fields["base_next_actions"] = (
+                _base_next if _base_next is not None
+                else np.zeros(action_dim, dtype=np.float32)
             )
         buffer.add_transition(
             {
@@ -912,12 +976,29 @@ def run_online_carla(
         if "reward_total" in info:
             step_wb["reward/total"] = float(info["reward_total"])
             step_wb["reward/terminal"] = float(info.get("reward_terminal", 0.0))
+<<<<<<< Updated upstream
             step_wb["reward/penalty_collision"] = float(info.get("penalty_collision", 0.0))
             step_wb["reward/penalty_outside_route"] = float(info.get("penalty_outside_route", 0.0))
             step_wb["reward/penalty_steer"] = float(info.get("penalty_steer", 0.0))
             step_wb["reward/penalty_brake"] = float(info.get("penalty_brake", 0.0))
             step_wb["reward/penalty_speed_limit"] = float(info.get("penalty_speed_limit", 0.0))
             step_wb["reward/penalty_crash_stuck"] = float(info.get("penalty_crash_stuck", 0.0))
+=======
+            step_wb["reward/collision_penalty_active"] = float(bool(info.get("collision_penalty_active", False)))
+            step_wb["reward/collision_contact_active"] = float(bool(info.get("collision_contact_active", False)))
+            step_wb["reward/penalty_speeding"] = float(info.get("penalty_speeding", 0.0))
+            step_wb["rollout/route_completion"] = float(info.get("route_completion", 0.0))
+            step_wb["rollout/route_completion_delta"] = float(info.get("route_completion_delta", 0.0))
+            step_wb["rollout/termination_reason"] = str(info.get("termination_reason", ""))
+            step_wb["rollout/speed_limit_mps"] = float(info.get("speed_limit_mps", 0.0))
+            step_wb["rollout/overspeed_kmh"] = float(info.get("overspeed_kmh", 0.0))
+            step_wb["reward/soft_penalty_outside_lanes"] = float(info.get("soft_penalty_outside_lanes", 1.0))
+            step_wb["reward/soft_penalty_lane_center"] = float(info.get("soft_penalty_lane_center", 1.0))
+            step_wb["reward/soft_penalty_speeding"] = float(info.get("soft_penalty_speeding", 1.0))
+            step_wb["reward/soft_penalty_ttc"] = float(info.get("soft_penalty_ttc", 1.0))
+            step_wb["reward/soft_penalty_comfort"] = float(info.get("soft_penalty_comfort", 1.0))
+            step_wb["reward/soft_penalty_product"] = float(info.get("soft_penalty_product", 1.0))
+>>>>>>> Stashed changes
             step_wb["rollout/lane_offset_m"] = float(info.get("lane_offset_m", 0.0))
             step_wb["rollout/heading_error_rad"] = float(info.get("heading_error_rad", 0.0))
 
@@ -954,9 +1035,14 @@ def run_online_carla(
             if "reward_total" in info:
                 rollout_log["rollout/final_step_reward"] = float(info["reward_total"])
                 rollout_log["rollout/final_step_reward_terminal"] = float(info.get("reward_terminal", 0.0))
+                rollout_log["reward/collision_penalty_active"] = float(bool(info.get("collision_penalty_active", False)))
+                rollout_log["reward/collision_contact_active"] = float(bool(info.get("collision_contact_active", False)))
+                rollout_log["reward/penalty_speeding"] = float(info.get("penalty_speeding", 0.0))
                 rollout_log["rollout/route_completion"] = float(info.get("route_completion", 0.0))
                 rollout_log["rollout/route_completion_delta"] = float(info.get("route_completion_delta", 0.0))
                 rollout_log["rollout/termination_reason"] = str(info.get("termination_reason", ""))
+                rollout_log["rollout/speed_limit_mps"] = float(info.get("speed_limit_mps", 0.0))
+                rollout_log["rollout/overspeed_kmh"] = float(info.get("overspeed_kmh", 0.0))
                 rollout_log["reward/soft_penalty_outside_lanes"] = float(info.get("soft_penalty_outside_lanes", 1.0))
                 rollout_log["reward/soft_penalty_lane_center"] = float(info.get("soft_penalty_lane_center", 1.0))
                 rollout_log["reward/soft_penalty_speeding"] = float(info.get("soft_penalty_speeding", 1.0))
@@ -1114,8 +1200,16 @@ def main(_):
             flush=True,
         )
     if online_training_mode in {"sac_residual", "dagger_residual"} and bool(config.get("residual_use_pi_image_features", False)):
+        residual_pi_feature_source = str(
+            config.get("residual_pi_feature_source", "prefix")
+        ).strip().lower()
         print(
-            "[main_carla] Residual actor input: pooled Pi VLM image features.",
+            f"[main_carla] Residual actor input: frozen Pi {residual_pi_feature_source} features.",
+            flush=True,
+        )
+    if bool(config.get("critic_use_pi_prefix_features", False)):
+        print(
+            "[main_carla] Critic input: frozen Pi prefix features.",
             flush=True,
         )
     critic_feedback_mode = str(config.get("critic_feedback_mode", "commentary_bow"))
@@ -1178,6 +1272,16 @@ def main(_):
                         # create_kwargs["vla_train_state"] = steervla_actor.train_state
                         create_kwargs["openpi_train_config"] = steervla_actor.train_cfg
                         create_kwargs["steervla_actor"] = steervla_actor
+                if bool(config.get("critic_use_pi_prefix_features", False)):
+                    if steervla_actor is None:
+                        raise ValueError(
+                            "critic_use_pi_prefix_features=True requires SteerVLA rollout."
+                        )
+                    if getattr(steervla_actor, "_remote", None) is not None:
+                        raise ValueError(
+                            "critic_use_pi_prefix_features=True requires local SteerVLA; "
+                            "remote actor mode does not expose Pi prefix features."
+                        )
 
             agent = agent_class.create(FLAGS.seed, ex_obs, ex_actions, config, **create_kwargs)
 
@@ -1194,12 +1298,29 @@ def main(_):
                     if getattr(steervla_actor, "_remote", None) is not None:
                         raise ValueError(
                             "residual_use_pi_image_features=True requires local SteerVLA; "
-                            "remote actor mode does not expose Pi image features."
+                            "remote actor mode does not expose Pi residual features."
                         )
                     openpi_obs = steervla_actor.build_observation_batch_numpy(
                         batch_size=1, raw=obs_dict,
                     )
-                    embed_dim = int(steervla_actor.encode_image_features(openpi_obs).shape[-1])
+                    residual_pi_feature_source = str(
+                        config.get("residual_pi_feature_source", "prefix")
+                    ).strip().lower()
+                    base_action_probe = np.zeros(
+                        (1, int(config.get("vla_action_horizon", 10)) * int(config.get("vla_action_dim", 4))),
+                        dtype=np.float32,
+                    )
+                    if residual_pi_feature_source == "prefix":
+                        embed_dim = int(steervla_actor.encode_prefix_features(openpi_obs).shape[-1])
+                    elif residual_pi_feature_source == "suffix":
+                        embed_dim = int(
+                            steervla_actor.encode_suffix_features(openpi_obs, base_action_probe).shape[-1]
+                        )
+                    else:
+                        raise ValueError(
+                            f"Unsupported residual_pi_feature_source={residual_pi_feature_source!r}; "
+                            "expected 'prefix' or 'suffix'."
+                        )
                 else:
                     obs_mode_cfg = str(config.get("observation_mode", "state"))
                     if obs_mode_cfg == "state":

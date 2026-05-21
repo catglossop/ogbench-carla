@@ -64,6 +64,8 @@ import gymnasium
 import numpy as np
 import yaml
 
+from ogbench.carla.reward_utils import compute_soft_penalty_reward, termination_crash_message
+
 
 def ensure_carla_python_api_on_path() -> None:
     """Prepend CARLA ``PythonAPI/carla`` so ``import agents`` and ``import carla`` match CARLA layouts."""
@@ -147,6 +149,7 @@ EGO_STATE_IDX_BRAKE = 18
 
 DEFAULT_CRASH_STUCK_SPEED_THRESHOLD = 0.1
 DEFAULT_CRASH_STUCK_STEPS = 20
+<<<<<<< Updated upstream
 DEFAULT_CRASH_STUCK_PENALTY = -1.0
 DEFAULT_COLLISION_EVENT_PENALTY = -5.0 # catastrophic - should update to make sure any contact is given negative reward
 DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -5.0 # should be pretty heavy
@@ -156,6 +159,12 @@ DEFAULT_PROGRESS_REWARD_WEIGHT = 1.0
 DEFAULT_STEER_PENALTY_WEIGHT = 0.05
 DEFAULT_BRAKE_PENALTY_WEIGHT = 0.02
 DEFAULT_SPEED_LIMIT_PENALTY_WEIGHT = 0.1
+=======
+DEFAULT_CRASH_STUCK_PENALTY = -20.0
+DEFAULT_COLLISION_EVENT_PENALTY = -20.0
+DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -20.0
+DEFAULT_SPEEDING_EVENT_PENALTY = -0.1
+>>>>>>> Stashed changes
 SUCCESS_BONUS = 5.0
 FAILURE_BONUS = -5.0
 CARLA_FPS = 20.0
@@ -696,6 +705,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._outside_route_event_penalty = float(
             self.carla_config.get("outside_route_event_penalty", DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY)
         )
+<<<<<<< Updated upstream
         self._progress_reward_weight = float(
             self.carla_config.get("progress_reward_weight", DEFAULT_PROGRESS_REWARD_WEIGHT)
         )
@@ -713,6 +723,10 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         )
         self._speed_limit_penalty_weight = float(
             self.carla_config.get("speed_limit_penalty_weight", DEFAULT_SPEED_LIMIT_PENALTY_WEIGHT)
+=======
+        self._speeding_event_penalty = float(
+            self.carla_config.get("speeding_event_penalty", DEFAULT_SPEEDING_EVENT_PENALTY)
+>>>>>>> Stashed changes
         )
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
@@ -727,7 +741,10 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._min_thresh_lat_dist = float(self.carla_config.get("min_thresh_lat_dist", 2.0))
         self._terminal_reward = float(self.carla_config.get("terminal_reward", 0.0))
         self._use_perc_progress = bool(self.carla_config.get("use_perc_progress", True))
+        self._use_soft_penalty_reward = bool(self.carla_config.get("use_soft_penalty_reward", False))
         self._speeding_infraction = bool(self.carla_config.get("speeding_infraction", False))
+        if self._use_soft_penalty_reward:
+            self._speeding_infraction = True
         self._comfort_infraction = bool(self.carla_config.get("comfort_infraction", False))
         self._route_progress_xyz: Optional[np.ndarray] = None
         self._route_progress_s: Optional[np.ndarray] = None
@@ -1375,6 +1392,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         if ego is not None:
             v = ego.get_velocity()
             speed = float(np.linalg.norm([v.x, v.y, v.z]))
+<<<<<<< Updated upstream
         lane_metrics = self._lane_alignment_metrics()
         lane_offset_m = float(lane_metrics["lane_offset_m"])
         heading_error_rad = float(lane_metrics["heading_error_rad"])
@@ -1400,24 +1418,72 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             - brake_pen
             - speed_limit_pen
         )
+=======
+        criteria = self._criteria_snapshot()
+        route_completion = self._route_completion_percent(criteria)
+        route_completion_delta = max(0.0, route_completion - self._last_route_completion)
+        self._last_route_completion = route_completion
+>>>>>>> Stashed changes
         info = self._info_with_sensors(
             {"scenario_tree_status": getattr(tree_status, "name", str(tree_status))}
         )
+
+        if self._use_soft_penalty_reward:
+            lane_metrics = self._lane_alignment_metrics()
+            soft_penalties = self._soft_penalty_state(lane_metrics=lane_metrics, speed_mps=speed)
+            terminal_state = self._terminal_state(
+                criteria=criteria,
+                lane_metrics=lane_metrics,
+                speed_mps=speed,
+                route_completion=route_completion,
+                base_terminated=terminated,
+            )
+            reward, terminated, reward_info = compute_soft_penalty_reward(
+                route_completion_delta=route_completion_delta,
+                soft_penalties=soft_penalties,
+                terminal_state=terminal_state,
+                use_perc_progress=self._use_perc_progress,
+            )
+            info.update(reward_info)
+            info["collision_count"] = self._collision_count()
+            info["blocked_ticks"] = self._blocked_ticks
+            info["lane_offset_m"] = float(lane_metrics["lane_offset_m"])
+            info["heading_error_rad"] = float(lane_metrics["heading_error_rad"])
+            info["lane_width_m"] = float(lane_metrics["lane_width_m"])
+            info["speed_limit_mps"] = float(lane_metrics["speed_limit_mps"])
+            info["route_completion"] = float(route_completion)
+            info["route_completion_delta"] = float(route_completion_delta)
+            if terminated:
+                crash_msg = termination_crash_message(terminal_state["termination_reason"])
+                self._finalize_route("Finished", crash_msg)
+            return float(reward), terminated, info
+
+        reward = 0.01 * speed
+        lane_metrics = self._lane_alignment_metrics()
         crash_stuck, collision_count = self._update_crash_stuck_state(speed)
         outside_route_value, _min_speed_value = self._route_infraction_values()
+        speed_limit_mps = float(lane_metrics["speed_limit_mps"])
+        overspeed_kmh = max(0.0, (speed - speed_limit_mps) * 3.6)
 
         collision_delta = max(0, collision_count - self._prev_collision_count)
         outside_route_delta = max(0.0, outside_route_value - self._prev_outside_route_value)
         self._prev_collision_count = collision_count
         self._prev_outside_route_value = outside_route_value
 
-        collision_pen = self._collision_event_penalty * float(collision_delta)
+        collision_contact_active = self._active_actor_collision_contact()
+        collision_penalty_active = collision_contact_active or (collision_delta > 0)
+        collision_pen = self._collision_event_penalty if collision_penalty_active else 0.0
         outside_route_pen = self._outside_route_event_penalty * float(outside_route_delta)
-        reward += collision_pen + outside_route_pen
+        speeding_pen = self._speeding_event_penalty * float(overspeed_kmh)
+        reward += collision_pen + outside_route_pen + speeding_pen
 
         info["collision_count"] = collision_count
         info["crash_stuck_ticks"] = self._crash_stuck_ticks
+        info["collision_penalty_active"] = bool(collision_penalty_active)
+        info["collision_contact_active"] = bool(collision_contact_active)
         info["outside_route_value"] = outside_route_value
+        info["speed_limit_mps"] = float(speed_limit_mps)
+        info["overspeed_kmh"] = float(overspeed_kmh)
         info["route_completion"] = float(route_completion)
         info["route_completion_delta"] = float(route_completion_delta)
         info["collision_delta"] = float(collision_delta)
@@ -1432,6 +1498,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         info["heading_factor"] = heading_factor
         info["penalty_collision"] = collision_pen
         info["penalty_outside_route"] = outside_route_pen
+<<<<<<< Updated upstream
         info["penalty_steer"] = -steer_pen
         info["penalty_brake"] = -brake_pen
         info["penalty_speed_limit"] = -speed_limit_pen
@@ -1439,6 +1506,11 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         # info["reward_centering"] = centering_reward
         # info["reward_heading"] = heading_reward
 
+=======
+        info["penalty_speeding"] = speeding_pen
+        info["reward_terminal"] = 0.0
+        info["reward_total"] = float(reward)
+>>>>>>> Stashed changes
         if crash_stuck:
             terminated = True
             reward += self._crash_stuck_penalty
@@ -2020,6 +2092,36 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                     continue
                 if self._obb_intersects(ego_bbox, actor_bbox):
                     return True
+        return False
+
+    def _active_actor_collision_contact(self) -> bool:
+        ego = self._ego_actor()
+        if ego is None:
+            return False
+        ego_bbox = self._bbox_at_prediction_step(ego, 0.0)
+        if ego_bbox is None:
+            return False
+        try:
+            actors = self.evaluator.world.get_actors()
+        except Exception:
+            return False
+        relevant_actors = [
+            actor
+            for actor in actors
+            if actor.id != ego.id and actor.is_alive and (
+                "vehicle" in actor.type_id
+                or "walker" in actor.type_id
+                or "static" in actor.type_id
+                or "traffic" in actor.type_id
+                or "prop" in actor.type_id
+            )
+        ]
+        for actor in relevant_actors:
+            actor_bbox = self._bbox_at_prediction_step(actor, 0.0)
+            if actor_bbox is None:
+                continue
+            if self._obb_intersects(ego_bbox, actor_bbox):
+                return True
         return False
 
     def _outside_lane_soft_violation(self, lane_metrics: Dict[str, Any]) -> bool:

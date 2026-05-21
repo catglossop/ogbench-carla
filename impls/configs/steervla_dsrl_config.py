@@ -40,8 +40,13 @@ def get_config():
     config.warmup_steps = 0
     # If True, use env.action_space.sample() during warmup instead of the policy.
     config.warmup_use_random_actions = False
+<<<<<<< Updated upstream
     config.updates_per_step = 10
     config.buffer_capacity = 1_000
+=======
+    config.updates_per_step = 1
+    config.buffer_capacity = 10_000
+>>>>>>> Stashed changes
     config.image_log_curr_interval = 10
     config.critic_action_dim = 4
     config.vla_action_dim = 4
@@ -72,14 +77,44 @@ def get_config():
     # language_label_dim is auto-set for commentary_bow / delta_commentary_bow in main_carla.py,
     # and critic_action_dim is used directly when mode is action_delta.
 
+    # Residual actor defaults (sac_residual / dagger_residual).
+    # scale=0.3 ≈ 2m correction capacity in DELTA_XY normalized space (7× phys).
+    config.residual_action_scale = 0.3
+    # alpha=0.3 provides reasonable entropy pressure for the 40-dim action space
+    # (action_horizon=10 * action_dim=4); higher than the default 0.1 used for
+    # smaller action spaces.
+    config.residual_alpha = 0.3
+    # Steps to execute pure Pi0 (zero residual) before enabling the MLP so
+    # random-init weights do not degrade driving quality from step 1.
+    config.residual_warmup_steps = 100
+    # Default residual input: frozen Pi prefix feature from the same conditioned
+    # transformer path used by direct DAgger, not a separately trained convnet.
+    config.residual_use_pi_image_features = True
+    # "prefix" matches the current default. "suffix" uses frozen action-suffix
+    # hidden states conditioned on the base action chunk.
+    config.residual_pi_feature_source = "prefix"
+    # Optional critic ablation: feed frozen Pi prefix features into the critic
+    # and noise_critic instead of DSRL's learned obs_encoder.
+    config.critic_use_pi_prefix_features = False
+
+    # Log VLA action distribution vs expert every N steps (0 = disabled).
+    config.steervla_debug_action_dist_interval = 300
+    config.steervla_debug_action_dist_num_samples = 32
+
     config.steervla = ml_collections.ConfigDict(
         dict(
             enabled=True,
             # Local OpenPI inference (ignored when actor_url is set):
+<<<<<<< Updated upstream
             actor_config="pi05_steervla_cot_simplified_reasoning",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
             checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260521_021239/6000",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning_20260512_144250/50000",
+=======
+            actor_config="pi05_steervla_cot_ki_inference",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
+            # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260521_021239/50000",
+>>>>>>> Stashed changes
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,
             include_ego_history=False,

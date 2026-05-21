@@ -880,6 +880,129 @@ class SteerVLAActor:
         pooled = jnp.sum(tokens * masks[..., None], axis=1) / denom
         return jax.lax.stop_gradient(pooled)
 
+    def encode_prefix_features(
+        self,
+        observation: _openpi_model.Observation,
+    ) -> jax.Array:
+        """Return a frozen Pi prefix feature aligned with direct-action conditioning.
+
+        Unlike :meth:`encode_image_features`, this runs the full frozen prefix
+        path used by direct DAgger: image tokens plus prompt/reasoning/subtask
+        through the Pi transformer, then mean-pools the valid prefix hidden
+        states into one feature vector per batch row.
+        """
+        if self._remote is not None:
+            raise RuntimeError("Pi prefix features are not available in remote SteerVLAActor mode.")
+        if self.model is None or self._jax_device is None:
+            raise RuntimeError("Local SteerVLA model is not initialized.")
+
+        obs_jax = jax.tree.map(
+            lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
+            observation,
+        )
+        obs_proc = _openpi_model.preprocess_observation(
+            None,
+            obs_jax,
+            train=False,
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+
+        img_tokens, img_masks, img_ar = self.model._embed_images(obs_proc)
+        prompt_emb = self.model._embed_text_tokens(obs_proc.tokenized_prompt)
+        prompt_mask = obs_proc.tokenized_prompt_mask
+        n_prompt = prompt_emb.shape[1]
+
+        reasoning_emb = self.model._embed_text_tokens(obs_proc.tokenized_reasoning)
+        reasoning_mask = obs_proc.tokenized_reasoning_mask
+        n_reasoning = reasoning_emb.shape[1]
+
+        subtask_emb = self.model._embed_text_tokens(obs_proc.tokenized_subtask)
+        subtask_mask = obs_proc.tokenized_subtask_mask
+        n_subtask = subtask_emb.shape[1]
+
+        prefix_tokens = jnp.concatenate(
+            img_tokens + [prompt_emb, reasoning_emb, subtask_emb], axis=1,
+        )
+        prefix_mask = jnp.concatenate(
+            img_masks + [prompt_mask, reasoning_mask, subtask_mask], axis=1,
+        )
+        prefix_ar = jnp.array(
+            img_ar + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask
+        )
+
+        prefix_attn_mask = _openpi_pi0.make_attn_mask(prefix_mask, prefix_ar)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), _kv_cache = self.model.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=prefix_attn_mask,
+            positions=positions,
+        )
+
+        prefix_mask_f = prefix_mask.astype(prefix_out.dtype)
+        denom = jnp.maximum(prefix_mask_f.sum(axis=1, keepdims=True), 1.0)
+        pooled = jnp.sum(prefix_out * prefix_mask_f[..., None], axis=1) / denom
+        return jax.lax.stop_gradient(pooled)
+
+    def encode_suffix_features(
+        self,
+        observation: _openpi_model.Observation,
+        base_action: jax.Array | np.ndarray,
+    ) -> jax.Array:
+        """Return a frozen Pi suffix/action-head feature for each batch row.
+
+        This reuses the same frozen prefix context as direct DAgger, then runs
+        the Pi action suffix stack conditioned on the current base action chunk.
+        The returned feature is the pooled hidden state over the final action
+        suffix tokens immediately before ``action_out_proj``.
+        """
+        if self._remote is not None:
+            raise RuntimeError("Pi suffix features are not available in remote SteerVLAActor mode.")
+        if self.model is None or self._jax_device is None:
+            raise RuntimeError("Local SteerVLA model is not initialized.")
+
+        obs_jax = jax.tree.map(
+            lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
+            observation,
+        )
+        obs_proc, kv_cache, prefix_mask, prefix_mask_no_reasoning = self._build_frozen_prefix_cache(
+            self.model, obs_jax,
+        )
+
+        base_action_np = np.asarray(base_action, dtype=np.float32)
+        padded_action = _pad_action_chunk_to_model_numpy(
+            base_action_np,
+            src_action_horizon=int(self.action_horizon),
+            src_action_dim=int(self.action_dim),
+            dst_action_horizon=int(self.model.action_horizon),
+            dst_action_dim=int(self.model.action_dim),
+        )
+        x_t = jax.device_put(jnp.asarray(padded_action), self._jax_device)
+        # Use a tiny fixed diffusion time so the suffix stack sees a nearly-final
+        # action chunk while remaining in-distribution for the time embedding.
+        time = jnp.full((x_t.shape[0],), 1e-3, dtype=jnp.float32)
+
+        suffix_tokens, suffix_mask, suffix_ar_list, adarms_cond = self.model._embed_action_suffix(
+            obs_proc, x_t, time,
+        )
+        suffix_ar = jnp.array(suffix_ar_list)
+        suffix_attn_mask = _openpi_pi0.make_attn_mask(suffix_mask, suffix_ar)
+        action_to_prefix = einops.repeat(
+            prefix_mask_no_reasoning, "b p -> b s p", s=suffix_tokens.shape[1],
+        )
+        full_attn_mask = jnp.concatenate([action_to_prefix, suffix_attn_mask], axis=-1)
+        positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+
+        (_, suffix_out), _ = self.model.PaliGemma.llm(
+            [None, suffix_tokens],
+            mask=full_attn_mask,
+            positions=positions,
+            kv_cache=kv_cache,
+            adarms_cond=[None, adarms_cond],
+        )
+        action_hidden = suffix_out[:, -int(self.model.action_horizon) :]
+        pooled = jnp.mean(action_hidden, axis=1)
+        return jax.lax.stop_gradient(pooled)
+
     def _suffix_only_direct_dagger_loss(
         self,
         model,

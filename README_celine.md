@@ -27,4 +27,10 @@ pkill -f 'CarlaUE4.*12020'
     --x-display-num 34
 
 
-    
+./run_carla.sh \
+    --train-gpu 4 \
+    --render-adapter 2 \
+    --carla-port 12044 \
+    --carla-streaming-port 12048 \
+    --tm-port 18049 \
+    --x-display-num 31

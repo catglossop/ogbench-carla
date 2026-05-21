@@ -194,9 +194,8 @@ def _joint_dagger_apply_step(
 
     Same loss as :func:`_dagger_actor_apply_step`, but the gradient also flows
     through DSRL's observation encoder (so its image CNN learns features useful
-    for residual prediction). Non-encoder DSRL params receive **zero gradient**
-    and are therefore left effectively unchanged by Adam — but the call still
-    advances DSRL's optimizer state, which is fine for our purposes.
+    for residual prediction). Non-encoder DSRL params receive zero gradient;
+    their Adam moments are zeroed out too so the optimizer state stays clean.
     """
 
     def loss_fn(params):
@@ -227,7 +226,15 @@ def _joint_dagger_apply_step(
         (dsrl_network.params, residual_network.params)
     )
     g_dsrl, g_res = grads
-    new_dsrl = dsrl_network.apply_gradients(grads=g_dsrl)
+
+    # Zero out gradients for all DSRL modules except obs_encoder so Adam's
+    # moment estimates for flow / noise_actor / critic stay intact.
+    def _mask_encoder_only(path, g):
+        key = path[0].key if hasattr(path[0], "key") else str(path[0])
+        return g if key == "modules_obs_encoder" else jnp.zeros_like(g)
+
+    g_dsrl_masked = jax.tree_util.tree_map_with_path(_mask_encoder_only, g_dsrl)
+    new_dsrl = dsrl_network.apply_gradients(grads=g_dsrl_masked)
     new_residual = residual_network.apply_gradients(grads=g_res)
     return new_dsrl, new_residual, info
 
@@ -412,14 +419,21 @@ def get_config():
             lr=3e-4,
             residual_lr=3e-4,
             residual_actor_hidden_dims=(256, 256),
-            residual_action_scale=0.1,
-            residual_alpha=0.1,
-            residual_log_std_min=-20.0,
+            # 0.3 ≈ 2m correction capacity in DELTA_XY normalized space (7× scale);
+            # the reference policy_decorator uses 0.2 for simpler envs.
+            residual_action_scale=0.3,
+            residual_alpha=0.3,
+            # Consistent with create() default (-5.0 prevents extreme log-stds).
+            residual_log_std_min=-5.0,
             residual_log_std_max=2.0,
             residual_layer_norm=False,
             layer_norm=False,
             vla_action_dim=4,
             vla_action_horizon=10,
             action_horizon=10,
+            # Env steps to execute pure Pi0 (zero residual) before applying the
+            # residual MLP. Prevents random-init residual from corrupting the
+            # base policy before any useful gradient signal has accumulated.
+            residual_warmup_steps=500,
         )
     )

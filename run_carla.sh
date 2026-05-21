@@ -9,6 +9,7 @@ ONLINE_STEPS="50000"
 SEED="0"
 RUN_GROUP="Debug"
 SAVE_BUFFER="true"
+BUFFER_CAPACITY=""
 EXPERT_DEBUG="false"
 EXPERT_RECOVER_DEBUG="false"
 WANDB_MODE="${WANDB_MODE:-online}"
@@ -25,6 +26,8 @@ X_DISPLAY_NUM=""
 CRITIC_MODE="delta"
 TRAIN_MODE="rl"
 DAGGER_RESIDUAL_TRAIN_OBS_ENCODER="false"
+CRITIC_USE_PI_PREFIX_FEATURES=""
+REWARD_MODE="event"
 
 BASE_AGENT_CFG="impls/configs/steervla_dsrl_config.py"
 BASE_CARLA_CFG="impls/configs/carla_config.yaml"
@@ -42,6 +45,7 @@ Options:
   --seed N                  Random seed. Default: 0
   --run-group NAME          W&B / experiment group. Default: Debug
   --save-buffer BOOL        true|false. Default: true
+  --buffer-capacity N       Replay buffer size. Default: value in agent config (1000)
   --expert-debug BOOL       true|false. Default: false
   --expert-recover-debug BOOL  true|false. Default: false
   --wandb-mode MODE         online|offline|disabled. Default: WANDB_MODE or offline
@@ -65,6 +69,15 @@ Options:
 
   --train-mode MODE         rl|dagger|dagger_direct|sac_direct|sac_residual|dagger_residual. Default: dagger
   --train-obs-encoder BOOL  true|false. Sets agent.dagger_residual_train_obs_encoder. Default: false
+  --critic-pi-prefix BOOL   true|false. Overrides agent.critic_use_pi_prefix_features.
+                            Default: config default
+
+  --reward-mode MODE        one of:
+                              event         -> event-based reward (collision/outside-route deltas
+                                              plus speed-limit penalty)
+                              soft-penalty  -> ca5be36 soft-penalty reward (progress * factors);
+                                              speed-limit penalty is automatically enabled
+                            Default: event
 
   --agent-config PATH       Base agent config. Default: impls/configs/steervla_dsrl_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
@@ -89,6 +102,7 @@ while [[ $# -gt 0 ]]; do
     --seed) SEED="$2"; shift 2 ;;
     --run-group) RUN_GROUP="$2"; shift 2 ;;
     --save-buffer) SAVE_BUFFER="$2"; shift 2 ;;
+    --buffer-capacity) BUFFER_CAPACITY="$2"; shift 2 ;;
     --expert-debug) EXPERT_DEBUG="$2"; shift 2 ;;
     --expert-recover-debug) EXPERT_RECOVER_DEBUG="$2"; shift 2 ;;
     --wandb-mode) WANDB_MODE="$2"; shift 2 ;;
@@ -103,6 +117,8 @@ while [[ $# -gt 0 ]]; do
     --critic-mode) CRITIC_MODE="$2"; shift 2 ;;
     --train-mode) TRAIN_MODE="$2"; shift 2 ;;
     --train-obs-encoder) DAGGER_RESIDUAL_TRAIN_OBS_ENCODER="$2"; shift 2 ;;
+    --critic-pi-prefix) CRITIC_USE_PI_PREFIX_FEATURES="$2"; shift 2 ;;
+    --reward-mode) REWARD_MODE="$2"; shift 2 ;;
     --agent-config) BASE_AGENT_CFG="$2"; shift 2 ;;
     --carla-config) BASE_CARLA_CFG="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -145,6 +161,26 @@ case "$DAGGER_RESIDUAL_TRAIN_OBS_ENCODER" in
     ;;
 esac
 
+if [[ -n "$CRITIC_USE_PI_PREFIX_FEATURES" ]]; then
+  case "$CRITIC_USE_PI_PREFIX_FEATURES" in
+    true|false) ;;
+    *)
+      echo "Invalid --critic-pi-prefix: $CRITIC_USE_PI_PREFIX_FEATURES" >&2
+      echo "Expected one of: true, false" >&2
+      exit 2
+      ;;
+  esac
+fi
+
+case "$REWARD_MODE" in
+  event|soft-penalty) ;;
+  *)
+    echo "Invalid --reward-mode: $REWARD_MODE" >&2
+    echo "Expected one of: event, soft-penalty" >&2
+    exit 2
+    ;;
+esac
+
 TMP_ROOT="$ROOT_DIR/.run_carla"
 mkdir -p "$TMP_ROOT"
 TMP_DIR="$(mktemp -d "$TMP_ROOT/run.XXXXXX")"
@@ -180,6 +216,8 @@ def get_config():
     config.critic_feedback_mode = "${CRITIC_FEEDBACK_MODE}"
     config.online_training_mode = "${TRAIN_MODE}"
     config.dagger_residual_train_obs_encoder = ${DAGGER_RESIDUAL_TRAIN_OBS_ENCODER^}
+$(if [[ -n "$CRITIC_USE_PI_PREFIX_FEATURES" ]]; then echo "    config.critic_use_pi_prefix_features = ${CRITIC_USE_PI_PREFIX_FEATURES^}"; fi)
+$(if [[ -n "$BUFFER_CAPACITY" ]]; then echo "    config.buffer_capacity = ${BUFFER_CAPACITY}"; fi)
     if config.critic_feedback_mode == "none":
         config.language_label_dim = 0
     return config
@@ -198,20 +236,24 @@ cfg["traffic_manager_port"] = int("${TM_PORT}")
 cfg["gpu_rank"] = int("${SIM_GPU_RANK}")
 cfg["x_display_num"] = int("${X_DISPLAY_NUM}")
 cfg["use_cuda_visible_devices"] = False
+cfg["use_soft_penalty_reward"] = "${REWARD_MODE}" == "soft-penalty"
 Path(r"${CARLA_CFG_TMP}").write_text(yaml.safe_dump(cfg, sort_keys=False))
 EOF
 
 echo "[run_carla.sh] route=${ROUTE}"
 echo "[run_carla.sh] train_mode=${TRAIN_MODE}"
 echo "[run_carla.sh] critic_mode=${CRITIC_MODE}"
+echo "[run_carla.sh] critic_pi_prefix=${CRITIC_USE_PI_PREFIX_FEATURES:-<config default>}"
+echo "[run_carla.sh] reward_mode=${REWARD_MODE}"
 echo "[run_carla.sh] train_obs_encoder=${DAGGER_RESIDUAL_TRAIN_OBS_ENCODER}"
 echo "[run_carla.sh] wandb_run_name=${WANDB_RUN_NAME}"
 echo "[run_carla.sh] train_gpu_rank=${TRAIN_GPU_RANK} render_adapter=${SIM_GPU_RANK}"
 echo "[run_carla.sh] carla_host=${CARLA_HOST} carla_port=${CARLA_PORT} streaming_port=${CARLA_STREAMING_PORT} tm_port=${TM_PORT} x_display=:${X_DISPLAY_NUM}"
-echo "[run_carla.sh] expert_debug=${EXPERT_DEBUG} expert_recover_debug=${EXPERT_RECOVER_DEBUG} save_buffer=${SAVE_BUFFER} online_steps=${ONLINE_STEPS}"
+echo "[run_carla.sh] expert_debug=${EXPERT_DEBUG} expert_recover_debug=${EXPERT_RECOVER_DEBUG} save_buffer=${SAVE_BUFFER} buffer_capacity=${BUFFER_CAPACITY:-<config default>} online_steps=${ONLINE_STEPS}"
 echo "[run_carla.sh] temp agent config: ${AGENT_CFG_TMP}"
 echo "[run_carla.sh] temp carla config: ${CARLA_CFG_TMP}"
 
+XLA_FLAGS="${XLA_FLAGS:+${XLA_FLAGS} }--xla_gpu_autotune_level=2" \
 WANDB_MODE="${WANDB_MODE}" WANDB_RUN_NAME="${WANDB_RUN_NAME}" uv run python impls/main_carla.py \
   --agent="${AGENT_CFG_TMP}" \
   --carla_config="${CARLA_CFG_TMP}" \
