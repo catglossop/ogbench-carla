@@ -10,7 +10,9 @@ implement ``vla_sample_fn`` for :class:`jax_agents.dsrl.DSRLAgent.sample_actions
 Uses ``openpi.models.pi0_cot.Pi0CoT.sample_cot`` then ``sample_actions`` (see
 ``openpi/visualizing/steervla_visualization.py``). Prompt layout follows
 :class:`openpi.models.tokenizer.CoTPaligemmaTokenizer` (``Prompt:...;State:...``
-through ``<start_of_reasoning>``).
+through ``<start_of_reasoning>``). When ``Pi0CoTConfig.use_fast_tokens`` is enabled,
+``sample_cot`` autoregressively generates FAST action tokens; ``sample_actions`` attends
+to subtask + FAST (not reasoning).
 
 Routing text mirrors ``SteerVLAInputs`` / ``simlingo/team_code/agent_steervla.py``:
 ``The current speed is X m/s. <routing_command>``. Continuous ``Observation.state``
@@ -220,18 +222,141 @@ def _observation_has_cot_tokens(observation: _openpi_model.Observation) -> bool:
         return False
 
 
+def _merge_cot_output_into_observation(
+    openpi_observation: _openpi_model.Observation,
+    cot_out: dict[str, Any],
+) -> _openpi_model.Observation:
+    """Attach sampled reasoning/subtask/FAST tokens for ``sample_actions``."""
+    obs_full = dataclasses.replace(
+        openpi_observation,
+        tokenized_reasoning=cot_out["tokenized_reasoning"],
+        tokenized_reasoning_mask=cot_out["tokenized_reasoning_mask"],
+        tokenized_subtask=cot_out["tokenized_subtask"],
+        tokenized_subtask_mask=cot_out["tokenized_subtask_mask"],
+    )
+    if "tokenized_fast" in cot_out and "tokenized_fast_mask" in cot_out:
+        obs_full = dataclasses.replace(
+            obs_full,
+            tokenized_fast=cot_out["tokenized_fast"],
+            tokenized_fast_mask=cot_out["tokenized_fast_mask"],
+        )
+    return obs_full
+
+
+def _model_uses_fast_tokens(model_cfg: Pi0CoTConfig | None) -> bool:
+    return bool(model_cfg is not None and getattr(model_cfg, "use_fast_tokens", False))
+
+
+def _pad_action_chunk_for_fast(actions: np.ndarray, *, model_action_dim: int) -> np.ndarray:
+    """Pad a single normalized action chunk ``(H, D)`` to Pi0 ``action_dim``."""
+    chunk = np.asarray(actions, dtype=np.float32)
+    if chunk.ndim == 1:
+        chunk = chunk.reshape(-1, model_action_dim)
+    pad_dim = int(model_action_dim) - int(chunk.shape[-1])
+    if pad_dim > 0:
+        chunk = np.pad(chunk, [(0, 0), (0, pad_dim)], mode="constant")
+    return chunk
+
+
+def _tokenize_fast_actions_batch(
+    tokenizer: CoTPaligemmaTokenizer,
+    actions: np.ndarray,
+    *,
+    model_action_dim: int,
+    action_horizon: int,
+    action_dim: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Tokenize normalized action chunks into FAST PaliGemma token buffers."""
+    if not tokenizer.use_fast_tokens:
+        raise RuntimeError("FAST tokenizer is disabled on CoTPaligemmaTokenizer.")
+    actions = np.asarray(actions, dtype=np.float32)
+    ah = int(action_horizon)
+    ad = int(action_dim)
+    flat_dim = ah * ad
+
+    if actions.ndim == 1:
+        if int(actions.size) != flat_dim:
+            raise ValueError(
+                f"Expected flat action length {flat_dim} (= {ah}×{ad}), got {actions.size}."
+            )
+        actions = actions.reshape(1, ah, ad)
+    elif actions.ndim == 2:
+        if int(actions.shape[-1]) == flat_dim:
+            # Replay batches store flattened chunks as (B, H*D).
+            actions = actions.reshape(int(actions.shape[0]), ah, ad)
+        elif actions.shape == (ah, ad):
+            actions = actions[None, ...]
+        else:
+            raise ValueError(
+                f"Expected actions shape (B, {flat_dim}), ({ah}, {ad}), or (B, {ah}, {ad}); "
+                f"got {actions.shape}."
+            )
+    elif actions.ndim == 3:
+        if int(actions.shape[-2]) != ah or int(actions.shape[-1]) != ad:
+            raise ValueError(
+                f"Expected actions shape (B, {ah}, {ad}); got {actions.shape}."
+            )
+    else:
+        raise ValueError(f"Expected 1D–3D actions array; got ndim={actions.ndim}.")
+
+    batch_size = int(actions.shape[0])
+    fast_len = int(tokenizer.max_fast_len)
+    fast = np.zeros((batch_size, fast_len), dtype=np.int32)
+    fast_mask = np.zeros((batch_size, fast_len), dtype=bool)
+    for i in range(batch_size):
+        row = _pad_action_chunk_for_fast(actions[i], model_action_dim=model_action_dim)
+        tok, mask = tokenizer.tokenize_fast_actions(row)
+        fast[i] = tok
+        fast_mask[i] = mask
+    return fast, fast_mask
+
+
+def _fast_arrays_from_raw(
+    raw: dict[str, Any] | None,
+    *,
+    batch_size: int,
+    fast_len: int,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Read FAST token buffers from a CARLA/raw obs dict when present."""
+    if raw is None or not isinstance(raw, dict):
+        return None, None
+    fast_src = raw.get("openpi_tokenized_fast")
+    if fast_src is None:
+        fast_src = raw.get("fast")
+    if fast_src is None:
+        return None, None
+    fast_arr = np.asarray(fast_src, dtype=np.int32).reshape(-1)
+    mask_src = raw.get("openpi_tokenized_fast_mask")
+    if mask_src is None:
+        mask_src = raw.get("fast_mask")
+    if mask_src is not None:
+        mask_arr = np.asarray(mask_src, dtype=bool).reshape(-1)
+    else:
+        mask_arr = fast_arr != 0
+    n = min(fast_len, fast_arr.size)
+    fast = np.zeros((batch_size, fast_len), dtype=np.int32)
+    fast_mask = np.zeros((batch_size, fast_len), dtype=bool)
+    fast[:, :n] = fast_arr[:n]
+    fast_mask[:, :n] = mask_arr[:n]
+    return fast, fast_mask
+
+
 def with_replay_cot_tokens(
-openpi_observation: _openpi_model.Observation,
+    openpi_observation: _openpi_model.Observation,
     replay_batch: dict[str, Any],
     *,
     prefix: str = "",
 ) -> _openpi_model.Observation:
-    """Overlay replay-stored CoT tokens onto an OpenPI observation when present."""
+    """Overlay replay-stored CoT / FAST tokens onto an OpenPI observation when present."""
     rk = f"{prefix}reasoning"
     rmk = f"{prefix}reasoning_mask"
     sk = f"{prefix}subtask"
     smk = f"{prefix}subtask_mask"
-    if rk not in replay_batch and sk not in replay_batch:
+    fk = f"{prefix}openpi_tokenized_fast"
+    fmk = f"{prefix}openpi_tokenized_fast_mask"
+    has_cot = rk in replay_batch or sk in replay_batch
+    has_fast = fk in replay_batch or f"{prefix}fast" in replay_batch
+    if not has_cot and not has_fast:
         return openpi_observation
 
     reasoning = jnp.asarray(replay_batch.get(rk, openpi_observation.tokenized_reasoning), dtype=jnp.int32)
@@ -246,13 +371,57 @@ openpi_observation: _openpi_model.Observation,
     else:
         subtask_mask = subtask != 0
 
-    return dataclasses.replace(
+    out = dataclasses.replace(
         openpi_observation,
         tokenized_reasoning=reasoning,
         tokenized_reasoning_mask=reasoning_mask,
         tokenized_subtask=subtask,
         tokenized_subtask_mask=subtask_mask,
     )
+    fast_src = replay_batch.get(fk, replay_batch.get(f"{prefix}fast"))
+    if fast_src is None:
+        return out
+    fast = jnp.asarray(fast_src, dtype=jnp.int32)
+    fast_mask_src = replay_batch.get(fmk, replay_batch.get(f"{prefix}fast_mask"))
+    if fast_mask_src is not None:
+        fast_mask = jnp.asarray(fast_mask_src, dtype=bool)
+    else:
+        fast_mask = fast != 0
+    return dataclasses.replace(
+        out,
+        tokenized_fast=fast,
+        tokenized_fast_mask=fast_mask,
+    )
+
+
+def openpi_replay_fields_from_observation(
+    obs_struct: _openpi_model.Observation,
+    *,
+    include_legacy_cot_keys: bool = True,
+) -> dict[str, np.ndarray]:
+    """Serialize OpenPI observation token/image/state fields for replay storage."""
+    out: dict[str, np.ndarray] = {
+        "openpi_image_base_0_rgb": np.asarray(obs_struct.images["base_0_rgb"][0], dtype=np.uint8),
+        "openpi_image_mask_base_0_rgb": np.asarray(obs_struct.image_masks["base_0_rgb"][0], dtype=bool),
+        "openpi_state": np.asarray(obs_struct.state[0], dtype=np.float32),
+        "openpi_tokenized_prompt": np.asarray(obs_struct.tokenized_prompt[0], dtype=np.int32),
+        "openpi_tokenized_prompt_mask": np.asarray(obs_struct.tokenized_prompt_mask[0], dtype=bool),
+        "openpi_tokenized_reasoning": np.asarray(obs_struct.tokenized_reasoning[0], dtype=np.int32),
+        "openpi_tokenized_reasoning_mask": np.asarray(obs_struct.tokenized_reasoning_mask[0], dtype=bool),
+        "openpi_tokenized_subtask": np.asarray(obs_struct.tokenized_subtask[0], dtype=np.int32),
+        "openpi_tokenized_subtask_mask": np.asarray(obs_struct.tokenized_subtask_mask[0], dtype=bool),
+    }
+    if obs_struct.tokenized_fast is not None and obs_struct.tokenized_fast_mask is not None:
+        out["openpi_tokenized_fast"] = np.asarray(obs_struct.tokenized_fast[0], dtype=np.int32)
+        out["openpi_tokenized_fast_mask"] = np.asarray(obs_struct.tokenized_fast_mask[0], dtype=bool)
+        out["fast"] = out["openpi_tokenized_fast"]
+        out["fast_mask"] = out["openpi_tokenized_fast_mask"]
+    if include_legacy_cot_keys:
+        out["reasoning"] = out["openpi_tokenized_reasoning"]
+        out["reasoning_mask"] = out["openpi_tokenized_reasoning_mask"]
+        out["subtask"] = out["openpi_tokenized_subtask"]
+        out["subtask_mask"] = out["openpi_tokenized_subtask_mask"]
+    return out
 
 
 def _batch_has_openpi_replay_fields(replay_batch: dict[str, Any], *, prefix: str = "") -> bool:
@@ -324,6 +493,18 @@ def openpi_observation_from_replay_batch(
         else (subtask != 0)
     )
 
+    fast = None
+    fast_mask = None
+    fast_src = _get("openpi_tokenized_fast", "fast")
+    if fast_src is not None:
+        fast = jnp.asarray(fast_src, dtype=jnp.int32)
+        fast_mask_src = _get("openpi_tokenized_fast_mask", "fast_mask")
+        fast_mask = (
+            jnp.asarray(fast_mask_src, dtype=bool)
+            if fast_mask_src is not None
+            else (fast != 0)
+        )
+
     data = {
         "image": images,
         "image_mask": image_masks,
@@ -335,6 +516,9 @@ def openpi_observation_from_replay_batch(
         "tokenized_subtask": subtask,
         "tokenized_subtask_mask": subtask_mask,
     }
+    if fast is not None and fast_mask is not None:
+        data["tokenized_fast"] = fast
+        data["tokenized_fast_mask"] = fast_mask
     return _openpi_model.Observation.from_dict(data)
 
 def _maybe_set_jax_default_gpu(training_gpu_rank: int) -> None:
@@ -491,6 +675,8 @@ class SteerVLAActor:
             max_prompt_len=model_cfg.max_token_len,
             max_subtask_len=model_cfg.max_subtask_len,
             max_reasoning_len=model_cfg.max_reasoning_len,
+            max_fast_len=model_cfg.max_fast_len,
+            use_fast_tokens=bool(getattr(model_cfg, "use_fast_tokens", False)),
         )
         self.model_cfg = model_cfg
         self._refresh_compiled_inference_fns()
@@ -749,20 +935,14 @@ class SteerVLAActor:
         self.model = nnx.merge(self._direct_dagger_graphdef, full_state)
     
     def flow_sample(self, rng, openpi_observation, input_noise):
-        
-        if _observation_has_cot_tokens(openpi_observation):
-            print(f"[DEBUG - steervla] Using stored CoT")
-            obs_full = openpi_observation
-        else:
-            cot_out = self._sample_cot(
-                rng,
-                openpi_observation,
-                temperature=float(self.cot_temperature),
-                image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-            )
-            obs_full = dataclasses.replace(
-                openpi_observation, 
-                tokenized_reasoning=cot_out["tokenized_reasoning"], tokenized_reasoning_mask=cot_out["tokenized_reasoning_mask"], tokenized_subtask=cot_out["tokenized_subtask"], tokenized_subtask_mask=cot_out["tokenized_subtask_mask"])
+        # Always run sample_cot so reasoning/subtask/FAST tokens match the current prompt.
+        cot_out = self._sample_cot(
+            rng,
+            openpi_observation,
+            temperature=float(self.cot_temperature),
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+        obs_full = _merge_cot_output_into_observation(openpi_observation, cot_out)
         
         # Construct the noise
         batch_size = int(openpi_observation.state.shape[0])
@@ -856,41 +1036,14 @@ class SteerVLAActor:
         prompt_detokenized = self.tokenizer._tokenizer.decode(valid.tolist())
         print(f"[DEBUG - steervla] Prompt text: {prompt_detokenized}")
         
-        # Optional CoT fields carried in raw obs holder from previous VLA inference.
         reasoning_len = int(self.model_cfg.max_reasoning_len)
         subtask_len = int(self.model_cfg.max_subtask_len)
+        # Do not preload stale CoT/FAST from raw; sample_cot generates fresh tokens each query.
         reasoning = np.zeros((batch_size, reasoning_len), dtype=np.int32)
         reasoning_mask = np.zeros((batch_size, reasoning_len), dtype=bool)
         subtask = np.zeros((batch_size, subtask_len), dtype=np.int32)
         subtask_mask = np.zeros((batch_size, subtask_len), dtype=bool)
 
-        if isinstance(raw, dict):
-            rr = raw.get("reasoning")
-            rrm = raw.get("reasoning_mask")
-            ss = raw.get("subtask")
-            ssm = raw.get("subtask_mask")
-            if rr is not None:
-                rr_arr = np.asarray(rr, dtype=np.int32).reshape(-1)
-                n = min(reasoning_len, rr_arr.size)
-                reasoning[:, :n] = rr_arr[:n]
-            if rrm is not None:
-                rrm_arr = np.asarray(rrm, dtype=bool).reshape(-1)
-                n = min(reasoning_len, rrm_arr.size)
-                reasoning_mask[:, :n] = rrm_arr[:n]
-            else:
-                reasoning_mask = reasoning != 0
-            if ss is not None:
-                ss_arr = np.asarray(ss, dtype=np.int32).reshape(-1)
-                n = min(subtask_len, ss_arr.size)
-                subtask[:, :n] = ss_arr[:n]
-            if ssm is not None:
-                ssm_arr = np.asarray(ssm, dtype=bool).reshape(-1)
-                n = min(subtask_len, ssm_arr.size)
-                subtask_mask[:, :n] = ssm_arr[:n]
-            else:
-                subtask_mask = subtask != 0
-
-        # Single base camera only (see CARLA_STEERVLA_IMAGE_KEYS + Pi0CoT ``image_keys``).
         data = {
             "image": {
                 "base_0_rgb": img,
@@ -923,9 +1076,54 @@ class SteerVLAActor:
             raw["subtask_mask"] = subtask_mask
             raw["reasoning_text"] = self.tokenizer._tokenizer.decode(reason_tokens[reason_mask].tolist())
             raw["subtask_text"] = self.tokenizer._tokenizer.decode(subtask_tokens[subtask_mask].tolist())
+            if "tokenized_fast" in cot_out and "tokenized_fast_mask" in cot_out:
+                fast_tokens = np.asarray(jax.device_get(cot_out["tokenized_fast"][0]), dtype=np.int32)
+                fast_mask = np.asarray(jax.device_get(cot_out["tokenized_fast_mask"][0]), dtype=bool)
+                raw["openpi_tokenized_fast"] = fast_tokens
+                raw["openpi_tokenized_fast_mask"] = fast_mask
+                raw["fast"] = fast_tokens
+                raw["fast_mask"] = fast_mask
         except Exception:
             # Keep rollout robust if CoT payload changes shape unexpectedly.
             return
+
+    def attach_replay_tokens(
+        self,
+        openpi_observation: _openpi_model.Observation,
+        replay_batch: dict[str, Any],
+        *,
+        prefix: str = "",
+    ) -> _openpi_model.Observation:
+        """Overlay replay CoT/FAST tokens; tokenize FAST from actions when needed."""
+        obs = with_replay_cot_tokens(openpi_observation, replay_batch, prefix=prefix)
+        if not _model_uses_fast_tokens(self.model_cfg) or self.tokenizer is None:
+            return obs
+        if obs.tokenized_fast is not None:
+            try:
+                if bool(jnp.any(jnp.asarray(obs.tokenized_fast_mask))):
+                    return obs
+            except Exception:
+                pass
+        actions_key = f"{prefix}openpi_actions"
+        if actions_key not in replay_batch:
+            actions_key = f"{prefix}actions" if f"{prefix}actions" in replay_batch else "actions"
+        if actions_key not in replay_batch:
+            return obs
+        try:
+            fast, fast_mask = _tokenize_fast_actions_batch(
+                self.tokenizer,
+                np.asarray(replay_batch[actions_key]),
+                model_action_dim=int(self.model_cfg.action_dim),
+                action_horizon=int(self.action_horizon),
+                action_dim=int(self.action_dim),
+            )
+        except Exception:
+            return obs
+        return dataclasses.replace(
+            obs,
+            tokenized_fast=jnp.asarray(fast, dtype=jnp.int32),
+            tokenized_fast_mask=jnp.asarray(fast_mask, dtype=bool),
+        )
 
     def _shift_cached_action_chunk(self, action: np.ndarray, step: int) -> np.ndarray:
         flat = np.asarray(action, dtype=np.float32)
@@ -1244,9 +1442,13 @@ class SteerVLAActor:
         subtask_valid = subtask_tokens[subtask_mask.astype(bool)]
         subtask_text = self.tokenizer._tokenizer.decode(subtask_valid.tolist())
         print(f"[DEBUG - steervla] Subtask text: {subtask_text}")
+        if "tokenized_fast" in cot_out and self.tokenizer.use_fast_tokens:
+            fast_tokens = cot_out["tokenized_fast"]
+            fast_mask = cot_out["tokenized_fast_mask"]
+            fast_valid = fast_tokens[fast_mask.astype(bool)]
+            fast_text = self.tokenizer._tokenizer.decode(fast_valid.tolist())
+            print(f"[DEBUG - steervla] FAST segment ({int(jnp.sum(fast_mask))} tok): {fast_text[:120]}")
         
-        
-       
         # Keep latest generated CoT in raw holder (batch-1 online CARLA path).
         if batch_size == 1:
             if raw is not None:
@@ -1254,14 +1456,7 @@ class SteerVLAActor:
             elif self.raw_obs_holder is not None and isinstance(self.raw_obs_holder.get("obs"), dict):
                 self._stash_cot_in_raw(self.raw_obs_holder["obs"], cot_out)
 
-        # Replace the reasoning, reasoning mask, subtask, and subtask mask in the observation
-        obs_full = dataclasses.replace(
-            obs_jax,
-            tokenized_reasoning=cot_out["tokenized_reasoning"],
-            tokenized_reasoning_mask=cot_out["tokenized_reasoning_mask"],
-            tokenized_subtask=cot_out["tokenized_subtask"],
-            tokenized_subtask_mask=cot_out["tokenized_subtask_mask"],
-        )
+        obs_full = _merge_cot_output_into_observation(obs_jax, cot_out)
         
         # Prepare noise for inference
         batch_size = obs_jax.state.shape[0]
@@ -1295,19 +1490,23 @@ class SteerVLAActor:
             noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(noise_chunk)
         
         # Sample the actions
+        traj = self._sample_actions(
+            rng_act,
+            obs_full,
+            noise=noise_full,
+            num_steps=int(self.sample_actions_num_steps),
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
         if self.return_normalized_action_chunk and not force_accel_steer:
-            traj = self._sample_actions(
-                rng_act,
-                obs_full,
-                noise=noise_full,
-                num_steps=int(self.sample_actions_num_steps),
-                image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-            )
             traj_clip = traj[:, : int(self.action_horizon), : int(self.action_dim)]
             flat = traj_clip.reshape(batch_size, -1)
-            out = jax.device_put(flat.astype(jnp.float32), self._jax_device)
-            return out
+            return jax.device_put(flat.astype(jnp.float32), self._jax_device)
 
+        first_step = traj[:, 0, :].astype(jnp.float32)
+        target_dim = int(self.action_dim)
+        out = jnp.zeros((batch_size, target_dim), dtype=jnp.float32)
+        copy_dim = min(target_dim, int(first_step.shape[-1]))
+        out = out.at[:, :copy_dim].set(first_step[:, :copy_dim])
         return out
 
     def __call__(self, observations_jax: jax.Array, noise_jax: jax.Array) -> jax.Array:

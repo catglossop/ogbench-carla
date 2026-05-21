@@ -2,57 +2,10 @@
     "_checkpoint": {
         "global_record": {},
         "progress": [],
-        "records": [
-            {
-                "index": 0,
-                "route_id": "RouteScenario_1711_rep0",
-                "scenario_name": "ParkingCutIn_1",
-                "weather_id": "15",
-                "save_name": "RouteScenario_1711_rep0_Town12_ParkingCutIn_1_15_05_20_01_09_58",
-                "status": "Failed - Agent crashed and got stuck",
-                "num_infractions": 10,
-                "infractions": {
-                    "collisions_layout": [
-                        "Agent collided against object with type=static.static and id=0 at (x=-501.727, y=3605.142, z=363.861)"
-                    ],
-                    "collisions_pedestrian": [],
-                    "collisions_vehicle": [],
-                    "red_light": [],
-                    "stop_infraction": [],
-                    "outside_route_lanes": [],
-                    "min_speed_infractions": [
-                        "Average speed is 57.74% of the surrounding traffic's one",
-                        "Average speed is 79.51% of the surrounding traffic's one",
-                        "Average speed is 245.65% of the surrounding traffic's one",
-                        "Average speed is 245.34% of the surrounding traffic's one",
-                        "Average speed is 231.76% of the surrounding traffic's one",
-                        "Average speed is 203.46% of the surrounding traffic's one",
-                        "Average speed is 195.08% of the surrounding traffic's one",
-                        "Average speed is 177.72% of the surrounding traffic's one",
-                        "Average speed is 156.82% of the surrounding traffic's one"
-                    ],
-                    "yield_emergency_vehicle_infractions": [],
-                    "scenario_timeouts": [],
-                    "route_dev": [],
-                    "vehicle_blocked": [],
-                    "route_timeout": []
-                },
-                "scores": {
-                    "score_route": 50.42,
-                    "score_penalty": 0.65,
-                    "score_composed": 32.773
-                },
-                "meta": {
-                    "route_length": 133.138,
-                    "duration_game": 11.95,
-                    "duration_system": 880.11
-                },
-                "town_name": "Town12"
-            }
-        ]
+        "records": []
     },
-    "entry_status": "Finished",
-    "eligible": true,
+    "entry_status": "Started",
+    "eligible": false,
     "sensors": [
         "carla_camera",
         "carla_gnss",

@@ -330,25 +330,37 @@ def run_online_carla(
         from openpi.shared import image_tools as openpi_image_tools
 
         obs_struct = steervla_actor.build_observation_batch_numpy(batch_size=1, raw=raw)
-        base_image = np.asarray(obs_struct.images["base_0_rgb"][0], dtype=np.uint8)
-        if base_image.shape[:2] != (224, 224):
-            base_image = np.asarray(openpi_image_tools.resize_with_pad(base_image, 224, 224), dtype=np.uint8)
-        out = {
-            "openpi_image_base_0_rgb": base_image,
-            "openpi_image_mask_base_0_rgb": np.asarray(obs_struct.image_masks["base_0_rgb"][0], dtype=bool),
-            "openpi_state": np.asarray(obs_struct.state[0], dtype=np.float32),
-            "openpi_tokenized_prompt": np.asarray(obs_struct.tokenized_prompt[0], dtype=np.int32),
-            "openpi_tokenized_prompt_mask": np.asarray(obs_struct.tokenized_prompt_mask[0], dtype=bool),
-            "openpi_tokenized_reasoning": np.asarray(obs_struct.tokenized_reasoning[0], dtype=np.int32),
-            "openpi_tokenized_reasoning_mask": np.asarray(obs_struct.tokenized_reasoning_mask[0], dtype=bool),
-            "openpi_tokenized_subtask": np.asarray(obs_struct.tokenized_subtask[0], dtype=np.int32),
-            "openpi_tokenized_subtask_mask": np.asarray(obs_struct.tokenized_subtask_mask[0], dtype=bool),
-            # Keep legacy key names for CoT for backwards-compat with existing buffers.
-            "reasoning": np.asarray(obs_struct.tokenized_reasoning[0], dtype=np.int32),
-            "reasoning_mask": np.asarray(obs_struct.tokenized_reasoning_mask[0], dtype=bool),
-            "subtask": np.asarray(obs_struct.tokenized_subtask[0], dtype=np.int32),
-            "subtask_mask": np.asarray(obs_struct.tokenized_subtask_mask[0], dtype=bool),
-        }
+        from vlas.steervla import openpi_replay_fields_from_observation
+
+        out = openpi_replay_fields_from_observation(obs_struct)
+        # ``build_observation_batch_numpy`` leaves CoT/FAST empty; overlay tokens stashed by VLA.
+        for src_key, dst_key in (
+            ("reasoning", "openpi_tokenized_reasoning"),
+            ("reasoning_mask", "openpi_tokenized_reasoning_mask"),
+            ("subtask", "openpi_tokenized_subtask"),
+            ("subtask_mask", "openpi_tokenized_subtask_mask"),
+            ("openpi_tokenized_fast", "openpi_tokenized_fast"),
+            ("openpi_tokenized_fast_mask", "openpi_tokenized_fast_mask"),
+            ("fast", "openpi_tokenized_fast"),
+            ("fast_mask", "openpi_tokenized_fast_mask"),
+        ):
+            if src_key in raw:
+                out[dst_key] = np.asarray(raw[src_key])
+        if "reasoning" in raw:
+            out["reasoning"] = np.asarray(raw["reasoning"], dtype=np.int32)
+            out["reasoning_mask"] = np.asarray(raw.get("reasoning_mask", raw["reasoning"] != 0), dtype=bool)
+        if "subtask" in raw:
+            out["subtask"] = np.asarray(raw["subtask"], dtype=np.int32)
+            out["subtask_mask"] = np.asarray(raw.get("subtask_mask", raw["subtask"] != 0), dtype=bool)
+        if "fast" in raw or "openpi_tokenized_fast" in raw:
+            fk = raw.get("openpi_tokenized_fast", raw.get("fast"))
+            fmk = raw.get("openpi_tokenized_fast_mask", raw.get("fast_mask"))
+            if fk is not None:
+                out["openpi_tokenized_fast"] = np.asarray(fk, dtype=np.int32)
+                out["fast"] = out["openpi_tokenized_fast"]
+            if fmk is not None:
+                out["openpi_tokenized_fast_mask"] = np.asarray(fmk, dtype=bool)
+                out["fast_mask"] = out["openpi_tokenized_fast_mask"]
         return out
 
     def _maybe_log_vla_action_support(step: int, raw: dict | None) -> dict[str, Any]:
@@ -473,7 +485,7 @@ def run_online_carla(
     episode_collision_events = 0
     prev_collision_count = 0
     last_log_time = time.time()
-    episode_video_every = 5
+    episode_video_every = 2
     episode_video_frames: list[np.ndarray] = []
     last_video_reward: float = 0.0
     last_video_critic_text: str = ""
@@ -483,6 +495,15 @@ def run_online_carla(
         if frame.dtype != np.uint8:
             frame = np.clip(frame, 0, 255).astype(np.uint8)
         return frame
+
+    def _viz_image_from_raw(raw: dict[str, Any] | np.ndarray) -> np.ndarray:
+        """High-res camera frame for W&B video; falls back to policy ``image``."""
+        if isinstance(raw, dict):
+            if raw.get("image_viz") is not None:
+                return np.asarray(raw["image_viz"], dtype=np.uint8)
+            if raw.get("image") is not None:
+                return np.asarray(raw["image"], dtype=np.uint8)
+        return np.asarray(raw, dtype=np.uint8)
 
     def _annotate_collision_frame(
         frame: np.ndarray,
@@ -494,26 +515,30 @@ def run_online_carla(
         try:
             import cv2  # type: ignore
 
-            h, w = annotated.shape[:2]
-            bar_h = max(24, h // 12)
-            cv2.rectangle(annotated, (0, 0), (w, bar_h), (0, 0, 255), thickness=-1)
-            label = f"COLLISION count={collision_count} events={collision_events}"
+            _, w = annotated.shape[:2]
+            label = f"COLL c={collision_count} e={collision_events}"
+            font_scale = 0.38
+            thickness = 1
+            pad = 4
+            (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+            x1 = w - 6
+            x0 = max(6, x1 - tw - 2 * pad)
+            y0 = 6
+            y1 = y0 + th + baseline + 2 * pad
+            cv2.rectangle(annotated, (x0, y0), (x1, y1), (255, 0, 0), thickness=-1)
+            cv2.rectangle(annotated, (x0, y0), (x1, y1), (255, 255, 255), thickness=1)
             cv2.putText(
                 annotated,
                 label,
-                (10, max(18, bar_h - 8)),
+                (x0 + pad, y1 - baseline - pad),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
+                font_scale,
                 (255, 255, 255),
-                2,
+                thickness,
                 cv2.LINE_AA,
             )
             return annotated
         except Exception:
-            # Fallback: mark top strip red even if cv2 text rendering is unavailable.
-            h = annotated.shape[0]
-            bar_h = max(8, h // 20)
-            annotated[:bar_h, :, :] = np.array([255, 0, 0], dtype=np.uint8)
             return annotated
 
     def _annotate_reward_corner(frame: np.ndarray, reward_value: float) -> np.ndarray:
@@ -522,8 +547,10 @@ def run_online_carla(
             import cv2  # type: ignore
 
             label = f"r={reward_value:+.3f}"
-            (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
-            pad = 6
+            font_scale = 0.38
+            thickness = 1
+            pad = 4
+            (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
             x0, y0 = 6, 6
             x1 = x0 + tw + 2 * pad
             y1 = y0 + th + baseline + 2 * pad
@@ -534,9 +561,9 @@ def run_online_carla(
                 label,
                 (x0 + pad, y1 - baseline - pad),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
+                font_scale,
                 (255, 255, 255),
-                2,
+                thickness,
                 cv2.LINE_AA,
             )
             return annotated
@@ -590,7 +617,9 @@ def run_online_carla(
             import cv2  # type: ignore
 
             h, w = base.shape[:2]
-            panel_h = max(112, h // 4)  # 6 lines × 16px + 16px offset
+            font_scale = 0.26
+            line_h = 13
+            panel_h = max(72, line_h * 6)
             annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
             annotated[:h, :, :] = _annotate_reward_corner(base, reward_value)
             # Bottom panel is already black via zeros; draw an explicit border line.
@@ -630,8 +659,6 @@ def run_online_carla(
                 f"Reasoning: {_clip_text(reasoning)}",
                 f"Subtask: {_clip_text(subtask)}",
             ]
-            font_scale = 0.32
-            line_h = 16
             y = h + line_h
             for line in lines:
                 cv2.putText(
@@ -742,7 +769,7 @@ def run_online_carla(
         drive_metrics = ego_drive_metrics_from_state_vec(next_obs_raw["state"])
         next_obs = _extract_agent_obs(env, next_obs_raw, obs_mode)
         done = bool(terminated or truncated)
-        end_img = np.copy(next_obs) if done and log_images else None
+        end_img = np.copy(_viz_image_from_raw(next_obs_raw)) if done and log_images else None
 
         # Compute critic language label for this transition.
         # raw_obs_holder["obs"] is still s_t here (not yet updated to s_{t+1}).
@@ -860,7 +887,7 @@ def run_online_carla(
             should_sample_periodic = episode_steps % episode_video_every == 0
             had_collision_this_step = collision_delta > 0
             if should_sample_periodic or had_collision_this_step:
-                frame = _as_video_frame(obs)
+                frame = _as_video_frame(_viz_image_from_raw(obs_raw))
                 frame = _annotate_text_panel(
                     frame,
                     cot_obs_raw,
@@ -873,7 +900,6 @@ def run_online_carla(
                         collision_count=collision_count,
                         collision_events=episode_collision_events,
                     )
-                    frame = _annotate_reward_corner(frame, float(reward))
                 episode_video_frames.append(frame)
         last_video_reward = float(reward)
         last_video_critic_text = _critic_text_for_video
@@ -886,15 +912,12 @@ def run_online_carla(
         if "reward_total" in info:
             step_wb["reward/total"] = float(info["reward_total"])
             step_wb["reward/terminal"] = float(info.get("reward_terminal", 0.0))
-            step_wb["rollout/route_completion"] = float(info.get("route_completion", 0.0))
-            step_wb["rollout/route_completion_delta"] = float(info.get("route_completion_delta", 0.0))
-            step_wb["rollout/termination_reason"] = str(info.get("termination_reason", ""))
-            step_wb["reward/soft_penalty_outside_lanes"] = float(info.get("soft_penalty_outside_lanes", 1.0))
-            step_wb["reward/soft_penalty_lane_center"] = float(info.get("soft_penalty_lane_center", 1.0))
-            step_wb["reward/soft_penalty_speeding"] = float(info.get("soft_penalty_speeding", 1.0))
-            step_wb["reward/soft_penalty_ttc"] = float(info.get("soft_penalty_ttc", 1.0))
-            step_wb["reward/soft_penalty_comfort"] = float(info.get("soft_penalty_comfort", 1.0))
-            step_wb["reward/soft_penalty_product"] = float(info.get("soft_penalty_product", 1.0))
+            step_wb["reward/penalty_collision"] = float(info.get("penalty_collision", 0.0))
+            step_wb["reward/penalty_outside_route"] = float(info.get("penalty_outside_route", 0.0))
+            step_wb["reward/penalty_steer"] = float(info.get("penalty_steer", 0.0))
+            step_wb["reward/penalty_brake"] = float(info.get("penalty_brake", 0.0))
+            step_wb["reward/penalty_speed_limit"] = float(info.get("penalty_speed_limit", 0.0))
+            step_wb["reward/penalty_crash_stuck"] = float(info.get("penalty_crash_stuck", 0.0))
             step_wb["rollout/lane_offset_m"] = float(info.get("lane_offset_m", 0.0))
             step_wb["rollout/heading_error_rad"] = float(info.get("heading_error_rad", 0.0))
 
@@ -973,15 +996,16 @@ def run_online_carla(
                     flush=True,
                 )
 
-        update_time = 0.0
+        update_times = []
         if (
             (not FLAGS.expert_debug)
             and agent is not None
             and not in_warmup
             and buffer.size >= batch_size
         ):
-            t_update_start = time.time()
+            
             for _ in range(updates_per_step):
+                t_update_start = time.time()
                 batch = buffer.sample(batch_size)
                 if _online_training_mode == "dagger_direct":
                     _, update_info = agent.update_dagger_direct(batch)
@@ -994,14 +1018,15 @@ def run_online_carla(
                 else:
                     _, update_info = agent.update(batch)
                 _block_until_ready_tree((agent, update_info))
+                t_update_end = time.time()
+                update_times.append(t_update_end - t_update_start)
             last_update_info = update_info
-            t_update_end = time.time()
-            update_time = t_update_end - t_update_start
+            
 
         if step % FLAGS.log_interval == 0:
             metrics = {
                 "time/steps_per_sec": FLAGS.log_interval / max(time.time() - last_log_time, 1e-6),
-                "time/update_time": update_time,
+                "time/update_time": np.mean(update_times),
             }
             if last_update_info is not None:
                 metrics.update({f"training/{k}": float(v) for k, v in last_update_info.items()})

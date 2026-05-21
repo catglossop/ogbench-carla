@@ -22,7 +22,8 @@ Observation:
 
 * ``observation`` -- a :class:`gymnasium.spaces.Dict` with two keys:
     * ``"state"`` -- ``float32`` vector of shape ``(STATE_DIM,)`` (ego kinematics).
-    * ``"image"`` -- ``uint8`` RGB array ``(*IMAGE_SHAPE_HWC,)`` from the front camera
+    * ``"image"`` -- ``uint8`` RGB array ``(*IMAGE_SHAPE_HWC,)`` downscaled for RL/VLA
+    * ``"image_viz"`` -- ``uint8`` RGB at native CARLA camera resolution (logging only)
       (zeros until the first sensor frame is available).
 * ``info["sensors"]`` -- raw leaderboard ``input_data`` dict when populated.
 
@@ -101,6 +102,7 @@ from ogbench.carla.route_registry import RouteEntry, find_route
 from ogbench.carla.leaderboard_agents.observation_only import (
     IMAGE_SHAPE_HWC,
     RGB_FRONT_CAMERA_TAG,
+    VIZ_IMAGE_SHAPE_HWC,
 )
 
 
@@ -146,8 +148,14 @@ EGO_STATE_IDX_BRAKE = 18
 DEFAULT_CRASH_STUCK_SPEED_THRESHOLD = 0.1
 DEFAULT_CRASH_STUCK_STEPS = 20
 DEFAULT_CRASH_STUCK_PENALTY = -1.0
-DEFAULT_COLLISION_EVENT_PENALTY = -5.0
-DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -5.0
+DEFAULT_COLLISION_EVENT_PENALTY = -5.0 # catastrophic - should update to make sure any contact is given negative reward
+DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -5.0 # should be pretty heavy
+DEFAULT_PROGRESS_REWARD_WEIGHT = 1.0
+# DEFAULT_CENTERING_REWARD_WEIGHT = 0.2
+# DEFAULT_HEADING_REWARD_WEIGHT = 0.2
+DEFAULT_STEER_PENALTY_WEIGHT = 0.05
+DEFAULT_BRAKE_PENALTY_WEIGHT = 0.02
+DEFAULT_SPEED_LIMIT_PENALTY_WEIGHT = 0.1
 SUCCESS_BONUS = 5.0
 FAILURE_BONUS = -5.0
 CARLA_FPS = 20.0
@@ -328,40 +336,78 @@ def _zeros_rgb_image() -> np.ndarray:
     return np.zeros(IMAGE_SHAPE_HWC, dtype=np.uint8)
 
 
+def _zeros_rgb_viz_image() -> np.ndarray:
+    return np.zeros(VIZ_IMAGE_SHAPE_HWC, dtype=np.uint8)
+
+
 def _bgra_to_rgb_hwc(arr: np.ndarray) -> np.ndarray:
     """CARLA leaderboard packs ``sensor.camera.rgb`` as H×W×4 BGRA uint8."""
     bgr = np.asarray(arr)[..., :3]
     return np.ascontiguousarray(bgr[..., ::-1], dtype=np.uint8)
 
 
-def rgb_front_from_leaderboard_dict(sensor_dict: Dict[str, Any]) -> np.ndarray:
-    """Decode ``rgb_front`` leaderboard sensor payload to RGB ``uint8`` H×W×3."""
+def _decode_rgb_front_viz(sensor_dict: Dict[str, Any]) -> np.ndarray | None:
+    """Decode ``rgb_front`` at native CARLA camera resolution, or ``None`` if missing."""
     if not sensor_dict or RGB_FRONT_CAMERA_TAG not in sensor_dict:
-        return _zeros_rgb_image()
+        return None
     tup = sensor_dict[RGB_FRONT_CAMERA_TAG]
     if not isinstance(tup, (tuple, list)) or len(tup) < 2:
-        return _zeros_rgb_image()
+        return None
     payload = tup[1]
     if payload is None:
-        return _zeros_rgb_image()
+        return None
     arr = np.asarray(payload)
     if arr.ndim != 3:
-        return _zeros_rgb_image()
+        return None
     if arr.shape[-1] == 4:
         rgb = _bgra_to_rgb_hwc(arr)
     elif arr.shape[-1] == 3:
         rgb = arr.astype(np.uint8, copy=False)
     else:
-        return _zeros_rgb_image()
-    if rgb.shape != IMAGE_SHAPE_HWC:
-        # Resize rarely needed if sensor definition matches IMAGE_SHAPE_HWC.
+        return None
+    if rgb.shape != VIZ_IMAGE_SHAPE_HWC:
         try:
             import cv2
 
-            rgb = cv2.resize(rgb, (IMAGE_SHAPE_HWC[1], IMAGE_SHAPE_HWC[0]), interpolation=cv2.INTER_AREA)
+            rgb = cv2.resize(
+                rgb,
+                (VIZ_IMAGE_SHAPE_HWC[1], VIZ_IMAGE_SHAPE_HWC[0]),
+                interpolation=cv2.INTER_AREA,
+            )
         except Exception:
-            return _zeros_rgb_image()
+            return None
     return rgb
+
+
+def downscale_rgb_for_policy(rgb_viz: np.ndarray) -> np.ndarray:
+    """Resize a viz-resolution RGB frame to policy/RL ``IMAGE_SHAPE_HWC``."""
+    rgb_viz = np.asarray(rgb_viz, dtype=np.uint8)
+    if rgb_viz.shape == IMAGE_SHAPE_HWC:
+        return rgb_viz
+    try:
+        import cv2
+
+        return cv2.resize(
+            rgb_viz,
+            (IMAGE_SHAPE_HWC[1], IMAGE_SHAPE_HWC[0]),
+            interpolation=cv2.INTER_AREA,
+        )
+    except Exception:
+        return _zeros_rgb_image()
+
+
+def rgb_viz_from_leaderboard_dict(sensor_dict: Dict[str, Any]) -> np.ndarray:
+    """Decode ``rgb_front`` at viz resolution for rollout video / W&B logging."""
+    rgb = _decode_rgb_front_viz(sensor_dict)
+    return rgb if rgb is not None else _zeros_rgb_viz_image()
+
+
+def rgb_front_from_leaderboard_dict(sensor_dict: Dict[str, Any]) -> np.ndarray:
+    """Decode ``rgb_front`` and downscale to policy resolution for RL/VLA/replay."""
+    rgb = _decode_rgb_front_viz(sensor_dict)
+    if rgb is None:
+        return _zeros_rgb_image()
+    return downscale_rgb_for_policy(rgb)
 
 
 class SteppableScenarioManager(ScenarioManager):
@@ -649,6 +695,24 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         )
         self._outside_route_event_penalty = float(
             self.carla_config.get("outside_route_event_penalty", DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY)
+        )
+        self._progress_reward_weight = float(
+            self.carla_config.get("progress_reward_weight", DEFAULT_PROGRESS_REWARD_WEIGHT)
+        )
+        # self._centering_reward_weight = float(
+        #     self.carla_config.get("centering_reward_weight", DEFAULT_CENTERING_REWARD_WEIGHT)
+        # )
+        # self._heading_reward_weight = float(
+        #     self.carla_config.get("heading_reward_weight", DEFAULT_HEADING_REWARD_WEIGHT)
+        # )
+        self._steer_penalty_weight = float(
+            self.carla_config.get("steer_penalty_weight", DEFAULT_STEER_PENALTY_WEIGHT)
+        )
+        self._brake_penalty_weight = float(
+            self.carla_config.get("brake_penalty_weight", DEFAULT_BRAKE_PENALTY_WEIGHT)
+        )
+        self._speed_limit_penalty_weight = float(
+            self.carla_config.get("speed_limit_penalty_weight", DEFAULT_SPEED_LIMIT_PENALTY_WEIGHT)
         )
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
@@ -1311,11 +1375,31 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         if ego is not None:
             v = ego.get_velocity()
             speed = float(np.linalg.norm([v.x, v.y, v.z]))
-        criteria = self._criteria_snapshot()
-        route_completion = self._route_completion_percent(criteria)
-        route_completion_delta = max(0.0, route_completion - self._last_route_completion)
-        self._last_route_completion = route_completion
-        reward = 0.01 * speed
+        lane_metrics = self._lane_alignment_metrics()
+        lane_offset_m = float(lane_metrics["lane_offset_m"])
+        heading_error_rad = float(lane_metrics["heading_error_rad"])
+        lane_width_m = float(lane_metrics["lane_width_m"])
+        speed_limit_mps = float(lane_metrics["speed_limit_mps"])
+        lane_half_width = max(0.5 * lane_width_m, 1e-3)
+        centering_factor = float(np.clip(1.0 - abs(lane_offset_m) / lane_half_width, 0.0, 1.0))
+        heading_factor = float(np.clip(math.cos(heading_error_rad), 0.0, 1.0))
+        speed_norm = float(np.clip(speed / max(speed_limit_mps, 1e-3), 0.0, 1.0))
+        overspeed_frac = max(0.0, speed / max(speed_limit_mps, 1e-3) - 1.0)
+        steer_pen = self._steer_penalty_weight * abs(float(getattr(self._last_control, "steer", 0.0)))
+        brake_pen = self._brake_penalty_weight * float(getattr(self._last_control, "brake", 0.0))
+        speed_limit_pen = self._speed_limit_penalty_weight * overspeed_frac
+        progress_reward = self._progress_reward_weight * speed_norm * centering_factor * heading_factor
+        # centering_reward = self._centering_reward_weight * centering_factor
+        # heading_reward = self._heading_reward_weight * heading_factor
+
+        reward = (
+            progress_reward
+            # + centering_reward
+            # + heading_reward
+            - steer_pen
+            - brake_pen
+            - speed_limit_pen
+        )
         info = self._info_with_sensors(
             {"scenario_tree_status": getattr(tree_status, "name", str(tree_status))}
         )
@@ -1338,10 +1422,23 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         info["route_completion_delta"] = float(route_completion_delta)
         info["collision_delta"] = float(collision_delta)
         info["outside_route_delta"] = float(outside_route_delta)
+        info["lane_offset_m"] = lane_offset_m
+        info["heading_error_rad"] = heading_error_rad
+        info["lane_width_m"] = lane_width_m
+        info["speed_limit_mps"] = speed_limit_mps
+        info["speed_norm"] = speed_norm
+        info["overspeed_frac"] = overspeed_frac
+        info["centering_factor"] = centering_factor
+        info["heading_factor"] = heading_factor
         info["penalty_collision"] = collision_pen
         info["penalty_outside_route"] = outside_route_pen
-        info["reward_terminal"] = 0.0
-        info["reward_total"] = float(reward)
+        info["penalty_steer"] = -steer_pen
+        info["penalty_brake"] = -brake_pen
+        info["penalty_speed_limit"] = -speed_limit_pen
+        info["reward_progress"] = progress_reward
+        # info["reward_centering"] = centering_reward
+        # info["reward_heading"] = heading_reward
+
         if crash_stuck:
             terminated = True
             reward += self._crash_stuck_penalty
@@ -1380,9 +1477,11 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         sensors = getattr(self.evaluator.manager, "last_agent_input", None) or {}
         expert_action = self._compute_expert_action()
         commentary_text, language_label = self._compute_language_label(expert_action=expert_action)
+        rgb_viz = rgb_viz_from_leaderboard_dict(sensors)
         return {
             "state": self._get_state_vector(),
-            "image": rgb_front_from_leaderboard_dict(sensors),
+            "image": downscale_rgb_for_policy(rgb_viz),
+            "image_viz": rgb_viz,
             "language_label": language_label,
             "commentary_text": commentary_text,
             "expert_action": expert_action,

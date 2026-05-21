@@ -372,6 +372,9 @@ def create_app(
             "tokenized_subtask_mask": out["tokenized_subtask_mask"],
             "policy_timing": out.get("policy_timing", {}),
         }
+        if "tokenized_fast" in out:
+            payload["tokenized_fast"] = out["tokenized_fast"]
+            payload["tokenized_fast_mask"] = out["tokenized_fast_mask"]
         return _jsonify_numpy(payload)
 
     @app.post("/update")

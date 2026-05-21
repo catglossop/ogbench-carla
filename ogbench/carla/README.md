@@ -105,7 +105,7 @@ WANDB_MODE=online \
 uv run python impls/main_carla.py \
   --agent=impls/configs/steervla_dsrl_config.py \
   --route=parking-cut-in-001 \
-  --online_steps=5000 \
+  --online_steps=10000 \
   --save_buffer=true \
   --seed=0
 ```

@@ -727,6 +727,13 @@ class DSRLAgent(flax.struct.PyTreeNode):
             next_openpi_observation = sv.openpi_observation_from_replay_batch(
                 batch, prefix="next_",
             )
+            if self.steervla_actor is not None:
+                openpi_observation = self.steervla_actor.attach_replay_tokens(
+                    openpi_observation, batch,
+                )
+                next_openpi_observation = self.steervla_actor.attach_replay_tokens(
+                    next_openpi_observation, batch, prefix="next_",
+                )
         else:
             raw_obs = None
             raw_next = None
@@ -743,6 +750,13 @@ class DSRLAgent(flax.struct.PyTreeNode):
             next_openpi_observation = sv.with_replay_cot_tokens(
                 next_openpi_observation, batch, prefix="next_",
             )
+            if self.steervla_actor is not None:
+                openpi_observation = self.steervla_actor.attach_replay_tokens(
+                    openpi_observation, batch,
+                )
+                next_openpi_observation = self.steervla_actor.attach_replay_tokens(
+                    next_openpi_observation, batch, prefix="next_",
+                )
         batch = dict(batch)
         batch["openpi_observation"] = self._as_jax_pytree(openpi_observation)
         batch["next_openpi_observation"] = self._as_jax_pytree(next_openpi_observation)

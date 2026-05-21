@@ -5,7 +5,7 @@ to drive the ego vehicle. The agent simply caches the most recent ``input_data``
 on ``self.last_input_data`` so the gym wrapper can read it as the observation.
 
 Sensors:
-  - one front RGB camera (low-res, low-overhead)
+  - one front RGB camera at viz resolution (downscaled in the gym wrapper for RL/VLA)
   - GPS + IMU + Speedometer (zero-cost text sensors used by most leaderboard agents)
 
 To swap in a real visual stack, subclass ``ObservationOnlyAgent.sensors``.
@@ -21,6 +21,10 @@ from leaderboard.autoagents.autonomous_agent import AutonomousAgent, Track
 
 
 RGB_FRONT_CAMERA_TAG = "rgb_front"
+# CARLA renders at viz resolution; ``carla_utils`` downscales to policy resolution.
+VIZ_CAMERA_HEIGHT = 288
+VIZ_CAMERA_WIDTH = 512
+VIZ_IMAGE_SHAPE_HWC = (VIZ_CAMERA_HEIGHT, VIZ_CAMERA_WIDTH, 3)
 CAMERA_HEIGHT = 144
 CAMERA_WIDTH = 256
 IMAGE_SHAPE_HWC = (CAMERA_HEIGHT, CAMERA_WIDTH, 3)
@@ -48,8 +52,8 @@ class ObservationOnlyAgent(AutonomousAgent):
                 "id": RGB_FRONT_CAMERA_TAG,
                 "x": 0.7, "y": 0.0, "z": 1.6,
                 "roll": 0.0, "pitch": 0.0, "yaw": 0.0,
-                "width": CAMERA_WIDTH,
-                "height": CAMERA_HEIGHT,
+                "width": VIZ_CAMERA_WIDTH,
+                "height": VIZ_CAMERA_HEIGHT,
                 "fov": 90,
             },
             {"type": "sensor.other.gnss", "id": "gps",

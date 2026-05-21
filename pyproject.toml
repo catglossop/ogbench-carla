@@ -16,6 +16,7 @@ dependencies = [
     "setuptools>=69,<81",
     "carla",
     "jax[cuda12]>=0.5.3",
+    "google-genai>=2.5.0",
 ]
 authors = [
     { name = "Seohong Park" },
