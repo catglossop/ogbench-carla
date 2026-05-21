@@ -35,3 +35,6 @@ repetition_index: 0
 crash_stuck_speed_threshold: 0.1
 crash_stuck_steps: 20
 crash_stuck_penalty: -1.0
+
+# Per-step reward shaping (defaults in carla_utils.py). Example:
+# speed_limit_penalty_weight: 0.1  # penalty = weight * max(0, speed/limit - 1)
