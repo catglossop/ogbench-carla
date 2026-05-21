@@ -146,6 +146,11 @@ EGO_STATE_IDX_BRAKE = 18
 DEFAULT_CRASH_STUCK_SPEED_THRESHOLD = 0.1
 DEFAULT_CRASH_STUCK_STEPS = 20
 DEFAULT_CRASH_STUCK_PENALTY = -1.0
+DEFAULT_COLLISION_EVENT_PENALTY = -5.0
+DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -5.0
+DEFAULT_MIN_SPEED_EVENT_PENALTY = -2.0
+SUCCESS_BONUS = 5.0
+FAILURE_BONUS = -5.0
 CARLA_FPS = 20.0
 REWARD_TTC_PERSIST_STEPS = 500
 REWARD_COMFORT_PERSIST_STEPS = 500
@@ -640,6 +645,18 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             self.carla_config.get("crash_stuck_penalty", DEFAULT_CRASH_STUCK_PENALTY)
         )
         self._crash_stuck_ticks = 0
+        self._collision_event_penalty = float(
+            self.carla_config.get("collision_event_penalty", DEFAULT_COLLISION_EVENT_PENALTY)
+        )
+        self._outside_route_event_penalty = float(
+            self.carla_config.get("outside_route_event_penalty", DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY)
+        )
+        self._min_speed_event_penalty = float(
+            self.carla_config.get("min_speed_event_penalty", DEFAULT_MIN_SPEED_EVENT_PENALTY)
+        )
+        self._prev_collision_count = 0
+        self._prev_outside_route_value = 0.0
+        self._prev_min_speed_value = 0.0
         self._blocked_ticks = 0
         self._blocked_steps = int(
             self.carla_config.get(
@@ -956,6 +973,9 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._scenario_active = True
         self._last_control = carla.VehicleControl()
         self._crash_stuck_ticks = 0
+        self._prev_collision_count = 0
+        self._prev_outside_route_value = 0.0
+        self._prev_min_speed_value = 0.0
         self._blocked_ticks = 0
         self._ttc_penalty_ticks = 0
         self._comfort_penalty_ticks = 0
@@ -1298,94 +1318,57 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             v = ego.get_velocity()
             speed = float(np.linalg.norm([v.x, v.y, v.z]))
         criteria = self._criteria_snapshot()
-        lane_metrics = self._lane_alignment_metrics()
         route_completion = self._route_completion_percent(criteria)
         route_completion_delta = max(0.0, route_completion - self._last_route_completion)
         self._last_route_completion = route_completion
-
-        soft_penalties = self._soft_penalty_state(
-            lane_metrics=lane_metrics,
-            speed_mps=speed,
-        )
-        terminal_state = self._terminal_state(
-            criteria=criteria,
-            lane_metrics=lane_metrics,
-            speed_mps=speed,
-            route_completion=route_completion,
-            base_terminated=terminated,
-        )
-        progress_reward = route_completion_delta
-        if soft_penalties["outside_lanes"]:
-            progress_reward = 0.0
-        else:
-            if soft_penalties["overspeed_kmh"] > 0.0:
-                progress_reward *= soft_penalties["speeding_factor"]
-            if soft_penalties["ttc_factor"] < 1.0:
-                progress_reward *= soft_penalties["ttc_factor"]
-            if soft_penalties["comfort_factor"] < 1.0:
-                progress_reward *= soft_penalties["comfort_factor"]
-        if self._use_perc_progress:
-            progress_reward *= soft_penalties["lane_center_factor"]
-        reward = progress_reward + terminal_state["terminal_reward"]
+        reward = 0.01 * speed
         info = self._info_with_sensors(
             {"scenario_tree_status": getattr(tree_status, "name", str(tree_status))}
         )
-        info["collision_count"] = self._collision_count()
-        info["blocked_ticks"] = self._blocked_ticks
-        info["lane_offset_m"] = float(lane_metrics["lane_offset_m"])
-        info["heading_error_rad"] = float(lane_metrics["heading_error_rad"])
-        info["lane_width_m"] = float(lane_metrics["lane_width_m"])
-        info["speed_limit_mps"] = float(lane_metrics["speed_limit_mps"])
+        crash_stuck, collision_count = self._update_crash_stuck_state(speed)
+        outside_route_value, min_speed_value = self._route_infraction_values()
+
+        collision_delta = max(0, collision_count - self._prev_collision_count)
+        outside_route_delta = max(0.0, outside_route_value - self._prev_outside_route_value)
+        min_speed_delta = max(0.0, min_speed_value - self._prev_min_speed_value)
+        self._prev_collision_count = collision_count
+        self._prev_outside_route_value = outside_route_value
+        self._prev_min_speed_value = min_speed_value
+
+        collision_pen = self._collision_event_penalty * float(collision_delta)
+        outside_route_pen = self._outside_route_event_penalty * float(outside_route_delta)
+        min_speed_pen = self._min_speed_event_penalty * float(min_speed_delta)
+        reward += collision_pen + outside_route_pen + min_speed_pen
+
+        info["collision_count"] = collision_count
+        info["crash_stuck_ticks"] = self._crash_stuck_ticks
+        info["outside_route_value"] = outside_route_value
+        info["min_speed_value"] = min_speed_value
         info["route_completion"] = float(route_completion)
         info["route_completion_delta"] = float(route_completion_delta)
-        info["progress_reward"] = float(progress_reward)
-        info["soft_penalty_product"] = float(soft_penalties["penalty_product"])
-        info["soft_penalty_outside_lanes"] = float(soft_penalties["outside_lanes_factor"])
-        info["soft_penalty_lane_center"] = float(soft_penalties["lane_center_factor"])
-        info["soft_penalty_speeding"] = float(soft_penalties["speeding_factor"])
-        info["soft_penalty_ttc"] = float(soft_penalties["ttc_factor"])
-        info["soft_penalty_comfort"] = float(soft_penalties["comfort_factor"])
-        info["outside_lanes"] = bool(soft_penalties["outside_lanes"])
-        info["overspeed_kmh"] = float(soft_penalties["overspeed_kmh"])
-        info["ttc_violated_now"] = bool(soft_penalties["ttc_violated_now"])
-        info["comfort_violated_now"] = bool(soft_penalties["comfort_violated_now"])
-        info["comfort_violations"] = list(soft_penalties["comfort_metrics"]["violations"])
-        info["comfort_metrics"] = {
-            k: v for k, v in soft_penalties["comfort_metrics"].items() if k != "violations"
-        }
-        info["terminal_reward"] = float(terminal_state["terminal_reward"])
-        info["collision"] = bool(terminal_state["collision"])
-        info["off_road"] = bool(terminal_state["off_road"])
-        info["run_red_light"] = bool(terminal_state["run_red_light"])
-        info["run_stop_sign"] = bool(terminal_state["run_stop_sign"])
-        info["route_deviation"] = bool(terminal_state["route_deviation"])
-        info["route_deviation_distance_m"] = float(terminal_state["route_deviation_distance_m"])
-        info["blocked"] = bool(terminal_state["blocked"])
-        info["left_route"] = bool(terminal_state["left_route"])
-        info["in_route_ok"] = bool(terminal_state["in_route_ok"])
-        info["route_completed"] = bool(terminal_state["route_completed"])
-        terminated = bool(terminal_state["terminated"])
-        info["success"] = bool(terminal_state["success"])
-        info["termination_reason"] = str(terminal_state["termination_reason"])
-
-        if terminated:
-            crash_message = ""
-            if terminal_state["termination_reason"] == "collision":
-                crash_message = "Collision"
-            elif terminal_state["termination_reason"] == "run_red_light":
-                crash_message = "RunningRedLight"
-            elif terminal_state["termination_reason"] == "run_stop_sign":
-                crash_message = "RunningStop"
-            elif terminal_state["termination_reason"] == "off_road":
-                crash_message = "OffRoad"
-            elif terminal_state["termination_reason"] == "route_deviation":
-                crash_message = "RouteDeviation"
-            elif terminal_state["termination_reason"] == "blocked":
-                crash_message = "Blocked"
-            self._finalize_route("Finished", crash_message)
-
-        info["reward_terminal"] = float(terminal_state["terminal_reward"])
+        info["collision_delta"] = float(collision_delta)
+        info["outside_route_delta"] = float(outside_route_delta)
+        info["min_speed_delta"] = float(min_speed_delta)
+        info["penalty_collision"] = collision_pen
+        info["penalty_outside_route"] = outside_route_pen
+        info["penalty_min_speed"] = min_speed_pen
+        info["reward_terminal"] = 0.0
         info["reward_total"] = float(reward)
+        if crash_stuck:
+            terminated = True
+            reward += self._crash_stuck_penalty
+            info["success"] = False
+            info["termination_reason"] = "crash_stuck"
+            info["reward_total"] = float(reward)
+        if terminated:
+            if crash_stuck:
+                self._finalize_route("Finished", "Agent crashed and got stuck")
+            else:
+                success = info["scenario_tree_status"] == "SUCCESS"
+                reward += SUCCESS_BONUS if success else FAILURE_BONUS
+                info["success"] = success
+                self._finalize_route("Finished", "")
+                info["reward_total"] = float(reward)
         return float(reward), bool(terminated), info
 
     def _step_with_control(self, control, *, tick_expert_after: bool = False):
