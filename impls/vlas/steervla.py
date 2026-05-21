@@ -662,6 +662,38 @@ class SteerVLAActor:
             jax.lax.stop_gradient(prefix_mask_no_reasoning),
         )
 
+    def encode_image_features(
+        self,
+        observation: _openpi_model.Observation,
+    ) -> jax.Array:
+        """Return a pooled Pi image feature vector for each batch row.
+
+        Uses the same OpenPI preprocessing and image embedding path as the
+        direct-DAgger trainer, but stops after the vision backbone and mean-pools
+        the valid image tokens into a single feature vector per row.
+        """
+        if self._remote is not None:
+            raise RuntimeError("Pi image features are not available in remote SteerVLAActor mode.")
+        if self.model is None or self._jax_device is None:
+            raise RuntimeError("Local SteerVLA model is not initialized.")
+
+        obs_jax = jax.tree.map(
+            lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
+            observation,
+        )
+        obs_proc = _openpi_model.preprocess_observation(
+            None,
+            obs_jax,
+            train=False,
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+        img_tokens, img_masks, _img_ar = self.model._embed_images(obs_proc)
+        tokens = jnp.concatenate(img_tokens, axis=1)
+        masks = jnp.concatenate(img_masks, axis=1).astype(tokens.dtype)
+        denom = jnp.maximum(masks.sum(axis=1, keepdims=True), 1.0)
+        pooled = jnp.sum(tokens * masks[..., None], axis=1) / denom
+        return jax.lax.stop_gradient(pooled)
+
     def _suffix_only_direct_dagger_loss(
         self,
         model,

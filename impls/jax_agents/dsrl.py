@@ -782,6 +782,30 @@ class DSRLAgent(flax.struct.PyTreeNode):
             return obs_e
         return jnp.concatenate([obs_e, jnp.asarray(lang, dtype=jnp.float32)], axis=-1)
 
+    def _residual_uses_pi_image_features(self) -> bool:
+        return bool(self.config.get("residual_use_pi_image_features", False))
+
+    def _residual_obs_features(self, observations, openpi_observation=None):
+        """Feature source for the residual actor.
+
+        By default this is DSRL's ``obs_encoder`` output. When
+        ``residual_use_pi_image_features=True``, use a frozen pooled image feature
+        from the Pi VLM backbone instead.
+        """
+        if not self._residual_uses_pi_image_features():
+            return self.network.select("obs_encoder")(observations)
+        if self.steervla_actor is None:
+            raise RuntimeError("Pi image residual features require an attached steervla_actor.")
+        if openpi_observation is None:
+            raw_obs = None
+            if getattr(self.steervla_actor, "raw_obs_holder", None) is not None:
+                raw_obs = self.steervla_actor.raw_obs_holder.get("obs")
+            openpi_observation = self.steervla_actor.build_observation_batch_numpy(
+                batch_size=observations.shape[0],
+                raw=raw_obs,
+            )
+        return self.steervla_actor.encode_image_features(openpi_observation)
+
     def sample_actions_sac_residual(self, observations, seed=None, temperature=1.0):
         """Rollout for SAC-residual / DAgger-residual: ``clip(base + residual * scale, -1, 1)``.
 
@@ -801,7 +825,7 @@ class DSRLAgent(flax.struct.PyTreeNode):
         noise = jax.random.normal(seed_b, (observations.shape[0], self._flat_noise_dim()))
         base_action = jnp.asarray(self.vla_sample_fn(observations, noise))
         base_action = self._clip_actions_to_env(base_action)
-        obs_e = self.network.select("obs_encoder")(observations)
+        obs_e = self._residual_obs_features(observations)
         action, _residual = self.sac_residual_agent.sample_actions_residual(
             obs_e,
             base_action,
@@ -837,7 +861,10 @@ class DSRLAgent(flax.struct.PyTreeNode):
             batch["next_observations"], batch["next_openpi_observation"], rng_base,
         )
         next_obs_e_sg = jax.lax.stop_gradient(
-            self.network.select("obs_encoder")(batch["next_observations"])
+            self._residual_obs_features(
+                batch["next_observations"],
+                batch["next_openpi_observation"],
+            )
         )
         next_action, _ = self.sac_residual_agent.sample_actions_residual(
             next_obs_e_sg, base_next, seed=rng_res,
@@ -849,10 +876,16 @@ class DSRLAgent(flax.struct.PyTreeNode):
 
         # 4. Residual actor update via Q-gradient.
         obs_e_sg = jax.lax.stop_gradient(
+            new_self._residual_obs_features(
+                batch["observations"],
+                batch["openpi_observation"],
+            )
+        )
+        critic_encoder_obs_e_sg = jax.lax.stop_gradient(
             new_self.network.select("obs_encoder")(batch["observations"])
         )
         critic_obs_e_sg = new_self._critic_obs_e_with_lang(
-            obs_e_sg, batch.get("language_label")
+            critic_encoder_obs_e_sg, batch.get("language_label")
         )
         base_action = new_self._clip_actions_to_env(
             jnp.asarray(batch["base_actions"], dtype=jnp.float32)
@@ -889,6 +922,15 @@ class DSRLAgent(flax.struct.PyTreeNode):
         if "base_actions" not in batch:
             return self.replace(rng=new_rng), {"dagger_residual/skipped_no_base_actions": 1.0}
 
+        if self._residual_uses_pi_image_features():
+            if bool(self.config.get("dagger_residual_train_obs_encoder", False)):
+                raise ValueError(
+                    "dagger_residual_train_obs_encoder=True is incompatible with "
+                    "residual_use_pi_image_features=True because the residual actor "
+                    "no longer consumes DSRL.obs_encoder features."
+                )
+            batch = self._prepare_vla_batch(batch)
+
         base_action = self._clip_actions_to_env(
             jnp.asarray(batch["base_actions"], dtype=jnp.float32)
         )
@@ -920,7 +962,10 @@ class DSRLAgent(flax.struct.PyTreeNode):
             return new_self, {f"dagger_residual/{k}": v for k, v in info.items()}
 
         obs_e_sg = jax.lax.stop_gradient(
-            self.network.select("obs_encoder")(batch["observations"])
+            self._residual_obs_features(
+                batch["observations"],
+                batch.get("openpi_observation"),
+            )
         )
         new_residual, residual_info = self.sac_residual_agent.update_actor_dagger(
             obs_e_sg=obs_e_sg,
@@ -1140,6 +1185,9 @@ def get_config():
             # Online training regime.
             # "rl": standard DSRL online RL updates.
             online_training_mode="rl",
+            # When True, the residual actor consumes a frozen pooled image feature
+            # from the Pi VLM backbone instead of DSRL's obs_encoder output.
+            residual_use_pi_image_features=False,
             # When ``online_training_mode="dagger_residual"`` and this is True, the
             # DAgger MSE gradient also updates DSRL's ``obs_encoder`` (image CNN).
             # Otherwise only the residual MLP is updated and the encoder stays at

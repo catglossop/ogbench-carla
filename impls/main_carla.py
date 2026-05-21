@@ -1088,6 +1088,11 @@ def main(_):
             "via MSE toward expert action.",
             flush=True,
         )
+    if online_training_mode in {"sac_residual", "dagger_residual"} and bool(config.get("residual_use_pi_image_features", False)):
+        print(
+            "[main_carla] Residual actor input: pooled Pi VLM image features.",
+            flush=True,
+        )
     critic_feedback_mode = str(config.get("critic_feedback_mode", "commentary_bow"))
     if critic_feedback_mode == "none":
         config.language_label_dim = 0
@@ -1160,11 +1165,22 @@ def main(_):
                     raise ValueError(
                         f"{online_training_mode} mode requires SteerVLA rollout (frozen Pi0 base policy)."
                     )
-                obs_mode_cfg = str(config.get("observation_mode", "state"))
-                if obs_mode_cfg == "state":
-                    embed_dim = int(ex_obs.shape[-1])
+                if bool(config.get("residual_use_pi_image_features", False)):
+                    if getattr(steervla_actor, "_remote", None) is not None:
+                        raise ValueError(
+                            "residual_use_pi_image_features=True requires local SteerVLA; "
+                            "remote actor mode does not expose Pi image features."
+                        )
+                    openpi_obs = steervla_actor.build_observation_batch_numpy(
+                        batch_size=1, raw=obs_dict,
+                    )
+                    embed_dim = int(steervla_actor.encode_image_features(openpi_obs).shape[-1])
                 else:
-                    embed_dim = int(tuple(config.get("image_mlp_hidden_dims", (512,)))[-1])
+                    obs_mode_cfg = str(config.get("observation_mode", "state"))
+                    if obs_mode_cfg == "state":
+                        embed_dim = int(ex_obs.shape[-1])
+                    else:
+                        embed_dim = int(tuple(config.get("image_mlp_hidden_dims", (512,)))[-1])
                 sac_residual_agent = SACResidualAgent.create(
                     FLAGS.seed, ex_obs, ex_actions, config, embed_dim=embed_dim,
                 )
