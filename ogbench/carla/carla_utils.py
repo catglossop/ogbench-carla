@@ -148,7 +148,6 @@ DEFAULT_CRASH_STUCK_STEPS = 20
 DEFAULT_CRASH_STUCK_PENALTY = -1.0
 DEFAULT_COLLISION_EVENT_PENALTY = -5.0
 DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -5.0
-DEFAULT_MIN_SPEED_EVENT_PENALTY = -2.0
 SUCCESS_BONUS = 5.0
 FAILURE_BONUS = -5.0
 CARLA_FPS = 20.0
@@ -651,12 +650,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._outside_route_event_penalty = float(
             self.carla_config.get("outside_route_event_penalty", DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY)
         )
-        self._min_speed_event_penalty = float(
-            self.carla_config.get("min_speed_event_penalty", DEFAULT_MIN_SPEED_EVENT_PENALTY)
-        )
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
-        self._prev_min_speed_value = 0.0
         self._blocked_ticks = 0
         self._blocked_steps = int(
             self.carla_config.get(
@@ -975,7 +970,6 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._crash_stuck_ticks = 0
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
-        self._prev_min_speed_value = 0.0
         self._blocked_ticks = 0
         self._ttc_penalty_ticks = 0
         self._comfort_penalty_ticks = 0
@@ -1326,32 +1320,26 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             {"scenario_tree_status": getattr(tree_status, "name", str(tree_status))}
         )
         crash_stuck, collision_count = self._update_crash_stuck_state(speed)
-        outside_route_value, min_speed_value = self._route_infraction_values()
+        outside_route_value, _min_speed_value = self._route_infraction_values()
 
         collision_delta = max(0, collision_count - self._prev_collision_count)
         outside_route_delta = max(0.0, outside_route_value - self._prev_outside_route_value)
-        min_speed_delta = max(0.0, min_speed_value - self._prev_min_speed_value)
         self._prev_collision_count = collision_count
         self._prev_outside_route_value = outside_route_value
-        self._prev_min_speed_value = min_speed_value
 
         collision_pen = self._collision_event_penalty * float(collision_delta)
         outside_route_pen = self._outside_route_event_penalty * float(outside_route_delta)
-        min_speed_pen = self._min_speed_event_penalty * float(min_speed_delta)
-        reward += collision_pen + outside_route_pen + min_speed_pen
+        reward += collision_pen + outside_route_pen
 
         info["collision_count"] = collision_count
         info["crash_stuck_ticks"] = self._crash_stuck_ticks
         info["outside_route_value"] = outside_route_value
-        info["min_speed_value"] = min_speed_value
         info["route_completion"] = float(route_completion)
         info["route_completion_delta"] = float(route_completion_delta)
         info["collision_delta"] = float(collision_delta)
         info["outside_route_delta"] = float(outside_route_delta)
-        info["min_speed_delta"] = float(min_speed_delta)
         info["penalty_collision"] = collision_pen
         info["penalty_outside_route"] = outside_route_pen
-        info["penalty_min_speed"] = min_speed_pen
         info["reward_terminal"] = 0.0
         info["reward_total"] = float(reward)
         if crash_stuck:
