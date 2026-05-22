@@ -473,10 +473,6 @@ def run_online_carla(
         # Base Pi0 action used at rollout time; residual = stored action - base.
         # (In dagger_residual the residual is supervised toward expert - base.)
         example_transition["base_actions"] = np.zeros((action_dim,), dtype=np.float32)
-    if _online_training_mode == "sac_residual":
-        # Pi0(next_obs) computed at rollout time so the SAC critic update does not
-        # need to re-run Pi0 inference for every training batch.
-        example_transition["base_next_actions"] = np.zeros((action_dim,), dtype=np.float32)
     if steervla_actor is not None:
         openpi0 = _openpi_fields_from_raw(obs_raw)
         example_transition.update(openpi0)
@@ -486,40 +482,6 @@ def run_online_carla(
     buffer = ReplayBuffer.create(example_transition, size=capacity)
     
     rng = jax.random.PRNGKey(FLAGS.seed + 1)
-
-    def _sample_base_action_at(obs_np: np.ndarray, obs_raw_: dict) -> np.ndarray | None:
-        """Run Pi0 on an arbitrary obs to get its base action (for base_next_actions).
-
-        Temporarily swaps raw_obs_holder so the VLA sample fn sees the right image/state.
-        Bypasses the action chunk cache so it never corrupts the rollout cache.
-        """
-        if (
-            agent is None
-            or _online_training_mode != "sac_residual"
-            or raw_obs_holder is None
-            or not hasattr(agent, "vla_sample_fn")
-            or agent.vla_sample_fn is None
-        ):
-            return None
-        saved = raw_obs_holder.get("obs")
-        raw_obs_holder["obs"] = obs_raw_
-        try:
-            rng_bn = jax.random.PRNGKey(int(np.random.randint(0, 2**30)))
-            noise = jax.random.normal(rng_bn, (1, agent._flat_noise_dim()))
-            # Call the underlying _forward_pi0 path directly when possible to skip
-            # the chunk cache; otherwise fall back to the public sample fn.
-            vla_actor = getattr(agent.vla_sample_fn, "__self__", None)
-            if vla_actor is not None and hasattr(vla_actor, "_forward_pi0"):
-                base_jax = vla_actor._forward_pi0(1, noise, raw=None)
-            else:
-                base_jax = jnp.asarray(agent.vla_sample_fn(obs_np[None], noise))
-            base_jax = agent._clip_actions_to_env(base_jax)
-            return np.asarray(base_jax[0], dtype=np.float32)
-        except Exception as _e:
-            print(f"[base_next] failed: {_e}", flush=True)
-            return None
-        finally:
-            raw_obs_holder["obs"] = saved
 
     episode_return, episode_steps, episode_count = 0.0, 0, 0
     episode_collision_count = 0
@@ -903,15 +865,6 @@ def run_online_carla(
             residual_fields["base_actions"] = (
                 base_action_np if base_action_np is not None else replay_action
             )
-        if _online_training_mode == "sac_residual":
-            # Compute Pi0(next_obs) now at rollout time so the SAC training update
-            # can look up base_next_actions from the batch without re-running Pi0
-            # inference for every gradient step (eliminates VLA call from the hot path).
-            _base_next = _sample_base_action_at(next_obs, next_obs_raw)
-            residual_fields["base_next_actions"] = (
-                _base_next if _base_next is not None
-                else np.zeros(action_dim, dtype=np.float32)
-            )
         buffer.add_transition(
             {
                 "observations": np.asarray(obs),
@@ -1005,7 +958,7 @@ def run_online_carla(
         elif _critic_feedback_mode == "delta_commentary_bow":
             if _lang_text:
                 step_wb["label/commentary_delta"] = wandb.Html(f"<p>{_lang_text}</p>")
-        else:
+        elif _critic_feedback_mode == "commentary_bow":
             _commentary = obs_raw.get("commentary_text", "") if isinstance(obs_raw, dict) else ""
             if _commentary:
                 step_wb["label/commentary"] = wandb.Html(f"<p>{_commentary}</p>")

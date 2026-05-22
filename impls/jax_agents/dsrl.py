@@ -815,21 +815,42 @@ class DSRLAgent(flax.struct.PyTreeNode):
     def _critic_uses_pi_prefix_features(self) -> bool:
         return bool(self.config.get("critic_use_pi_prefix_features", False))
 
+    def _residual_uses_pi_image_features(self) -> bool:
+        return bool(self.config.get("residual_use_pi_image_features", False))
+
+    def _residual_pi_feature_source(self) -> str:
+        return str(self.config.get("residual_pi_feature_source", "prefix")).strip().lower()
+
+    def _residual_uses_pi_prefix_features(self) -> bool:
+        return self._residual_uses_pi_image_features() and self._residual_pi_feature_source() == "prefix"
+
+    def _prepare_pi_prefix_feature_batch(self, batch):
+        """Attach frozen Pi prefix embeddings once so critic/residual can share them."""
+        if not (self._critic_uses_pi_prefix_features() or self._residual_uses_pi_prefix_features()):
+            return batch
+        if self.steervla_actor is None:
+            raise RuntimeError("Pi prefix features require an attached steervla_actor.")
+        if "openpi_observation" not in batch or "next_openpi_observation" not in batch:
+            batch = self._prepare_vla_batch(batch)
+        if "pi_prefix_obs_e" in batch and "pi_prefix_next_obs_e" in batch:
+            return batch
+        batch = dict(batch)
+        batch["pi_prefix_obs_e"] = jax.lax.stop_gradient(
+            self.steervla_actor.encode_prefix_features(batch["openpi_observation"])
+        )
+        batch["pi_prefix_next_obs_e"] = jax.lax.stop_gradient(
+            self.steervla_actor.encode_prefix_features(batch["next_openpi_observation"])
+        )
+        return batch
+
     def _prepare_critic_feature_batch(self, batch):
         """Attach frozen Pi prefix embeddings for critic/noise_critic when enabled."""
         if not self._critic_uses_pi_prefix_features():
             return batch
-        if self.steervla_actor is None:
-            raise RuntimeError("critic_use_pi_prefix_features=True requires an attached steervla_actor.")
-        if "openpi_observation" not in batch or "next_openpi_observation" not in batch:
-            batch = self._prepare_vla_batch(batch)
+        batch = self._prepare_pi_prefix_feature_batch(batch)
         batch = dict(batch)
-        batch["critic_obs_e"] = jax.lax.stop_gradient(
-            self.steervla_actor.encode_prefix_features(batch["openpi_observation"])
-        )
-        batch["critic_next_obs_e"] = jax.lax.stop_gradient(
-            self.steervla_actor.encode_prefix_features(batch["next_openpi_observation"])
-        )
+        batch["critic_obs_e"] = batch["pi_prefix_obs_e"]
+        batch["critic_next_obs_e"] = batch["pi_prefix_next_obs_e"]
         return batch
 
     def update_dagger_direct(self, batch):
@@ -878,13 +899,13 @@ class DSRLAgent(flax.struct.PyTreeNode):
             return obs_e
         return jnp.concatenate([obs_e, jnp.asarray(lang, dtype=jnp.float32)], axis=-1)
 
-    def _residual_uses_pi_image_features(self) -> bool:
-        return bool(self.config.get("residual_use_pi_image_features", False))
-
-    def _residual_pi_feature_source(self) -> str:
-        return str(self.config.get("residual_pi_feature_source", "prefix")).strip().lower()
-
-    def _residual_obs_features(self, observations, openpi_observation=None, base_action=None):
+    def _residual_obs_features(
+        self,
+        observations,
+        openpi_observation=None,
+        base_action=None,
+        precomputed_prefix_features=None,
+    ):
         """Feature source for the residual actor.
 
         By default this is DSRL's ``obs_encoder`` output. When
@@ -905,6 +926,8 @@ class DSRLAgent(flax.struct.PyTreeNode):
             )
         source = self._residual_pi_feature_source()
         if source == "prefix":
+            if precomputed_prefix_features is not None:
+                return jnp.asarray(precomputed_prefix_features, dtype=jnp.float32)
             return self.steervla_actor.encode_prefix_features(openpi_observation)
         if source == "suffix":
             if base_action is None:
@@ -947,42 +970,41 @@ class DSRLAgent(flax.struct.PyTreeNode):
 
         Steps:
 
-        1. Read ``base_next = batch["base_next_actions"]`` (Pi0(s') stored at rollout time).
+        1. Compute ``base_next = Pi0(s')`` eagerly.
         2. Compute ``next_action = clip(base_next + residual(obs_e', base_next) * scale, -1, 1)``.
         3. Update the DSRL critic with TD target bootstrapped from ``next_action``.
         4. Update the residual MLP by maximizing ``Q(s, clip(base_stored + residual(obs_e, base_stored) * scale))``.
 
-        Requires ``batch`` to contain ``base_actions`` and ``base_next_actions`` —
-        both stored by ``main_carla.py`` so Pi0 inference is NOT re-run here.
+        Requires ``batch`` to contain ``base_actions`` — the base Pi0 action that
+        was used during rollout (stored separately by ``main_carla.py``).
         """
         new_rng, rng = jax.random.split(self.rng)
         if self.sac_residual_agent is None:
             return self.replace(rng=new_rng), {"sac_residual/skipped_no_subagent": 1.0}
-        if "base_actions" not in batch or "base_next_actions" not in batch:
+        if "base_actions" not in batch:
             return self.replace(rng=new_rng), {"sac_residual/skipped_no_base_actions": 1.0}
 
-        # Only call the expensive VLA batch-prep when Pi-backed residual or critic features are needed.
-        if self._residual_uses_pi_image_features() or self._critic_uses_pi_prefix_features():
-            batch = self._prepare_vla_batch(batch)
+        batch = self._prepare_vla_batch(batch)
+        batch = self._prepare_pi_prefix_feature_batch(batch)
         if self._critic_uses_pi_prefix_features():
             batch = self._prepare_critic_feature_batch(batch)
 
-        _rng_res, rng = jax.random.split(rng)
+        rng_base, rng_res = jax.random.split(rng)
 
         # 1-2. Bootstrap action + log_prob for the critic TD target.
-        # base_next was computed by running Pi0(next_obs) at rollout time.
-        base_next = self._clip_actions_to_env(
-            jnp.asarray(batch["base_next_actions"], dtype=jnp.float32)
+        base_next = self._vla_forward(
+            batch["next_observations"], batch["next_openpi_observation"], rng_base,
         )
         next_obs_e_sg = jax.lax.stop_gradient(
             self._residual_obs_features(
                 batch["next_observations"],
-                batch.get("next_openpi_observation"),
+                batch["next_openpi_observation"],
                 base_next,
+                precomputed_prefix_features=batch.get("pi_prefix_next_obs_e"),
             )
         )
         next_action, _, next_log_pi = self.sac_residual_agent.sample_actions_and_log_prob_residual(
-            next_obs_e_sg, base_next, seed=_rng_res,
+            next_obs_e_sg, base_next, seed=rng_res,
         )
         next_action = jax.lax.stop_gradient(self._clip_actions_to_env(next_action))
         next_log_pi = jax.lax.stop_gradient(next_log_pi)
@@ -1000,6 +1022,7 @@ class DSRLAgent(flax.struct.PyTreeNode):
                 batch["observations"],
                 batch.get("openpi_observation"),
                 base_action,
+                precomputed_prefix_features=batch.get("pi_prefix_obs_e"),
             )
         )
         if "critic_obs_e" in batch:
