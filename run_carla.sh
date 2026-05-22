@@ -61,10 +61,11 @@ Options:
   --x-display-num N         Xvfb display number. Default: derived from carla port
 
   --critic-mode MODE        one of:
-                              none         -> no extra critic info
-                              delta        -> numeric action delta
-                              delta-lang   -> language on expert-agent delta
-                              expert-lang  -> language on expert action
+                              none          -> no extra critic info
+                              delta         -> numeric action delta
+                              delta-lang    -> language on expert-agent delta
+                              expert-lang   -> language on expert action
+                              expert-action -> expert action itself (no delta)
                             Default: delta
 
   --train-mode MODE         rl|dagger|dagger_direct|sac_direct|sac_residual|dagger_residual. Default: rl
@@ -135,9 +136,10 @@ case "$CRITIC_MODE" in
   delta) CRITIC_FEEDBACK_MODE="action_delta" ;;
   delta-lang) CRITIC_FEEDBACK_MODE="delta_commentary_bow" ;;
   expert-lang) CRITIC_FEEDBACK_MODE="commentary_bow" ;;
+  expert-action) CRITIC_FEEDBACK_MODE="expert_action" ;;
   *)
     echo "Invalid --critic-mode: $CRITIC_MODE" >&2
-    echo "Expected one of: none, delta, delta-lang, expert-lang" >&2
+    echo "Expected one of: none, delta, delta-lang, expert-lang, expert-action" >&2
     exit 2
     ;;
 esac

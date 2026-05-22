@@ -76,7 +76,7 @@ def get_config():
 
     # Residual actor defaults (sac_residual / dagger_residual).
     # scale=0.3 ≈ 2m correction capacity in DELTA_XY normalized space (7× phys).
-    config.residual_action_scale = 0.3
+    config.residual_action_scale = 0.3 # 1.0 # 0.3
     # alpha=0.3 provides reasonable entropy pressure for the 40-dim action space
     # (action_horizon=10 * action_dim=4); higher than the default 0.1 used for
     # smaller action spaces.
@@ -104,7 +104,7 @@ def get_config():
             # Local OpenPI inference (ignored when actor_url is set):
             actor_config="pi05_steervla_cot_simplified_reasoning",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
-            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260521_021239/8000",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260521_021239/16000",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning_20260512_144250/50000",
 
             routing_command="Follow the route and stay in lane.",

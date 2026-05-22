@@ -17,7 +17,7 @@ def critic_language_dim(agent_config: Any) -> int:
     mode = str(agent_config.get("critic_feedback_mode", "commentary_bow"))
     if mode == "none":
         return 0
-    if mode == "action_delta":
+    if mode in ("action_delta", "expert_action"):
         return int(agent_config.get("critic_action_dim", 4))
     if mode == "delta_commentary_bow":
         return NUM_DELTA_COMMENTARY_WORDS
@@ -92,6 +92,27 @@ def compute_action_delta(
         return (expert_first - agent_first).astype(np.float32)
     except Exception as e:
         print(f"[action_delta] failed: {e}", flush=True)
+        return zeros
+
+
+def compute_expert_action(
+    obs_raw: dict,
+    agent,
+    agent_config,
+) -> np.ndarray:
+    """Return ``first_step(expert_action)`` in env action space."""
+    critic_action_dim = int(agent_config.get("critic_action_dim", 4))
+    zeros = np.zeros(critic_action_dim, dtype=np.float32)
+    expert_raw = obs_raw.get("expert_action")
+    if expert_raw is None:
+        return zeros
+    try:
+        import jax.numpy as jnp
+
+        expert_first = np.asarray(agent._env_action_first_step(jnp.array(np.asarray(expert_raw).reshape(1, -1))))[0]
+        return expert_first.astype(np.float32)
+    except Exception as e:
+        print(f"[expert_action] failed: {e}", flush=True)
         return zeros
 
 

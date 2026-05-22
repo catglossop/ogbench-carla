@@ -131,6 +131,7 @@ def _residual_actor_apply_step(
         loss = (alpha * log_prob - q).mean()
         info = {
             "residual_actor_loss": loss,
+            "residual_entropy": -log_prob.mean(),
             "residual_log_prob": log_prob.mean(),
             "residual_q_mean": q.mean(),
             "residual_q_min": q.min(),
@@ -175,6 +176,8 @@ def _dagger_actor_apply_step(
             "dagger_residual_base_mse": jnp.mean(jnp.square(base_diff)),
             "dagger_residual_abs_mean": jnp.abs(residual).mean(),
             "dagger_residual_abs_max": jnp.abs(residual).max(),
+            "dagger_base_diff_hist": base_diff.ravel(),
+            "dagger_pred_diff_hist": diff.ravel(),
         }
         return loss, info
 
@@ -219,6 +222,8 @@ def _joint_dagger_apply_step(
             "dagger_residual_base_mse": jnp.mean(jnp.square(base_diff)),
             "dagger_residual_abs_mean": jnp.abs(residual).mean(),
             "dagger_residual_abs_max": jnp.abs(residual).max(),
+            "dagger_base_diff_hist": base_diff.ravel(),
+            "dagger_pred_diff_hist": diff.ravel(),
         }
         return loss, info
 

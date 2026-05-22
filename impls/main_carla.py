@@ -56,6 +56,7 @@ from coaches.expert_label import NUM_COMMENTARY_WORDS, NUM_DELTA_COMMENTARY_WORD
 from coaches.critic_feedback import (
     compute_action_delta,
     compute_action_delta_commentary,
+    compute_expert_action,
     critic_language_dim,
     denormalize_action_chunk,
 )
@@ -598,6 +599,84 @@ def run_online_carla(
         except Exception:
             return annotated
 
+    def _overlay_waypoints_on_frame(
+        frame: np.ndarray,
+        agent_chunk_flat: np.ndarray | None,
+        expert_chunk_flat: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Project temporal (speed) and spatial (route) waypoints onto the camera frame.
+
+        Coordinate convention mirrors simlingo/team_code/simlingo_utils.py:
+        - x_ego = forward, y_ego = lateral (left negative, right positive)
+        - camera is at [0, 2, 1.5] (y=2m right, z=1.5m up) with no rotation
+        Colors: agent route=red, agent speed=green, expert route=blue, expert speed=cyan
+        """
+        try:
+            import cv2  # type: ignore
+            from PIL import Image, ImageDraw  # type: ignore
+
+            h, w = frame.shape[:2]
+
+            def _camera_K(width, height, fov=110.0):
+                focal = width / (2.0 * np.tan(fov * np.pi / 360.0))
+                K = np.eye(3, dtype=np.float32)
+                K[0, 0] = K[1, 1] = focal
+                K[0, 2] = width / 2.0
+                K[1, 2] = height / 2.0
+                return K
+
+            def _project(points_xy, K):
+                """Project ego-frame (x_forward, y_lateral) points to image coords."""
+                tvec = np.array([[0.0, 2.0, 1.5]], np.float32)
+                rvec = np.zeros((3, 1), np.float32)
+                dist = np.zeros((5, 1), np.float32)
+                out = []
+                for pt in points_xy:
+                    pos3d = np.array([pt[1], 0.0, pt[0] + tvec[0][2]], np.float32)
+                    p2d, _ = cv2.projectPoints(pos3d, rvec, tvec, K, dist)
+                    out.append(p2d[0][0])
+                return out
+
+            def _chunk_to_wps(flat, action_dim=4):
+                if flat is None or flat.size < action_dim:
+                    return None, None
+                if flat.size % action_dim != 0:
+                    return None, None
+                chunk = flat.reshape(-1, action_dim)
+                speed_wps = np.cumsum(chunk[:, :2], axis=0)
+                route_wps = np.cumsum(
+                    np.concatenate([np.zeros((1, 2), dtype=np.float32), chunk[:, 2:]], axis=0),
+                    axis=0,
+                )
+                return speed_wps, route_wps
+
+            K = _camera_K(w, h)
+            image = Image.fromarray(frame)
+            draw = ImageDraw.Draw(image)
+
+            def _draw_dots(wps, color, r=3):
+                if wps is None:
+                    return
+                for px, py in _project(wps, K):
+                    if 0 <= px < w and 0 <= py < h:
+                        draw.ellipse((px - r, py - r, px + r, py + r), fill=color)
+
+            agent_speed, agent_route = _chunk_to_wps(
+                np.asarray(agent_chunk_flat, dtype=np.float32) if agent_chunk_flat is not None else None
+            )
+            expert_speed, expert_route = _chunk_to_wps(
+                np.asarray(expert_chunk_flat, dtype=np.float32) if expert_chunk_flat is not None else None
+            )
+
+            _draw_dots(expert_route, (0, 0, 255), r=4)   # blue
+            _draw_dots(expert_speed, (0, 255, 255), r=3)  # cyan
+            _draw_dots(agent_route, (255, 0, 0), r=4)    # red
+            _draw_dots(agent_speed, (0, 255, 0), r=3)    # green
+
+            return np.asarray(image, dtype=np.uint8)
+        except Exception:
+            return frame
+
     def _format_text_field(raw: dict[str, Any] | None, key: str) -> str:
         
         if not isinstance(raw, dict) or key not in raw or raw.get(key) is None:
@@ -622,7 +701,7 @@ def run_online_carla(
     ) -> str:
         if critic_mode == "none":
             return "none"
-        if critic_mode == "action_delta":
+        if critic_mode in ("action_delta", "expert_action"):
             arr = np.asarray(critic_label, dtype=np.float32).reshape(-1)
             if arr.size == 0:
                 return "[]"
@@ -821,6 +900,9 @@ def run_online_carla(
                 denormalize_kwargs=_agent_action_denorm_kwargs,
             )
             _next_lang = _zero_label  # bootstrap target sees zero delta (next action unknown)
+        elif _critic_feedback_mode == "expert_action":
+            _lang = compute_expert_action(obs_raw, agent, agent_config)
+            _next_lang = compute_expert_action(next_obs_raw, agent, agent_config)
         elif _critic_feedback_mode == "delta_commentary_bow":
             _lang_text, _lang = compute_action_delta_commentary(
                 obs_raw, action, agent,
@@ -882,6 +964,24 @@ def run_online_carla(
                 expert_mse_metrics["rollout/mse_base_to_expert"] = float(
                     np.mean(np.square(_base_flat_env - _expert_flat))
                 )
+            if (
+                step % 50 == 0
+                and _online_training_mode in {"sac_residual", "dagger_residual"}
+                and _agent_action_denorm_kwargs is not None
+            ):
+                from vlas.steervla import _normalize_action_chunk_numpy
+                _norm_kw = _agent_action_denorm_kwargs
+                _exp_norm = _normalize_action_chunk_numpy(_expert_flat[None], **_norm_kw)[0]
+                if _action_flat_env.shape == _expert_flat.shape:
+                    _act_norm = _normalize_action_chunk_numpy(_action_flat_env[None], **_norm_kw)[0]
+                    expert_mse_metrics["rollout/action_expert_diff_hist"] = wandb.Histogram(
+                        _act_norm - _exp_norm
+                    )
+                if _base_flat_env is not None and _base_flat_env.shape == _expert_flat.shape:
+                    _base_norm = _normalize_action_chunk_numpy(_base_flat_env[None], **_norm_kw)[0]
+                    expert_mse_metrics["rollout/base_expert_diff_hist"] = wandb.Histogram(
+                        _base_norm - _exp_norm
+                    )
 
         residual_fields: dict[str, np.ndarray] = {}
         if _online_training_mode in {"sac_residual", "dagger_residual"}:
@@ -946,6 +1046,11 @@ def run_online_carla(
             had_collision_this_step = collision_delta > 0
             if should_sample_periodic or had_collision_this_step:
                 frame = _as_video_frame(_viz_image_from_raw(obs_raw))
+                frame = _overlay_waypoints_on_frame(
+                    frame,
+                    _action_flat_env,
+                    obs_raw.get("expert_action") if isinstance(obs_raw, dict) else None,
+                )
                 frame = _annotate_text_panel(
                     frame,
                     cot_obs_raw,
@@ -996,6 +1101,8 @@ def run_online_carla(
         # Log critic feedback signal (obs_raw is already next_obs_raw here)
         if _critic_feedback_mode == "action_delta":
             step_wb["label/action_delta_norm"] = float(np.linalg.norm(_lang))
+        elif _critic_feedback_mode == "expert_action":
+            step_wb["label/expert_action_norm"] = float(np.linalg.norm(_lang))
         elif _critic_feedback_mode == "delta_commentary_bow":
             if _lang_text:
                 step_wb["label/commentary_delta"] = wandb.Html(f"<p>{_lang_text}</p>")
@@ -1108,7 +1215,9 @@ def run_online_carla(
                 "time/update_time": np.mean(update_times),
             }
             if last_update_info is not None:
-                metrics.update({f"training/{k}": float(v) for k, v in last_update_info.items()})
+                for k, v in last_update_info.items():
+                    v_np = np.asarray(v)
+                    metrics[f"training/{k}"] = wandb.Histogram(v_np) if v_np.ndim > 0 else float(v_np)
                 metrics["training/buffer_size"] = int(buffer.size)
             last_log_time = time.time()
             wandb.log(metrics, step=step)

@@ -1220,7 +1220,7 @@ class DSRLAgent(flax.struct.PyTreeNode):
             )
             critic_embed_dim = int(steervla_actor.encode_prefix_features(openpi_obs).shape[-1])
         critic_feedback_mode = str(config.get("critic_feedback_mode", "commentary_bow"))
-        if critic_feedback_mode == "action_delta":
+        if critic_feedback_mode in ("action_delta", "expert_action"):
             lang_dim = int(config.get("critic_action_dim", 4))
         else:
             lang_dim = int(config.get("language_label_dim", 119))
