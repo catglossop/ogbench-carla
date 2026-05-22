@@ -1020,10 +1020,11 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             planner.set_route(ev.route_scenario.route, gps=False)
             self._route_planner = planner
             if planner.route:
-                _, first_cmd = planner.route[0]
-                cmd_int = int(getattr(first_cmd, "value", first_cmd))
-                if 1 <= cmd_int <= 6:
-                    self._current_routing_command = cmd_int
+                for _, init_cmd in planner.route:
+                    init_cmd_int = int(getattr(init_cmd, "value", init_cmd))
+                    if init_cmd_int != 4 and 1 <= init_cmd_int <= 6:
+                        self._current_routing_command = init_cmd_int
+                        break
         except Exception as _rp_exc:
             print(f"[routing_command] RoutePlanner init failed: {_rp_exc}", flush=True)
         self._scenario_active = True
@@ -1049,15 +1050,15 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         loc = ego.get_transform().location
         ego_pos = np.array([loc.x, loc.y, loc.z], dtype=np.float64)
         waypoint_route = self._route_planner.run_step(ego_pos)
-        if len(waypoint_route) > 1:
-            _, cmd = waypoint_route[1]
-        elif len(waypoint_route) > 0:
-            _, cmd = waypoint_route[0]
-        else:
-            return
-        cmd_int = int(getattr(cmd, "value", cmd))
-        if 1 <= cmd_int <= 6:
-            self._current_routing_command = cmd_int
+        # Scan ahead for the first non-LANEFOLLOW command so turning routes announce
+        # the maneuver from the start of the straight approach, not just 4m before it.
+        for _, cmd in waypoint_route:
+            cmd_int = int(getattr(cmd, "value", cmd))
+            if cmd_int != 4 and 1 <= cmd_int <= 6:
+                self._current_routing_command = cmd_int
+                return
+        # All remaining waypoints are LANEFOLLOW.
+        self._current_routing_command = 4
 
     def _load_speed_limit_map(self, map_name: str) -> bool:
         """Load the precomputed speed-limit cKDTree for ``map_name``; return True on success."""
