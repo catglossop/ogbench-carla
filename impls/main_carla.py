@@ -473,6 +473,10 @@ def run_online_carla(
         # Base Pi0 action used at rollout time; residual = stored action - base.
         # (In dagger_residual the residual is supervised toward expert - base.)
         example_transition["base_actions"] = np.zeros((action_dim,), dtype=np.float32)
+    if _online_training_mode == "sac_residual":
+        # Pi0(s') for the TD bootstrap target, backfilled one step later at zero cost
+        # (the next step's base_action_np == Pi0(next_obs) for the current transition).
+        example_transition["base_next_actions"] = np.zeros((action_dim,), dtype=np.float32)
     if steervla_actor is not None:
         openpi0 = _openpi_fields_from_raw(obs_raw)
         example_transition.update(openpi0)
@@ -886,6 +890,16 @@ def run_online_carla(
             residual_fields["base_actions"] = (
                 base_action_np if base_action_np is not None else replay_action
             )
+        if _online_training_mode == "sac_residual":
+            # Placeholder — the real value is backfilled on the next step.
+            residual_fields["base_next_actions"] = np.zeros_like(
+                residual_fields["base_actions"]
+            )
+        if _online_training_mode == "sac_residual" and buffer.size > 0 and base_action_np is not None:
+            # base_action_np = Pi0(obs) = Pi0(s') for the *previous* transition.
+            # Backfill it now so sac_residual training never needs a live _vla_forward.
+            # Terminal transitions have masks=0 so their base_next_actions are unused.
+            buffer._dict["base_next_actions"][(buffer.pointer - 1) % buffer.max_size] = base_action_np
         if _uses_pi_prefix and _pi_prefix_e is not None:
             _pi_prefix_next_e = _compute_pi_prefix_e(next_obs_raw)
             residual_fields["pi_prefix_obs_e"] = _pi_prefix_e

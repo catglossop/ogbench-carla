@@ -992,9 +992,16 @@ class DSRLAgent(flax.struct.PyTreeNode):
         rng_base, rng_res = jax.random.split(rng)
 
         # 1-2. Bootstrap action + log_prob for the critic TD target.
-        base_next = self._vla_forward(
-            batch["next_observations"], batch["next_openpi_observation"], rng_base,
-        )
+        # Use pre-stored base_next_actions from the replay buffer when available (zero
+        # Pi0 overhead at training time); fall back to a live _vla_forward if not cached.
+        if "base_next_actions" in batch:
+            base_next = jax.lax.stop_gradient(
+                self._clip_actions_to_env(jnp.asarray(batch["base_next_actions"], dtype=jnp.float32))
+            )
+        else:
+            base_next = self._vla_forward(
+                batch["next_observations"], batch["next_openpi_observation"], rng_base,
+            )
         next_obs_e_sg = jax.lax.stop_gradient(
             self._residual_obs_features(
                 batch["next_observations"],
@@ -1112,6 +1119,7 @@ class DSRLAgent(flax.struct.PyTreeNode):
                 batch["observations"],
                 batch.get("openpi_observation"),
                 base_action,
+                precomputed_prefix_features=batch.get("pi_prefix_obs_e"),
             )
         )
         new_residual, residual_info = self.sac_residual_agent.update_actor_dagger(
