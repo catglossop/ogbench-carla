@@ -122,7 +122,7 @@ def carla_state_vec_to_steervla_state(
     include_ego_history: bool,
     proprio_norm: bool,
 ) -> np.ndarray:
-    """Map CARLA ego vector (``ogbench.carla.carla_utils._ego_state_vector`` layout) to padded proprio."""
+    """Map CARLA ego+command vector (``carla_utils.STATE_DIM``-dim) to padded proprio; uses indices 5 and 15."""
     flat_sv = np.asarray(carla_vec, dtype=np.float32).reshape(-1)
     speed = float(flat_sv[15])
     yaw_deg = float(flat_sv[5])
