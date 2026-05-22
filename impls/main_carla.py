@@ -477,11 +477,32 @@ def run_online_carla(
         openpi0 = _openpi_fields_from_raw(obs_raw)
         example_transition.update(openpi0)
         example_transition.update({f"next_{k}": np.array(v) for k, v in openpi0.items()})
-        
+    _uses_pi_prefix: bool = (
+        steervla_actor is not None
+        and (
+            (
+                bool(agent_config.get("residual_use_pi_image_features", False))
+                and str(agent_config.get("residual_pi_feature_source", "prefix")).strip().lower() == "prefix"
+            )
+            or bool(agent_config.get("critic_use_pi_prefix_features", False))
+        )
+    )
+    if _uses_pi_prefix:
+        _ex_openpi_obs = steervla_actor.build_observation_batch_numpy(batch_size=1, raw=obs_raw)
+        _pi_prefix_dim = int(steervla_actor.encode_prefix_features(_ex_openpi_obs).shape[-1])
+        example_transition["pi_prefix_obs_e"] = np.zeros((_pi_prefix_dim,), dtype=np.float32)
+        example_transition["pi_prefix_next_obs_e"] = np.zeros((_pi_prefix_dim,), dtype=np.float32)
+
     # Create replay buffer
     buffer = ReplayBuffer.create(example_transition, size=capacity)
     
     rng = jax.random.PRNGKey(FLAGS.seed + 1)
+
+    def _compute_pi_prefix_e(raw_obs: dict) -> np.ndarray:
+        openpi_obs = steervla_actor.build_observation_batch_numpy(batch_size=1, raw=raw_obs)
+        return np.asarray(steervla_actor.encode_prefix_features(openpi_obs)[0], dtype=np.float32)
+
+    _pi_prefix_e: np.ndarray | None = _compute_pi_prefix_e(obs_raw) if _uses_pi_prefix else None
 
     episode_return, episode_steps, episode_count = 0.0, 0, 0
     episode_collision_count = 0
@@ -865,6 +886,10 @@ def run_online_carla(
             residual_fields["base_actions"] = (
                 base_action_np if base_action_np is not None else replay_action
             )
+        if _uses_pi_prefix and _pi_prefix_e is not None:
+            _pi_prefix_next_e = _compute_pi_prefix_e(next_obs_raw)
+            residual_fields["pi_prefix_obs_e"] = _pi_prefix_e
+            residual_fields["pi_prefix_next_obs_e"] = _pi_prefix_next_e
         buffer.add_transition(
             {
                 "observations": np.asarray(obs),
@@ -884,6 +909,8 @@ def run_online_carla(
                 ),
             }
         )
+        if _uses_pi_prefix and _pi_prefix_e is not None:
+            _pi_prefix_e = _pi_prefix_next_e
         t_step_end = time.time()
         
         t_log_start = time.time()
@@ -1020,6 +1047,8 @@ def run_online_carla(
                 if reset_vla_cache is not None:
                     reset_vla_cache()
             obs = _extract_agent_obs(env, obs_raw, obs_mode)
+            if _uses_pi_prefix:
+                _pi_prefix_e = _compute_pi_prefix_e(obs_raw)
             episode_video_frames = []
             episode_return, episode_steps = 0.0, 0
             episode_collision_count = 0
