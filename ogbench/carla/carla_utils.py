@@ -149,15 +149,16 @@ EGO_STATE_IDX_BRAKE = 18
 
 DEFAULT_CRASH_STUCK_SPEED_THRESHOLD = 0.1
 DEFAULT_CRASH_STUCK_STEPS = 20
-DEFAULT_CRASH_STUCK_PENALTY = -1.0
-DEFAULT_COLLISION_EVENT_PENALTY = -5.0  # catastrophic - should update to make sure any contact is given negative reward
-DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -5.0  # should be pretty heavy
+DEFAULT_CRASH_STUCK_PENALTY = -20.0
+DEFAULT_COLLISION_EVENT_PENALTY = -20.0
+DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -20.0
 DEFAULT_PROGRESS_REWARD_WEIGHT = 1.0
 # DEFAULT_CENTERING_REWARD_WEIGHT = 0.2
 # DEFAULT_HEADING_REWARD_WEIGHT = 0.2
 DEFAULT_STEER_PENALTY_WEIGHT = 0.05
 DEFAULT_BRAKE_PENALTY_WEIGHT = 0.02
 DEFAULT_SPEED_LIMIT_PENALTY_WEIGHT = 0.1
+DEFAULT_SPEEDING_EVENT_PENALTY = -0.1
 SUCCESS_BONUS = 5.0
 FAILURE_BONUS = -5.0
 CARLA_FPS = 20.0
@@ -715,6 +716,9 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         )
         self._speed_limit_penalty_weight = float(
             self.carla_config.get("speed_limit_penalty_weight", DEFAULT_SPEED_LIMIT_PENALTY_WEIGHT)
+        )
+        self._speeding_event_penalty = float(
+            self.carla_config.get("speeding_event_penalty", DEFAULT_SPEEDING_EVENT_PENALTY)
         )
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
@@ -1444,19 +1448,27 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
 
         crash_stuck, collision_count = self._update_crash_stuck_state(speed)
         outside_route_value, _min_speed_value = self._route_infraction_values()
+        overspeed_kmh = max(0.0, (speed - speed_limit_mps) * 3.6)
 
         collision_delta = max(0, collision_count - self._prev_collision_count)
         outside_route_delta = max(0.0, outside_route_value - self._prev_outside_route_value)
         self._prev_collision_count = collision_count
         self._prev_outside_route_value = outside_route_value
 
-        collision_pen = self._collision_event_penalty * float(collision_delta)
+        collision_contact_active = self._active_actor_collision_contact()
+        collision_penalty_active = collision_contact_active or (collision_delta > 0)
+        collision_pen = self._collision_event_penalty if collision_penalty_active else 0.0
         outside_route_pen = self._outside_route_event_penalty * float(outside_route_delta)
-        reward += collision_pen + outside_route_pen
+        speeding_pen = self._speeding_event_penalty * float(overspeed_kmh)
+        reward += collision_pen + outside_route_pen + speeding_pen
 
         info["collision_count"] = collision_count
         info["crash_stuck_ticks"] = self._crash_stuck_ticks
+        info["collision_penalty_active"] = bool(collision_penalty_active)
+        info["collision_contact_active"] = bool(collision_contact_active)
         info["outside_route_value"] = outside_route_value
+        info["speed_limit_mps"] = float(speed_limit_mps)
+        info["overspeed_kmh"] = float(overspeed_kmh)
         info["route_completion"] = float(route_completion)
         info["route_completion_delta"] = float(route_completion_delta)
         info["collision_delta"] = float(collision_delta)
@@ -1474,6 +1486,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         info["penalty_steer"] = -steer_pen
         info["penalty_brake"] = -brake_pen
         info["penalty_speed_limit"] = -speed_limit_pen
+        info["penalty_speeding"] = speeding_pen
         info["reward_progress"] = progress_reward
         # info["reward_centering"] = centering_reward
         # info["reward_heading"] = heading_reward
@@ -2058,6 +2071,36 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                     continue
                 if self._obb_intersects(ego_bbox, actor_bbox):
                     return True
+        return False
+
+    def _active_actor_collision_contact(self) -> bool:
+        ego = self._ego_actor()
+        if ego is None:
+            return False
+        ego_bbox = self._bbox_at_prediction_step(ego, 0.0)
+        if ego_bbox is None:
+            return False
+        try:
+            actors = self.evaluator.world.get_actors()
+        except Exception:
+            return False
+        relevant_actors = [
+            actor
+            for actor in actors
+            if actor.id != ego.id and actor.is_alive and (
+                "vehicle" in actor.type_id
+                or "walker" in actor.type_id
+                or "static" in actor.type_id
+                or "traffic" in actor.type_id
+                or "prop" in actor.type_id
+            )
+        ]
+        for actor in relevant_actors:
+            actor_bbox = self._bbox_at_prediction_step(actor, 0.0)
+            if actor_bbox is None:
+                continue
+            if self._obb_intersects(ego_bbox, actor_bbox):
+                return True
         return False
 
     def _outside_lane_soft_violation(self, lane_metrics: Dict[str, Any]) -> bool:
