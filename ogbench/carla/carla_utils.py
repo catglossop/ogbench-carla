@@ -731,6 +731,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._cached_world_map: Any | None = None
         self._route_planner: Any | None = None
         self._current_routing_command: int = 4  # LANEFOLLOW until route is loaded
+        self._routing_last_command_tmp: int = -1  # simlingo carryover state
+        self._routing_last_command: int = -1
         self._speed_limit_tree: Any | None = None
         self._speed_limit_values: Any | None = None
         self._speed_limit_map_name: str = ""
@@ -1013,18 +1015,14 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             self._expert_agent = self._build_simlingo_autopilot()
         self._cached_world_map = None
         self._current_routing_command = 4
+        self._routing_last_command_tmp = -1
+        self._routing_last_command = -1
         self._route_planner = None
         try:
             from coaches.simlingo.nav_planner import RoutePlanner as _RoutePlanner
-            planner = _RoutePlanner(min_distance=4.0, max_distance=50.0)
+            planner = _RoutePlanner(min_distance=7.5, max_distance=50.0)
             planner.set_route(ev.route_scenario.route, gps=False)
             self._route_planner = planner
-            if planner.route:
-                for _, init_cmd in planner.route:
-                    init_cmd_int = int(getattr(init_cmd, "value", init_cmd))
-                    if init_cmd_int != 4 and 1 <= init_cmd_int <= 6:
-                        self._current_routing_command = init_cmd_int
-                        break
         except Exception as _rp_exc:
             print(f"[routing_command] RoutePlanner init failed: {_rp_exc}", flush=True)
         self._scenario_active = True
@@ -1050,15 +1048,24 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         loc = ego.get_transform().location
         ego_pos = np.array([loc.x, loc.y, loc.z], dtype=np.float64)
         waypoint_route = self._route_planner.run_step(ego_pos)
-        # Scan ahead for the first non-LANEFOLLOW command so turning routes announce
-        # the maneuver from the start of the straight approach, not just 4m before it.
-        for _, cmd in waypoint_route:
-            cmd_int = int(getattr(cmd, "value", cmd))
-            if cmd_int != 4 and 1 <= cmd_int <= 6:
-                self._current_routing_command = cmd_int
-                return
-        # All remaining waypoints are LANEFOLLOW.
-        self._current_routing_command = 4
+        if len(waypoint_route) > 1:
+            _, cmd = waypoint_route[1]
+        elif len(waypoint_route) > 0:
+            _, cmd = waypoint_route[0]
+        else:
+            return
+        far_cmd_int = int(getattr(cmd, "value", cmd))
+        if not (1 <= far_cmd_int <= 6):
+            return
+        # Simlingo carryover: when transitioning back to LANEFOLLOW after a turn,
+        # keep showing the turn command (last_command) until the next route event.
+        if self._routing_last_command_tmp != far_cmd_int:
+            self._routing_last_command = self._routing_last_command_tmp
+        self._routing_last_command_tmp = far_cmd_int
+        if self._routing_last_command in (1, 2, 3) and far_cmd_int == 4:
+            self._current_routing_command = self._routing_last_command
+        else:
+            self._current_routing_command = far_cmd_int
 
     def _load_speed_limit_map(self, map_name: str) -> bool:
         """Load the precomputed speed-limit cKDTree for ``map_name``; return True on success."""
