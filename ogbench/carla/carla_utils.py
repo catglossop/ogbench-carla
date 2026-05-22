@@ -159,6 +159,9 @@ ROUTING_COMMAND_TEXT = {
     6: "do a lane change to the right",
 }
 
+# Pre-computed per-town speed-limit lookup tables (simlingo, km/h, CARLA world coords).
+_SPEED_LIMITS_DIR = Path(__file__).resolve().parent.parent.parent / "impls" / "coaches" / "simlingo" / "speed_limits"
+
 DEFAULT_CRASH_STUCK_SPEED_THRESHOLD = 0.1
 DEFAULT_CRASH_STUCK_STEPS = 20
 DEFAULT_CRASH_STUCK_PENALTY = -1.0
@@ -728,6 +731,9 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._cached_world_map: Any | None = None
         self._route_planner: Any | None = None
         self._current_routing_command: int = 4  # LANEFOLLOW until route is loaded
+        self._speed_limit_tree: Any | None = None
+        self._speed_limit_values: Any | None = None
+        self._speed_limit_map_name: str = ""
         try:
             from coaches.expert_label import ExpertLabelComputer
             self._label_computer = ExpertLabelComputer()
@@ -1052,6 +1058,35 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         cmd_int = int(getattr(cmd, "value", cmd))
         if 1 <= cmd_int <= 6:
             self._current_routing_command = cmd_int
+
+    def _load_speed_limit_map(self, map_name: str) -> bool:
+        """Load the precomputed speed-limit cKDTree for ``map_name``; return True on success."""
+        if map_name == self._speed_limit_map_name and self._speed_limit_tree is not None:
+            return True
+        npy_path = _SPEED_LIMITS_DIR / f"{map_name}_speed_limits.npy"
+        if not npy_path.exists():
+            return False
+        try:
+            from scipy.spatial import cKDTree
+            data = np.load(str(npy_path), allow_pickle=True).item()
+            self._speed_limit_tree = cKDTree(data["locations"])
+            self._speed_limit_values = data["speed_limits"]  # km/h
+            self._speed_limit_map_name = map_name
+            return True
+        except Exception as exc:
+            print(f"[speed_limit] failed to load {npy_path}: {exc}", flush=True)
+            return False
+
+    def _lookup_speed_limit(self, location) -> Optional[float]:
+        """Return speed limit in m/s for the given CARLA location, or None if unavailable."""
+        if self._speed_limit_tree is None:
+            return None
+        try:
+            pos = np.array([location.x, location.y, location.z], dtype=np.float64)
+            _, idx = self._speed_limit_tree.query(pos, k=1)
+            return float(self._speed_limit_values[idx]) / 3.6  # km/h → m/s
+        except Exception:
+            return None
 
     def _get_state_vector(self) -> np.ndarray:
         ego = self._ego_actor()
@@ -1568,7 +1603,13 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             heading_error_rad = self._wrap_angle_rad(
                 math.radians(float(ego_tf.rotation.yaw - lane_tf.rotation.yaw))
             )
-            speed_limit_mps = max(float(ego.get_speed_limit()) / 3.6, 1.0)
+            map_name = self._cached_world_map.name.split("/")[-1]
+            self._load_speed_limit_map(map_name)
+            speed_limit_mps = self._lookup_speed_limit(ego_tf.location)
+            if speed_limit_mps is None:
+                speed_limit_mps = max(float(ego.get_speed_limit()) / 3.6, 1.0)
+            else:
+                speed_limit_mps = max(speed_limit_mps, 1.0)
             lane_width_m = max(float(getattr(wp, "lane_width", 3.5)), 1.0)
             return {
                 "lane_offset_m": float(lane_offset_m),
