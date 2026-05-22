@@ -40,13 +40,10 @@ def get_config():
     config.warmup_steps = 0
     # If True, use env.action_space.sample() during warmup instead of the policy.
     config.warmup_use_random_actions = False
-<<<<<<< Updated upstream
+
     config.updates_per_step = 10
-    config.buffer_capacity = 1_000
-=======
-    config.updates_per_step = 1
     config.buffer_capacity = 10_000
->>>>>>> Stashed changes
+    
     config.image_log_curr_interval = 10
     config.critic_action_dim = 4
     config.vla_action_dim = 4
@@ -105,16 +102,11 @@ def get_config():
         dict(
             enabled=True,
             # Local OpenPI inference (ignored when actor_url is set):
-<<<<<<< Updated upstream
             actor_config="pi05_steervla_cot_simplified_reasoning",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
-            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260521_021239/6000",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260521_021239/8000",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning_20260512_144250/50000",
-=======
-            actor_config="pi05_steervla_cot_ki_inference",
-            checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
-            # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260521_021239/50000",
->>>>>>> Stashed changes
+
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,
             include_ego_history=False,

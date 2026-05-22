@@ -19,7 +19,7 @@ SIM_GPU_RANK="3"
 RENDER_ADAPTER=""
 CARLA_HOST="localhost"
 CARLA_PORT="2020"
-CARLA_STREAMING_2PORT="0"
+CARLA_STREAMING_PORT="0"
 TM_PORT="8020"
 X_DISPLAY_NUM=""
 
@@ -41,14 +41,14 @@ Usage:
 
 Options:
   --route NAME              Bench2Drive route name/id. Default: parking-cut-in-001
-  --online-steps N          Number of env steps. Default: 5000
+  --online-steps N          Number of env steps. Default: 50000
   --seed N                  Random seed. Default: 0
   --run-group NAME          W&B / experiment group. Default: Debug
   --save-buffer BOOL        true|false. Default: true
   --buffer-capacity N       Replay buffer size. Default: value in agent config (1000)
   --expert-debug BOOL       true|false. Default: false
   --expert-recover-debug BOOL  true|false. Default: false
-  --wandb-mode MODE         online|offline|disabled. Default: WANDB_MODE or offline
+  --wandb-mode MODE         online|offline|disabled. Default: WANDB_MODE or online
 
   --train-gpu N             JAX / learner GPU rank. Default: 2
   --sim-gpu N               Alias for --render-adapter. Default: 3
@@ -67,14 +67,13 @@ Options:
                               expert-lang  -> language on expert action
                             Default: delta
 
-  --train-mode MODE         rl|dagger|dagger_direct|sac_direct|sac_residual|dagger_residual. Default: dagger
+  --train-mode MODE         rl|dagger|dagger_direct|sac_direct|sac_residual|dagger_residual. Default: rl
   --train-obs-encoder BOOL  true|false. Sets agent.dagger_residual_train_obs_encoder. Default: false
   --critic-pi-prefix BOOL   true|false. Overrides agent.critic_use_pi_prefix_features.
                             Default: config default
 
   --reward-mode MODE        one of:
-                              event         -> event-based reward (collision/outside-route deltas
-                                              plus speed-limit penalty)
+                              event         -> existing shaped/event reward
                               soft-penalty  -> ca5be36 soft-penalty reward (progress * factors);
                                               speed-limit penalty is automatically enabled
                             Default: event

@@ -34,15 +34,12 @@ repetition_index: 0
 # Terminate early when a counted collision is followed by sustained low speed.
 crash_stuck_speed_threshold: 0.1
 crash_stuck_steps: 20
-crash_stuck_penalty: -20.0
-speeding_event_penalty: -0.1
+crash_stuck_penalty: -1.0
 
-# Event reward shaping and CaRL-style soft penalties.
-# Event collision penalties stay active while ego is overlapping another actor bbox.
-# Event mode subtracts `speeding_event_penalty * overspeed_kmh`.
+# CaRL-style soft penalties.
 speeding_infraction: false
 comfort_infraction: false
 
-# Soft-penalty reward: progress * speeding/TTC/comfort factors + terminal_reward.
+# Soft-penalty reward from ca5be36: progress * speeding/TTC/comfort factors + terminal_reward.
 # Automatically enables speeding_infraction (speed-limit penalty).
 use_soft_penalty_reward: false
