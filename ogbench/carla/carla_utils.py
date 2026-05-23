@@ -733,6 +733,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._current_routing_command: int = 4  # LANEFOLLOW until route is loaded
         self._routing_last_command_tmp: int = -1  # simlingo carryover state
         self._routing_last_command: int = -1
+        self._routing_dist_to_waypoint: int = 0  # metres; only shown when far_cmd != LANEFOLLOW
+        self._routing_include_distance: bool = False
         self._speed_limit_tree: Any | None = None
         self._speed_limit_values: Any | None = None
         self._speed_limit_map_name: str = ""
@@ -1017,6 +1019,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._current_routing_command = 4
         self._routing_last_command_tmp = -1
         self._routing_last_command = -1
+        self._routing_dist_to_waypoint = 0
+        self._routing_include_distance = False
         self._route_planner = None
         try:
             from coaches.simlingo.nav_planner import RoutePlanner as _RoutePlanner
@@ -1049,14 +1053,16 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         ego_pos = np.array([loc.x, loc.y, loc.z], dtype=np.float64)
         waypoint_route = self._route_planner.run_step(ego_pos)
         if len(waypoint_route) > 1:
-            _, cmd = waypoint_route[1]
+            far_wp, cmd = waypoint_route[1]
         elif len(waypoint_route) > 0:
-            _, cmd = waypoint_route[0]
+            far_wp, cmd = waypoint_route[0]
         else:
             return
         far_cmd_int = int(getattr(cmd, "value", cmd))
         if not (1 <= far_cmd_int <= 6):
             return
+        # Distance from ego to the far waypoint (world coords, same as np.linalg.norm in ego frame).
+        dist = int(np.linalg.norm(np.asarray(far_wp[:2], dtype=np.float64) - ego_pos[:2]))
         # Simlingo carryover: when transitioning back to LANEFOLLOW after a turn,
         # keep showing the turn command (last_command) until the next route event.
         if self._routing_last_command_tmp != far_cmd_int:
@@ -1064,8 +1070,11 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._routing_last_command_tmp = far_cmd_int
         if self._routing_last_command in (1, 2, 3) and far_cmd_int == 4:
             self._current_routing_command = self._routing_last_command
+            self._routing_include_distance = False  # carryover: no distance (matches simlingo far_cmd==4 branch)
         else:
             self._current_routing_command = far_cmd_int
+            self._routing_include_distance = far_cmd_int != 4
+            self._routing_dist_to_waypoint = dist
 
     def _load_speed_limit_map(self, map_name: str) -> bool:
         """Load the precomputed speed-limit cKDTree for ``map_name``; return True on success."""
@@ -1529,7 +1538,12 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             "language_label": language_label,
             "commentary_text": commentary_text,
             "expert_action": expert_action,
-            "routing_command": ROUTING_COMMAND_TEXT.get(self._current_routing_command, "follow the road"),
+            "routing_command": (
+                f"{ROUTING_COMMAND_TEXT.get(self._current_routing_command, 'follow the road')}"
+                f" in {self._routing_dist_to_waypoint} meter."
+                if self._routing_include_distance
+                else f"{ROUTING_COMMAND_TEXT.get(self._current_routing_command, 'follow the road')}."
+            ),
         }
 
     def _info_with_sensors(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
