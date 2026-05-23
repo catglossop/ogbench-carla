@@ -21,7 +21,7 @@ space); controls follow ``simlingo/team_code/agent_steervla.py`` cumsums + PID.
 Observation:
 
 * ``observation`` -- a :class:`gymnasium.spaces.Dict` with two keys:
-    * ``"state"`` -- ``float32`` vector of shape ``(STATE_DIM,)`` (ego kinematics).
+    * ``"state"`` -- ``float32`` vector of shape ``(STATE_DIM,)`` (ego kinematics + routing command one-hot).
     * ``"image"`` -- ``uint8`` RGB array ``(*IMAGE_SHAPE_HWC,)`` downscaled for RL/VLA
     * ``"image_viz"`` -- ``uint8`` RGB at native CARLA camera resolution (logging only)
       (zeros until the first sensor frame is available).
@@ -134,9 +134,12 @@ def _patch_speedometer_no_rpc() -> None:
 
 _patch_speedometer_no_rpc()
 
-# Flat ego-state vector layout (length = 19): 3 location, 3 rotation (rpy),
-# 3 velocity, 3 angular velocity, 3 acceleration, 1 speed, 3 last-applied control.
-STATE_DIM = 19
+# Flat ego-state vector layout (length = 25): 3 location, 3 rotation (rpy),
+# 3 velocity, 3 angular velocity, 3 acceleration, 1 speed, 3 last-applied control,
+# 6 routing command one-hot (RoadOption 1–6: LEFT, RIGHT, STRAIGHT, LANEFOLLOW,
+# CHANGELANELEFT, CHANGELANERIGHT).
+ROUTING_COMMAND_DIM = 6
+STATE_DIM = 19 + ROUTING_COMMAND_DIM
 ACTION_DIM = 2
 
 # Indices into ``obs["state"]`` for :func:`_ego_state_vector` (length :data:`STATE_DIM`).
@@ -144,6 +147,20 @@ EGO_STATE_IDX_SPEED = 15
 EGO_STATE_IDX_THROTTLE = 16
 EGO_STATE_IDX_STEER = 17
 EGO_STATE_IDX_BRAKE = 18
+EGO_STATE_IDX_COMMAND_START = 19  # first of 6 one-hot routing-command dims
+
+# Human-readable labels for the 6 RoadOption routing commands (values 1–6).
+ROUTING_COMMAND_TEXT = {
+    1: "go left at the next intersection",
+    2: "go right at the next intersection",
+    3: "go straight at the next intersection",
+    4: "follow the road",
+    5: "do a lane change to the left",
+    6: "do a lane change to the right",
+}
+
+# Pre-computed per-town speed-limit lookup tables (simlingo, km/h, CARLA world coords).
+_SPEED_LIMITS_DIR = Path(__file__).resolve().parent.parent.parent / "impls" / "coaches" / "simlingo" / "speed_limits"
 
 DEFAULT_CRASH_STUCK_SPEED_THRESHOLD = 0.1
 DEFAULT_CRASH_STUCK_STEPS = 20
@@ -611,10 +628,19 @@ def _action_to_control(action: np.ndarray) -> carla.VehicleControl:
     return carla.VehicleControl(throttle=throttle, steer=steer, brake=brake)
 
 
+def _routing_command_to_onehot(command: int) -> np.ndarray:
+    """Convert a RoadOption integer (1–6) to a :data:`ROUTING_COMMAND_DIM`-dim one-hot."""
+    if command < 1 or command > 6:
+        command = 4  # fallback to LANEFOLLOW
+    out = np.zeros(ROUTING_COMMAND_DIM, dtype=np.float32)
+    out[command - 1] = 1.0
+    return out
+
+
 def _ego_state_vector(
     ego: carla.Actor, last_control: carla.VehicleControl
 ) -> np.ndarray:
-    """Build a length-:data:`STATE_DIM` flat float32 vector describing the ego car."""
+    """Build the first 19 dims of the ego-state vector (kinematics + last control)."""
     transform = ego.get_transform()
     loc = transform.location
     rot = transform.rotation
@@ -697,6 +723,13 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._expert_controller_kind = str(self.carla_config.get("expert_controller", "") or "").strip().lower()
         self._expert_agent: Any | None = None
         self._cached_world_map: Any | None = None
+        self._route_planner: Any | None = None
+        self._current_routing_command: int = 4  # LANEFOLLOW until route is loaded
+        self._routing_last_command_tmp: int = -1  # simlingo carryover state
+        self._routing_last_command: int = -1
+        self._speed_limit_tree: Any | None = None
+        self._speed_limit_values: Any | None = None
+        self._speed_limit_map_name: str = ""
         try:
             from impls.coaches.expert_label import ExpertLabelComputer
             self._label_computer = ExpertLabelComputer()
@@ -977,6 +1010,17 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         if self._expert_controller_kind == "simlingo_autopilot":
             self._expert_agent = self._build_simlingo_autopilot()
         self._cached_world_map = None
+        self._current_routing_command = 4
+        self._routing_last_command_tmp = -1
+        self._routing_last_command = -1
+        self._route_planner = None
+        try:
+            from coaches.simlingo.nav_planner import RoutePlanner as _RoutePlanner
+            planner = _RoutePlanner(min_distance=7.5, max_distance=50.0)
+            planner.set_route(ev.route_scenario.route, gps=False)
+            self._route_planner = planner
+        except Exception as _rp_exc:
+            print(f"[routing_command] RoutePlanner init failed: {_rp_exc}", flush=True)
         self._scenario_active = True
         self._last_control = carla.VehicleControl()
         self._crash_stuck_ticks = 0
@@ -990,11 +1034,71 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         ego_list = getattr(ev.manager, "ego_vehicles", None) or []
         return ego_list[0] if ego_list else None
 
+    def _update_routing_command(self) -> None:
+        """Advance the route planner by one step and cache the current routing command."""
+        if self._route_planner is None:
+            return
+        ego = self._ego_actor()
+        if ego is None:
+            return
+        loc = ego.get_transform().location
+        ego_pos = np.array([loc.x, loc.y, loc.z], dtype=np.float64)
+        waypoint_route = self._route_planner.run_step(ego_pos)
+        if len(waypoint_route) > 1:
+            _, cmd = waypoint_route[1]
+        elif len(waypoint_route) > 0:
+            _, cmd = waypoint_route[0]
+        else:
+            return
+        far_cmd_int = int(getattr(cmd, "value", cmd))
+        if not (1 <= far_cmd_int <= 6):
+            return
+        # Simlingo carryover: when transitioning back to LANEFOLLOW after a turn,
+        # keep showing the turn command (last_command) until the next route event.
+        if self._routing_last_command_tmp != far_cmd_int:
+            self._routing_last_command = self._routing_last_command_tmp
+        self._routing_last_command_tmp = far_cmd_int
+        if self._routing_last_command in (1, 2, 3) and far_cmd_int == 4:
+            self._current_routing_command = self._routing_last_command
+        else:
+            self._current_routing_command = far_cmd_int
+
+    def _load_speed_limit_map(self, map_name: str) -> bool:
+        """Load the precomputed speed-limit cKDTree for ``map_name``; return True on success."""
+        if map_name == self._speed_limit_map_name and self._speed_limit_tree is not None:
+            return True
+        npy_path = _SPEED_LIMITS_DIR / f"{map_name}_speed_limits.npy"
+        if not npy_path.exists():
+            return False
+        try:
+            from scipy.spatial import cKDTree
+            data = np.load(str(npy_path), allow_pickle=True).item()
+            self._speed_limit_tree = cKDTree(data["locations"])
+            self._speed_limit_values = data["speed_limits"]  # km/h
+            self._speed_limit_map_name = map_name
+            return True
+        except Exception as exc:
+            print(f"[speed_limit] failed to load {npy_path}: {exc}", flush=True)
+            return False
+
+    def _lookup_speed_limit(self, location) -> Optional[float]:
+        """Return speed limit in m/s for the given CARLA location, or None if unavailable."""
+        if self._speed_limit_tree is None:
+            return None
+        try:
+            pos = np.array([location.x, location.y, location.z], dtype=np.float64)
+            _, idx = self._speed_limit_tree.query(pos, k=1)
+            return float(self._speed_limit_values[idx]) / 3.6  # km/h → m/s
+        except Exception:
+            return None
+
     def _get_state_vector(self) -> np.ndarray:
         ego = self._ego_actor()
         if ego is None:
             return np.zeros(STATE_DIM, dtype=np.float32)
-        return _ego_state_vector(ego, self._last_control)
+        ego_vec = _ego_state_vector(ego, self._last_control)
+        cmd_onehot = _routing_command_to_onehot(self._current_routing_command)
+        return np.concatenate([ego_vec, cmd_onehot])
 
     def _build_simlingo_autopilot(self):
         """Instantiate SimLingo's privileged autopilot as the expert controller."""
@@ -1401,6 +1505,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         except Exception as e:
             return self._obs_dict(), -1.0, True, False, {"error": str(e)}
         terminated = not running
+        self._update_routing_command()
         reward, terminated, info = self._compute_reward_and_info(
             tree_status=tree_status,
             terminated=terminated,
@@ -1421,6 +1526,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             "language_label": language_label,
             "commentary_text": commentary_text,
             "expert_action": expert_action,
+            "routing_command": ROUTING_COMMAND_TEXT.get(self._current_routing_command, "follow the road"),
         }
 
     def _info_with_sensors(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1515,7 +1621,13 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             heading_error_rad = self._wrap_angle_rad(
                 math.radians(float(ego_tf.rotation.yaw - lane_tf.rotation.yaw))
             )
-            speed_limit_mps = max(float(ego.get_speed_limit()) / 3.6, 1.0)
+            map_name = self._cached_world_map.name.split("/")[-1]
+            self._load_speed_limit_map(map_name)
+            speed_limit_mps = self._lookup_speed_limit(ego_tf.location)
+            if speed_limit_mps is None:
+                speed_limit_mps = max(float(ego.get_speed_limit()) / 3.6, 1.0)
+            else:
+                speed_limit_mps = max(speed_limit_mps, 1.0)
             lane_width_m = max(float(getattr(wp, "lane_width", 3.5)), 1.0)
             return {
                 "lane_offset_m": float(lane_offset_m),
