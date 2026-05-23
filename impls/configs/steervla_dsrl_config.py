@@ -5,8 +5,9 @@ convenience wrapper around :func:`jax_agents.dsrl.get_config` with sensible
 defaults for online single-route runs and a ``steervla`` block describing how
 to plug in a frozen SteerVLA flow.
 
-Set ``config.observation_mode`` to ``"state"`` (default) or ``"image"`` so DSRL
-reads either the vector ``obs['state']`` or RGB ``obs['image']`` from the CARLA env.
+Set ``config.observation_mode`` to ``"state"``, ``"image"``, or ``"policy_embed"``.
+``policy_embed`` uses the pooled frozen Pi0-CoT prefix hidden from
+:class:`vlas.steervla.SteerVLAActor.ensure_policy_embedding` as the DSRL observation.
 
 Set ``config.training_gpu_rank`` to pin JAX RL and SteerVLA OpenPI checkpoint restore
 to one GPU (``-1`` = default device / GPU 0 for restores). CARLA's sim GPU is ``gpu_rank``
@@ -32,15 +33,19 @@ def get_config():
     config = dsrl_agent.get_config()
 
     config.lr = 3e-4
-    config.batch_size = 64
+    config.batch_size = 16
     config.flow_steps = 10
+    # Denoise steps for frozen VLA forwards during RL updates (rollout uses steervla.sample_actions_num_steps).
+    config.vla_update_flow_steps = 5
     config.noise_scale = 1.0
     config.alpha = 0.1
     # Collect transitions with the rollout policy (SteerVLA / DSRL) but skip RL updates.
     config.warmup_steps = 0
     # If True, use env.action_space.sample() during warmup instead of the policy.
     config.warmup_use_random_actions = False
-    config.updates_per_step = 10
+    config.updates_per_step = 5
+    # Set to false for rollout-only runs (no RL gradient updates).
+    config.enable_updates = True
     config.buffer_capacity = 1_000
     config.image_log_curr_interval = 10
     config.critic_action_dim = 4
@@ -50,7 +55,9 @@ def get_config():
     config.action_horizon = 10
     # config.steervla = None
     # DSRL trains on ``observation_mode`` only; env step always returns both keys.
-    config.observation_mode = "image"
+    # ``policy_embed``: pooled frozen Pi0-CoT prefix hidden (see SteerVLAActor.ensure_policy_embedding).
+    config.observation_mode = "policy_embed"
+    config.policy_embed_dim = 2048
     config.image_keys = ("base_0_rgb",)
     # JAX RL device: ``-1`` = unset. CARLA uses ``gpu_rank`` in carla_config.yaml.
     config.training_gpu_rank = 0
@@ -65,8 +72,39 @@ def get_config():
     #   "rl"     : standard DSRL online RL
     #   "dagger" : on-policy data aggregation with expert actions as supervision
     config.online_training_mode = "rl"
-    # language_label_dim is auto-set for commentary_bow / delta_commentary_bow in main_carla.py,
-    # and critic_action_dim is used directly when mode is action_delta.
+    # language_label_dim is auto-set from language_feedback / critic_feedback_mode in main_carla.py.
+
+    config.language_feedback = ml_collections.ConfigDict(
+        dict(
+            # Where DSRL critic language labels come from:
+            #   "expert" — SimLingo-style expert commentary / action-delta coaches
+            #   "vlm"    — Gemini/Perceptron VLM chunk feedback (see ``vlm_coach``)
+            source="expert",
+            # Used when source="expert". One of commentary_bow | action_delta |
+            # delta_commentary_bow | none
+            expert_mode="commentary_bow",
+        )
+    )
+    # Enable VLM chunk coaching for the DSRL critic:
+    # config.language_feedback.source = "vlm"
+
+    config.vlm_coach = ml_collections.ConfigDict(
+        dict(
+            # Query the VLM every N episode env steps (0 = only at episode end).
+            query_every_n_episode_steps=128,
+            query_on_episode_end=True,
+            provider="gemini",
+            gemini_model="gemini-3.5-flash",
+            include_plots_in_prompt=False,
+            action_chunk_steps=10,
+            action_chunk_duration_sec=0.5,
+            bad_event_radius_chunks=2,
+            annotate_video=False,
+            save_artifacts=True,
+            video_fps=10.0,
+            video_frame_stride=2,
+        )
+    )
 
     config.steervla = ml_collections.ConfigDict(
         dict(
@@ -74,7 +112,7 @@ def get_config():
             # Local OpenPI inference (ignored when actor_url is set):
             actor_config="pi05_steervla_cot_simplified_reasoning",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
-            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260521_021239/6000",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260521_021239/18000",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning_20260512_144250/50000",
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,

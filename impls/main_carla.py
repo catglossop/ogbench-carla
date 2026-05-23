@@ -13,6 +13,16 @@ Three calling patterns:
    Set ``warmup_steps`` in the agent config to run the policy without RL updates
    while prefilling the replay buffer (default 500 in ``steervla_dsrl_config.py``).
 
+   Set ``enable_updates=false`` in the agent config (or ``--enable_updates=false``)
+   to run rollout-only: collect transitions and log videos without gradient updates.
+
+   Live rollout video (single overwriting MP4 + browser UI)::
+
+     --live_policy_view=true --live_policy_port=8765 --live_policy_interval=5
+
+   Open ``http://<host>:8765/`` while training; the file is also written to
+   ``<save_dir>/live_policy.mp4``.
+
    ``--route`` accepts any of three name styles:
      * scenario-name kebab    (e.g. ``parking-cut-in-001``)
      * file basename           (e.g. ``bench2drive_007``)
@@ -55,7 +65,9 @@ from coaches.critic_feedback import (
     compute_action_delta,
     compute_action_delta_commentary,
     critic_language_dim,
+    resolve_critic_feedback_mode,
 )
+from impls.coaches.online_vlm_coach import OnlineVLMSession
 
 _IMPLS_ROOT = Path(__file__).resolve().parent
 if str(_IMPLS_ROOT) not in sys.path:
@@ -73,6 +85,7 @@ from utils.datasets import ReplayBuffer
 from utils.flax_utils import save_agent
 
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
+from utils.live_policy_viewer import LivePolicyViewer
 
 FLAGS = flags.FLAGS
 
@@ -139,6 +152,27 @@ flags.DEFINE_string(
     None,
     "W&B mode (online/offline/disabled). Default: env WANDB_MODE or online.",
 )
+flags.DEFINE_bool(
+    "enable_updates",
+    None,
+    "If false, skip RL gradient updates (rollout/buffer logging only). "
+    "Default: agent config ``enable_updates`` (true).",
+)
+flags.DEFINE_bool(
+    "live_policy_view",
+    False,
+    "Serve a single overwriting live_policy.mp4 updated during rollouts.",
+)
+flags.DEFINE_integer(
+    "live_policy_port",
+    8765,
+    "HTTP port for --live_policy_view (GET / and /live.mp4).",
+)
+flags.DEFINE_integer(
+    "live_policy_interval",
+    5,
+    "Rewrite live_policy.mp4 every N env steps.",
+)
 
 config_flags.DEFINE_config_file("agent", "jax_agents/dsrl.py", lock_config=False)
 
@@ -185,7 +219,15 @@ def _extract_agent_obs(env, env_obs: dict, mode: str) -> np.ndarray:
         return np.asarray(env_obs["state"], dtype=np.float32)
     if mode == "image":
         return np.asarray(env_obs["image"], dtype=np.uint8)
-    raise ValueError(f"Unknown observation_mode {mode!r}; expected 'state' or 'image'.")
+    if mode == "policy_embed":
+        embed = env_obs.get("policy_embedding")
+        if embed is None:
+            raise ValueError(
+                "observation_mode='policy_embed' requires env_obs['policy_embedding']; "
+                "call SteerVLAActor.ensure_policy_embedding() before extracting obs."
+            )
+        return np.asarray(embed, dtype=np.float32)
+    raise ValueError(f"Unknown observation_mode {mode!r}; expected 'state', 'image', or 'policy_embed'.")
 
 
 # Check if valid task environment
@@ -227,8 +269,8 @@ def _steervla_action_execution_cfg(steervla_cfg) -> dict[str, Any] | None:
         "output_action_format": fmt,
         "action_horizon": ah,
         "action_dim": ad,
-        # Remote HTTP policy applies ``Unnormalize`` (dataset units); local JAX returns raw flow outputs.
-        "action_input_space": "policy_output" if remote else "normalized",
+        # SteerVLA actor applies OpenPI Unnormalize + fixed steervla denormalize_actions.
+        "action_input_space": "policy_output",
     }
 
 
@@ -309,8 +351,13 @@ def run_online_carla(
     warmup = int(agent_config.get("warmup_steps", 1000))
     updates_per_step = int(agent_config.get("updates_per_step", 1))
     batch_size = int(agent_config.get("batch_size", 256))
+    enable_updates = bool(agent_config.get("enable_updates", True))
+    if FLAGS.enable_updates is not None:
+        enable_updates = bool(FLAGS.enable_updates)
 
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, "train.csv"))
+    if not enable_updates:
+        print("[main_carla] enable_updates=False: rollout-only (no RL gradient updates)", flush=True)
     if warmup > 0 and agent is not None and not FLAGS.expert_debug:
         policy_src = "rollout policy (no RL updates)"
         print(f"[main_carla] warmup: {warmup} steps using {policy_src}", flush=True)
@@ -368,12 +415,45 @@ def run_online_carla(
     if raw_obs_holder is not None:
         raw_obs_holder["obs"] = obs_raw
         raw_obs_holder["next_obs"] = obs_raw
+    if obs_mode == "policy_embed" and steervla_actor is not None:
+        steervla_actor.ensure_policy_embedding(1, raw=obs_raw, force=True)
     obs = _extract_agent_obs(env, obs_raw, obs_mode)
     log_images = obs_mode == "image"
+    capture_rollout_video = log_images or bool(FLAGS.live_policy_view)
 
-    _critic_feedback_mode = str(agent_config.get("critic_feedback_mode", "commentary_bow"))
+    live_viewer: LivePolicyViewer | None = None
+    if FLAGS.live_policy_view:
+        live_viewer = LivePolicyViewer(
+            os.path.join(FLAGS.save_dir, "live_policy.mp4"),
+            port=int(FLAGS.live_policy_port),
+            fps=10.0,
+            publish_every_n_steps=int(FLAGS.live_policy_interval),
+        )
+        live_viewer.start()
+
+    _critic_feedback_mode = resolve_critic_feedback_mode(agent_config)
+    _vlm_coach: OnlineVLMSession | None = None
+    lang_fb = agent_config.get("language_feedback")
+    if _critic_feedback_mode == "vlm_chunk_bow":
+        vlm_cfg = agent_config.get("vlm_coach")
+        if vlm_cfg is None:
+            raise ValueError(
+                "language_feedback.source='vlm' requires agent config block 'vlm_coach'."
+            )
+        _vlm_coach = OnlineVLMSession(
+            vlm_cfg,
+            save_dir=FLAGS.save_dir,
+            action_chunk_steps=int(agent_config.get("action_horizon", 10)),
+        )
+        print(
+            f"[main_carla] VLM coach enabled (provider={_vlm_coach.provider}, "
+            f"query_every={_vlm_coach.query_every_n_episode_steps} ep steps)",
+            flush=True,
+        )
+        capture_rollout_video = True
     _online_training_mode = str(agent_config.get("online_training_mode", "rl")).strip().lower()
     _lang_dim = critic_language_dim(agent_config)
+    _steervla_exec_cfg = _steervla_action_execution_cfg(agent_config.get("steervla") or {})
 
     steervla_cfg = agent_config.get("steervla") or {}
     env_ah = int(steervla_cfg.get("action_horizon", agent_config.get("vla_action_horizon", 10)))
@@ -399,14 +479,26 @@ def run_online_carla(
     
     rng = jax.random.PRNGKey(FLAGS.seed + 1)
     episode_return, episode_steps, episode_count = 0.0, 0, 0
+    _last_buf_idx: int | None = None
     episode_collision_count = 0
     episode_collision_events = 0
     prev_collision_count = 0
     last_log_time = time.time()
     episode_video_every = 2
+    episode_video_fps = 10.0
     episode_video_frames: list[np.ndarray] = []
+    episode_trajectory: list[dict[str, Any]] = []
+    episode_video_frame_index = 0
     last_video_reward: float = 0.0
+    last_policy_action: np.ndarray | None = None
     last_video_critic_text: str = ""
+    trajectory_dir = os.path.join(FLAGS.save_dir, "trajectories")
+    os.makedirs(trajectory_dir, exist_ok=True)
+    if _vlm_coach is not None:
+        _vlm_coach.begin_episode(
+            episode_count=max(1, episode_count),
+            route_name=str(obs_raw.get("routing_command", "?") if isinstance(obs_raw, dict) else "?"),
+        )
 
     def _as_video_frame(image: np.ndarray) -> np.ndarray:
         frame = np.asarray(image)
@@ -518,7 +610,7 @@ def run_online_carla(
                 return "[]"
             show = " ".join(f"{v:+.3f}" for v in arr[:8])
             return show if arr.size <= 8 else f"{show} ..."
-        if critic_mode == "delta_commentary_bow":
+        if critic_mode == "delta_commentary_bow" or critic_mode == "vlm_chunk_bow":
             return critic_text or "?"
         commentary = raw.get("commentary_text", "") if isinstance(raw, dict) else ""
         return str(commentary or "?")
@@ -543,12 +635,32 @@ def run_online_carla(
             # Bottom panel is already black via zeros; draw an explicit border line.
             cv2.line(annotated, (0, h), (w - 1, h), (255, 255, 255), 1)
 
-            state = np.asarray(raw.get("state", []), dtype=np.float32).reshape(-1) if isinstance(raw, dict) else np.zeros((0,), dtype=np.float32)
-            speed = float(state[15]) if state.size > 15 else 0.0
-            routing = ""
+            prompt = ""
             if isinstance(raw, dict):
-                routing = str(raw.get("routing_command", "") or "").strip()
-            prompt = f"The current speed is {speed:.2f} m/s. {routing or 'Follow the route.'}"
+                prompt = str(raw.get("openpi_prompt_text") or "").strip()
+            if not prompt and isinstance(raw, dict):
+                from vlas.steervla import (
+                    carla_state_vec_to_steervla_state,
+                    format_steervla_cot_prompt,
+                    routing_instruction_prompt,
+                    steervla_prompt_state_dim,
+                )
+
+                state = np.asarray(raw.get("state", []), dtype=np.float32).reshape(-1)
+                speed = float(state[15]) if state.size > 15 else 0.0
+                routing = str(raw.get("routing_command", "") or "").strip() or "Follow the route."
+                include_hist = bool(getattr(steervla_actor, "include_ego_history", False)) if steervla_actor is not None else False
+                proprio_norm = bool(getattr(steervla_actor, "proprio_norm", True)) if steervla_actor is not None else True
+                state_pad = carla_state_vec_to_steervla_state(
+                    state,
+                    include_ego_history=include_hist,
+                    proprio_norm=proprio_norm,
+                )
+                prompt = format_steervla_cot_prompt(
+                    routing_instruction_prompt(routing_command=routing, current_speed_mps=speed),
+                    state_pad,
+                    state_dim=steervla_prompt_state_dim(include_ego_history=include_hist),
+                )
             reasoning = _format_text_field(raw, "reasoning_text") or _format_text_field(raw, "reasoning")
             subtask = _format_text_field(raw, "subtask_text") or _format_text_field(raw, "subtask")
             expert_action_str = ""
@@ -587,6 +699,23 @@ def run_online_carla(
         except Exception:
             return base
 
+    def _annotate_waypoints(
+        frame: np.ndarray,
+        action_flat: np.ndarray | None,
+    ) -> np.ndarray:
+        if _steervla_exec_cfg is None or action_flat is None:
+            return frame
+        try:
+            from ogbench.carla.waypoint_viz import annotate_waypoints_on_frame
+
+            return annotate_waypoints_on_frame(
+                frame,
+                action_flat=action_flat,
+                exec_cfg=_steervla_exec_cfg,
+            )
+        except Exception:
+            return frame
+
     def _maybe_log_episode_video(
         rollout_log: dict,
         final_frame: np.ndarray | None,
@@ -599,9 +728,12 @@ def run_online_carla(
             return
         frames = list(episode_video_frames)
         if final_frame is not None:
+            final_viz = _as_video_frame(final_frame)
+            if not FLAGS.expert_debug:
+                final_viz = _annotate_waypoints(final_viz, last_policy_action)
             frames.append(
                 _annotate_text_panel(
-                    _as_video_frame(final_frame),
+                    final_viz,
                     final_raw,
                     reward_value=final_reward,
                     critic_text=final_critic_text,
@@ -613,7 +745,62 @@ def run_online_carla(
         if video.ndim == 4:
             # W&B expects (T, C, H, W) for videos.
             video = np.transpose(video, (0, 3, 1, 2))
-        rollout_log["rollout/episode_video"] = wandb.Video(video, fps=10, format="mp4")
+        rollout_log["rollout/episode_video"] = wandb.Video(video, fps=episode_video_fps, format="mp4")
+
+    def _save_episode_trajectory_json(
+        *,
+        episode_index: int,
+        route_name: str,
+        episode_step_count: int,
+        done_info: dict[str, Any],
+    ) -> str | None:
+        if not episode_trajectory:
+            return None
+        out_path = os.path.join(trajectory_dir, f"episode_{episode_index:04d}.json")
+        payload = {
+            "episode": int(episode_index),
+            "route": route_name,
+            "episode_steps": int(episode_step_count),
+            "video_fps": float(episode_video_fps),
+            "video_frame_stride": int(episode_video_every),
+            "success": bool(done_info.get("success", False)),
+            "termination_reason": done_info.get("termination_reason"),
+            "scenario_tree_status": done_info.get("scenario_tree_status"),
+            "steps": episode_trajectory,
+        }
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        return out_path
+
+    def _append_trajectory_step(
+        *,
+        global_step: int,
+        episode_step: int,
+        state_raw: dict[str, Any],
+        step_info: dict[str, Any],
+        collision_occurred: bool,
+        in_video: bool,
+        video_frame_index: int | None,
+    ) -> None:
+        drive = ego_drive_metrics_from_state_vec(state_raw["state"])
+        record: dict[str, Any] = {
+            "step": int(global_step),
+            "episode_step": int(episode_step),
+            "ego_speed_mps": float(drive["ego_speed"]),
+            "control_throttle": float(drive["control_throttle"]),
+            "control_steer": float(drive["control_steer"]),
+            "control_brake": float(drive["control_brake"]),
+            "collision": bool(collision_occurred),
+            "route_progress_pct": float(step_info.get("route_progress_pct", 0.0)),
+            "in_video": bool(in_video),
+        }
+        if in_video and video_frame_index is not None:
+            record["video_frame_index"] = int(video_frame_index)
+            record["video_timestamp_sec"] = round(float(video_frame_index) / episode_video_fps, 3)
+        else:
+            record["video_frame_index"] = None
+            record["video_timestamp_sec"] = None
+        episode_trajectory.append(record)
 
     def _block_until_ready_tree(tree):
         return jax.tree_util.tree_map(
@@ -650,15 +837,31 @@ def run_online_carla(
             action_jax = _sample_agent_action(sub)
             _block_until_ready_tree(action_jax)
             action = np.asarray(action_jax[0])
+            last_policy_action = action
+            if obs_mode == "policy_embed" and steervla_actor is not None:
+                obs = _extract_agent_obs(env, obs_raw, obs_mode)
+            if steervla_actor is not None and _last_buf_idx is not None:
+                from vlas.steervla import openpi_cot_replay_fields_from_raw
+
+                _cot_for_next = openpi_cot_replay_fields_from_raw(obs_raw)
+                if _cot_for_next:
+                    buffer.update_at(
+                        _last_buf_idx,
+                        **{f"next_{k}": v for k, v in _cot_for_next.items()},
+                    )
         t_sample_end = time.time()
 
         t_step_start = time.time()
         if FLAGS.expert_debug or _in_expert_recovery:
             next_obs_raw, reward, terminated, truncated, info = env.step_expert(obs_raw)
         else:
+            print("Action:")
+            print(action)
             next_obs_raw, reward, terminated, truncated, info = env.step(action)
         if raw_obs_holder is not None:
             raw_obs_holder["next_obs"] = next_obs_raw
+        if obs_mode == "policy_embed" and steervla_actor is not None:
+            steervla_actor.ensure_policy_embedding(1, raw=next_obs_raw, force=True)
         drive_metrics = ego_drive_metrics_from_state_vec(next_obs_raw["state"])
         next_obs = _extract_agent_obs(env, next_obs_raw, obs_mode)
         done = bool(terminated or truncated)
@@ -680,6 +883,13 @@ def run_online_carla(
         elif _critic_feedback_mode == "delta_commentary_bow":
             _lang_text, _lang = compute_action_delta_commentary(obs_raw, action, agent)
             _next_lang = _zero_label  # depends on current action-vs-expert comparison only
+        elif _critic_feedback_mode == "vlm_chunk_bow":
+            _lang_text, _lang = (
+                _vlm_coach.language_label_for_episode_step(episode_steps + 1)
+                if _vlm_coach is not None
+                else ("", _zero_label)
+            )
+            _next_lang = _zero_label
         else:
             _lang = np.asarray(obs_raw.get("language_label", _zero_label), dtype=np.float32)
             _next_lang = np.asarray(next_obs_raw.get("language_label", _zero_label), dtype=np.float32)
@@ -689,7 +899,7 @@ def run_online_carla(
         if _online_training_mode == "dagger" and not FLAGS.expert_debug:
             replay_action = np.asarray(obs_raw.get("expert_action", replay_action), dtype=np.float32)
 
-        buffer.add_transition(
+        buf_idx = buffer.add_transition(
             {
                 "observations": np.asarray(obs),
                 "actions": replay_action,
@@ -707,6 +917,7 @@ def run_online_carla(
                 ),
             }
         )
+        _last_buf_idx = int(buf_idx)
         t_step_end = time.time()
         
         t_log_start = time.time()
@@ -715,16 +926,25 @@ def run_online_carla(
         obs_raw = next_obs_raw
         episode_return += float(reward)
         episode_steps += 1
+        if _vlm_coach is not None:
+            _vlm_coach.track_buffer_transition(buffer_index=buf_idx, episode_step=episode_steps)
         collision_count = int(info.get("collision_count", 0))
         episode_collision_count = max(episode_collision_count, collision_count)
         collision_delta = max(0, collision_count - prev_collision_count)
         episode_collision_events += collision_delta
         prev_collision_count = collision_count
-        if log_images:
+        step_in_video = False
+        step_video_frame_index: int | None = None
+        if capture_rollout_video:
             should_sample_periodic = episode_steps % episode_video_every == 0
             had_collision_this_step = collision_delta > 0
+            step_in_video = should_sample_periodic or had_collision_this_step
+            if step_in_video:
+                step_video_frame_index = episode_video_frame_index
             if should_sample_periodic or had_collision_this_step:
                 frame = _as_video_frame(_viz_image_from_raw(obs_raw))
+                if not FLAGS.expert_debug:
+                    frame = _annotate_waypoints(frame, last_policy_action)
                 frame = _annotate_text_panel(
                     frame,
                     cot_obs_raw,
@@ -738,6 +958,25 @@ def run_online_carla(
                         collision_events=episode_collision_events,
                     )
                 episode_video_frames.append(frame)
+                if _vlm_coach is not None:
+                    _vlm_coach.record_frame(frame)
+                if step_in_video:
+                    episode_video_frame_index += 1
+            if live_viewer is not None and episode_video_frames:
+                live_viewer.publish_frames(episode_video_frames, step)
+        _append_trajectory_step(
+            global_step=step,
+            episode_step=episode_steps,
+            state_raw=next_obs_raw,
+            step_info=info,
+            collision_occurred=collision_delta > 0,
+            in_video=step_in_video,
+            video_frame_index=step_video_frame_index,
+        )
+        if _vlm_coach is not None and episode_trajectory:
+            _vlm_coach.record_trajectory_step(episode_trajectory[-1])
+            if _vlm_coach.maybe_query(episode_step=episode_steps, done_info=info):
+                _vlm_coach.backfill_buffer(buffer)
         last_video_reward = float(reward)
         last_video_critic_text = _critic_text_for_video
         t_log_end = time.time()
@@ -769,6 +1008,9 @@ def run_online_carla(
         elif _critic_feedback_mode == "delta_commentary_bow":
             if _lang_text:
                 step_wb["label/commentary_delta"] = wandb.Html(f"<p>{_lang_text}</p>")
+        elif _critic_feedback_mode == "vlm_chunk_bow":
+            if _lang_text:
+                step_wb["label/vlm_chunk_feedback"] = wandb.Html(f"<p>{_lang_text}</p>")
         else:
             _commentary = obs_raw.get("commentary_text", "") if isinstance(obs_raw, dict) else ""
             if _commentary:
@@ -778,34 +1020,87 @@ def run_online_carla(
         step_wb["time/step_time"] = t_step_end - t_step_start
         step_wb["time/log_time"] = t_log_end - t_log_start
         step_wb["training/in_warmup"] = float(in_warmup)
+        step_wb["training/enable_updates"] = float(enable_updates)
 
         wandb.log(step_wb, step=step)
 
         if done:
             episode_count += 1
+            done_info = dict(info)
+            done_episode_return = float(episode_return)
+            done_episode_steps = int(episode_steps)
+            done_collision_count = int(episode_collision_count)
+            done_collision_events = int(episode_collision_events)
+            done_route = str(done_info.get("route", "?"))
+
+            # Finish pending JAX work, then reset CARLA immediately.
+            if agent is not None:
+                _block_until_ready_tree(agent)
+                reset_vla_cache = getattr(getattr(agent, "vla_sample_fn", None), "reset_action_cache", None)
+                if reset_vla_cache is not None:
+                    reset_vla_cache()
+            obs_raw, _info = env.reset(seed=FLAGS.seed + episode_count)
+            if raw_obs_holder is not None:
+                raw_obs_holder["obs"] = obs_raw
+                raw_obs_holder["next_obs"] = obs_raw
+            obs = _extract_agent_obs(env, obs_raw, obs_mode)
+            _last_buf_idx = None
+
             rollout_log = {
-                "rollout/episode_return": episode_return,
-                "rollout/episode_steps": episode_steps,
+                "rollout/episode_return": done_episode_return,
+                "rollout/episode_steps": done_episode_steps,
                 "rollout/episodes": episode_count,
-                "rollout/route": info.get("route", "?"),
-                "rollout/episode_collision_count": float(episode_collision_count),
-                "rollout/episode_collision_events": float(episode_collision_events),
-                "rollout/collisions_over_episode": float(episode_collision_events) / max(float(episode_steps), 1.0),
+                "rollout/route": done_route,
+                "rollout/episode_collision_count": float(done_collision_count),
+                "rollout/episode_collision_events": float(done_collision_events),
+                "rollout/collisions_over_episode": float(done_collision_events)
+                / max(float(done_episode_steps), 1.0),
             }
-            if "reward_total" in info:
-                rollout_log["rollout/final_step_reward"] = float(info["reward_total"])
-                rollout_log["rollout/final_step_reward_progress"] = float(info.get("reward_progress", 0.0))
-                rollout_log["rollout/final_step_reward_centering"] = float(info.get("reward_centering", 0.0))
-                rollout_log["rollout/final_step_reward_heading"] = float(info.get("reward_heading", 0.0))
-                rollout_log["rollout/final_step_reward_terminal"] = float(info.get("reward_terminal", 0.0))
-                rollout_log["rollout/final_step_penalty_collision"] = float(info.get("penalty_collision", 0.0))
-                rollout_log["rollout/final_step_penalty_outside_route"] = float(info.get("penalty_outside_route", 0.0))
-                rollout_log["rollout/final_step_penalty_steer"] = float(info.get("penalty_steer", 0.0))
-                rollout_log["rollout/final_step_penalty_brake"] = float(info.get("penalty_brake", 0.0))
-                rollout_log["rollout/final_step_penalty_crash_stuck"] = float(info.get("penalty_crash_stuck", 0.0))
-                rollout_log["rollout/final_step_success"] = float(bool(info.get("success", False)))
+            if "reward_total" in done_info:
+                rollout_log["rollout/final_step_reward"] = float(done_info["reward_total"])
+                rollout_log["rollout/final_step_reward_progress"] = float(
+                    done_info.get("reward_progress", 0.0)
+                )
+                rollout_log["rollout/final_step_reward_centering"] = float(
+                    done_info.get("reward_centering", 0.0)
+                )
+                rollout_log["rollout/final_step_reward_heading"] = float(
+                    done_info.get("reward_heading", 0.0)
+                )
+                rollout_log["rollout/final_step_reward_terminal"] = float(
+                    done_info.get("reward_terminal", 0.0)
+                )
+                rollout_log["rollout/final_step_penalty_collision"] = float(
+                    done_info.get("penalty_collision", 0.0)
+                )
+                rollout_log["rollout/final_step_penalty_outside_route"] = float(
+                    done_info.get("penalty_outside_route", 0.0)
+                )
+                rollout_log["rollout/final_step_penalty_steer"] = float(
+                    done_info.get("penalty_steer", 0.0)
+                )
+                rollout_log["rollout/final_step_penalty_brake"] = float(
+                    done_info.get("penalty_brake", 0.0)
+                )
+                rollout_log["rollout/final_step_penalty_crash_stuck"] = float(
+                    done_info.get("penalty_crash_stuck", 0.0)
+                )
+                rollout_log["rollout/final_step_success"] = float(bool(done_info.get("success", False)))
             if FLAGS.expert_recover_debug:
                 rollout_log["rollout/vla_steps_budget"] = float(_vla_steps_budget)
+            traj_path = _save_episode_trajectory_json(
+                episode_index=episode_count,
+                route_name=done_route,
+                episode_step_count=done_episode_steps,
+                done_info=done_info,
+            )
+            if traj_path is not None:
+                rollout_log["rollout/trajectory_json"] = traj_path
+            if _vlm_coach is not None:
+                _vlm_coach.maybe_query(
+                    episode_step=done_episode_steps, done_info=done_info, force=True
+                )
+                _vlm_coach.backfill_buffer(buffer)
             _maybe_log_episode_video(
                 rollout_log,
                 end_img if log_images else None,
@@ -813,19 +1108,19 @@ def run_online_carla(
                 final_reward=last_video_reward,
                 final_critic_text=last_video_critic_text,
             )
+            if live_viewer is not None and episode_video_frames:
+                live_viewer.publish_frames(episode_video_frames, step, force=True)
             wandb.log(rollout_log, step=step)
-            obs_raw, _info = env.reset(seed=FLAGS.seed + episode_count)
-            if raw_obs_holder is not None:
-                raw_obs_holder["obs"] = obs_raw
-                raw_obs_holder["next_obs"] = obs_raw
-                
-            if agent is not None:
-                reset_vla_cache = getattr(getattr(agent, "vla_sample_fn", None), "reset_action_cache", None)
-                if reset_vla_cache is not None:
-                    reset_vla_cache()
-            obs = _extract_agent_obs(env, obs_raw, obs_mode)
             episode_video_frames = []
+            episode_trajectory = []
+            episode_video_frame_index = 0
             episode_return, episode_steps = 0.0, 0
+            if _vlm_coach is not None:
+                _vlm_coach.reset_episode()
+                _vlm_coach.begin_episode(
+                    episode_count=episode_count,
+                    route_name=done_route,
+                )
             episode_collision_count = 0
             episode_collision_events = 0
             prev_collision_count = 0
@@ -838,7 +1133,8 @@ def run_online_carla(
 
         update_times = []
         if (
-            (not FLAGS.expert_debug)
+            enable_updates
+            and (not FLAGS.expert_debug)
             and agent is not None
             and not in_warmup
             and buffer.size >= batch_size
@@ -846,10 +1142,11 @@ def run_online_carla(
             
             for _ in range(updates_per_step):
                 t_update_start = time.time()
+                use_vla_update = getattr(agent, "vla_sample_fn", None) is not None
                 batch = buffer.sample(batch_size)
                 if _online_training_mode == "dagger":
                     _, update_info = agent.update_dagger(batch)
-                elif getattr(agent, "vla_sample_fn", None) is not None:
+                elif use_vla_update:
                     _, update_info = agent.update_with_vla(batch)
                 else:
                     _, update_info = agent.update(batch)
@@ -866,12 +1163,12 @@ def run_online_carla(
             }
             if last_update_info is not None:
                 metrics.update({f"training/{k}": float(v) for k, v in last_update_info.items()})
-                metrics["training/buffer_size"] = int(buffer.size)
+            metrics["training/buffer_size"] = int(buffer.size)
             last_log_time = time.time()
             wandb.log(metrics, step=step)
             train_logger.log(metrics, step=step)
 
-        if agent is not None and step % FLAGS.save_interval == 0:
+        if agent is not None and enable_updates and step % FLAGS.save_interval == 0:
             save_agent(agent, FLAGS.save_dir, step)
 
     train_logger.close()
@@ -935,13 +1232,15 @@ def main(_):
                 "[main_carla] DAgger mode requested but SteerVLA rollout is disabled; falling back to learner rollout for data collection.",
                 flush=True,
             )
-    critic_feedback_mode = str(config.get("critic_feedback_mode", "commentary_bow"))
+    critic_feedback_mode = resolve_critic_feedback_mode(config)
     if critic_feedback_mode == "none":
         config.language_label_dim = 0
-    elif critic_feedback_mode == "delta_commentary_bow":
+    elif critic_feedback_mode in ("delta_commentary_bow", "vlm_chunk_bow"):
         config.language_label_dim = NUM_DELTA_COMMENTARY_WORDS
     elif critic_feedback_mode == "commentary_bow":
         config.language_label_dim = NUM_COMMENTARY_WORDS
+    elif critic_feedback_mode == "action_delta":
+        config.language_label_dim = int(config.get("critic_action_dim", 4))
     extra_carla: dict[str, Any] = {}
     exec_cfg = _steervla_action_execution_cfg(steervla_cfg)
     if exec_cfg is not None:
@@ -970,31 +1269,38 @@ def main(_):
             raw_carla_holder = {"obs": obs_dict, "next_obs": obs_dict}
 
         steervla_actor = None
+        vla_sample_fn = None
         agent = None
         if not FLAGS.expert_debug:
+            tr_rank = int(config.get("training_gpu_rank", -1))
+            if use_steervla_rollout:
+                vla_bundle = _build_vla_sample_fn(
+                    steervla_cfg, raw_carla_holder, training_gpu_rank=tr_rank
+                )
+                if vla_bundle is None:
+                    raise ValueError("SteerVLA rollout enabled but vla_sample_fn could not be built.")
+                vla_sample_fn, steervla_actor = vla_bundle
+
+            if obs_mode == "policy_embed":
+                if steervla_actor is None:
+                    raise ValueError("observation_mode='policy_embed' requires SteerVLA rollout.")
+                config.policy_embed_dim = int(steervla_actor.policy_embedding_dim())
+                steervla_actor.ensure_policy_embedding(1, raw=obs_dict, force=True)
+
             agent_obs = _extract_agent_obs(env, obs_dict, obs_mode)
             ex_obs = np.expand_dims(agent_obs, 0)
             ex_actions = np.zeros((1,) + tuple(env.action_space.shape), dtype=np.float32)
 
-            _configure_jax_training_device(int(config.get("training_gpu_rank", -1)))
+            _configure_jax_training_device(tr_rank)
 
             agent_class = agents[config["agent_name"]]
             create_kwargs = {}
-            if config["agent_name"] == "dsrl":
-                tr_rank = int(config.get("training_gpu_rank", -1))
-                vla_bundle = None
-                if use_steervla_rollout:
-                    vla_bundle = _build_vla_sample_fn(
-                        steervla_cfg, raw_carla_holder, training_gpu_rank=tr_rank
-                    )
-                if vla_bundle is not None:
-                    vla_sample_fn, steervla_actor = vla_bundle
-                    create_kwargs["vla_sample_fn"] = vla_sample_fn
-                    url = steervla_cfg.get("actor_url") if steervla_cfg else None
-                    if not (url and str(url).strip()):
-                        # create_kwargs["vla_train_state"] = steervla_actor.train_state
-                        create_kwargs["openpi_train_config"] = steervla_actor.train_cfg
-                        create_kwargs["steervla_actor"] = steervla_actor
+            if config["agent_name"] == "dsrl" and vla_sample_fn is not None:
+                create_kwargs["vla_sample_fn"] = vla_sample_fn
+                url = steervla_cfg.get("actor_url") if steervla_cfg else None
+                if not (url and str(url).strip()):
+                    create_kwargs["openpi_train_config"] = steervla_actor.train_cfg
+                    create_kwargs["steervla_actor"] = steervla_actor
 
             agent = agent_class.create(FLAGS.seed, ex_obs, ex_actions, config, **create_kwargs)
 

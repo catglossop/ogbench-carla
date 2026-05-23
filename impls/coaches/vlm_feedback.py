@@ -8,12 +8,23 @@ Run from ``impls/``::
 
     python -m coaches.vlm_feedback \\
         --video /path/to/rollout.mp4 \\
-        --metadata /path/to/metadata.json \\
+        --metadata /path/to/episode_0001.json \\
         --provider gemini \\
         --output /path/to/annotated.mp4
 
+    # Attach trajectory plots (speed, controls, collisions, route progress) to the prompt:
+    python -m coaches.vlm_feedback ... --include-plots-in-prompt
+
+Plots are always written under ``<output_dir>/<metadata_stem>_plots/`` (override with ``--plots-dir``).
+When ``--include-plots-in-prompt`` is off, the prompt still receives the JSON (video-aligned steps)
+plus a field guide describing each key.
+
+By default, BAD events are mapped to 10-step action chunks (0.5s each) within ±2 chunks and written
+to ``<metadata_stem>_chunk_feedback.json``. Use ``--no-chunk-feedback`` to skip.
+
 Output videos are twice as wide as the input: original footage on the left,
-black panel on the right with timed coach annotations.
+black panel on the right with timed coach annotations and per-chunk feedback
+(lateral/longitudinal coaching for each 0.5s action chunk near BAD events).
 """
 
 from __future__ import annotations
@@ -29,6 +40,26 @@ from pathlib import Path
 from typing import Any, Literal
 
 import tyro
+
+from impls.coaches.action_chunk_feedback import (
+    DEFAULT_ACTION_CHUNK_STEPS,
+    DEFAULT_BAD_EVENT_RADIUS_CHUNKS,
+    DEFAULT_CHUNK_DURATION_SEC,
+    active_chunk_at_time,
+    affected_chunks_from_bad_events,
+    assemble_chunk_feedback_json,
+    build_action_chunk_specs,
+    build_chunk_feedback_prompt,
+    format_chunk_feedback_lines,
+    parse_chunk_feedback_response,
+)
+from impls.coaches.trajectory_plots import (
+    TRAJECTORY_JSON_DESCRIPTION,
+    compact_metadata_for_prompt,
+    generate_trajectory_plots,
+    is_trajectory_metadata,
+    load_trajectory_metadata,
+)
 
 ProviderName = Literal["gemini", "perceptron"]
 
@@ -64,27 +95,39 @@ class CoachEvent:
 
 
 def load_metadata(metadata_path: str | Path) -> dict[str, Any]:
-    """Load optional JSON metadata; empty dict if the file is missing or blank."""
-    path = Path(metadata_path)
-    if not path.exists():
-        return {}
-    text = path.read_text(encoding="utf-8").strip()
-    if not text:
-        return {}
-    data = json.loads(text)
-    if not isinstance(data, dict):
-        raise ValueError(f"Metadata file must contain a JSON object, got {type(data).__name__}.")
-    return data
+    """Load trajectory JSON metadata from a rollout episode file."""
+    return load_trajectory_metadata(metadata_path)
 
 
-def build_coaching_prompt(metadata: dict[str, Any]) -> str:
+def build_coaching_prompt(
+    metadata: dict[str, Any],
+    *,
+    include_plots: bool = False,
+) -> str:
     """Prompt shared by Gemini and Perceptron coaches."""
-    metadata_block = json.dumps(metadata, indent=2) if metadata else "{}"
+    if is_trajectory_metadata(metadata):
+        prompt_metadata = compact_metadata_for_prompt(metadata)
+        metadata_block = json.dumps(prompt_metadata, indent=2)
+        metadata_intro = TRAJECTORY_JSON_DESCRIPTION
+        if include_plots:
+            metadata_intro += (
+                "\n\nA combined trajectory plot image is attached (speed, controls, collisions, "
+                "route progress vs video time in seconds). Use it together with the video and JSON."
+            )
+        else:
+            metadata_intro += (
+                "\n\nUse the JSON below as structured context; timestamps in ``video_timestamp_sec`` "
+                "align with the rollout video."
+            )
+    else:
+        metadata_block = json.dumps(metadata, indent=2) if metadata else "{}"
+        metadata_intro = "Optional metadata (may be empty):"
+
     return textwrap.dedent(
         f"""
         You are reviewing a driving rollout video for an autonomous vehicle policy.
 
-        Optional metadata (may be empty for now):
+        {metadata_intro}
         ```json
         {metadata_block}
         ```
@@ -114,7 +157,12 @@ def build_coaching_prompt(metadata: dict[str, Any]) -> str:
         - Use seconds from the start of the video for ``timestamp_sec``.
         - ``label`` must be exactly ``GOOD`` or ``BAD``.
         - Include ``correction`` only for ``BAD`` events (empty string otherwise).
+        - For ``BAD`` events, phrase ``correction`` using controlled driving verbs:
+          combine lateral guidance (``adjust left`` / ``adjust right``) and/or longitudinal
+          guidance (``accelerate`` / ``decelerate``). You may add brief extra detail after that.
         - Prefer 3–12 high-signal events rather than narrating every second.
+        - When trajectory metadata is provided, cross-check timestamps with
+          ``video_timestamp_sec``, speed, controls, collisions, and route progress.
         """
     ).strip()
 
@@ -149,7 +197,14 @@ class VLMCOach(ABC):
     """Base interface for video-based VLM coaches."""
 
     @abstractmethod
-    def analyze(self, video_path: str | Path, metadata: dict[str, Any]) -> list[CoachEvent]:
+    def analyze(
+        self,
+        video_path: str | Path,
+        metadata: dict[str, Any],
+        *,
+        plot_paths: list[Path] | None = None,
+        include_plots_in_prompt: bool = False,
+    ) -> list[CoachEvent]:
         """Return timestamped GOOD/BAD events for a rollout video."""
 
 
@@ -165,7 +220,14 @@ class GeminiVLMCOach(VLMCOach):
         self.api_key = api_key
         self.model = model
 
-    def analyze(self, video_path: str | Path, metadata: dict[str, Any]) -> list[CoachEvent]:
+    def analyze(
+        self,
+        video_path: str | Path,
+        metadata: dict[str, Any],
+        *,
+        plot_paths: list[Path] | None = None,
+        include_plots_in_prompt: bool = False,
+    ) -> list[CoachEvent]:
         try:
             from google import genai
         except ImportError as exc:
@@ -185,13 +247,39 @@ class GeminiVLMCOach(VLMCOach):
         if uploaded.state.name != "ACTIVE":
             raise RuntimeError(f"Gemini file upload failed with state={uploaded.state.name!r}.")
 
-        prompt = build_coaching_prompt(metadata)
+        contents: list[Any] = [uploaded]
+        if include_plots_in_prompt and plot_paths:
+            for plot_path in plot_paths:
+                plot_upload = client.files.upload(file=str(plot_path))
+                while plot_upload.state.name == "PROCESSING":
+                    time.sleep(0.5)
+                    plot_upload = client.files.get(name=plot_upload.name)
+                if plot_upload.state.name != "ACTIVE":
+                    raise RuntimeError(
+                        f"Gemini plot upload failed for {plot_path} "
+                        f"with state={plot_upload.state.name!r}."
+                    )
+                contents.append(plot_upload)
+
+        prompt = build_coaching_prompt(metadata, include_plots=include_plots_in_prompt)
+        contents.append(prompt)
         response = client.models.generate_content(
             model=self.model,
-            contents=[uploaded, prompt],
+            contents=contents,
         )
         text = getattr(response, "text", None) or str(response)
         return parse_coach_response(text)
+
+    def complete_text(self, prompt: str) -> str:
+        """Text-only completion (used for per-chunk feedback refinement)."""
+        from google import genai
+
+        client = genai.Client(api_key=self.api_key)
+        response = client.models.generate_content(
+            model=self.model,
+            contents=prompt,
+        )
+        return getattr(response, "text", None) or str(response)
 
 
 class PerceptronVLMCOach(VLMCOach):
@@ -200,7 +288,14 @@ class PerceptronVLMCOach(VLMCOach):
     def __init__(self, *, api_key: str = PERCEPTRON_API_KEY) -> None:
         self.api_key = api_key
 
-    def analyze(self, video_path: str | Path, metadata: dict[str, Any]) -> list[CoachEvent]:
+    def analyze(
+        self,
+        video_path: str | Path,
+        metadata: dict[str, Any],
+        *,
+        plot_paths: list[Path] | None = None,
+        include_plots_in_prompt: bool = False,
+    ) -> list[CoachEvent]:
         try:
             from perceptron import question, video
         except ImportError as exc:
@@ -216,7 +311,13 @@ class PerceptronVLMCOach(VLMCOach):
         if self.api_key and not self.api_key.startswith("YOUR_"):
             os.environ.setdefault("PERCEPTRON_API_KEY", self.api_key)
 
-        prompt = build_coaching_prompt(metadata)
+        prompt = build_coaching_prompt(metadata, include_plots=include_plots_in_prompt)
+        if include_plots_in_prompt and plot_paths:
+            plot_note = ", ".join(str(p) for p in plot_paths)
+            prompt += (
+                f"\n\nNote: trajectory plots were generated at {plot_note} but cannot be "
+                "attached via the Perceptron video API; rely on the JSON metadata above."
+            )
         result = question(
             video(str(path)),
             prompt,
@@ -224,6 +325,76 @@ class PerceptronVLMCOach(VLMCOach):
         )
         text = getattr(result, "text", None) or str(result)
         return parse_coach_response(text)
+
+    def complete_text(self, prompt: str) -> str:
+        raise NotImplementedError(
+            "Perceptron chunk-feedback refinement is not supported; use provider=gemini."
+        )
+
+
+def generate_action_chunk_feedback(
+    coach: VLMCOach,
+    metadata: dict[str, Any],
+    events: list[CoachEvent],
+    *,
+    steps_per_chunk: int = DEFAULT_ACTION_CHUNK_STEPS,
+    chunk_duration_sec: float = DEFAULT_CHUNK_DURATION_SEC,
+    bad_event_radius_chunks: int = DEFAULT_BAD_EVENT_RADIUS_CHUNKS,
+) -> dict[str, Any]:
+    """Map episode BAD events to per-chunk feedback (null outside the affected window)."""
+    chunk_specs = build_action_chunk_specs(
+        metadata,
+        steps_per_chunk=steps_per_chunk,
+        chunk_duration_sec=chunk_duration_sec,
+    )
+    num_chunks = len(chunk_specs)
+    bad_timestamps = [e.timestamp_sec for e in events if e.label == "BAD"]
+    affected = affected_chunks_from_bad_events(
+        bad_timestamps,
+        num_chunks=num_chunks,
+        radius_chunks=bad_event_radius_chunks,
+        chunk_duration_sec=chunk_duration_sec,
+    )
+
+    chunk_feedback: list[dict[str, Any] | None] = [None] * num_chunks
+    if affected and bad_timestamps:
+        bad_payload = [
+            {
+                "timestamp_sec": e.timestamp_sec,
+                "description": e.description,
+                "correction": e.correction,
+            }
+            for e in events
+            if e.label == "BAD"
+        ]
+        prompt = build_chunk_feedback_prompt(
+            bad_events=bad_payload,
+            chunk_specs=chunk_specs,
+            affected_chunk_indices=affected,
+            metadata=metadata,
+            steps_per_chunk=steps_per_chunk,
+            chunk_duration_sec=chunk_duration_sec,
+            bad_event_radius_chunks=bad_event_radius_chunks,
+        )
+        if not hasattr(coach, "complete_text"):
+            raise RuntimeError(f"Coach {type(coach).__name__} does not support text completion.")
+        response_text = coach.complete_text(prompt)  # type: ignore[attr-defined]
+        chunk_feedback = parse_chunk_feedback_response(
+            response_text,
+            num_chunks=num_chunks,
+            affected_chunk_indices=affected,
+        )
+
+    return assemble_chunk_feedback_json(
+        metadata,
+        events=events,
+        chunk_feedback=chunk_feedback,
+        chunk_specs=chunk_specs,
+        affected_chunk_indices=affected,
+        steps_per_chunk=steps_per_chunk,
+        chunk_duration_sec=chunk_duration_sec,
+        bad_event_radius_chunks=bad_event_radius_chunks,
+    )
 
 
 def create_coach(provider: ProviderName, **kwargs: Any) -> VLMCOach:
@@ -260,46 +431,60 @@ def _extend_frame(frame) -> Any:
     return extended
 
 
-def _annotation_lines(event: CoachEvent, *, wrap_width: int) -> list[str]:
-    """Structured annotation text for the right-hand panel."""
-    lines = [f"Status: {event.label}"]
-    if event.description:
-        lines.append("Description of behavior:")
-        lines.extend(_wrap_text(event.description, width=wrap_width))
-    if event.label == "BAD" and event.correction:
-        lines.append("Correction:")
-        lines.extend(_wrap_text(event.correction, width=wrap_width))
-    return lines
-
-
-def _draw_side_panel_annotations(frame, event: CoachEvent | None):
-    """Draw coach text on the black right-hand panel of a doubled-width frame."""
+def _draw_side_panel_annotations(
+    frame,
+    event: CoachEvent | None,
+    *,
+    chunk: dict[str, Any] | None = None,
+):
+    """Draw coach event pulse and/or action-chunk feedback on the right-hand panel."""
     import cv2  # type: ignore
 
     annotated = frame.copy()
     h, w = annotated.shape[:2]
     panel_x0 = w // 2
     panel_w = w - panel_x0
-    if event is None or panel_w <= 0:
+    if panel_w <= 0:
+        return annotated
+    if event is None and chunk is None:
         return annotated
 
     wrap_width = max(24, panel_w // 10)
-    lines = _annotation_lines(event, wrap_width=wrap_width)
+    lines: list[tuple[str, tuple[int, int, int], int]] = []
+
+    if event is not None:
+        status_color = (0, 200, 0) if event.label == "GOOD" else (0, 0, 255)
+        lines.append((f"Event: {event.label}", status_color, 2))
+        if event.description:
+            lines.append(("Description:", (255, 255, 255), 1))
+            for part in _wrap_text(event.description, width=wrap_width):
+                lines.append((part, (255, 255, 255), 1))
+        if event.label == "BAD" and event.correction:
+            lines.append(("Correction:", (255, 255, 255), 1))
+            for part in _wrap_text(event.correction, width=wrap_width):
+                lines.append((part, (255, 255, 255), 1))
+        if chunk is not None:
+            lines.append(("", (255, 255, 255), 1))
+
+    if chunk is not None:
+        chunk_color = (255, 200, 80)
+        for idx, line in enumerate(format_chunk_feedback_lines(chunk, wrap_width=wrap_width)):
+            color = chunk_color if idx == 0 else (220, 220, 220)
+            weight = 2 if idx == 0 else 1
+            lines.append((line, color, weight))
 
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.45
-    thickness = 1
-    line_height = 18
+    font_scale = 0.42
+    line_height = 17
     x = panel_x0 + 12
-    y = 28
-    status_color = (0, 200, 0) if event.label == "GOOD" else (0, 0, 255)
-    body_color = (255, 255, 255)
+    y = 24
 
-    for line in lines:
+    for line, color, weight in lines:
+        if not line:
+            y += line_height // 2
+            continue
         if y + line_height > h - 8:
             break
-        color = status_color if line.startswith("Status:") else body_color
-        weight = 2 if line.startswith("Status:") else 1
         cv2.putText(
             annotated,
             line,
@@ -315,12 +500,46 @@ def _draw_side_panel_annotations(frame, event: CoachEvent | None):
     return annotated
 
 
+def _draw_chunk_badge_on_video(frame, chunk: dict[str, Any] | None):
+    """Small chunk-index badge on the source video (left half)."""
+    if chunk is None:
+        return frame
+    import cv2  # type: ignore
+
+    annotated = frame.copy()
+    h, w = annotated.shape[:2]
+    video_w = w // 2 if w > h else w
+    label = f"Chunk {chunk.get('chunk_index', '?')}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.45
+    thickness = 1
+    pad = 4
+    (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+    x0, y0 = 8, 8
+    x1 = min(video_w - 8, x0 + tw + 2 * pad)
+    y1 = y0 + th + baseline + 2 * pad
+    cv2.rectangle(annotated, (x0, y0), (x1, y1), (40, 40, 40), thickness=-1)
+    cv2.rectangle(annotated, (x0, y0), (x1, y1), (255, 200, 80), thickness=1)
+    cv2.putText(
+        annotated,
+        label,
+        (x0 + pad, y1 - baseline - pad),
+        font,
+        font_scale,
+        (255, 200, 80),
+        thickness,
+        cv2.LINE_AA,
+    )
+    return annotated
+
+
 def annotate_video(
     video_path: str | Path,
     events: list[CoachEvent],
     output_path: str | Path,
     *,
     display_sec: float = ANNOTATION_DISPLAY_SEC,
+    chunk_feedback_json: dict[str, Any] | None = None,
 ) -> Path:
     """Write a video with the frame width doubled; annotations appear on the right panel."""
     try:
@@ -356,8 +575,14 @@ def annotate_video(
             timestamp_sec = frame_idx / fps
             active = _active_events(events, timestamp_sec, display_sec)
             event = active[-1] if active else None
+            chunk = (
+                active_chunk_at_time(chunk_feedback_json, timestamp_sec)
+                if chunk_feedback_json is not None
+                else None
+            )
             extended = _extend_frame(frame)
-            annotated = _draw_side_panel_annotations(extended, event)
+            extended = _draw_chunk_badge_on_video(extended, chunk)
+            annotated = _draw_side_panel_annotations(extended, event, chunk=chunk)
             writer.write(annotated)
             frame_idx += 1
     finally:
@@ -374,13 +599,40 @@ def main(
     output: Path | None = None,
     display_sec: float = ANNOTATION_DISPLAY_SEC,
     gemini_model: str = DEFAULT_GEMINI_MODEL,
+    include_plots_in_prompt: bool = False,
+    plots_dir: Path | None = None,
+    chunk_feedback: bool = True,
+    chunk_feedback_output: Path | None = None,
+    action_chunk_steps: int = DEFAULT_ACTION_CHUNK_STEPS,
+    action_chunk_duration_sec: float = DEFAULT_CHUNK_DURATION_SEC,
+    bad_event_radius_chunks: int = DEFAULT_BAD_EVENT_RADIUS_CHUNKS,
 ) -> Path:
     """Run VLM coaching on a video and write an annotated output clip."""
     metadata_dict = load_metadata(metadata)
+    resolved_plots_dir = plots_dir
+    if resolved_plots_dir is None:
+        stem = metadata.stem if metadata else video.stem
+        resolved_plots_dir = (output.parent if output is not None else video.parent) / f"{stem}_plots"
+
+    plot_paths: list[Path] = []
+    if is_trajectory_metadata(metadata_dict):
+        plot_map = generate_trajectory_plots(metadata_dict, resolved_plots_dir)
+        plot_paths = [plot_map["combined"]]
+        print(f"[vlm_feedback] wrote trajectory plots to {resolved_plots_dir}", flush=True)
+        for name, path in plot_map.items():
+            print(f"  {name}: {path}", flush=True)
+
     coach = create_coach(provider, model=gemini_model) if provider == "gemini" else create_coach(provider)
 
     print(f"[vlm_feedback] provider={provider} video={video}", flush=True)
-    events = coach.analyze(video, metadata_dict)
+    if include_plots_in_prompt:
+        print("[vlm_feedback] including trajectory plots in coaching prompt", flush=True)
+    events = coach.analyze(
+        video,
+        metadata_dict,
+        plot_paths=plot_paths if include_plots_in_prompt else None,
+        include_plots_in_prompt=include_plots_in_prompt,
+    )
     print(f"[vlm_feedback] parsed {len(events)} events", flush=True)
     for event in events:
         suffix = f" | correction: {event.correction}" if event.correction else ""
@@ -391,8 +643,38 @@ def main(
 
     if output is None:
         output = video.with_name(f"{video.stem}_annotated{video.suffix}")
-    annotated_path = annotate_video(video, events, output, display_sec=display_sec)
+
+    chunk_json: dict[str, Any] | None = None
+    if chunk_feedback and is_trajectory_metadata(metadata_dict):
+        chunk_json = generate_action_chunk_feedback(
+            coach,
+            metadata_dict,
+            events,
+            steps_per_chunk=action_chunk_steps,
+            chunk_duration_sec=action_chunk_duration_sec,
+            bad_event_radius_chunks=bad_event_radius_chunks,
+        )
+        chunk_out = chunk_feedback_output
+        if chunk_out is None:
+            chunk_out = (output.parent if output is not None else metadata.parent) / f"{metadata.stem}_chunk_feedback.json"
+        chunk_out.parent.mkdir(parents=True, exist_ok=True)
+        chunk_out.write_text(json.dumps(chunk_json, indent=2), encoding="utf-8")
+        n_with_feedback = sum(1 for c in chunk_json["action_chunks"] if c["feedback"] is not None)
+        print(
+            f"[vlm_feedback] wrote chunk feedback to {chunk_out} "
+            f"({n_with_feedback}/{len(chunk_json['action_chunks'])} chunks)",
+            flush=True,
+        )
+
+    annotated_path = annotate_video(
+        video,
+        events,
+        output,
+        display_sec=display_sec,
+        chunk_feedback_json=chunk_json,
+    )
     print(f"[vlm_feedback] wrote annotated video to {annotated_path}", flush=True)
+
     return annotated_path
 
 

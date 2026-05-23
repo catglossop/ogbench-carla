@@ -8,8 +8,10 @@ Supports:
 
 * **normalized** chunks — apply OpenPI ``denormalize_actions`` (same scaling as
   :mod:`openpi.visualizing.steervla_visualization`) before cumsums.
-* **policy_output** chunks — values already in dataset / physical units after policy
-  ``Unnormalize`` (e.g. HTTP ``/gen_action``); skip fixed scaling.
+* **policy_output** chunks — values already in physical units (meters / degrees) after
+  OpenPI ``Unnormalize`` and fixed ``denormalize_actions`` scaling in the VLA actor.
+* **normalized** chunks — apply only fixed ``denormalize_actions`` (legacy path when the
+  actor returns raw model outputs without OpenPI ``Unnormalize``).
 """
 
 from __future__ import annotations
@@ -181,7 +183,14 @@ class SimlingoStyleWaypointDecoder:
             action_dim=action_dim,
             space=action_input_space,
         )
+        print("Denormalized action chunks:")
+        print(denorm)
+        #TODO: Check this produces correct waypoints
         pred_speed_wps, pred_route = _chunks_to_speed_and_route_waypoints(np.asarray(denorm, dtype=np.float64))
+        
+        print("Predicted speed waypoints:")
+        print(pred_speed_wps)
+        # breakpoint()
 
         s = np.asarray(state_vec, dtype=np.float32).reshape(-1)
         gt_velocity = float(s[EGO_STATE_IDX_SPEED]) if s.size > EGO_STATE_IDX_SPEED else 0.0

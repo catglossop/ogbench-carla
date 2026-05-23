@@ -14,14 +14,27 @@ from coaches.expert_label import (
 
 def critic_language_dim(agent_config: Any) -> int:
     """Return replay-buffer language-label width for the configured critic mode."""
-    mode = str(agent_config.get("critic_feedback_mode", "commentary_bow"))
+    mode = resolve_critic_feedback_mode(agent_config)
     if mode == "none":
         return 0
     if mode == "action_delta":
         return int(agent_config.get("critic_action_dim", 4))
-    if mode == "delta_commentary_bow":
+    if mode in ("delta_commentary_bow", "vlm_chunk_bow"):
         return NUM_DELTA_COMMENTARY_WORDS
     return NUM_COMMENTARY_WORDS
+
+
+def resolve_critic_feedback_mode(agent_config: Any) -> str:
+    """Map ``language_feedback`` config (or legacy ``critic_feedback_mode``) to a mode string."""
+    lang_fb = agent_config.get("language_feedback")
+    if lang_fb is not None:
+        src = str(lang_fb.get("source", "expert")).strip().lower()
+        if src == "vlm":
+            return "vlm_chunk_bow"
+        expert_mode = lang_fb.get("expert_mode")
+        if expert_mode is not None:
+            return str(expert_mode)
+    return str(agent_config.get("critic_feedback_mode", "commentary_bow"))
 
 
 def compute_action_delta(

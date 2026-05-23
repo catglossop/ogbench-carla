@@ -227,7 +227,7 @@ def _vla_forward_prepare_actor_noise(
 
 
 class CarlaObservationEncoder(nn.Module):
-    """Encode CARLA observations: vector state as float, or RGB uint8 via IMPALA."""
+    """Encode CARLA observations: vector state, RGB via IMPALA, or precomputed policy embed."""
 
     observation_mode: str
     impala_width: int = 1
@@ -238,7 +238,7 @@ class CarlaObservationEncoder(nn.Module):
 
     @nn.compact
     def __call__(self, observations):
-        if self.observation_mode == "state":
+        if self.observation_mode in ("state", "policy_embed"):
             return observations.astype(jnp.float32)
         return ImpalaEncoder(
             width=self.impala_width,
@@ -476,7 +476,14 @@ class DSRLAgent(flax.struct.PyTreeNode):
             return self.sample_actions(observations, seed=seed, temperature=temperature)
         seed = seed if seed is not None else self.rng
         seed, sub = jax.random.split(seed)
-        enc = self._encode_obs(self.network.params, observations)
+        obs_mode = str(self.config.get("observation_mode", "state"))
+        if obs_mode == "policy_embed":
+            if self.steervla_actor is None:
+                raise RuntimeError("observation_mode='policy_embed' requires an attached SteerVLAActor.")
+            embed = self.steervla_actor.ensure_policy_embedding(int(observations.shape[0]))
+            enc = jnp.asarray(embed, dtype=jnp.float32)
+        else:
+            enc = self._encode_obs(self.network.params, observations)
         dist = self.network.select("noise_actor")(enc, temperature=temperature)
         noise = dist.sample(seed=sub)
         noise = noise * self.config["noise_scale"]
@@ -552,33 +559,45 @@ class DSRLAgent(flax.struct.PyTreeNode):
             )
         noise_chunk = self._as_noise_chunk(noise)
         next_openpi_observation = self._as_jax_pytree(openpi_observations)
+        sample_actions_time = time.time()
         next_actions = self.steervla_actor._sample_actions(
             rng_act,
             next_openpi_observation,
             noise=noise_chunk,
             image_keys=tuple(self.config.get("image_keys", ("base_0_rgb",))),
-            num_steps=int(self.config.get("flow_steps", 10)),
+            num_steps=int(
+                self.config.get(
+                    "vla_update_flow_steps",
+                    self.config.get("flow_steps", 10),
+                )
+            ),
         )
-
+        next_actions = self.steervla_actor.postprocess_sampled_trajectory(
+            next_actions,
+            observation_state=next_openpi_observation.state,
+        )
+        jax.block_until_ready(next_actions)
+        sample_actions_time = time.time() - sample_actions_time
+        print(f"[DEBUG - dsrl] Sample actions time: {sample_actions_time} seconds")
         return jax.lax.stop_gradient(self._clip_actions_to_env(next_actions))
 
-    def _vla_forward_for_actor(self, batch, rng):
-        rng_a, rng_act = jax.random.split(rng)
-        noise_scale = jnp.asarray(self.config["noise_scale"], dtype=jnp.float32)
-        noise = _vla_forward_prepare_actor_noise(
-            self.network, batch["observations"], rng_a, noise_scale,
-        )
-        noise_flat = self._as_flat_noise(noise)
-        openpi_observation = self._as_jax_pytree(batch["openpi_observation"])
+    # def _vla_forward_for_actor(self, batch, rng):
+    #     rng_a, rng_act = jax.random.split(rng)
+    #     noise_scale = jnp.asarray(self.config["noise_scale"], dtype=jnp.float32)
+    #     noise = _vla_forward_prepare_actor_noise(
+    #         self.network, batch["observations"], rng_a, noise_scale,
+    #     )
+    #     noise_flat = self._as_flat_noise(noise)
+    #     openpi_observation = self._as_jax_pytree(batch["openpi_observation"])
 
-        actions = self.steervla_actor._sample_actions(
-            rng_act,
-            openpi_observation,
-            noise=self._as_noise_chunk(noise_flat),
-            image_keys=tuple(self.config.get("image_keys", ("base_0_rgb",))),
-            num_steps=int(self.config.get("flow_steps", 10)),
-        )
-        return self._clip_actions_to_env(actions), jax.lax.stop_gradient(noise_flat)
+    #     actions = self.steervla_actor._sample_actions(
+    #         rng_act,
+    #         openpi_observation,
+    #         noise=self._as_noise_chunk(noise_flat),
+    #         image_keys=tuple(self.config.get("image_keys", ("base_0_rgb",))),
+    #         num_steps=int(self.config.get("flow_steps", 10)),
+    #     )
+    #     return self._clip_actions_to_env(actions), jax.lax.stop_gradient(noise_flat)
 
     def noise_critic_loss_vla(self, batch, grad_params, rng):
         """Distill ``noise_critic(s, z)`` toward ``critic(s, VLA(s, z))``."""
@@ -628,7 +647,9 @@ class DSRLAgent(flax.struct.PyTreeNode):
         noise_scale = jnp.asarray(self.config["noise_scale"], dtype=jnp.float32)
         critic_actions = self._clip_actions_to_env(batch["actions"])
 
+        noise_total_loss_vla_time = time.time()
         if vla_cache is not None:
+            noise_critic_loss_vla_time = time.time()
             nc_loss, nc_info = _noise_critic_loss_vla_pure_math(
                 self.network,
                 batch,
@@ -647,11 +668,17 @@ class DSRLAgent(flax.struct.PyTreeNode):
                 grad_params,
                 discount,
             )
+            noise_critic_loss_vla_time = time.time() - noise_critic_loss_vla_time
+            print(f"[DEBUG - dsrl] Noise critic loss vla time: {noise_critic_loss_vla_time} seconds")
         else:
+            noise_critic_loss_vla_time = time.time()
             nc_loss, nc_info = self.noise_critic_loss_vla(batch, grad_params, nc_rng)
             na_loss, na_info = self.noise_actor_loss_vla(batch, grad_params, na_rng)
             c_loss, c_info = self.critic_loss_vla(batch, grad_params, c_rng)
-        
+            noise_critic_loss_vla_time = time.time() - noise_critic_loss_vla_time
+            print(f"[DEBUG - dsrl] Noise critic loss vla time: {noise_critic_loss_vla_time} seconds")
+        total_loss_vla_time = time.time() - noise_total_loss_vla_time
+        print(f"[DEBUG - dsrl] Total loss vla time: {total_loss_vla_time} seconds")
         info = {}
         for k, v in nc_info.items():
             info[f"noise_critic_vla/{k}"] = v
@@ -811,8 +838,10 @@ class DSRLAgent(flax.struct.PyTreeNode):
         rng, init_rng = jax.random.split(rng)
 
         obs_mode = str(config.get("observation_mode", "state"))
-        if obs_mode not in ("state", "image"):
-            raise ValueError(f"observation_mode must be 'state' or 'image', got {obs_mode!r}")
+        if obs_mode not in ("state", "image", "policy_embed"):
+            raise ValueError(
+                f"observation_mode must be 'state', 'image', or 'policy_embed', got {obs_mode!r}"
+            )
 
         if vla_sample_fn is not None:
             env_action_dim = int(config.get("vla_action_dim", 4)) * int(
@@ -832,6 +861,8 @@ class DSRLAgent(flax.struct.PyTreeNode):
         )
         if obs_mode == "state":
             embed_dim = int(ex_observations.shape[-1])
+        elif obs_mode == "policy_embed":
+            embed_dim = int(config.get("policy_embed_dim", ex_observations.shape[-1]))
         else:
             embed_dim = int(tuple(config.get("image_mlp_hidden_dims", (512,)))[-1])
         critic_feedback_mode = str(config.get("critic_feedback_mode", "commentary_bow"))
@@ -930,6 +961,8 @@ def get_config():
             # Env steps with policy rollouts but no RL updates (see main_carla.run_online_carla).
             warmup_steps=1000,
             updates_per_step=1,
+            # If false, main_carla collects rollouts but skips RL gradient updates.
+            enable_updates=True,
             buffer_capacity=100_000,
             # W&B: when ``observation_mode`` is ``image``, log ``rollout/curr_obs`` every N env steps.
             image_log_curr_interval=1000,
@@ -943,6 +976,8 @@ def get_config():
             vla_cot_temperature=0.0,
             vla_cot_replay_reasoning=True,
             vla_sample_actions_num_steps=10,
+            # Pi0 flow-matching denoise steps in ``update_with_vla`` (rollout uses ``steervla.sample_actions_num_steps``).
+            vla_update_flow_steps=10,
             vla_sample_actions_low_memory=True,
             vla_sample_actions_jit_denoise_steps=False,
             vla_action_horizon=10,
