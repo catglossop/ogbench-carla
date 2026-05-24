@@ -143,16 +143,16 @@ def build_openpi_policy_transforms(
     if data_config.asset_id is None:
         raise ValueError("TrainConfig data requires asset_id to load norm stats.")
     env_action_dim = int(getattr(data_factory, "action_dim", 4))
-    norm_stats = openpi_checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+    # norm_stats = openpi_checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
     input_transform = openpi_transforms.compose(
         [
-            openpi_transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            # openpi_transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
         ]
     )
     output_transform = openpi_transforms.compose(
         [
             *data_config.model_transforms.outputs,
-            openpi_transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            # openpi_transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             _SliceActionDim(action_dim=env_action_dim),
         ]
     )
@@ -603,6 +603,8 @@ class SteerVLAActor:
         sample_actions_num_steps: int = 10,
         training_gpu_rank: int = -1,
         return_normalized_action_chunk: bool = False,
+        fixed_subtask_text: Optional[str] = None,
+        fixed_reasoning_text: Optional[str] = None,
     ) -> None:
         self.actor_url = actor_url
         self._remote: Optional[RemoteActor] = None
@@ -621,6 +623,12 @@ class SteerVLAActor:
         self.actions_per_cot = max(1, int(actions_per_cot))
         self.sample_actions_num_steps = int(sample_actions_num_steps)
         self.return_normalized_action_chunk = bool(return_normalized_action_chunk)
+        self.fixed_subtask_text = (
+            str(fixed_subtask_text).strip() if fixed_subtask_text else None
+        )
+        self.fixed_reasoning_text = (
+            str(fixed_reasoning_text).strip() if fixed_reasoning_text else None
+        )
         self.prompt_state_dim = steervla_prompt_state_dim(include_ego_history=include_ego_history)
         self._call_counter = 0
         self._cached_action_chunk: np.ndarray | None = None
@@ -828,17 +836,11 @@ class SteerVLAActor:
         return jnp.asarray(out, dtype=jnp.float32)
     
     def flow_sample(self, rng, openpi_observation, input_noise):
-        # Always run sample_cot so reasoning/subtask/FAST tokens match the current prompt.
-        cot_out = self._sample_cot(
-            rng,
-            openpi_observation,
-            temperature=float(self.cot_temperature),
-            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-        )
+        batch_size = int(openpi_observation.state.shape[0])
+        cot_out = self._sample_or_reuse_cot(rng, openpi_observation, batch_size)
         obs_full = _merge_cot_output_into_observation(openpi_observation, cot_out)
         
         # Construct the noise
-        batch_size = int(openpi_observation.state.shape[0])
         model_ah = int(self.model.action_horizon)
         model_ad = int(self.model.action_dim)
         cfg_ah = min(int(self.action_horizon), model_ah)
@@ -1193,12 +1195,59 @@ class SteerVLAActor:
     def _cot_cache_enabled(self, batch_size: int) -> bool:
         return self.actions_per_cot > 1 and batch_size == 1
 
+    def _uses_fixed_cot(self) -> bool:
+        return self.fixed_subtask_text is not None
+
+    def _build_fixed_cot_out(
+        self,
+        batch_size: int,
+        *,
+        ref_array: jnp.ndarray,
+    ) -> dict[str, Any]:
+        """Teacher-forced CoT matching ``inspect_outputs.ipynb`` (no ``sample_cot``)."""
+        if self.tokenizer is None or self.model_cfg is None:
+            raise RuntimeError("Fixed CoT requires a loaded local SteerVLAActor tokenizer/model.")
+        reasoning_text = self.fixed_reasoning_text or "Follow the route."
+        rea_np, rea_mask_np = self.tokenizer.tokenize_reasoning(reasoning_text)
+        sub_np, sub_mask_np = self.tokenizer.tokenize_subtask(self.fixed_subtask_text)
+        device = self._jax_device if self._jax_device is not None else ref_array.devices().pop()
+
+        def _tile(tok: np.ndarray, mask: np.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+            tokens = jnp.asarray(np.tile(tok[None, :], (batch_size, 1)), dtype=ref_array.dtype)
+            masks = jnp.asarray(np.tile(mask[None, :], (batch_size, 1)), dtype=bool)
+            return jax.device_put(tokens, device), jax.device_put(masks, device)
+
+        reasoning, reasoning_mask = _tile(rea_np, rea_mask_np)
+        subtask, subtask_mask = _tile(sub_np, sub_mask_np)
+        out: dict[str, Any] = {
+            "tokenized_reasoning": reasoning,
+            "tokenized_reasoning_mask": reasoning_mask,
+            "tokenized_subtask": subtask,
+            "tokenized_subtask_mask": subtask_mask,
+        }
+        if self.tokenizer.use_fast_tokens:
+            mf = int(self.model_cfg.max_fast_len)
+            out["tokenized_fast"] = jax.device_put(
+                jnp.zeros((batch_size, mf), dtype=ref_array.dtype),
+                device,
+            )
+            out["tokenized_fast_mask"] = jax.device_put(
+                jnp.zeros((batch_size, mf), dtype=bool),
+                device,
+            )
+        return out
+
     def _sample_or_reuse_cot(
         self,
         rng: jax.Array,
         obs_jax: _openpi_model.Observation,
         batch_size: int,
     ) -> dict[str, Any]:
+        if self._uses_fixed_cot():
+            return self._build_fixed_cot_out(
+                batch_size,
+                ref_array=obs_jax.tokenized_prompt,
+            )
         if (
             self._cot_cache_enabled(batch_size)
             and self._cached_cot is not None
@@ -1407,13 +1456,7 @@ class SteerVLAActor:
             lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
             obs_np_struct,
         )
-        cot_out = self._sample_cot(
-            rng,
-            obs_jax,
-            temperature=float(self.cot_temperature),
-            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-            # replay_reasoning=self.cot_replay_reasoning,
-        )
+        cot_out = self._sample_or_reuse_cot(rng, obs_jax, 1)
 
         def _to_numpy(x: Any) -> Any:
             return np.asarray(jax.device_get(x))
@@ -1448,6 +1491,8 @@ def create_steervla_pi0_cot_sample_fn(
         sample_actions_num_steps=int(steervla_cfg.get("sample_actions_num_steps", 10)),
         training_gpu_rank=int(srank),
         return_normalized_action_chunk=bool(steervla_cfg.get("use_pi_action_chunk_for_env", True)),
+        fixed_subtask_text=steervla_cfg.get("fixed_subtask_text"),
+        fixed_reasoning_text=steervla_cfg.get("fixed_reasoning_text"),
     )
 
     if url_clean:

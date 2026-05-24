@@ -96,7 +96,7 @@ class SimlingoStyleWaypointDecoder:
         carla_fps: float = 20.0,
         wp_dilation: int = 1,
         data_save_freq: int = 5,
-        brake_speed: float = 0.4,
+        brake_speed: float = 0.1,
         brake_ratio: float = 1.1,
         clip_delta: float = 1.0,
         clip_throttle: float = 1.0,
@@ -143,7 +143,8 @@ class SimlingoStyleWaypointDecoder:
         desired_speed = (
             np.linalg.norm(speed_waypoints[idx_hi] - speed_waypoints[idx_lo]) * 2.0
         )
-
+        print("Desired speed: ", desired_speed)
+        print("Speed: ", speed)
         brake = (desired_speed < self.brake_speed) or (
             (speed / max(desired_speed, 1e-6)) > self.brake_ratio
         )
@@ -156,7 +157,9 @@ class SimlingoStyleWaypointDecoder:
         route_interp = interpolate_waypoints(route_waypoints.squeeze())
         steer = float(self.turn_controller.step(route_interp, speed))
         steer = float(np.clip(round(steer, 3), -1.0, 1.0))
-
+        print("Steer: ", steer)
+        print("Throttle: ", throttle)
+        print("Brake: ", brake)
         return steer, throttle, brake
 
     def flat_action_to_vehicle_control(
@@ -183,14 +186,8 @@ class SimlingoStyleWaypointDecoder:
             action_dim=action_dim,
             space=action_input_space,
         )
-        print("Denormalized action chunks:")
-        print(denorm)
         #TODO: Check this produces correct waypoints
         pred_speed_wps, pred_route = _chunks_to_speed_and_route_waypoints(np.asarray(denorm, dtype=np.float64))
-        
-        print("Predicted speed waypoints:")
-        print(pred_speed_wps)
-        # breakpoint()
 
         s = np.asarray(state_vec, dtype=np.float32).reshape(-1)
         gt_velocity = float(s[EGO_STATE_IDX_SPEED]) if s.size > EGO_STATE_IDX_SPEED else 0.0

@@ -98,6 +98,18 @@ def _critic_obs_e(obs_e: jnp.ndarray, batch: dict, key: str) -> jnp.ndarray:
         return obs_e
     return jnp.concatenate([obs_e, jnp.asarray(lang, dtype=jnp.float32)], axis=-1)
 
+
+def _apply_debug_stop_reward_relabel(batch: dict) -> dict:
+    """Debug task: replace env reward with ``-ego_speed`` (m/s) to encourage stopping."""
+    if "ego_speed" not in batch:
+        raise KeyError(
+            "debug_task requires replay field 'ego_speed' (store CARLA speed m/s in main_carla)."
+        )
+    out = dict(batch)
+    out["rewards"] = -jnp.asarray(out["ego_speed"], dtype=jnp.float32)
+    return out
+
+
 @jax.jit
 def _critic_loss_vla_pure_math(
     network: TrainState,
@@ -640,6 +652,8 @@ class DSRLAgent(flax.struct.PyTreeNode):
 
     def total_loss_vla(self, batch, grad_params, rng=None, vla_cache=None):
         """Sum of VLA-path losses; ``update_with_vla`` passes precomputed ``vla_cache``."""
+        if bool(self.config.get("debug_task", False)):
+            batch = _apply_debug_stop_reward_relabel(batch)
         rng = rng if rng is not None else self.rng
         rng, nc_rng, na_rng, c_rng = jax.random.split(rng, 4)
         discount = jnp.asarray(self.config["discount"], dtype=jnp.float32)
@@ -1002,6 +1016,8 @@ def get_config():
             # "rl": standard DSRL online RL updates.
             # "dagger": collect on-policy states, store expert actions, and train with flow imitation only.
             online_training_mode="rl",
+            # When true, RL updates use reward = -ego_speed (m/s) instead of env reward.
+            debug_task=False,
         )
     )
     return config

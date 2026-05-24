@@ -209,6 +209,17 @@ def _configure_jax_training_device(training_gpu_rank: int) -> None:
     )
 
 
+# Must match :data:`ogbench.carla.carla_utils.EGO_STATE_IDX_SPEED`.
+_EGO_STATE_IDX_SPEED = 15
+
+
+def _ego_speed_mps_from_raw(raw: dict) -> np.float32:
+    state = np.asarray(raw["state"], dtype=np.float32).reshape(-1)
+    if state.size <= _EGO_STATE_IDX_SPEED:
+        return np.float32(0.0)
+    return np.float32(state[_EGO_STATE_IDX_SPEED])
+
+
 def _extract_agent_obs(env, env_obs: dict, mode: str) -> np.ndarray:
     """Pick the tensor the RL agent trains on (env always exposes both keys).
 
@@ -469,6 +480,8 @@ def run_online_carla(
         language_label=np.zeros(_lang_dim, dtype=np.float32),
         next_language_label=np.zeros(_lang_dim, dtype=np.float32),
     )
+    if agent_config.get("debug_task", False):
+        example_transition["ego_speed"] = _ego_speed_mps_from_raw(obs_raw)
     if steervla_actor is not None:
         openpi0 = _openpi_fields_from_raw(obs_raw)
         example_transition.update(openpi0)
@@ -855,8 +868,6 @@ def run_online_carla(
         if FLAGS.expert_debug or _in_expert_recovery:
             next_obs_raw, reward, terminated, truncated, info = env.step_expert(obs_raw)
         else:
-            print("Action:")
-            print(action)
             next_obs_raw, reward, terminated, truncated, info = env.step(action)
         if raw_obs_holder is not None:
             raw_obs_holder["next_obs"] = next_obs_raw
@@ -913,6 +924,11 @@ def run_online_carla(
                 **(
                     {f"next_{k}": np.array(v) for k, v in _openpi_fields_from_raw(next_obs_raw).items()}
                     if steervla_actor is not None
+                    else {}
+                ),
+                **(
+                    {"ego_speed": _ego_speed_mps_from_raw(obs_raw)}
+                    if agent_config.get("debug_task", False)
                     else {}
                 ),
             }

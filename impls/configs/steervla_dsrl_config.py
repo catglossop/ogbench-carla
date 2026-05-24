@@ -45,8 +45,10 @@ def get_config():
     config.warmup_use_random_actions = False
     config.updates_per_step = 5
     # Set to false for rollout-only runs (no RL gradient updates).
-    config.enable_updates = True
+    config.enable_updates = False
     config.buffer_capacity = 1_000
+    # When true, RL updates use reward = -ego_speed (m/s) instead of env reward.
+    config.debug_task = False 
     config.image_log_curr_interval = 10
     config.critic_action_dim = 4
     config.vla_action_dim = 4
@@ -112,12 +114,12 @@ def get_config():
             # Local OpenPI inference (ignored when actor_url is set):
             actor_config="pi05_steervla_cot_simplified_reasoning",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
-            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260521_021239/18000",
+            checkpoint="/home/carla/.cache/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning_20260512_144250/50000",
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,
             include_ego_history=False,
-            proprio_norm=True,
+            proprio_norm=False,
             # Replay buffer + CARLA ``step`` use OpenPI chunk layout (``action_horizon`` × ``action_dim``),
             # executed like ``simlingo/team_code/agent_steervla.py`` (cumsums + PID). Set
             # ``use_pi_action_chunk_for_env: false`` for legacy ``[accel, steer]`` controls only.
@@ -132,6 +134,9 @@ def get_config():
             actions_per_cot=1,
             output_action_format="DELTA_XY_T_DELTA_XY_SPACE",
             sample_actions_num_steps=10,
+            # When set, skip sample_cot and teacher-force CoT like inspect_outputs.ipynb.
+            # fixed_subtask_text="The vehicle decelerates with a slight left adjustment.",
+            # fixed_reasoning_text="Follow the route.",
             # Remote HTTP actor (leave unset or falsy for local checkpoint load):
             # actor_url="http://35.186.30.251:8000",
         )
