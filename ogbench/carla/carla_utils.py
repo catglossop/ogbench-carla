@@ -104,6 +104,10 @@ from ogbench.carla.leaderboard_agents.observation_only import (
     RGB_FRONT_CAMERA_TAG,
     VIZ_IMAGE_SHAPE_HWC,
 )
+from ogbench.carla.leaderboard_agents.simlingo_obs import (
+    SIMLINGO_CAMERA_TAG,
+    SIMLINGO_IMAGE_SHAPE_HWC,
+)
 
 
 def _patch_speedometer_no_rpc() -> None:
@@ -236,23 +240,36 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
             display_num = _find_free_display_num()
 
         xvfb_cmd = [
-            "Xvfb",
-            f":{display_num}",
-            "-screen",
-            "0",
-            "1280x1024x24",
-            "-ac",
-            "+extension",
-            "GLX",
-            "+render",
-            "-noreset",
+            "Xvfb", f":{display_num}",
+            "-screen", "0", "1280x1024x24",
+            "-ac", "+extension", "GLX", "+render", "-noreset",
         ]
-        self.xvfb = subprocess.Popen(xvfb_cmd, preexec_fn=os.setsid)
+        # stdin=DEVNULL so Xvfb/CARLA don't inherit any pipe fds from our process.
+        self.xvfb = subprocess.Popen(
+            xvfb_cmd, preexec_fn=os.setsid,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
         atexit.register(os.killpg, self.xvfb.pid, signal.SIGKILL)
         time.sleep(2)
 
-        carla_env = os.environ.copy()
-        carla_env["DISPLAY"] = f":{display_num}"
+        # Build a minimal clean env for CARLA/UE4. When this process is launched
+        # via `conda run` + `uv run`, both inject LD_LIBRARY_PATH entries with
+        # incompatible libstdc++/libssl versions that crash the UE4 binary right
+        # after "Disabling core dumps.". Use only what UE4 actually needs.
+        _sys_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        carla_env = {
+            "HOME": os.environ.get("HOME", "/root"),
+            "USER": os.environ.get("USER", "root"),
+            "LOGNAME": os.environ.get("LOGNAME", os.environ.get("USER", "root")),
+            "PATH": _sys_path,
+            "DISPLAY": f":{display_num}",
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+        }
+        # Forward CUDA and GPU visibility vars.
+        for _k in ("CUDA_VISIBLE_DEVICES", "CUDA_HOME", "CUDA_ROOT",
+                   "XDG_RUNTIME_DIR", "TMPDIR", "TMP", "TEMP"):
+            if _k in os.environ:
+                carla_env[_k] = os.environ[_k]
 
         cmd = [
             os.path.join(self.carla_path, "CarlaUE4.sh"),
@@ -264,10 +281,14 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
         streaming_port = int(getattr(args, "streaming_port", 0) or 0)
         if streaming_port > 0:
             cmd.append(f"-carla-streaming-port={streaming_port}")
-        self.server = subprocess.Popen(cmd, preexec_fn=os.setsid, env=carla_env)
+        _carla_log = open(f"/tmp/carla_rpc{rpc_port}.log", "w")
+        self.server = subprocess.Popen(
+            cmd, preexec_fn=os.setsid, env=carla_env,
+            stdin=subprocess.DEVNULL, stdout=_carla_log, stderr=_carla_log,
+        )
         print(" ".join(cmd), self.server.returncode, flush=True)
         atexit.register(os.killpg, self.server.pid, signal.SIGKILL)
-        time.sleep(30)
+        time.sleep(60)
 
         attempts = 0
         num_max_restarts = 20
@@ -344,6 +365,59 @@ def _bgra_to_rgb_hwc(arr: np.ndarray) -> np.ndarray:
     """CARLA leaderboard packs ``sensor.camera.rgb`` as H×W×4 BGRA uint8."""
     bgr = np.asarray(arr)[..., :3]
     return np.ascontiguousarray(bgr[..., ::-1], dtype=np.uint8)
+
+
+def _decode_simlingo_image(sensor_dict: Dict[str, Any]) -> np.ndarray:
+    """Decode ``rgb_simlingo`` at native 1024×512 resolution for SimLingo inference."""
+    if not sensor_dict or SIMLINGO_CAMERA_TAG not in sensor_dict:
+        return np.zeros(SIMLINGO_IMAGE_SHAPE_HWC, dtype=np.uint8)
+    tup = sensor_dict[SIMLINGO_CAMERA_TAG]
+    if not isinstance(tup, (tuple, list)) or len(tup) < 2:
+        return np.zeros(SIMLINGO_IMAGE_SHAPE_HWC, dtype=np.uint8)
+    payload = tup[1]
+    if payload is None:
+        return np.zeros(SIMLINGO_IMAGE_SHAPE_HWC, dtype=np.uint8)
+    arr = np.asarray(payload)
+    if arr.ndim != 3:
+        return np.zeros(SIMLINGO_IMAGE_SHAPE_HWC, dtype=np.uint8)
+    rgb = _bgra_to_rgb_hwc(arr) if arr.shape[-1] == 4 else arr.astype(np.uint8, copy=False)
+    if rgb.shape != SIMLINGO_IMAGE_SHAPE_HWC:
+        try:
+            import cv2
+            rgb = cv2.resize(rgb, (SIMLINGO_IMAGE_SHAPE_HWC[1], SIMLINGO_IMAGE_SHAPE_HWC[0]), interpolation=cv2.INTER_AREA)
+        except Exception:
+            return np.zeros(SIMLINGO_IMAGE_SHAPE_HWC, dtype=np.uint8)
+    return rgb
+
+
+def _compute_target_point_ego(ego_actor, route_planner) -> np.ndarray:
+    """Return the next route waypoint in the ego vehicle's local 2-D frame.
+
+    Matches the SimLingo convention: x is forward, y is left (right-hand frame).
+    Returns zeros if no route info is available.
+    """
+    if route_planner is None or ego_actor is None:
+        return np.zeros(2, dtype=np.float32)
+    try:
+        import math as _math
+        tf = ego_actor.get_transform()
+        ego_pos = np.array([tf.location.x, tf.location.y, tf.location.z], dtype=np.float64)
+        waypoint_route = route_planner.run_step(ego_pos)
+        if len(waypoint_route) > 1:
+            far_wp, _ = waypoint_route[1]
+        elif len(waypoint_route) > 0:
+            far_wp, _ = waypoint_route[0]
+        else:
+            return np.zeros(2, dtype=np.float32)
+        yaw = _math.radians(tf.rotation.yaw)
+        rel_x = float(far_wp[0]) - tf.location.x
+        rel_y = float(far_wp[1]) - tf.location.y
+        # Rotate from CARLA world to ego frame: x=forward, y=left
+        x_e = rel_x * _math.cos(yaw) + rel_y * _math.sin(yaw)
+        y_e = -rel_x * _math.sin(yaw) + rel_y * _math.cos(yaw)
+        return np.array([x_e, y_e], dtype=np.float32)
+    except Exception:
+        return np.zeros(2, dtype=np.float32)
 
 
 def _decode_rgb_front_viz(sensor_dict: Dict[str, Any]) -> np.ndarray | None:
@@ -735,6 +809,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._routing_last_command: int = -1
         self._routing_dist_to_waypoint: int = 0  # metres; only shown when far_cmd != LANEFOLLOW
         self._routing_include_distance: bool = False
+        self._target_points_ego: np.ndarray = np.zeros((2, 2), dtype=np.float32)  # (2, 2) ego-frame
         self._speed_limit_tree: Any | None = None
         self._speed_limit_values: Any | None = None
         self._speed_limit_map_name: str = ""
@@ -1021,9 +1096,10 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._routing_last_command = -1
         self._routing_dist_to_waypoint = 0
         self._routing_include_distance = False
+        self._target_points_ego = np.zeros((2, 2), dtype=np.float32)
         self._route_planner = None
         try:
-            from coaches.simlingo.nav_planner import RoutePlanner as _RoutePlanner
+            from team_code.nav_planner import RoutePlanner as _RoutePlanner
             planner = _RoutePlanner(min_distance=7.5, max_distance=50.0)
             planner.set_route(ev.route_scenario.route, gps=False)
             self._route_planner = planner
@@ -1049,7 +1125,9 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         ego = self._ego_actor()
         if ego is None:
             return
-        loc = ego.get_transform().location
+        import math as _math
+        tf = ego.get_transform()
+        loc = tf.location
         ego_pos = np.array([loc.x, loc.y, loc.z], dtype=np.float64)
         waypoint_route = self._route_planner.run_step(ego_pos)
         if len(waypoint_route) > 1:
@@ -1063,6 +1141,19 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             return
         # Distance from ego to the far waypoint (world coords, same as np.linalg.norm in ego frame).
         dist = int(np.linalg.norm(np.asarray(far_wp[:2], dtype=np.float64) - ego_pos[:2]))
+
+        # Compute target_points in ego frame (matches agent_simlingo target_point_command mode).
+        # x = forward, y = left (SimLingo convention).
+        yaw = _math.radians(tf.rotation.yaw)
+        cos_y, sin_y = _math.cos(yaw), _math.sin(yaw)
+        def _to_ego(wp_world):
+            dx = float(wp_world[0]) - loc.x
+            dy = float(wp_world[1]) - loc.y
+            return np.array([dx * cos_y + dy * sin_y, -dx * sin_y + dy * cos_y], dtype=np.float32)
+        ego_tp = _to_ego(far_wp)
+        next_far_wp = waypoint_route[2][0] if len(waypoint_route) > 2 else far_wp
+        ego_next_tp = _to_ego(next_far_wp)
+        self._target_points_ego = np.array([ego_tp, ego_next_tp], dtype=np.float32)  # (2, 2)
         # Simlingo carryover: when transitioning back to LANEFOLLOW after a turn,
         # keep showing the turn command (last_command) until the next route event.
         if self._routing_last_command_tmp != far_cmd_int:
@@ -1535,6 +1626,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             "state": self._get_state_vector(),
             "image": downscale_rgb_for_policy(rgb_viz),
             "image_viz": rgb_viz,
+            "simlingo_image": _decode_simlingo_image(sensors),
             "language_label": language_label,
             "commentary_text": commentary_text,
             "expert_action": expert_action,
@@ -1544,6 +1636,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 if self._routing_include_distance
                 else f"{ROUTING_COMMAND_TEXT.get(self._current_routing_command, 'follow the road')}."
             ),
+            "target_points": self._target_points_ego,
         }
 
     def _info_with_sensors(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1689,6 +1782,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             self.evaluator._cleanup()
             raise
 
+        self._update_routing_command()
         return self._obs_dict(), self._info_with_sensors()
 
     def step(
@@ -1746,6 +1840,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             )
 
         terminated = not running
+        self._update_routing_command()
         reward, terminated, info = self._compute_reward_and_info(
             tree_status=tree_status,
             terminated=terminated,
