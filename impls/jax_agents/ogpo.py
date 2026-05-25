@@ -224,39 +224,40 @@ class OGPOAgent(flax.struct.PyTreeNode):
 
     def _integrate_sde_trajectory(
         self,
-        params,
+        flow_params,
         obs_e,
         rng,
         *,
         initial_noise: Optional[jnp.ndarray] = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        """Sample denoising chain; returns ``(final_action, trajectory, log_prob_sum)``.
+        """Sample denoising chain via ``jax.lax.scan``; returns ``(final_action, trajectory, log_prob_sum)``.
 
         ``trajectory`` has shape ``(K+1, B, A)`` with index 0 the initial noise.
         """
         batch = obs_e.shape[0]
         action_dim = int(self.config["action_dim"])
         flow_steps = int(self.config["flow_steps"])
+        sigma = jnp.asarray(self.config["sde_sigma"], dtype=obs_e.dtype)
+        dt = 1.0 / flow_steps
 
         if initial_noise is None:
             rng, noise_rng = jax.random.split(rng)
-            action = (
+            action_0 = (
                 jax.random.normal(noise_rng, (batch, action_dim))
                 * self.config["noise_scale"]
             )
         else:
-            action = initial_noise
+            action_0 = initial_noise
 
-        traj = [action]
-        log_prob_sum = jnp.zeros((batch,), dtype=obs_e.dtype)
-        for i in range(flow_steps):
+        def step_fn(carry, i):
+            action, rng = carry
             rng, step_rng = jax.random.split(rng)
             t = jnp.full(action.shape[:-1] + (1,), i / flow_steps, dtype=jnp.float32)
-            v = self._flow_velocity(params, obs_e, action, t)
-            sigma = jnp.asarray(self.config["sde_sigma"], dtype=action.dtype)
-            dt = 1.0 / flow_steps
+            v = self._flow_velocity(flow_params, obs_e, action, t)
             if self.config["error_correct_sde_to_ode"]:
-                z_hat = self.network.select("score")(obs_e, action, t, params=params)
+                # flow_params is module-specific (e.g., EMA flow weights) and cannot be
+                # passed to the score network which has its own separate weights.
+                z_hat = self.network.select("score")(obs_e, action, t)
                 mean = action + (v + (sigma / (2.0 * dt)) * z_hat) * dt
             else:
                 mean = action + v * dt
@@ -264,22 +265,26 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 loc=mean,
                 scale_diag=jnp.full(action.shape[-1:], sigma),
             )
-            action, lp = dist.sample_and_log_prob(seed=step_rng)
-            log_prob_sum = log_prob_sum + lp
-            traj.append(action)
+            new_action, lp = dist.sample_and_log_prob(seed=step_rng)
+            return (new_action, rng), (new_action, lp)
 
-        trajectory = jnp.stack(traj, axis=0)
-        return jnp.clip(action, -1.0, 1.0), trajectory, log_prob_sum
+        (final_action, _), (action_seq, log_probs_per_step) = jax.lax.scan(
+            step_fn, (action_0, rng), jnp.arange(flow_steps)
+        )
+        trajectory = jnp.concatenate([action_0[None], action_seq], axis=0)
+        log_prob_sum = log_probs_per_step.sum(axis=0)
+        return jnp.clip(final_action, -1.0, 1.0), trajectory, log_prob_sum
 
     def _trajectory_log_prob(self, params, obs_e, trajectory):
         """Sum of log pi(a_{i+1}|a_i,s) along a fixed trajectory ``(K+1, B, A)``."""
         flow_steps = int(self.config["flow_steps"])
-        log_prob = jnp.zeros((trajectory.shape[1],), dtype=trajectory.dtype)
-        for i in range(flow_steps):
-            log_prob = log_prob + self._sde_step(
-                params, obs_e, trajectory[i], trajectory[i + 1], i,
-            )
-        return log_prob
+
+        def step_fn(_, i):
+            lp = self._sde_step(params, obs_e, trajectory[i], trajectory[i + 1], i)
+            return None, lp
+
+        _, log_probs = jax.lax.scan(step_fn, None, jnp.arange(flow_steps))
+        return log_probs.sum(axis=0)
 
     def _integrate_ode(self, params, obs_e, initial_noise: Optional[jnp.ndarray], rng):
         """Deterministic flow integration (BC inference / rollout without SDE noise)."""
@@ -296,11 +301,13 @@ class OGPOAgent(flax.struct.PyTreeNode):
         else:
             action = initial_noise
 
-        for i in range(flow_steps):
+        def step_fn(action, i):
             t = jnp.full(action.shape[:-1] + (1,), i / flow_steps, dtype=jnp.float32)
             v = self._flow_velocity(params, obs_e, action, t)
-            action = action + v / flow_steps
-        return jnp.clip(action, -1.0, 1.0)
+            return action + v / flow_steps, None
+
+        final_action, _ = jax.lax.scan(step_fn, action, jnp.arange(flow_steps))
+        return jnp.clip(final_action, -1.0, 1.0)
 
     def _q_all(self, params, batch, obs_e, actions):
         critic_in = _critic_obs_e(obs_e, batch, "language_label")
@@ -406,6 +413,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
         # ``final_actions``: (G, B, A), ``trajectories``: (G, K+1, B, A)
 
         trajectories_sg = jax.lax.stop_gradient(trajectories)
+        old_log_probs = jax.lax.stop_gradient(old_log_probs)
 
         def group_new_logprob(traj_g):
             return self._trajectory_log_prob(grad_params, obs_e, traj_g)
@@ -435,6 +443,9 @@ class OGPOAgent(flax.struct.PyTreeNode):
             )(trajectories_sg)
             beta = float(self.config["chi2_beta_init"]) * jnp.std(q_ensemble)
             advantages = advantages - beta * jnp.exp(old_log_probs - slow_log_probs)
+
+        # Normalize advantages across the group (standard GRPO practice; stabilizes PPO step size).
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         pg1 = -advantages * ratio
         pg2 = -advantages * jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
@@ -482,6 +493,32 @@ class OGPOAgent(flax.struct.PyTreeNode):
         info["total_loss"] = loss
         return loss, info
 
+    def actor_loss(self, batch, grad_params, rng, succ_batch=None):
+        """IGP update loss: PPO + optional score denoiser + BC from success buffer (Algorithm 6)."""
+        info = {}
+        rng, ppo_rng, score_rng, bc_rng = jax.random.split(rng, 4)
+
+        ppo_loss, ppo_info = self.ppo_loss(batch, grad_params, ppo_rng)
+        for k, v in ppo_info.items():
+            info[f"actor/{k}"] = v
+        loss = ppo_loss
+
+        if self.config["train_score"]:
+            score_loss, score_info = self.score_loss(batch, grad_params, score_rng)
+            for k, v in score_info.items():
+                info[f"score/{k}"] = v
+            loss = loss + float(self.config["score_coeff"]) * score_loss
+
+        bc_coeff = float(self.config["bc_coeff"])
+        if succ_batch is not None and bc_coeff > 0.0:
+            bc_loss, bc_info = self.flow_bc_loss(succ_batch, grad_params, bc_rng)
+            for k, v in bc_info.items():
+                info[f"bc/{k}"] = v
+            loss = loss + bc_coeff * bc_loss
+
+        info["actor_total_loss"] = loss
+        return loss, info
+
     # ----- target / EMA updates ------------------------------------------- #
 
     def target_update(self, network, module_name):
@@ -516,12 +553,22 @@ class OGPOAgent(flax.struct.PyTreeNode):
     @jax.jit
     def update(self, batch, succ_batch=None):
         new_rng, rng = jax.random.split(self.rng)
+        rng, critic_rng, actor_rng = jax.random.split(rng, 3)
+        info = {}
 
-        def loss_fn(grad_params):
-            return self.total_loss(batch, grad_params, rng=rng, succ_batch=succ_batch)
-
-        new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
+        # UPDATEQ (Algorithm 5): critic-only backward pass.
+        def critic_loss_fn(grad_params):
+            return self.critic_loss(batch, grad_params, critic_rng)
+        new_network, critic_info = self.network.apply_loss_fn(loss_fn=critic_loss_fn)
         self.target_update(new_network, "critic")
+        info.update(critic_info)
+
+        # UPDATEIGP (Algorithm 6): actor-only backward pass.
+        def actor_loss_fn(grad_params):
+            return self.actor_loss(batch, grad_params, actor_rng, succ_batch=succ_batch)
+        new_network, actor_info = new_network.apply_loss_fn(loss_fn=actor_loss_fn)
+        info.update(actor_info)
+
         self.ema_update(new_network, "flow", "ema_flow")
         self.slow_ema_update(new_network)
         return self.replace(network=new_network, rng=new_rng), info
@@ -548,18 +595,15 @@ class OGPOAgent(flax.struct.PyTreeNode):
 
     @jax.jit
     def sample_actions(self, observations, seed=None, temperature=1.0, use_sde=False):
-        """Rollout actions. SDE sampling uses the EMA flow; ODE is deterministic."""
+        """Rollout actions using EMA policy (πθtarg, Algorithm 4). ODE is deterministic."""
         seed = seed if seed is not None else self.rng
         obs_e = self._encode_obs(self.network.params, observations)
-        params = (
-            self.network.params["modules_ema_flow"]
-            if use_sde or self.config["rollout_use_sde"]
-            else self.network.params["modules_flow"]
-        )
+        # Algorithm 4 uses πθtarg (EMA) for all rollouts, not the live online policy.
+        ema_params = self.network.params["modules_ema_flow"]
         if use_sde or self.config["rollout_use_sde"]:
-            actions, _, _ = self._integrate_sde_trajectory(params, obs_e, seed)
+            actions, _, _ = self._integrate_sde_trajectory(ema_params, obs_e, seed)
         else:
-            actions = self._integrate_ode(params, obs_e, None, seed)
+            actions = self._integrate_ode(ema_params, obs_e, None, seed)
         return actions
 
     def sample_actions_with_vla(self, observations, seed=None, temperature=1.0):
@@ -656,12 +700,13 @@ class OGPOAgent(flax.struct.PyTreeNode):
     def update_with_vla(self, batch, succ_batch=None):
         """Update using VLA next-state actions for the critic, PPO over local flow.
 
-        VLA forward runs eagerly (PyTorch); the jitted gradient step only sees the
+        VLA forward runs eagerly (PyTorch); the jitted gradient steps only see the
         precomputed stop-gradient ``next_vla_actions``.
         """
         new_rng, rng = jax.random.split(self.rng)
         batch = self._prepare_vla_batch(batch)
-        rng, vla_rng = jax.random.split(rng)
+        rng, vla_rng, critic_rng, actor_rng = jax.random.split(rng, 4)
+        info = {}
 
         next_vla_actions = self._vla_forward(
             batch["next_observations"],
@@ -669,13 +714,19 @@ class OGPOAgent(flax.struct.PyTreeNode):
             vla_rng,
         )
 
-        def loss_fn(grad_params):
-            return self.total_loss_vla(
-                batch, grad_params, rng, next_vla_actions, succ_batch=succ_batch
-            )
-
-        new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
+        # UPDATEQ with VLA bootstrap actions (Algorithm 5).
+        def critic_loss_fn(grad_params):
+            return self.critic_loss_vla(batch, grad_params, critic_rng, next_vla_actions)
+        new_network, critic_info = self.network.apply_loss_fn(loss_fn=critic_loss_fn)
         self.target_update(new_network, "critic")
+        info.update(critic_info)
+
+        # UPDATEIGP (Algorithm 6): actor-only backward pass.
+        def actor_loss_fn(grad_params):
+            return self.actor_loss(batch, grad_params, actor_rng, succ_batch=succ_batch)
+        new_network, actor_info = new_network.apply_loss_fn(loss_fn=actor_loss_fn)
+        info.update(actor_info)
+
         self.ema_update(new_network, "flow", "ema_flow")
         self.slow_ema_update(new_network)
         return self.replace(network=new_network, rng=new_rng), info
