@@ -719,6 +719,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         )
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
+        self._raw_collision_sensor: Optional[carla.Actor] = None
+        self._raw_collision_active: bool = False
 
         self._expert_controller_kind = str(self.carla_config.get("expert_controller", "") or "").strip().lower()
         self._expert_agent: Any | None = None
@@ -922,6 +924,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
     def _stop_active_scenario(self) -> None:
         if not self._scenario_active or self._evaluator is None:
             return
+        self._destroy_raw_collision_sensor()
         try:
             print("\033[1m> Stopping the route (wrapper)\033[0m", flush=True)
             self._evaluator.manager.stop_scenario()
@@ -1026,6 +1029,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._crash_stuck_ticks = 0
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
+        self._raw_collision_active = False
+        self._spawn_raw_collision_sensor()
 
     def _ego_actor(self) -> Optional[carla.Actor]:
         ev = self._evaluator
@@ -1445,8 +1450,9 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._prev_collision_count = collision_count
         self._prev_outside_route_value = outside_route_value
 
-        # Continuous collision penalty: apply every step while bounding boxes overlap,
-        collision_contact_active = self._active_actor_collision_contact()
+        # Continuous collision penalty: raw physics sensor fires every tick while in
+        # contact (unlike the leaderboard's deduplicated CollisionTest counter).
+        collision_contact_active = self._raw_collision_active
         collision_penalty_active = collision_contact_active or (collision_delta > 0)
         collision_pen = self._collision_event_penalty if collision_penalty_active else 0.0
         outside_route_pen = self._outside_route_event_penalty * float(outside_route_delta)
@@ -1505,6 +1511,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         """Apply a pre-computed VehicleControl and run one leaderboard tick."""
         self._last_control = control
         self.evaluator.manager.pending_control = control
+        self._raw_collision_active = False
         try:
             running, tree_status = self.evaluator.manager.step_once()
         except Exception as e:
@@ -1682,10 +1689,12 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 self.evaluator.manager.scenario_duration_game,
                 crash_message,
             )
+            self._destroy_raw_collision_sensor()
             self._drain_pseudo_sensors()
             self.evaluator._cleanup()
             raise RuntimeError(f"Invalid sensors: {e}") from e
         except Exception:
+            self._destroy_raw_collision_sensor()
             self._drain_pseudo_sensors()
             self.evaluator._cleanup()
             raise
@@ -1721,7 +1730,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             control = _action_to_control(action)
         self._last_control = control
         self.evaluator.manager.pending_control = control
-
+        self._raw_collision_active = False
         try:
             running, tree_status = self.evaluator.manager.step_once()
         except AgentError as e:
@@ -1756,6 +1765,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
     def _finalize_route(self, entry_status: str, crash_message: str) -> None:
         if not self._scenario_active:
             return
+        self._destroy_raw_collision_sensor()
         config_index = self.evaluator.manager.route_index
         try:
             print("\033[1m> Stopping the route (wrapper)\033[0m", flush=True)
@@ -1784,109 +1794,35 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             # JAX threads are live and can corrupt the msgpack RPC connection.
 
 
-    @staticmethod
-    def _bbox_at_prediction_step(actor: carla.Actor, step_seconds: float) -> Optional[carla.BoundingBox]:
-        try:
-            transform = actor.get_transform()
-            bbox = actor.bounding_box
-            velocity = actor.get_velocity()
-            angular_velocity = actor.get_angular_velocity()
-            transform.location = carla.Location(
-                x=float(transform.location.x + velocity.x * step_seconds),
-                y=float(transform.location.y + velocity.y * step_seconds),
-                z=float(transform.location.z + velocity.z * step_seconds),
-            )
-            transform.rotation = carla.Rotation(
-                pitch=float(transform.rotation.pitch + angular_velocity.x * step_seconds),
-                yaw=float(transform.rotation.yaw + angular_velocity.z * step_seconds),
-                roll=float(transform.rotation.roll + angular_velocity.y * step_seconds),
-            )
-            world_bbox = carla.BoundingBox(transform.transform(bbox.location), bbox.extent)
-            world_bbox.rotation = transform.rotation
-            return world_bbox
-        except Exception:
-            return None
-
-    @staticmethod
-    def _dot_product(vec1, vec2) -> float:
-        return float(vec1.x * vec2.x + vec1.y * vec2.y + vec1.z * vec2.z)
-
-    @staticmethod
-    def _cross_product(vec1, vec2):
-        return carla.Vector3D(
-            x=vec1.y * vec2.z - vec1.z * vec2.y,
-            y=vec1.z * vec2.x - vec1.x * vec2.z,
-            z=vec1.x * vec2.y - vec1.y * vec2.x,
-        )
-
-    @classmethod
-    def _has_separating_plane(cls, rel_pos, plane_normal, obb1, obb2) -> bool:
-        projection_distance = abs(cls._dot_product(rel_pos, plane_normal))
-        obb1_projection = (
-            abs(cls._dot_product(obb1.rotation.get_forward_vector() * obb1.extent.x, plane_normal))
-            + abs(cls._dot_product(obb1.rotation.get_right_vector() * obb1.extent.y, plane_normal))
-            + abs(cls._dot_product(obb1.rotation.get_up_vector() * obb1.extent.z, plane_normal))
-        )
-        obb2_projection = (
-            abs(cls._dot_product(obb2.rotation.get_forward_vector() * obb2.extent.x, plane_normal))
-            + abs(cls._dot_product(obb2.rotation.get_right_vector() * obb2.extent.y, plane_normal))
-            + abs(cls._dot_product(obb2.rotation.get_up_vector() * obb2.extent.z, plane_normal))
-        )
-        return projection_distance > obb1_projection + obb2_projection
-
-    @classmethod
-    def _obb_intersects(cls, obb1, obb2) -> bool:
-        rel_pos = obb2.location - obb1.location
-        axes = [
-            obb1.rotation.get_forward_vector(),
-            obb1.rotation.get_right_vector(),
-            obb1.rotation.get_up_vector(),
-            obb2.rotation.get_forward_vector(),
-            obb2.rotation.get_right_vector(),
-            obb2.rotation.get_up_vector(),
-        ]
-        axes.extend(
-            [
-                cls._cross_product(a1, a2)
-                for a1 in axes[:3]
-                for a2 in axes[3:]
-            ]
-        )
-        for axis in axes:
-            if abs(axis.x) < 1e-6 and abs(axis.y) < 1e-6 and abs(axis.z) < 1e-6:
-                continue
-            if cls._has_separating_plane(rel_pos, axis, obb1, obb2):
-                return False
-        return True
-
-    def _active_actor_collision_contact(self) -> bool:
-        """Return True if the ego bounding box currently overlaps any other actor."""
+    def _spawn_raw_collision_sensor(self) -> None:
+        """Attach a raw sensor.other.collision to the ego and set _raw_collision_active each tick."""
         ego = self._ego_actor()
         if ego is None:
-            return False
-        ego_bbox = self._bbox_at_prediction_step(ego, 0.0)
-        if ego_bbox is None:
-            return False
+            return
         try:
-            actors = self.evaluator.world.get_actors()
+            world = self.evaluator.world
+            bp = world.get_blueprint_library().find("sensor.other.collision")
+            sensor = world.spawn_actor(bp, carla.Transform(), attach_to=ego)
+            sensor.listen(lambda _event: setattr(self, "_raw_collision_active", True))
+            self._raw_collision_sensor = sensor
+        except Exception as exc:
+            print(f"[raw_collision_sensor] spawn failed: {exc}", flush=True)
+            self._raw_collision_sensor = None
+
+    def _destroy_raw_collision_sensor(self) -> None:
+        """Stop and destroy the raw collision sensor before scenario teardown."""
+        sensor = self._raw_collision_sensor
+        self._raw_collision_sensor = None
+        if sensor is None:
+            return
+        try:
+            sensor.stop()
         except Exception:
-            return False
-        # Only check vehicles and walkers.
-        relevant_actors = [
-            actor
-            for actor in actors
-            if actor.id != ego.id and actor.is_alive and (
-                "vehicle" in actor.type_id
-                or "walker" in actor.type_id
-            )
-        ]
-        for actor in relevant_actors:
-            actor_bbox = self._bbox_at_prediction_step(actor, 0.0)
-            if actor_bbox is None:
-                continue
-            if self._obb_intersects(ego_bbox, actor_bbox):
-                return True
-        return False
+            pass
+        try:
+            sensor.destroy()
+        except Exception:
+            pass
 
     def render(self):
         """Placeholder frame for evaluation video paths (avoid NotImplementedError)."""
