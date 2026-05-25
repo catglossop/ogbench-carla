@@ -173,6 +173,7 @@ DEFAULT_PROGRESS_REWARD_WEIGHT = 1.0
 DEFAULT_STEER_PENALTY_WEIGHT = 0.05
 DEFAULT_BRAKE_PENALTY_WEIGHT = 0.02
 DEFAULT_SPEED_LIMIT_PENALTY_WEIGHT = 0.1
+DEFAULT_MAX_EPISODE_STEPS = 250
 SUCCESS_BONUS = 5.0
 FAILURE_BONUS = -5.0
 
@@ -719,6 +720,10 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         )
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
+        self._max_episode_steps = int(
+            self.carla_config.get("max_episode_steps", DEFAULT_MAX_EPISODE_STEPS)
+        )
+        self._episode_step_count = 0
 
         self._expert_controller_kind = str(self.carla_config.get("expert_controller", "") or "").strip().lower()
         self._expert_agent: Any | None = None
@@ -1496,6 +1501,31 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         info["reward_total"] = float(reward)
         return float(reward), bool(terminated), info
 
+    def _apply_episode_max_steps(
+        self,
+        reward: float,
+        terminated: bool,
+        info: Dict[str, Any],
+    ) -> tuple[float, bool, Dict[str, Any]]:
+        """Force route termination in the simulator once the step cap is reached."""
+        self._episode_step_count += 1
+        info = dict(info)
+        info["episode_step_count"] = self._episode_step_count
+
+        if (
+            self._max_episode_steps > 0
+            and self._episode_step_count >= self._max_episode_steps
+            and not terminated
+        ):
+            info["termination_reason"] = "episode_max_steps"
+            info["success"] = False
+            info["scenario_tree_status"] = "TIMEOUT"
+            info["reward_terminal"] = 0.0
+            info["reward_total"] = float(reward)
+            self._finalize_route("Finished", "Episode max steps")
+            terminated = True
+        return float(reward), bool(terminated), info
+
     def _step_with_control(self, control):
         """Apply a pre-computed VehicleControl and run one leaderboard tick."""
         self._last_control = control
@@ -1510,6 +1540,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             tree_status=tree_status,
             terminated=terminated,
         )
+        reward, terminated, info = self._apply_episode_max_steps(reward, terminated, info)
         if self._expert_agent is not None:
             self.tick_expert()
         return self._obs_dict(), float(reward), terminated, False, info
@@ -1663,6 +1694,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         if self._evaluator is None:
             self.setup()
 
+        self._episode_step_count = 0
         self._stop_active_scenario()
 
         config = self._get_single_route_config()
@@ -1692,6 +1724,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
     ) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
         flat = np.asarray(action, dtype=np.float32).reshape(-1)
         control = None
+        self._update_routing_command()
         if self._steervla_exec_cfg is not None and self._steervla_decoder is not None:
             ah = int(self._steervla_exec_cfg["action_horizon"])
             ad = int(self._steervla_exec_cfg["action_dim"])
@@ -1746,6 +1779,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             tree_status=tree_status,
             terminated=terminated,
         )
+        reward, terminated, info = self._apply_episode_max_steps(reward, terminated, info)
         return self._obs_dict(), float(reward), terminated, False, info
 
     def _finalize_route(self, entry_status: str, crash_message: str) -> None:

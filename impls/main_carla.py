@@ -220,25 +220,79 @@ def _ego_speed_mps_from_raw(raw: dict) -> np.float32:
     return np.float32(state[_EGO_STATE_IDX_SPEED])
 
 
-def _extract_agent_obs(env, env_obs: dict, mode: str) -> np.ndarray:
+def _steervla_prompt_subtask_strings(raw: dict, steervla_actor=None) -> tuple[str, str]:
+    """Extract SteerVLA prompt and subtask strings from a CARLA raw obs dict."""
+    prompt = str(raw.get("openpi_prompt_text") or "").strip()
+    if not prompt:
+        from vlas.steervla import (
+            carla_state_vec_to_steervla_state,
+            format_steervla_cot_prompt,
+            routing_instruction_prompt,
+            steervla_prompt_state_dim,
+        )
+
+        state = np.asarray(raw.get("state", []), dtype=np.float32).reshape(-1)
+        speed = float(state[_EGO_STATE_IDX_SPEED]) if state.size > _EGO_STATE_IDX_SPEED else 0.0
+        routing = str(raw.get("routing_command", "") or "").strip() or "Follow the route."
+        include_hist = bool(getattr(steervla_actor, "include_ego_history", False)) if steervla_actor else False
+        proprio_norm = bool(getattr(steervla_actor, "proprio_norm", True)) if steervla_actor else True
+        state_pad = carla_state_vec_to_steervla_state(
+            state,
+            include_ego_history=include_hist,
+            proprio_norm=proprio_norm,
+        )
+        prompt = format_steervla_cot_prompt(
+            routing_instruction_prompt(routing_command=routing, current_speed_mps=speed),
+            state_pad,
+            state_dim=steervla_prompt_state_dim(include_ego_history=include_hist),
+        )
+
+    subtask = ""
+    for key in ("subtask_text", "subtask"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            subtask = value.strip()
+            break
+    return prompt, subtask
+
+
+def _extract_agent_obs(
+    env,
+    env_obs: dict,
+    mode: str,
+    *,
+    image_encoder: str = "impala",
+    siglip_encoder=None,
+    siglip_include_prompt_subtask: bool = False,
+    steervla_actor=None,
+) -> np.ndarray:
     """Pick the tensor the RL agent trains on (env always exposes both keys).
 
     The language label (BOW or delta) is stored separately in the replay buffer
     and concatenated to the encoded observation ONLY inside the critic (dsrl.py).
+    When ``image_encoder='siglip'`` and ``siglip_include_prompt_subtask=True``,
+    returns ``[image_embed, prompt_embed, subtask_embed]`` for actor and critics.
     """
     if mode == "state":
         return np.asarray(env_obs["state"], dtype=np.float32)
     if mode == "image":
+        if image_encoder == "siglip":
+            if siglip_encoder is None:
+                raise ValueError("image_encoder='siglip' requires a SigLIPEncoder instance.")
+            if siglip_include_prompt_subtask:
+                prompt, subtask = _steervla_prompt_subtask_strings(env_obs, steervla_actor)
+                return np.asarray(
+                    siglip_encoder.encode_observation(
+                        env_obs["image"],
+                        prompt=prompt,
+                        subtask=subtask,
+                        include_prompt_subtask=True,
+                    ),
+                    dtype=np.float32,
+                )
+            return np.asarray(siglip_encoder.encode(env_obs["image"]), dtype=np.float32)
         return np.asarray(env_obs["image"], dtype=np.uint8)
-    if mode == "policy_embed":
-        embed = env_obs.get("policy_embedding")
-        if embed is None:
-            raise ValueError(
-                "observation_mode='policy_embed' requires env_obs['policy_embedding']; "
-                "call SteerVLAActor.ensure_policy_embedding() before extracting obs."
-            )
-        return np.asarray(embed, dtype=np.float32)
-    raise ValueError(f"Unknown observation_mode {mode!r}; expected 'state', 'image', or 'policy_embed'.")
+    raise ValueError(f"Unknown observation_mode {mode!r}; expected 'state' or 'image'.")
 
 
 # Check if valid task environment
@@ -354,9 +408,19 @@ def run_online_carla(
     exp_name: str,
     raw_carla_obs_holder: dict | None = None,
     steervla_actor=None,
+    *,
+    image_encoder: str = "impala",
+    siglip_encoder=None,
+    siglip_include_prompt_subtask: bool = False,
 ) -> None:
 
     obs_mode = str(agent_config.get("observation_mode", "state"))
+    _extract_obs_kwargs = dict(
+        image_encoder=image_encoder,
+        siglip_encoder=siglip_encoder,
+        siglip_include_prompt_subtask=siglip_include_prompt_subtask,
+        steervla_actor=steervla_actor,
+    )
 
     capacity = int(agent_config.get("buffer_capacity", 5_000))
     warmup = int(agent_config.get("warmup_steps", 1000))
@@ -384,7 +448,10 @@ def run_online_carla(
             return {}
 
         obs_struct = steervla_actor.build_observation_batch_numpy(batch_size=1, raw=raw)
-        from vlas.steervla import openpi_replay_fields_from_observation
+        from vlas.steervla import (
+            openpi_replay_fields_from_observation,
+            openpi_replay_fields_with_fast_placeholders,
+        )
 
         out = openpi_replay_fields_from_observation(obs_struct)
         # ``build_observation_batch_numpy`` leaves CoT/FAST empty; overlay tokens stashed by VLA.
@@ -409,13 +476,15 @@ def run_online_carla(
         if "fast" in raw or "openpi_tokenized_fast" in raw:
             fk = raw.get("openpi_tokenized_fast", raw.get("fast"))
             fmk = raw.get("openpi_tokenized_fast_mask", raw.get("fast_mask"))
-            if fk is not None:
+            if fk is not None and fmk is not None:
                 out["openpi_tokenized_fast"] = np.asarray(fk, dtype=np.int32)
-                out["fast"] = out["openpi_tokenized_fast"]
-            if fmk is not None:
                 out["openpi_tokenized_fast_mask"] = np.asarray(fmk, dtype=bool)
+                out["fast"] = out["openpi_tokenized_fast"]
                 out["fast_mask"] = out["openpi_tokenized_fast_mask"]
-        return out
+        return openpi_replay_fields_with_fast_placeholders(
+            out,
+            model_cfg=getattr(steervla_actor, "model_cfg", None),
+        )
     
     raw_obs_holder = raw_carla_obs_holder
 
@@ -426,9 +495,12 @@ def run_online_carla(
     if raw_obs_holder is not None:
         raw_obs_holder["obs"] = obs_raw
         raw_obs_holder["next_obs"] = obs_raw
-    if obs_mode == "policy_embed" and steervla_actor is not None:
-        steervla_actor.ensure_policy_embedding(1, raw=obs_raw, force=True)
-    obs = _extract_agent_obs(env, obs_raw, obs_mode)
+    obs = _extract_agent_obs(env, obs_raw, obs_mode, **_extract_obs_kwargs)
+    if siglip_include_prompt_subtask:
+        print(
+            "[main_carla] SigLIP observations = [image_embed, prompt_embed, subtask_embed]",
+            flush=True,
+        )
     log_images = obs_mode == "image"
     capture_rollout_video = log_images or bool(FLAGS.live_policy_view)
 
@@ -489,6 +561,26 @@ def run_online_carla(
         
     # Create replay buffer
     buffer = ReplayBuffer.create(example_transition, size=capacity)
+    _buffer_keys = frozenset(example_transition.keys())
+
+    def _buffer_transition(raw_obs: dict, next_raw_obs: dict, **core) -> dict[str, np.ndarray]:
+        """Build a transition dict whose keys match the replay buffer schema exactly."""
+        transition = dict(core)
+        if steervla_actor is not None:
+            transition.update(_openpi_fields_from_raw(raw_obs))
+            transition.update(
+                {f"next_{k}": np.array(v) for k, v in _openpi_fields_from_raw(next_raw_obs).items()}
+            )
+        extra = set(transition.keys()) - _buffer_keys
+        if extra:
+            raise KeyError(
+                f"Transition has keys not in replay buffer schema: {sorted(extra)}. "
+                f"Recreate the buffer or extend example_transition."
+            )
+        missing = _buffer_keys - set(transition.keys())
+        if missing:
+            raise KeyError(f"Transition missing replay buffer keys: {sorted(missing)}")
+        return transition
     
     rng = jax.random.PRNGKey(FLAGS.seed + 1)
     episode_return, episode_steps, episode_count = 0.0, 0, 0
@@ -844,15 +936,28 @@ def run_online_carla(
         if FLAGS.expert_recover_debug and (episode_steps == _vla_steps_budget):
             env.reinit_expert()
         in_warmup = warmup > 0 and step <= warmup
+        if (
+            obs_mode == "image"
+            and image_encoder == "siglip"
+            and siglip_include_prompt_subtask
+        ):
+            obs = _extract_agent_obs(env, obs_raw, obs_mode, **_extract_obs_kwargs)
         if FLAGS.expert_debug or _in_expert_recovery or agent is None:
             action = np.zeros(env.action_space.shape, dtype=np.float32)
+            step_obs = obs
         else:
             action_jax = _sample_agent_action(sub)
             _block_until_ready_tree(action_jax)
             action = np.asarray(action_jax[0])
             last_policy_action = action
-            if obs_mode == "policy_embed" and steervla_actor is not None:
-                obs = _extract_agent_obs(env, obs_raw, obs_mode)
+            if (
+                obs_mode == "image"
+                and image_encoder == "siglip"
+                and siglip_include_prompt_subtask
+            ):
+                step_obs = _extract_agent_obs(env, obs_raw, obs_mode, **_extract_obs_kwargs)
+            else:
+                step_obs = obs
             if steervla_actor is not None and _last_buf_idx is not None:
                 from vlas.steervla import openpi_cot_replay_fields_from_raw
 
@@ -860,7 +965,11 @@ def run_online_carla(
                 if _cot_for_next:
                     buffer.update_at(
                         _last_buf_idx,
-                        **{f"next_{k}": v for k, v in _cot_for_next.items()},
+                        **{
+                            f"next_{k}": v
+                            for k, v in _cot_for_next.items()
+                            if f"next_{k}" in _buffer_keys
+                        },
                     )
         t_sample_end = time.time()
 
@@ -871,10 +980,8 @@ def run_online_carla(
             next_obs_raw, reward, terminated, truncated, info = env.step(action)
         if raw_obs_holder is not None:
             raw_obs_holder["next_obs"] = next_obs_raw
-        if obs_mode == "policy_embed" and steervla_actor is not None:
-            steervla_actor.ensure_policy_embedding(1, raw=next_obs_raw, force=True)
         drive_metrics = ego_drive_metrics_from_state_vec(next_obs_raw["state"])
-        next_obs = _extract_agent_obs(env, next_obs_raw, obs_mode)
+        next_obs = _extract_agent_obs(env, next_obs_raw, obs_mode, **_extract_obs_kwargs)
         done = bool(terminated or truncated)
         end_img = np.copy(_viz_image_from_raw(next_obs_raw)) if done and log_images else None
 
@@ -911,27 +1018,23 @@ def run_online_carla(
             replay_action = np.asarray(obs_raw.get("expert_action", replay_action), dtype=np.float32)
 
         buf_idx = buffer.add_transition(
-            {
-                "observations": np.asarray(obs),
-                "actions": replay_action,
-                "rewards": np.float32(reward),
-                "next_observations": np.asarray(next_obs),
-                "masks": np.float32(0.0 if terminated else 1.0),
-                "terminals": np.float32(1.0 if done else 0.0),
-                "language_label": _lang,
-                "next_language_label": _next_lang,
-                **(_openpi_fields_from_raw(obs_raw) if steervla_actor is not None else {}),
-                **(
-                    {f"next_{k}": np.array(v) for k, v in _openpi_fields_from_raw(next_obs_raw).items()}
-                    if steervla_actor is not None
-                    else {}
-                ),
+            _buffer_transition(
+                obs_raw,
+                next_obs_raw,
+                observations=np.asarray(step_obs),
+                actions=replay_action,
+                rewards=np.float32(reward),
+                next_observations=np.asarray(next_obs),
+                masks=np.float32(0.0 if done else 1.0),
+                terminals=np.float32(1.0 if done else 0.0),
+                language_label=_lang,
+                next_language_label=_next_lang,
                 **(
                     {"ego_speed": _ego_speed_mps_from_raw(obs_raw)}
                     if agent_config.get("debug_task", False)
                     else {}
                 ),
-            }
+            )
         )
         _last_buf_idx = int(buf_idx)
         t_step_end = time.time()
@@ -1059,7 +1162,7 @@ def run_online_carla(
             if raw_obs_holder is not None:
                 raw_obs_holder["obs"] = obs_raw
                 raw_obs_holder["next_obs"] = obs_raw
-            obs = _extract_agent_obs(env, obs_raw, obs_mode)
+            obs = _extract_agent_obs(env, obs_raw, obs_mode, **_extract_obs_kwargs)
             _last_buf_idx = None
 
             rollout_log = {
@@ -1273,11 +1376,32 @@ def main(_):
         np.random.seed(FLAGS.seed)
 
         obs_mode = str(config.get("observation_mode", "state"))
+        image_encoder = str(config.get("image_encoder", "impala")).lower()
         obs_dict, _info = env.reset(seed=FLAGS.seed)
         if not isinstance(obs_dict, dict) or "state" not in obs_dict or "image" not in obs_dict:
             raise ValueError(
                 "CARLA env must return a Dict observation with 'state' and 'image'; "
                 f"got {type(obs_dict).__name__}."
+            )
+
+        siglip_encoder = None
+        siglip_include_prompt_subtask = bool(config.get("siglip_include_prompt_subtask", False))
+        if obs_mode == "image" and image_encoder == "siglip":
+            from utils.siglip_encoder import SigLIPEncoder
+
+            siglip_encoder = SigLIPEncoder(
+                model_id=str(config.get("siglip_model_id", "google/siglip2-so400m-patch14-384")),
+                device=config.get("siglip_device"),
+            )
+            siglip_encoder.setup()
+            config.siglip_embed_dim = int(siglip_encoder.embedding_dim)
+            obs_dim = siglip_encoder.observation_dim(
+                include_prompt_subtask=siglip_include_prompt_subtask
+            )
+            print(
+                f"[main_carla] SigLIP encoder {siglip_encoder.model_id} "
+                f"embed_dim={config.siglip_embed_dim} obs_dim={obs_dim}",
+                flush=True,
             )
 
         raw_carla_holder: dict | None = None
@@ -1296,14 +1420,24 @@ def main(_):
                 if vla_bundle is None:
                     raise ValueError("SteerVLA rollout enabled but vla_sample_fn could not be built.")
                 vla_sample_fn, steervla_actor = vla_bundle
+                steervla_actor.debug_noise = bool(config.get("debug_noise", False))
+                steervla_actor.debug_noise_samples = int(config.get("debug_noise_samples", 100))
+                if steervla_actor.debug_noise:
+                    print(
+                        f"[main_carla] debug_noise enabled: "
+                        f"{steervla_actor.debug_noise_samples} random noises per fresh VLA query",
+                        flush=True,
+                    )
 
-            if obs_mode == "policy_embed":
-                if steervla_actor is None:
-                    raise ValueError("observation_mode='policy_embed' requires SteerVLA rollout.")
-                config.policy_embed_dim = int(steervla_actor.policy_embedding_dim())
-                steervla_actor.ensure_policy_embedding(1, raw=obs_dict, force=True)
-
-            agent_obs = _extract_agent_obs(env, obs_dict, obs_mode)
+            agent_obs = _extract_agent_obs(
+                env,
+                obs_dict,
+                obs_mode,
+                image_encoder=image_encoder,
+                siglip_encoder=siglip_encoder,
+                siglip_include_prompt_subtask=siglip_include_prompt_subtask,
+                steervla_actor=steervla_actor,
+            )
             ex_obs = np.expand_dims(agent_obs, 0)
             ex_actions = np.zeros((1,) + tuple(env.action_space.shape), dtype=np.float32)
 
@@ -1335,6 +1469,9 @@ def main(_):
             exp_name,
             raw_carla_obs_holder=raw_carla_holder,
             steervla_actor=steervla_actor,
+            image_encoder=image_encoder,
+            siglip_encoder=siglip_encoder,
+            siglip_include_prompt_subtask=siglip_include_prompt_subtask,
         )
     finally:
         try:

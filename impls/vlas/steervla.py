@@ -39,16 +39,14 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, MutableMapping, Optional
 
-from numpy.ma import innerproduct
-
 import flax.nnx as nnx
 import flax.traverse_util as traverse_util
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import os
 
-from openpi.models import gemma as _openpi_gemma
 from openpi.models import model as _openpi_model
 from openpi.models import pi0 as _openpi_pi0
 from openpi.models.pi0_config import Pi0CoTConfig
@@ -72,14 +70,6 @@ from impls.vlas.utils import RemoteActor
 
 # Only the front camera for OpenPI preprocess + SigLIP (skip zero-padded wrist streams).
 CARLA_STEERVLA_IMAGE_KEYS: tuple[str, ...] = ("base_0_rgb",)
-
-
-def _pool_prefix_hidden(prefix_out: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
-    """Mean-pool valid prefix token hiddens to a single vector per batch row."""
-    mask_f = mask.astype(prefix_out.dtype)[..., None]
-    summed = jnp.sum(prefix_out * mask_f, axis=1)
-    denom = jnp.maximum(jnp.sum(mask_f, axis=1), 1.0)
-    return summed / denom
 
 
 def restore_openpi_params_on_single_gpu(
@@ -260,6 +250,38 @@ def _model_uses_fast_tokens(model_cfg: Pi0CoTConfig | None) -> bool:
     return bool(model_cfg is not None and getattr(model_cfg, "use_fast_tokens", False))
 
 
+def empty_openpi_replay_fast_fields(max_fast_len: int) -> dict[str, np.ndarray]:
+    """Zero FAST token buffers for replay schema / transitions without FAST yet."""
+    fast = np.zeros((int(max_fast_len),), dtype=np.int32)
+    fast_mask = np.zeros((int(max_fast_len),), dtype=bool)
+    return {
+        "openpi_tokenized_fast": fast,
+        "openpi_tokenized_fast_mask": fast_mask,
+        "fast": fast.copy(),
+        "fast_mask": fast_mask.copy(),
+    }
+
+
+def with_openpi_replay_fast_fields(
+    fields: dict[str, np.ndarray],
+    *,
+    max_fast_len: int | None,
+    use_fast_tokens: bool,
+) -> dict[str, np.ndarray]:
+    """Ensure replay dicts always carry FAST keys when the model uses FAST tokens."""
+    if not use_fast_tokens or max_fast_len is None:
+        return fields
+    out = dict(fields)
+    if "openpi_tokenized_fast" not in out:
+        out.update(empty_openpi_replay_fast_fields(int(max_fast_len)))
+        return out
+    if "fast" not in out:
+        out["fast"] = out["openpi_tokenized_fast"]
+    if "fast_mask" not in out:
+        out["fast_mask"] = out["openpi_tokenized_fast_mask"]
+    return out
+
+
 def _pad_action_chunk_for_fast(actions: np.ndarray, *, model_action_dim: int) -> np.ndarray:
     """Pad a single normalized action chunk ``(H, D)`` to Pi0 ``action_dim``."""
     chunk = np.asarray(actions, dtype=np.float32)
@@ -437,6 +459,20 @@ def openpi_replay_fields_from_observation(
     return out
 
 
+def openpi_replay_fields_with_fast_placeholders(
+    fields: dict[str, np.ndarray],
+    *,
+    model_cfg: Pi0CoTConfig | None,
+) -> dict[str, np.ndarray]:
+    """Add empty FAST replay keys when needed so buffer schema stays fixed."""
+    max_fast_len = int(getattr(model_cfg, "max_fast_len", 0)) if model_cfg is not None else 0
+    return with_openpi_replay_fast_fields(
+        fields,
+        max_fast_len=max_fast_len if max_fast_len > 0 else None,
+        use_fast_tokens=_model_uses_fast_tokens(model_cfg),
+    )
+
+
 def openpi_cot_replay_fields_from_raw(raw: dict[str, Any] | None) -> dict[str, np.ndarray]:
     """CoT/FAST token fields from a raw CARLA obs dict after VLA ``_stash_cot_in_raw``.
 
@@ -461,11 +497,10 @@ def openpi_cot_replay_fields_from_raw(raw: dict[str, Any] | None) -> dict[str, n
     }
     fast = raw.get("openpi_tokenized_fast", raw.get("fast"))
     fast_mask = raw.get("openpi_tokenized_fast_mask", raw.get("fast_mask"))
-    if fast is not None:
+    if fast is not None and fast_mask is not None:
         out["openpi_tokenized_fast"] = np.asarray(fast, dtype=np.int32)
-        out["fast"] = out["openpi_tokenized_fast"]
-    if fast_mask is not None:
         out["openpi_tokenized_fast_mask"] = np.asarray(fast_mask, dtype=bool)
+        out["fast"] = out["openpi_tokenized_fast"]
         out["fast_mask"] = out["openpi_tokenized_fast_mask"]
     return out
 
@@ -605,6 +640,8 @@ class SteerVLAActor:
         return_normalized_action_chunk: bool = False,
         fixed_subtask_text: Optional[str] = None,
         fixed_reasoning_text: Optional[str] = None,
+        debug_noise: bool = False,
+        debug_noise_samples: int = 100,
     ) -> None:
         self.actor_url = actor_url
         self._remote: Optional[RemoteActor] = None
@@ -629,14 +666,14 @@ class SteerVLAActor:
         self.fixed_reasoning_text = (
             str(fixed_reasoning_text).strip() if fixed_reasoning_text else None
         )
+        self.debug_noise = bool(debug_noise)
+        self.debug_noise_samples = max(1, int(debug_noise_samples))
         self.prompt_state_dim = steervla_prompt_state_dim(include_ego_history=include_ego_history)
         self._call_counter = 0
         self._cached_action_chunk: np.ndarray | None = None
         self._cached_action_step = 0
         self._cached_cot: dict[str, Any] | None = None
         self._cached_cot_actions_used = 0
-        self._cached_policy_embed: np.ndarray | None = None
-        self._cached_policy_embed_obs_id: int | None = None
 
         self.train_cfg = None
         self.model = None
@@ -962,140 +999,6 @@ class SteerVLAActor:
         }
         return _openpi_model.Observation.from_dict(data)
 
-    def policy_embedding_dim(self) -> int:
-        """Hidden size of the frozen prefix (PaliGemma) representation."""
-        if self.model_cfg is None:
-            return 2048
-        variant = getattr(self.model_cfg, "paligemma_variant", "gemma_2b")
-        return int(_openpi_gemma.get_config(variant).width)
-
-    def _build_frozen_prefix_cache(
-        self,
-        model,
-        observation: _openpi_model.Observation,
-    ) -> tuple[_openpi_model.Observation, Any, jax.Array, jax.Array, jax.Array]:
-        """Precompute frozen prefix KV/cache and a pooled prefix embedding for DSRL."""
-        observation = _openpi_model.preprocess_observation(
-            None,
-            observation,
-            train=False,
-            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-        )
-
-        img_tokens, img_masks, img_ar = model._embed_images(observation)
-        n_img = sum(t.shape[1] for t in img_tokens)
-
-        prompt_emb = model._embed_text_tokens(observation.tokenized_prompt)
-        prompt_mask = observation.tokenized_prompt_mask
-        n_prompt = prompt_emb.shape[1]
-
-        reasoning_emb = model._embed_text_tokens(observation.tokenized_reasoning)
-        reasoning_mask = observation.tokenized_reasoning_mask
-        n_reasoning = reasoning_emb.shape[1]
-
-        subtask_emb = model._embed_text_tokens(observation.tokenized_subtask)
-        subtask_mask = observation.tokenized_subtask_mask
-        n_subtask = subtask_emb.shape[1]
-
-        prefix_parts = img_tokens + [prompt_emb, reasoning_emb, subtask_emb]
-        prefix_mask_parts = img_masks + [prompt_mask, reasoning_mask, subtask_mask]
-        prefix_ar_list = img_ar + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask
-        n_fast = 0
-        if getattr(model, "_use_fast_tokens", False) and observation.tokenized_fast is not None:
-            fast_emb = model._embed_text_tokens(observation.tokenized_fast)
-            fast_mask = observation.tokenized_fast_mask
-            n_fast = int(fast_emb.shape[1])
-            prefix_parts.append(fast_emb)
-            prefix_mask_parts.append(fast_mask)
-            prefix_ar_list += [True] * n_fast
-
-        prefix_tokens = jnp.concatenate(prefix_parts, axis=1)
-        prefix_mask = jnp.concatenate(prefix_mask_parts, axis=1)
-        prefix_ar = jnp.array(prefix_ar_list)
-
-        prefix_attn_mask = _openpi_pi0.make_attn_mask(prefix_mask, prefix_ar)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        (prefix_out, _), kv_cache = model.PaliGemma.llm(
-            [prefix_tokens, None],
-            mask=prefix_attn_mask,
-            positions=positions,
-        )
-
-        reasoning_start = n_img + n_prompt
-        reasoning_end = reasoning_start + n_reasoning
-        prefix_len = prefix_mask.shape[1]
-        col_is_reasoning = (jnp.arange(prefix_len) >= reasoning_start) & (jnp.arange(prefix_len) < reasoning_end)
-        prefix_mask_no_reasoning = prefix_mask & ~col_is_reasoning[None, :]
-        prefix_embed = jax.lax.stop_gradient(
-            _pool_prefix_hidden(prefix_out, prefix_mask_no_reasoning)
-        )
-
-        return (
-            observation,
-            jax.tree.map(jax.lax.stop_gradient, kv_cache),
-            jax.lax.stop_gradient(prefix_mask),
-            jax.lax.stop_gradient(prefix_mask_no_reasoning),
-            prefix_embed,
-        )
-
-    def _stash_policy_embedding(self, embed: np.ndarray | jax.Array, *, raw: Optional[Dict[str, Any]] = None) -> np.ndarray:
-        embed_np = np.asarray(jax.device_get(embed), dtype=np.float32)
-        if embed_np.ndim == 1:
-            embed_np = embed_np[None, ...]
-        self._cached_policy_embed = embed_np
-        vec = embed_np[0] if embed_np.shape[0] == 1 else embed_np
-        targets: list[Dict[str, Any]] = []
-        if isinstance(raw, dict):
-            targets.append(raw)
-        if self.raw_obs_holder is not None and isinstance(self.raw_obs_holder.get("obs"), dict):
-            holder_obs = self.raw_obs_holder["obs"]
-            if holder_obs is not raw:
-                targets.append(holder_obs)
-        for tgt in targets:
-            tgt["policy_embedding"] = np.asarray(vec, dtype=np.float32)
-        return embed_np
-
-    def ensure_policy_embedding(
-        self,
-        batch_size: int = 1,
-        *,
-        raw: Optional[Dict[str, Any]] = None,
-        force: bool = False,
-    ) -> np.ndarray:
-        """Run CoT (if needed) + frozen prefix forward; cache pooled embedding for DSRL."""
-        if self._remote is not None:
-            raise RuntimeError("Policy prefix embeddings require local SteerVLAActor inference.")
-        assert self.model is not None and self._jax_device is not None
-
-        obs_id = id(raw) if raw is not None else id(self.raw_obs_holder.get("obs") if self.raw_obs_holder else None)
-        if (
-            not force
-            and self._cached_policy_embed is not None
-            and int(self._cached_policy_embed.shape[0]) == int(batch_size)
-            and self._cached_policy_embed_obs_id == obs_id
-        ):
-            return self._cached_policy_embed
-
-        self._call_counter += 1
-        rng = jax.random.PRNGKey(self._call_counter)
-        obs_np_struct = self.build_observation_batch_numpy(batch_size, raw=raw)
-        obs_jax = jax.tree.map(
-            lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
-            obs_np_struct,
-        )
-        cot_out = self._sample_or_reuse_cot(rng, obs_jax, batch_size)
-        if batch_size == 1:
-            stash_raw = raw
-            if stash_raw is None and self.raw_obs_holder is not None:
-                stash_raw = self.raw_obs_holder.get("obs")
-            if isinstance(stash_raw, dict):
-                self._stash_cot_in_raw(stash_raw, cot_out)
-        obs_full = _merge_cot_output_into_observation(obs_jax, cot_out)
-        _, _, _, _, prefix_embed = self._build_frozen_prefix_cache(self.model, obs_full)
-        embed_np = self._stash_policy_embedding(prefix_embed, raw=raw)
-        self._cached_policy_embed_obs_id = obs_id
-        return embed_np
-
     def _stash_cot_in_raw(self, raw: Optional[Dict[str, Any]], cot_out: dict[str, Any]) -> None:
         """Persist latest CoT tokens/masks in raw obs dict for downstream training."""
         if raw is None:
@@ -1114,10 +1017,11 @@ class SteerVLAActor:
             if "tokenized_fast" in cot_out and "tokenized_fast_mask" in cot_out:
                 fast_tokens = np.asarray(jax.device_get(cot_out["tokenized_fast"][0]), dtype=np.int32)
                 fast_mask = np.asarray(jax.device_get(cot_out["tokenized_fast_mask"][0]), dtype=bool)
-                raw["openpi_tokenized_fast"] = fast_tokens
-                raw["openpi_tokenized_fast_mask"] = fast_mask
-                raw["fast"] = fast_tokens
-                raw["fast_mask"] = fast_mask
+                if np.any(fast_mask):
+                    raw["openpi_tokenized_fast"] = fast_tokens
+                    raw["openpi_tokenized_fast_mask"] = fast_mask
+                    raw["fast"] = fast_tokens
+                    raw["fast_mask"] = fast_mask
         except Exception:
             # Keep rollout robust if CoT payload changes shape unexpectedly.
             return
@@ -1274,8 +1178,6 @@ class SteerVLAActor:
         self._cached_action_step = 0
         self._cached_cot = None
         self._cached_cot_actions_used = 0
-        self._cached_policy_embed = None
-        self._cached_policy_embed_obs_id = None
 
     def _forward_pi0(
         self,
@@ -1330,12 +1232,6 @@ class SteerVLAActor:
 
         obs_full = _merge_cot_output_into_observation(obs_jax, cot_out)
 
-        obs_id = id(raw) if raw is not None else id(self.raw_obs_holder.get("obs") if self.raw_obs_holder else None)
-        if self._cached_policy_embed is None or self._cached_policy_embed_obs_id != obs_id:
-            _, _, _, _, prefix_embed = self._build_frozen_prefix_cache(self.model, obs_full)
-            self._stash_policy_embedding(prefix_embed, raw=raw)
-            self._cached_policy_embed_obs_id = obs_id
-        
         # Prepare noise for inference
         batch_size = obs_jax.state.shape[0]
         model_ah = int(self.model.action_horizon)
@@ -1383,6 +1279,114 @@ class SteerVLAActor:
         first_step = traj_np[:, 0, : int(self.action_dim)]
         return jax.device_put(jnp.asarray(first_step, dtype=jnp.float32), self._jax_device)
 
+    def _debug_speed_score_from_flat(self, flat_action: Any) -> float:
+        """First-step speed delta magnitude (``delta_xy`` cols 0:2); lower means slower."""
+        ah = int(self.action_horizon)
+        ad = int(self.action_dim)
+        flat = np.asarray(jax.device_get(flat_action), dtype=np.float32).reshape(-1)
+        expected = ah * ad
+        if flat.size != expected:
+            return float("inf")
+        speed_xy = flat.reshape(ah, ad)[:, :2]
+        speed_xy_final = np.cumsum(speed_xy, axis=0)[-1, :2]
+        return float(np.linalg.norm(speed_xy_final))
+
+    def _sample_best_of_random_noises(self, batch_size: int, _noise_jax: jax.Array) -> jnp.ndarray:
+        """Rollout debug: try many random noises and pick the slowest action chunk."""
+        import matplotlib.pyplot as plt
+        n = int(self.debug_noise_samples)
+        self._call_counter += 1
+        rng = jax.random.PRNGKey(self._call_counter)
+        rng, samp_rng = jax.random.split(rng)
+
+        ref_noise = np.asarray(jax.device_get(_noise_jax), dtype=np.float32)
+        if ref_noise.ndim == 1:
+            ref_noise = ref_noise.reshape(1, -1)
+        noise_dim = int(ref_noise.shape[-1])
+        candidate_noises = np.asarray(
+            jax.device_get(
+                jax.random.normal(samp_rng, (n, batch_size, noise_dim), dtype=jnp.float32)
+            ),
+            dtype=np.float32,
+        )
+
+        best_out: jnp.ndarray | None = None
+        best_score = float("inf")
+        best_idx = -1
+        scores: list[float] = []
+        for i in range(n):
+            noise_i = jnp.asarray(candidate_noises[i], dtype=jnp.float32)
+            out = self._forward_pi0(batch_size, noise_i, raw=None)
+            score = self._debug_speed_score_from_flat(out)
+            scores.append(score)
+            if score < best_score:
+                best_score = score
+                best_out = out
+                best_idx = i
+        
+        fig, ax = plt.subplots()
+        scores_arr = np.asarray(scores, dtype=np.float64)
+        score_mean = float(np.mean(scores_arr))
+        score_std = float(np.std(scores_arr))
+        score_max = float(np.max(scores_arr))
+        score_min = float(np.min(scores_arr))
+
+        ax.scatter(range(n), scores_arr, alpha=0.75, label="candidates")
+        if best_idx >= 0:
+            ax.scatter(
+                [best_idx],
+                [scores_arr[best_idx]],
+                color="red",
+                s=80,
+                zorder=3,
+                label=f"best ({best_idx})",
+            )
+        ax.axhline(score_mean, color="C1", linestyle="-", linewidth=1.5, label="mean")
+        ax.axhline(score_max, color="C2", linestyle="--", linewidth=1.2, label="max")
+        ax.axhline(score_min, color="C3", linestyle="--", linewidth=1.2, label="min")
+        ax.axhspan(
+            score_mean - score_std,
+            score_mean + score_std,
+            color="C1",
+            alpha=0.15,
+            label="±1 std",
+        )
+        stats_text = (
+            f"mean = {score_mean:.4f}\n"
+            f"std  = {score_std:.4f}\n"
+            f"max  = {score_max:.4f}\n"
+            f"min  = {score_min:.4f}"
+        )
+        ax.text(
+            0.02,
+            0.98,
+            stats_text,
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=9,
+            bbox={"boxstyle": "round", "facecolor": "wheat", "alpha": 0.85},
+        )
+        ax.set_title("debug_noise speed scores (lower = slower)")
+        ax.set_xlabel("Candidate")
+        ax.set_ylabel("Speed score (||cumsum delta_xy||)")
+        ax.legend(loc="upper right", fontsize=8)
+        fig.tight_layout()
+        os.makedirs("debug_noises", exist_ok=True)
+        plt.savefig(f"debug_noises/debug_noise_scores_{self._call_counter}.png")
+        plt.close()
+
+        print(
+            f"[debug_noise] candidates={n} best_idx={best_idx} "
+            f"best_speed_delta_xy={best_score:.4f} "
+            f"mean={score_mean:.4f} std={score_std:.4f} "
+            f"min={score_min:.4f} max={score_max:.4f}",
+            flush=True,
+        )
+        if best_out is None:
+            raise RuntimeError("debug_noise search failed to produce any action.")
+        return jnp.asarray(best_out)
+
     def __call__(self, observations_jax: jax.Array, noise_jax: jax.Array) -> jax.Array:
         """DSRL ``vla_sample_fn``: map encoder observations + noise to CARLA actions.
 
@@ -1422,7 +1426,11 @@ class SteerVLAActor:
             self._mark_action_served(batch_size)
             return out
 
-        out = self._forward_pi0(batch_size, noise_jax, raw=None)
+        out = (
+            self._sample_best_of_random_noises(batch_size, noise_jax)
+            if self.debug_noise
+            else self._forward_pi0(batch_size, noise_jax, raw=None)
+        )
         self._remember_action_chunk(out, batch_size)
         self._mark_action_served(batch_size)
         return out
@@ -1493,6 +1501,8 @@ def create_steervla_pi0_cot_sample_fn(
         return_normalized_action_chunk=bool(steervla_cfg.get("use_pi_action_chunk_for_env", True)),
         fixed_subtask_text=steervla_cfg.get("fixed_subtask_text"),
         fixed_reasoning_text=steervla_cfg.get("fixed_reasoning_text"),
+        debug_noise=bool(steervla_cfg.get("debug_noise", False)),
+        debug_noise_samples=int(steervla_cfg.get("debug_noise_samples", 100)),
     )
 
     if url_clean:

@@ -178,12 +178,9 @@ def _noise_actor_loss_vla_pure_math(
     noise_scale: jnp.ndarray,
 ):
     """SAC-style noise actor loss using ``noise_critic`` Q-values."""
-    noise_actions = _vla_forward_prepare_actor_noise(
-        network, batch["observations"], rng_noise, noise_scale,
-    )
     obs_e = network.select("obs_encoder")(batch["observations"], params=grad_params)
     dist = network.select("noise_actor")(obs_e, params=grad_params)
-    log_prob = dist.log_prob(noise_actions / noise_scale)
+    noise_actions, log_prob = dist.sample_and_log_prob(seed=rng_noise)
     qs = network.select("noise_critic")(
         _critic_obs_e(obs_e, batch, "language_label"), noise_actions,
     )
@@ -239,9 +236,10 @@ def _vla_forward_prepare_actor_noise(
 
 
 class CarlaObservationEncoder(nn.Module):
-    """Encode CARLA observations: vector state, RGB via IMPALA, or precomputed policy embed."""
+    """Encode CARLA observations: vector state or precomputed image/SigLIP embeddings."""
 
     observation_mode: str
+    image_encoder: str = "impala"
     impala_width: int = 1
     impala_stack_sizes: tuple = (16, 32, 32)
     impala_num_blocks: int = 2
@@ -250,7 +248,9 @@ class CarlaObservationEncoder(nn.Module):
 
     @nn.compact
     def __call__(self, observations):
-        if self.observation_mode in ("state", "policy_embed"):
+        if self.observation_mode == "state":
+            return observations.astype(jnp.float32)
+        if self.image_encoder == "siglip":
             return observations.astype(jnp.float32)
         return ImpalaEncoder(
             width=self.impala_width,
@@ -483,19 +483,16 @@ class DSRLAgent(flax.struct.PyTreeNode):
         return actions
 
     def sample_actions_with_vla(self, observations, seed=None, temperature=1.0):
-        """Rollout path only: when ``vla_sample_fn`` is set, map noise through VLA instead of BC flow."""
+        """Rollout path only: when ``vla_sample_fn`` is set, map noise through VLA instead of BC flow.
+
+        With ``config.debug_noise=True``, the attached SteerVLAActor runs a best-of-N search over
+        random flow-matching noises on each fresh VLA query (open-loop cache hits are unchanged).
+        """
         if self.vla_sample_fn is None:
             return self.sample_actions(observations, seed=seed, temperature=temperature)
         seed = seed if seed is not None else self.rng
         seed, sub = jax.random.split(seed)
-        obs_mode = str(self.config.get("observation_mode", "state"))
-        if obs_mode == "policy_embed":
-            if self.steervla_actor is None:
-                raise RuntimeError("observation_mode='policy_embed' requires an attached SteerVLAActor.")
-            embed = self.steervla_actor.ensure_policy_embedding(int(observations.shape[0]))
-            enc = jnp.asarray(embed, dtype=jnp.float32)
-        else:
-            enc = self._encode_obs(self.network.params, observations)
+        enc = self._encode_obs(self.network.params, observations)
         dist = self.network.select("noise_actor")(enc, temperature=temperature)
         noise = dist.sample(seed=sub)
         noise = noise * self.config["noise_scale"]
@@ -852,10 +849,15 @@ class DSRLAgent(flax.struct.PyTreeNode):
         rng, init_rng = jax.random.split(rng)
 
         obs_mode = str(config.get("observation_mode", "state"))
-        if obs_mode not in ("state", "image", "policy_embed"):
+        if obs_mode not in ("state", "image"):
             raise ValueError(
-                f"observation_mode must be 'state', 'image', or 'policy_embed', got {obs_mode!r}"
+                f"observation_mode must be 'state' or 'image', got {obs_mode!r}"
             )
+        image_encoder = str(config.get("image_encoder", "impala")).lower()
+        if image_encoder not in ("impala", "siglip"):
+            raise ValueError(f"image_encoder must be 'impala' or 'siglip', got {image_encoder!r}")
+        if obs_mode != "image" and image_encoder == "siglip":
+            raise ValueError("image_encoder='siglip' requires observation_mode='image'.")
 
         if vla_sample_fn is not None:
             env_action_dim = int(config.get("vla_action_dim", 4)) * int(
@@ -867,6 +869,7 @@ class DSRLAgent(flax.struct.PyTreeNode):
             noise_action_dim = env_action_dim
         obs_encoder_def = CarlaObservationEncoder(
             observation_mode=obs_mode,
+            image_encoder=image_encoder,
             impala_width=int(config.get("image_impala_width", 1)),
             impala_stack_sizes=tuple(config.get("image_impala_stack_sizes", (16, 32, 32))),
             impala_num_blocks=int(config.get("image_impala_num_blocks", 2)),
@@ -875,8 +878,12 @@ class DSRLAgent(flax.struct.PyTreeNode):
         )
         if obs_mode == "state":
             embed_dim = int(ex_observations.shape[-1])
-        elif obs_mode == "policy_embed":
-            embed_dim = int(config.get("policy_embed_dim", ex_observations.shape[-1]))
+        elif image_encoder == "siglip":
+            single = int(config.get("siglip_embed_dim", ex_observations.shape[-1]))
+            if bool(config.get("siglip_include_prompt_subtask", False)):
+                embed_dim = single * 3
+            else:
+                embed_dim = single
         else:
             embed_dim = int(tuple(config.get("image_mlp_hidden_dims", (512,)))[-1])
         critic_feedback_mode = str(config.get("critic_feedback_mode", "commentary_bow"))
@@ -967,10 +974,16 @@ def get_config():
             noise_scale=1.0,
             flow_steps=5,
             observation_mode="state",
+            image_encoder="impala",
             image_impala_width=1,
             image_impala_stack_sizes=(16, 32, 32),
             image_impala_num_blocks=2,
             image_mlp_hidden_dims=(512,),
+            siglip_model_id="google/siglip2-so400m-patch14-384",
+            siglip_embed_dim=1152,
+            siglip_include_prompt_subtask=False,
+            siglip_device=None,
+            # SigLIP runs in PyTorch; default CPU avoids competing with JAX GPU memory.
             # Online-loop knobs (used by main_carla.py, not by the agent itself).
             # Env steps with policy rollouts but no RL updates (see main_carla.run_online_carla).
             warmup_steps=1000,
@@ -1018,6 +1031,9 @@ def get_config():
             online_training_mode="rl",
             # When true, RL updates use reward = -ego_speed (m/s) instead of env reward.
             debug_task=False,
+            # Rollout-only: sample many random VLA flow noises and pick the slowest chunk.
+            debug_noise=True,
+            debug_noise_samples=50,
         )
     )
     return config
