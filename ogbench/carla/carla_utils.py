@@ -167,6 +167,7 @@ DEFAULT_CRASH_STUCK_STEPS = 20
 DEFAULT_CRASH_STUCK_PENALTY = -1.0
 DEFAULT_COLLISION_EVENT_PENALTY = -5.0 # catastrophic - should update to make sure any contact is given negative reward
 DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -5.0 # should be pretty heavy
+DEFAULT_TRAFFIC_VIOLATION_PENALTY = -10.0  # per new RunningStop or RunningRedLight event
 DEFAULT_PROGRESS_REWARD_WEIGHT = 1.0
 # DEFAULT_CENTERING_REWARD_WEIGHT = 0.2
 # DEFAULT_HEADING_REWARD_WEIGHT = 0.2
@@ -705,6 +706,9 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._outside_route_event_penalty = float(
             self.carla_config.get("outside_route_event_penalty", DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY)
         )
+        self._traffic_violation_penalty = float(
+            self.carla_config.get("traffic_violation_penalty", DEFAULT_TRAFFIC_VIOLATION_PENALTY)
+        )
         self._progress_reward_weight = float(
             self.carla_config.get("progress_reward_weight", DEFAULT_PROGRESS_REWARD_WEIGHT)
         )
@@ -719,6 +723,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         )
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
+        self._prev_traffic_violation_count = 0
         self._raw_collision_sensor: Optional[carla.Actor] = None
         self._raw_collision_active: bool = False
 
@@ -1029,6 +1034,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._crash_stuck_ticks = 0
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
+        self._prev_traffic_violation_count = 0
         self._raw_collision_active = False
         self._spawn_raw_collision_sensor()
 
@@ -1444,11 +1450,14 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         )
         crash_stuck, collision_count = self._update_crash_stuck_state(speed)
         outside_route_value, _min_speed_value = self._route_infraction_values()
+        traffic_violation_count = self._traffic_violation_count()
 
         collision_delta = max(0, collision_count - self._prev_collision_count)
         outside_route_delta = max(0.0, outside_route_value - self._prev_outside_route_value)
+        traffic_violation_delta = max(0, traffic_violation_count - self._prev_traffic_violation_count)
         self._prev_collision_count = collision_count
         self._prev_outside_route_value = outside_route_value
+        self._prev_traffic_violation_count = traffic_violation_count
 
         # Continuous collision penalty: raw physics sensor fires every tick while in
         # contact (unlike the leaderboard's deduplicated CollisionTest counter).
@@ -1456,7 +1465,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         collision_penalty_active = collision_contact_active or (collision_delta > 0)
         collision_pen = self._collision_event_penalty if collision_penalty_active else 0.0
         outside_route_pen = self._outside_route_event_penalty * float(outside_route_delta)
-        reward += collision_pen + outside_route_pen
+        traffic_violation_pen = self._traffic_violation_penalty * float(traffic_violation_delta)
+        reward += collision_pen + outside_route_pen + traffic_violation_pen
 
         terminal_bonus = 0.0
         info["collision_count"] = collision_count
@@ -1467,6 +1477,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         info["outside_route_value"] = outside_route_value
         info["collision_delta"] = float(collision_delta)
         info["outside_route_delta"] = float(outside_route_delta)
+        info["traffic_violation_count"] = traffic_violation_count
+        info["traffic_violation_delta"] = float(traffic_violation_delta)
         info["lane_offset_m"] = lane_offset_m
         info["heading_error_rad"] = heading_error_rad
         info["lane_width_m"] = lane_width_m
@@ -1477,6 +1489,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         info["heading_factor"] = heading_factor
         info["penalty_collision"] = collision_pen
         info["penalty_outside_route"] = outside_route_pen
+        info["penalty_traffic_violation"] = traffic_violation_pen
         info["penalty_steer"] = -steer_pen
         info["penalty_brake"] = -brake_pen
         info["penalty_speed_limit"] = -speed_limit_pen
@@ -1576,6 +1589,21 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 except Exception:
                     return 0.0
         return 0.0
+
+    def _traffic_violation_count(self) -> int:
+        """Return total count of RunningStopTest + RunningRedLightTest infractions so far."""
+        scenario = getattr(self.evaluator, "route_scenario", None)
+        if scenario is None:
+            return 0
+        count = 0
+        for criterion in scenario.get_criteria():
+            name = str(getattr(criterion, "name", ""))
+            if name in ("RunningStopTest", "RunningRedLightTest"):
+                try:
+                    count += int(getattr(criterion, "actual_value", 0))
+                except Exception:
+                    pass
+        return count
 
     def _route_infraction_values(self) -> Tuple[float, float]:
         """Return cumulative infraction values for outside-route and minimum-speed criteria."""
