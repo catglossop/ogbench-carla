@@ -52,6 +52,7 @@ for _p in [str(_IMPLS_ROOT), str(_REPO_ROOT), str(_REBUTTAL_ROOT), str(_REBUTTAL
 from absl import app, flags
 
 import wandb
+from ogbench.carla.carla_utils import ego_drive_metrics_from_state_vec
 from utils.log_utils import get_exp_name, setup_wandb  # type: ignore
 
 FLAGS = flags.FLAGS
@@ -483,6 +484,9 @@ def main(_argv):
 
     episode_reward = 0.0
     episode_steps = 0
+    episode_collision_count = 0
+    episode_collision_events = 0
+    prev_collision_count = 0
     num_episodes = 0
     total_updates = 0
 
@@ -497,23 +501,39 @@ def main(_argv):
         target_points=obs["target_points"],
     )
 
+    reward_mode = "neg_speed" if FLAGS.debug_neg_speed_reward else "env"
     print(f"[train] Starting residual SAC training for {FLAGS.total_steps} steps "
-          f"(chunk_size={chunk_size}, ticks_per_wp={ticks_per_wp}) ...", flush=True)
+          f"(chunk_size={chunk_size}, ticks_per_wp={ticks_per_wp}, "
+          f"reward_mode={reward_mode}) ...", flush=True)
     t0 = time.time()
     last_log_time = t0
     last_sac_metrics: Dict[str, float] = {}
+    last_step_info: Dict[str, Any] = {}
+    last_drive_metrics = ego_drive_metrics_from_state_vec(obs["state"])
+    last_env_reward = 0.0
+    last_train_reward = 0.0
+    last_actual_speed = float(obs["state"][15])
+    last_base_action = np.zeros(2, dtype=np.float32)
+    last_final_action = np.zeros(2, dtype=np.float32)
+    last_collision_delta = 0
+    last_update_time = 0.0
     video = _open_video(num_episodes)
 
     for global_step in range(FLAGS.total_steps):
+        t_sample_start = time.time()
         # ── Rollout: execute chunk_size waypoints, ticks_per_wp ticks each ───
         in_warmup = global_step < FLAGS.warmup_steps
         if in_warmup:
             residual_action = np.zeros(2, dtype=np.float32)
         else:
             residual_action = agent.sample_actions(vlm_features)
+        t_sample_end = time.time()
 
         chunk_reward = 0.0
+        chunk_env_reward = 0.0
         done = False
+        info: Dict[str, Any] = {}
+        t_step_start = time.time()
         for k in range(chunk_size):
             for _tick in range(ticks_per_wp):
                 actual_speed = float(obs["state"][15])
@@ -530,43 +550,121 @@ def main(_argv):
                 )
                 _write_frame(video, obs["simlingo_image"], annotated)
                 next_obs, reward, terminated, truncated, info = env.step(final_action)
+                env_reward = float(reward)
                 if FLAGS.debug_neg_speed_reward:
                     reward = -float(next_obs["state"][15])
+                last_env_reward = env_reward
+                last_train_reward = float(reward)
+                last_actual_speed = actual_speed
+                last_base_action = base_action
+                last_final_action = final_action
+                last_step_info = dict(info)
+                last_drive_metrics = ego_drive_metrics_from_state_vec(next_obs["state"])
+                collision_count = int(info.get("collision_count", 0))
+                last_collision_delta = max(0, collision_count - prev_collision_count)
+                episode_collision_count = max(episode_collision_count, collision_count)
+                episode_collision_events += last_collision_delta
+                prev_collision_count = collision_count
                 chunk_reward += reward
+                chunk_env_reward += env_reward
                 done = terminated or truncated
                 obs = next_obs
                 if done:
                     break
             if done:
                 break
+        t_step_end = time.time()
 
         # ── Next VLM call (for replay buffer and next iteration) ─────────────
+        t_vlm_start = time.time()
         next_desired_speeds, _next_route_interp, next_vlm_features = simlingo_base.get_chunk_and_features(
             simlingo_image=obs["simlingo_image"],
             ego_state=obs["state"],
             target_points=obs["target_points"],
         )
+        t_vlm_end = time.time()
         buffer.add(vlm_features, next_vlm_features, residual_action, chunk_reward, done)
 
         episode_reward += chunk_reward
+        episode_env_reward += chunk_env_reward
         episode_steps += 1
 
         # ── SAC updates ───────────────────────────────────────────────────────
+        t_update_start = time.time()
         if len(buffer) >= FLAGS.learning_starts and not in_warmup:
             for _ in range(FLAGS.updates_per_step):
                 batch = buffer.sample(FLAGS.batch_size, torch.device(FLAGS.device))
                 last_sac_metrics = agent.update(batch)
                 total_updates += 1
+        t_update_end = time.time()
+        last_update_time = t_update_end - t_update_start
 
         # ── Per-step wandb logging (SAC metrics + timing) ─────────────────────
         if global_step % FLAGS.log_interval == 0:
             step_log: Dict[str, Any] = {
                 "time/steps_per_sec": FLAGS.log_interval / max(time.time() - last_log_time, 1e-6),
                 "time/global_step": global_step,
+                "time/sample_time": t_sample_end - t_sample_start,
+                "time/step_time": t_step_end - t_step_start,
+                "time/vlm_time": t_vlm_end - t_vlm_start,
+                "time/update_time": last_update_time,
                 "training/in_warmup": float(in_warmup),
                 "training/buffer_size": len(buffer),
                 "training/total_updates": total_updates,
+                "reward/mode_is_neg_speed": float(FLAGS.debug_neg_speed_reward),
+                "reward/train": float(last_train_reward),
+                "reward/env_step": float(last_env_reward),
+                "reward/chunk_train": float(chunk_reward),
+                "reward/chunk_env": float(chunk_env_reward),
+                "rollout/chunk_reward": float(chunk_reward),
+                "rollout/chunk_env_reward": float(chunk_env_reward),
+                "rollout/env_reward": float(last_env_reward),
+                "rollout/train_reward": float(last_train_reward),
+                "rollout/debug_reward": float(last_train_reward),
+                "rollout/collision_count": float(last_step_info.get("collision_count", 0)),
+                "rollout/collision_events": float(last_collision_delta),
+                "rollout/episode_collision_count": float(episode_collision_count),
+                "rollout/episode_collision_events": float(episode_collision_events),
+                "rollout/current_episode_reward": float(episode_reward),
+                "rollout/current_episode_steps": float(episode_steps),
+                "rollout/actual_speed": float(last_actual_speed),
+                "action/base_accel": float(last_base_action[0]),
+                "action/base_steer": float(last_base_action[1]),
+                "action/residual_accel": float(residual_action[0]),
+                "action/residual_steer": float(residual_action[1]),
+                "action/residual_norm": float(np.linalg.norm(residual_action)),
+                "action/final_accel": float(last_final_action[0]),
+                "action/final_steer": float(last_final_action[1]),
+                "action/res_scale": float(FLAGS.res_scale),
+                "simlingo/desired_speed_first": float(desired_speeds[0]),
+                "simlingo/desired_speed_mean": float(np.mean(desired_speeds)),
+                "simlingo/desired_speed_min": float(np.min(desired_speeds)),
+                "simlingo/desired_speed_max": float(np.max(desired_speeds)),
+                "simlingo/vlm_feature_norm": float(np.linalg.norm(vlm_features)),
             }
+            step_log.update({f"rollout/{k}": float(v) for k, v in last_drive_metrics.items()})
+            if last_step_info.get("reward_total") is not None:
+                step_log.update({
+                    # Keep reward/total aligned with the reward optimized by SAC.
+                    # Raw CARLA reward remains available as reward/env_total.
+                    "reward/total": float(last_train_reward) if FLAGS.debug_neg_speed_reward else float(last_step_info.get("reward_total", 0.0)),
+                    "reward/env_total": float(last_step_info.get("reward_total", 0.0)),
+                    "reward/progress": float(last_step_info.get("reward_progress", 0.0)),
+                    "reward/centering": float(last_step_info.get("reward_centering", 0.0)),
+                    "reward/heading": float(last_step_info.get("reward_heading", 0.0)),
+                    "reward/terminal": float(last_step_info.get("reward_terminal", 0.0)),
+                    "reward/penalty_collision": float(last_step_info.get("penalty_collision", 0.0)),
+                    "reward/penalty_outside_route": float(last_step_info.get("penalty_outside_route", 0.0)),
+                    "reward/penalty_steer": float(last_step_info.get("penalty_steer", 0.0)),
+                    "reward/penalty_brake": float(last_step_info.get("penalty_brake", 0.0)),
+                    "reward/penalty_speed_limit": float(last_step_info.get("penalty_speed_limit", 0.0)),
+                    "reward/penalty_crash_stuck": float(last_step_info.get("penalty_crash_stuck", 0.0)),
+                    "rollout/lane_offset_m": float(last_step_info.get("lane_offset_m", 0.0)),
+                    "rollout/heading_error_rad": float(last_step_info.get("heading_error_rad", 0.0)),
+                    "rollout/speed_norm": float(last_step_info.get("speed_norm", 0.0)),
+                    "rollout/centering_factor": float(last_step_info.get("centering_factor", 0.0)),
+                    "rollout/heading_factor": float(last_step_info.get("heading_factor", 0.0)),
+                })
             if last_sac_metrics:
                 step_log.update({f"training/{k}": v for k, v in last_sac_metrics.items()})
             wandb.log(step_log, step=global_step)
@@ -580,9 +678,11 @@ def main(_argv):
                 "global_step": global_step,
                 "episode": num_episodes,
                 "episode_reward": episode_reward,
+                "episode_env_reward": episode_env_reward,
                 "episode_steps": episode_steps,
                 "success": info.get("success", False),
                 "collision_count": info.get("collision_count", 0),
+                "collision_events": episode_collision_events,
                 "elapsed_s": elapsed,
             }
             print(
@@ -597,18 +697,46 @@ def main(_argv):
 
             ep_log: Dict[str, Any] = {
                 "rollout/episode_reward": episode_reward,
+                "rollout/episode_env_reward": episode_env_reward,
                 "rollout/episode_steps": episode_steps,
                 "rollout/success": float(info.get("success", False)),
                 "rollout/collision_count": float(info.get("collision_count", 0)),
+                "rollout/episode_collision_count": float(episode_collision_count),
+                "rollout/episode_collision_events": float(episode_collision_events),
+                "rollout/collisions_over_episode": float(episode_collision_events) / max(float(episode_steps), 1.0),
                 "rollout/outside_route": float(info.get("outside_route_value", 0.0)),
                 "rollout/num_episodes": num_episodes,
+                "rollout/episodes": num_episodes,
+                "rollout/route": FLAGS.route or "?",
             }
             if info.get("reward_total") is not None:
                 ep_log.update({
-                    "reward/total": float(info.get("reward_total", 0.0)),
+                    "reward/total": float(episode_reward) if FLAGS.debug_neg_speed_reward else float(info.get("reward_total", 0.0)),
+                    "reward/env_total": float(info.get("reward_total", 0.0)),
                     "reward/progress": float(info.get("reward_progress", 0.0)),
+                    "reward/centering": float(info.get("reward_centering", 0.0)),
+                    "reward/heading": float(info.get("reward_heading", 0.0)),
+                    "reward/terminal": float(info.get("reward_terminal", 0.0)),
+                    "reward/penalty_collision": float(info.get("penalty_collision", 0.0)),
+                    "reward/penalty_outside_route": float(info.get("penalty_outside_route", 0.0)),
+                    "reward/penalty_steer": float(info.get("penalty_steer", 0.0)),
+                    "reward/penalty_brake": float(info.get("penalty_brake", 0.0)),
+                    "reward/penalty_speed_limit": float(info.get("penalty_speed_limit", 0.0)),
+                    "reward/penalty_crash_stuck": float(info.get("penalty_crash_stuck", 0.0)),
+                    # Backward-compatible names from early SimLingo SAC runs.
                     "reward/collision_penalty": float(info.get("penalty_collision", 0.0)),
                     "reward/outside_route_penalty": float(info.get("penalty_outside_route", 0.0)),
+                    "rollout/final_step_reward": float(info.get("reward_total", 0.0)),
+                    "rollout/final_step_reward_progress": float(info.get("reward_progress", 0.0)),
+                    "rollout/final_step_reward_centering": float(info.get("reward_centering", 0.0)),
+                    "rollout/final_step_reward_heading": float(info.get("reward_heading", 0.0)),
+                    "rollout/final_step_reward_terminal": float(info.get("reward_terminal", 0.0)),
+                    "rollout/final_step_penalty_collision": float(info.get("penalty_collision", 0.0)),
+                    "rollout/final_step_penalty_outside_route": float(info.get("penalty_outside_route", 0.0)),
+                    "rollout/final_step_penalty_steer": float(info.get("penalty_steer", 0.0)),
+                    "rollout/final_step_penalty_brake": float(info.get("penalty_brake", 0.0)),
+                    "rollout/final_step_penalty_crash_stuck": float(info.get("penalty_crash_stuck", 0.0)),
+                    "rollout/final_step_success": float(bool(info.get("success", False))),
                 })
             if _frame_buffer and FLAGS.video_log_interval > 0 and num_episodes % FLAGS.video_log_interval == 0:
                 frames_np = np.stack(_frame_buffer)  # (T, H, W, 3)
@@ -621,7 +749,11 @@ def main(_argv):
             obs, _ = env.reset()
             simlingo_base.reset_pid()
             episode_reward = 0.0
+            episode_env_reward = 0.0
             episode_steps = 0
+            episode_collision_count = 0
+            episode_collision_events = 0
+            prev_collision_count = 0
             video = _open_video(num_episodes)
             desired_speeds, _route_interp, vlm_features = simlingo_base.get_chunk_and_features(
                 simlingo_image=obs["simlingo_image"],
