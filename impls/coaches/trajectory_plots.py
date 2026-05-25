@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+import numpy as np
 
 TRAJECTORY_JSON_DESCRIPTION = """
 Trajectory metadata is logged during CARLA online rollouts (one record per env step, after the
@@ -120,6 +121,9 @@ def generate_trajectory_plots(
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
     fig.suptitle(title, fontsize=12)
 
+    times = np.arange(len(speed)) * 0.05
+    
+    breakpoint()
     ax_speed = axes[0, 0]
     ax_speed.plot(times, speed, color="#4C9AFF", linewidth=1.5)
     ax_speed.set_ylabel("Speed (m/s)")
