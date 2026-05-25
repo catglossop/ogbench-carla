@@ -7,3 +7,4 @@ exp/
 .DS_Store
 .idea/
 .ruff_cache/
+debug_noises/
