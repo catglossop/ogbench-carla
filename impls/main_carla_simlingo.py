@@ -52,18 +52,51 @@ for _p in [str(_IMPLS_ROOT), str(_REPO_ROOT), str(_REBUTTAL_ROOT), str(_REBUTTAL
 from absl import app, flags
 
 import wandb
-from ogbench.carla.carla_utils import ego_drive_metrics_from_state_vec
 from utils.log_utils import get_exp_name, setup_wandb  # type: ignore
+
+# Keep this file importable in the SimLingo conda env.  Importing
+# ogbench.carla.carla_utils here pulls in Bench2Drive leaderboard modules that
+# only the env-server subprocess needs.
+_STATE_DIM = 25
+_EGO_STATE_IDX_SPEED = 15
+_EGO_STATE_IDX_THROTTLE = 16
+_EGO_STATE_IDX_STEER = 17
+_EGO_STATE_IDX_BRAKE = 18
+
+
+def _ego_drive_metrics_from_state_vec(state: Any) -> Dict[str, float]:
+    s = np.asarray(state, dtype=np.float32).reshape(-1)
+    if s.size < _STATE_DIM:
+        return {
+            "ego_speed": 0.0,
+            "control_throttle": 0.0,
+            "control_steer": 0.0,
+            "control_brake": 0.0,
+        }
+    return {
+        "ego_speed": float(s[_EGO_STATE_IDX_SPEED]),
+        "control_throttle": float(s[_EGO_STATE_IDX_THROTTLE]),
+        "control_steer": float(s[_EGO_STATE_IDX_STEER]),
+        "control_brake": float(s[_EGO_STATE_IDX_BRAKE]),
+    }
 
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("simlingo_checkpoint", None, "Path to SimLingo epoch=013.ckpt directory.")
+flags.DEFINE_enum("policy_mode", "single", ["single", "hierarchical"], "Policy mode: single SimLingo or HL+LL hierarchical SimLingo.")
+flags.DEFINE_string("high_level_checkpoint", None, "Path to high-level SimLingo checkpoint for hierarchical mode.")
+flags.DEFINE_string("low_level_checkpoint", None, "Path to low-level SimLingo checkpoint for hierarchical mode.")
+flags.DEFINE_string("high_level_hydra_config", None, "Hydra config for high-level checkpoint if not stored beside checkpoint.")
+flags.DEFINE_string("low_level_hydra_config", None, "Hydra config for low-level checkpoint if not stored beside checkpoint.")
+flags.DEFINE_string("hierarchical_source_root", "", "Optional legacy source tree override for both hierarchical SimLingo models.")
+flags.DEFINE_string("high_level_source_root", "/scratch/current/celinet/simlingo-steervla", "Source tree used to instantiate the high-level SimLingo model.")
+flags.DEFINE_string("low_level_source_root", "/scratch/current/celinet/simlingo-tian", "Source tree used to instantiate the low-level SimLingo model.")
 flags.DEFINE_string("route", None, "Bench2Drive route (scenario name, file basename, or route id).")
 flags.DEFINE_bool("eval_only", False, "Run base policy only (no residual training).")
 flags.DEFINE_integer("total_steps", 10_000, "Total environment steps for training.")
 flags.DEFINE_integer("warmup_steps", 500, "Steps collecting data before SAC updates begin.")
 flags.DEFINE_integer("learning_starts", 500, "Buffer size threshold before updates begin.")
-flags.DEFINE_integer("updates_per_step", 4, "SAC gradient updates per env step.")
+flags.DEFINE_integer("updates_per_step", 10, "SAC gradient updates per env step / UTD ratio.")
 flags.DEFINE_integer("batch_size", 256, "SAC mini-batch size.")
 flags.DEFINE_integer("buffer_capacity", 10_000, "Replay buffer capacity.")
 flags.DEFINE_float("res_scale", 0.1, "Residual action scaling (final = base + scale*residual).")
@@ -90,9 +123,14 @@ flags.DEFINE_string("run_group", "Debug", "W&B run group.")
 flags.DEFINE_enum("wandb_mode", "online", ["online", "offline", "disabled"], "W&B logging mode.")
 flags.DEFINE_integer("log_interval", 1, "Log training metrics to W&B every N episodes.")
 flags.DEFINE_integer("video_log_interval", 5, "Upload episode video to W&B every N episodes (0=never).")
+flags.DEFINE_integer("eval_episodes", 2, "Number of episodes to run in eval-only mode.")
+flags.DEFINE_integer("eval_step_limit", 4000, "Maximum CARLA ticks per eval episode.")
 
 
 # ── Video overlay ─────────────────────────────────────────────────────────────
+
+_VIDEO_PANEL_H = 113
+
 
 def _annotate_frame(
     image_rgb: np.ndarray,
@@ -101,51 +139,102 @@ def _annotate_frame(
     current_speed: float,
     base_action: np.ndarray,
     residual_action: Optional[np.ndarray] = None,
+    *,
+    reward_value: Optional[float] = None,
+    env_reward_value: Optional[float] = None,
+    info: Optional[Dict[str, Any]] = None,
+    collision_events: int = 0,
 ) -> np.ndarray:
-    """Draw projected waypoints + HUD onto a video frame.
+    """Draw projected waypoints plus a black text panel like main_carla.py.
 
     Green dots  = speed waypoints (from speed head)
     Red dots    = route waypoints (from route head)
     Blue dots   = GPS target waypoints (from obs)
-    Yellow text = HUD (speed, accel, steer, residual)
     """
+    frame = np.asarray(image_rgb)
+    if frame.dtype != np.uint8:
+        frame = np.clip(frame, 0, 255).astype(np.uint8)
+    frame = np.ascontiguousarray(frame)
+    H, W = frame.shape[:2]
+
     try:
-        from PIL import Image as _PIL_Image, ImageDraw as _ImageDraw, ImageFont as _ImageFont
+        from PIL import Image as _PIL_Image, ImageDraw as _ImageDraw
         from team_code.simlingo_utils import project_points, get_camera_intrinsics  # type: ignore
-    except ImportError:
-        return image_rgb
 
-    H, W = image_rgb.shape[:2]
-    K = get_camera_intrinsics(W, H, 110).numpy()
+        K = get_camera_intrinsics(W, H, 110).numpy()
 
-    pil_img = _PIL_Image.fromarray(image_rgb).convert("RGBA")
-    draw = _ImageDraw.Draw(pil_img)
+        pil_img = _PIL_Image.fromarray(frame).convert("RGBA")
+        draw = _ImageDraw.Draw(pil_img)
 
-    def _draw_pts(waypoints_ego, color, r=4):
-        if waypoints_ego is None or len(waypoints_ego) == 0:
-            return
-        pts = project_points(waypoints_ego, K)
-        for p in pts:
-            x, y = int(p[0]), int(p[1])
-            if 0 <= x < W and 0 <= y < H:
-                draw.ellipse((x - r, y - r, x + r, y + r), fill=color)
+        def _draw_pts(waypoints_ego, color, r=4):
+            if waypoints_ego is None or len(waypoints_ego) == 0:
+                return
+            pts = project_points(waypoints_ego, K)
+            for p in pts:
+                x, y = int(p[0]), int(p[1])
+                if 0 <= x < W and 0 <= y < H:
+                    draw.ellipse((x - r, y - r, x + r, y + r), fill=color)
 
-    _draw_pts(simlingo_base._last_speed_wps, (0, 255, 0, 255), r=3)   # green
-    _draw_pts(simlingo_base._last_route, (255, 0, 0, 255), r=2)        # red
-    if target_points is not None:
-        _draw_pts(target_points, (0, 0, 255, 255), r=5)                # blue
+        _draw_pts(simlingo_base._last_speed_wps, (0, 255, 0, 255), r=3)   # green
+        _draw_pts(simlingo_base._last_route, (255, 0, 0, 255), r=2)        # red
+        if target_points is not None:
+            _draw_pts(target_points, (0, 0, 255, 255), r=5)                # blue
+        frame = np.asarray(pil_img.convert("RGB"))
+    except Exception:
+        pass
 
-    # HUD
-    hud = [
-        f"spd {current_speed:.1f} m/s",
-        f"acc {base_action[0]:+.2f}  str {base_action[1]:+.3f}",
-    ]
-    if residual_action is not None:
-        hud.append(f"res {residual_action[0]:+.2f} / {residual_action[1]:+.3f}")
-    for i, line in enumerate(hud):
-        draw.text((10, 10 + i * 18), line, fill=(255, 255, 0, 255))
+    info = info or {}
+    collision_count = int(info.get("collision_count", 0))
+    collision_now = bool(collision_events > 0 or collision_count > 0)
+    residual = residual_action if residual_action is not None else np.zeros(2, dtype=np.float32)
+    final_action = np.clip(base_action + FLAGS.res_scale * residual, -1.0, 1.0)
+    train_reward = "?" if reward_value is None else f"{reward_value:+.3f}"
+    env_reward = "?" if env_reward_value is None else f"{env_reward_value:+.3f}"
+    prompt = str(getattr(simlingo_base, "_last_prompt_text", "") or "")
+    language = str(getattr(simlingo_base, "_last_language_text", "") or "")
 
-    return np.array(pil_img.convert("RGB"))
+    def _clip_text(txt: str, max_chars: int = 142) -> str:
+        txt = " ".join(str(txt).split())
+        return txt if len(txt) <= max_chars else (txt[: max_chars - 3] + "...")
+
+    annotated = np.zeros((H + _VIDEO_PANEL_H, W, 3), dtype=np.uint8)
+    annotated[:H, :, :] = frame
+    try:
+        import cv2  # type: ignore
+
+        cv2.line(annotated, (0, H), (W - 1, H), (255, 255, 255), 1)
+        if collision_now:
+            label = f"COLLISION c={collision_count} e={collision_events}"
+            (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+            x1 = W - 8
+            x0 = max(8, x1 - tw - 12)
+            y0 = 8
+            y1 = y0 + th + baseline + 10
+            cv2.rectangle(annotated, (x0, y0), (x1, y1), (220, 0, 0), thickness=-1)
+            cv2.rectangle(annotated, (x0, y0), (x1, y1), (255, 255, 255), thickness=1)
+            cv2.putText(annotated, label, (x0 + 6, y1 - baseline - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+
+        pen_coll = float(info.get("penalty_collision", 0.0))
+        pen_route = float(info.get("penalty_outside_route", 0.0))
+        pen_crash = float(info.get("penalty_crash_stuck", 0.0))
+        pen_term = float(info.get("reward_terminal", 0.0))
+        contact = bool(info.get("collision_contact_active", False))
+        lines = [
+            f"Reward train={train_reward} env={env_reward} | speed={current_speed:.2f} m/s | collision={'YES' if collision_now else 'no'} c={collision_count} e={collision_events}",
+            f"Action base=({base_action[0]:+.2f},{base_action[1]:+.3f}) residual=({residual[0]:+.2f},{residual[1]:+.3f}) final=({final_action[0]:+.2f},{final_action[1]:+.3f})",
+            f"Prompt: {_clip_text(prompt)}",
+            f"Reasoning: {_clip_text(language) if language else '(no language output)'}",
+            "Waypoints: green=speed head  red=route head  blue=GPS target",
+            f"Pen: coll={pen_coll:+.1f}{'(bb)' if contact else ''}  route={pen_route:+.1f}  crash={pen_crash:+.1f}  term={pen_term:+.1f}",
+        ]
+        y = H + 15
+        for line in lines:
+            cv2.putText(annotated, line, (6, y), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (255, 255, 255), 1, cv2.LINE_AA)
+            y += 17
+    except Exception:
+        pass
+
+    return annotated
 
 
 # ── Environment proxy ─────────────────────────────────────────────────────────
@@ -271,6 +360,7 @@ def run_eval_episode(env: CarlaEnvProxy, simlingo_base, step_limit: int = 4000) 
             simlingo_image=obs["simlingo_image"],
             ego_state=obs["state"],
             target_points=obs["target_points"],
+            routing_command=obs.get("routing_command", ""),
         )
         obs, reward, terminated, truncated, info = env.step(base_action)
         episode_reward += reward
@@ -293,8 +383,10 @@ def run_eval_episode(env: CarlaEnvProxy, simlingo_base, step_limit: int = 4000) 
 def main(_argv):
     np.random.seed(FLAGS.seed)
 
-    if FLAGS.simlingo_checkpoint is None:
+    if FLAGS.policy_mode == "single" and FLAGS.simlingo_checkpoint is None:
         raise ValueError("--simlingo_checkpoint is required.")
+    if FLAGS.policy_mode == "hierarchical" and (FLAGS.high_level_checkpoint is None or FLAGS.low_level_checkpoint is None):
+        raise ValueError("--high_level_checkpoint and --low_level_checkpoint are required for hierarchical mode.")
     if FLAGS.route is None:
         raise ValueError("--route is required.")
 
@@ -313,9 +405,21 @@ def main(_argv):
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Load SimLingo base policy ─────────────────────────────────────────────
-    print("[main] Loading SimLingo base policy ...", flush=True)
-    from vlas.simlingo_base import SimLingoBase, VLM_FEATURE_DIM  # type: ignore
-    simlingo_base = SimLingoBase(FLAGS.simlingo_checkpoint, device=FLAGS.device)
+    print(f"[main] Loading SimLingo policy (mode={FLAGS.policy_mode}) ...", flush=True)
+    from vlas.simlingo_base import HierarchicalSimLingoPolicy, SimLingoBase, VLM_FEATURE_DIM  # type: ignore
+    if FLAGS.policy_mode == "hierarchical":
+        simlingo_base = HierarchicalSimLingoPolicy(
+            high_checkpoint_path=FLAGS.high_level_checkpoint,
+            low_checkpoint_path=FLAGS.low_level_checkpoint,
+            device=FLAGS.device,
+            high_hydra_config_path=FLAGS.high_level_hydra_config,
+            low_hydra_config_path=FLAGS.low_level_hydra_config,
+            source_root=FLAGS.hierarchical_source_root if FLAGS.hierarchical_source_root else None,
+            high_source_root=FLAGS.high_level_source_root,
+            low_source_root=FLAGS.low_level_source_root,
+        )
+    else:
+        simlingo_base = SimLingoBase(FLAGS.simlingo_checkpoint, device=FLAGS.device)
 
     # ── Start CARLA env server ────────────────────────────────────────────────
     # Read the initial obs (server sends it right after ready signal)
@@ -349,12 +453,20 @@ def main(_argv):
         import cv2
         path = str(video_dir / f"ep{ep_idx:04d}.mp4")
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(path, fourcc, 20.0, (1024, 512))
+        writer = cv2.VideoWriter(path, fourcc, 20.0, (1024, 512 + _VIDEO_PANEL_H))
         print(f"[video] Writing {path}", flush=True)
         return writer
 
     def _write_frame(writer, image_rgb, annotated: Optional[np.ndarray] = None):
         frame = annotated if annotated is not None else image_rgb
+        if frame.shape[:2] == (512, 1024):
+            frame = _annotate_frame(
+                frame,
+                simlingo_base,
+                None,
+                0.0,
+                np.zeros(2, dtype=np.float32),
+            )
         _frame_buffer.append(frame)
         if writer is None:
             return
@@ -370,7 +482,7 @@ def main(_argv):
 
     # ── Eval-only mode ────────────────────────────────────────────────────────
     if FLAGS.eval_only:
-        print("[main] Eval-only mode: rolling out base policy on 2 episodes ...", flush=True)
+        print(f"[main] Eval-only mode: rolling out base policy on {FLAGS.eval_episodes} episode(s) ...", flush=True)
         results: List[Dict[str, Any]] = []
 
         # Eval always runs VLM every CARLA tick (1 tick per wp call) to match
@@ -378,7 +490,7 @@ def main(_argv):
         ticks_per_wp = 1
         chunk_size = FLAGS.chunk_size  # only affects how many speed targets are pre-computed
 
-        for ep_idx in range(2):
+        for ep_idx in range(FLAGS.eval_episodes):
             if ep_idx == 0:
                 obs = initial_obs
             else:
@@ -389,14 +501,15 @@ def main(_argv):
             info: Dict[str, Any] = {}
             video = _open_video(ep_idx)
 
-            print(f"\n[eval] Episode {ep_idx + 1} / 2", flush=True)
+            print(f"\n[eval] Episode {ep_idx + 1} / {FLAGS.eval_episodes}", flush=True)
             done = False
-            while not done and steps < 4000:
+            while not done and steps < FLAGS.eval_step_limit:
                 # VLM call: get desired speeds + store route_interp for steer_for_speed()
                 desired_speeds, _route_interp, _ = simlingo_base.get_chunk_and_features(
                     simlingo_image=obs["simlingo_image"],
                     ego_state=obs["state"],
                     target_points=obs["target_points"],
+                    routing_command=obs.get("routing_command", ""),
                 )
                 for k in range(chunk_size):
                     for _tick in range(ticks_per_wp):
@@ -406,12 +519,21 @@ def main(_argv):
                         # using the route from the current VLM call (matches control_pid)
                         base_steer = simlingo_base.steer_for_speed(actual_speed)
                         action = np.array([base_accel, base_steer], dtype=np.float32)
-                        annotated = _annotate_frame(
-                            obs["simlingo_image"], simlingo_base,
-                            obs.get("target_points"), actual_speed, action,
-                        )
-                        _write_frame(video, obs["simlingo_image"], annotated)
+                        image_for_video = obs["simlingo_image"]
+                        target_points_for_video = obs.get("target_points")
                         obs, reward, terminated, truncated, info = env.step(action)
+                        annotated = _annotate_frame(
+                            image_for_video,
+                            simlingo_base,
+                            target_points_for_video,
+                            actual_speed,
+                            action,
+                            reward_value=float(reward),
+                            env_reward_value=float(reward),
+                            info=info,
+                            collision_events=int(info.get("collision_count", 0)),
+                        )
+                        _write_frame(video, image_for_video, annotated)
                         episode_reward += reward
                         steps += 1
                         done = terminated or truncated
@@ -483,6 +605,7 @@ def main(_argv):
     simlingo_base.reset_pid()
 
     episode_reward = 0.0
+    episode_env_reward = 0.0
     episode_steps = 0
     episode_collision_count = 0
     episode_collision_events = 0
@@ -499,6 +622,7 @@ def main(_argv):
         simlingo_image=obs["simlingo_image"],
         ego_state=obs["state"],
         target_points=obs["target_points"],
+        routing_command=obs.get("routing_command", ""),
     )
 
     reward_mode = "neg_speed" if FLAGS.debug_neg_speed_reward else "env"
@@ -509,7 +633,7 @@ def main(_argv):
     last_log_time = t0
     last_sac_metrics: Dict[str, float] = {}
     last_step_info: Dict[str, Any] = {}
-    last_drive_metrics = ego_drive_metrics_from_state_vec(obs["state"])
+    last_drive_metrics = _ego_drive_metrics_from_state_vec(obs["state"])
     last_env_reward = 0.0
     last_train_reward = 0.0
     last_actual_speed = float(obs["state"][15])
@@ -543,12 +667,8 @@ def main(_argv):
                 final_action = np.clip(
                     base_action + FLAGS.res_scale * residual_action, -1.0, 1.0
                 ).astype(np.float32)
-                annotated = _annotate_frame(
-                    obs["simlingo_image"], simlingo_base,
-                    obs.get("target_points"), actual_speed,
-                    base_action, residual_action,
-                )
-                _write_frame(video, obs["simlingo_image"], annotated)
+                image_for_video = obs["simlingo_image"]
+                target_points_for_video = obs.get("target_points")
                 next_obs, reward, terminated, truncated, info = env.step(final_action)
                 env_reward = float(reward)
                 if FLAGS.debug_neg_speed_reward:
@@ -559,12 +679,25 @@ def main(_argv):
                 last_base_action = base_action
                 last_final_action = final_action
                 last_step_info = dict(info)
-                last_drive_metrics = ego_drive_metrics_from_state_vec(next_obs["state"])
+                last_drive_metrics = _ego_drive_metrics_from_state_vec(next_obs["state"])
                 collision_count = int(info.get("collision_count", 0))
                 last_collision_delta = max(0, collision_count - prev_collision_count)
                 episode_collision_count = max(episode_collision_count, collision_count)
                 episode_collision_events += last_collision_delta
                 prev_collision_count = collision_count
+                annotated = _annotate_frame(
+                    image_for_video,
+                    simlingo_base,
+                    target_points_for_video,
+                    actual_speed,
+                    base_action,
+                    residual_action,
+                    reward_value=float(reward),
+                    env_reward_value=env_reward,
+                    info=info,
+                    collision_events=last_collision_delta,
+                )
+                _write_frame(video, image_for_video, annotated)
                 chunk_reward += reward
                 chunk_env_reward += env_reward
                 done = terminated or truncated
@@ -581,6 +714,7 @@ def main(_argv):
             simlingo_image=obs["simlingo_image"],
             ego_state=obs["state"],
             target_points=obs["target_points"],
+            routing_command=obs.get("routing_command", ""),
         )
         t_vlm_end = time.time()
         buffer.add(vlm_features, next_vlm_features, residual_action, chunk_reward, done)
@@ -626,6 +760,8 @@ def main(_argv):
                 "rollout/episode_collision_count": float(episode_collision_count),
                 "rollout/episode_collision_events": float(episode_collision_events),
                 "rollout/current_episode_reward": float(episode_reward),
+                "rollout/current_episode_return": float(episode_reward),
+                "rollout/current_episode_env_return": float(episode_env_reward),
                 "rollout/current_episode_steps": float(episode_steps),
                 "rollout/actual_speed": float(last_actual_speed),
                 "action/base_accel": float(last_base_action[0]),
@@ -659,6 +795,8 @@ def main(_argv):
                     "reward/penalty_brake": float(last_step_info.get("penalty_brake", 0.0)),
                     "reward/penalty_speed_limit": float(last_step_info.get("penalty_speed_limit", 0.0)),
                     "reward/penalty_crash_stuck": float(last_step_info.get("penalty_crash_stuck", 0.0)),
+                    "reward/collision_penalty_active": float(bool(last_step_info.get("collision_penalty_active", False))),
+                    "reward/collision_contact_active": float(bool(last_step_info.get("collision_contact_active", False))),
                     "rollout/lane_offset_m": float(last_step_info.get("lane_offset_m", 0.0)),
                     "rollout/heading_error_rad": float(last_step_info.get("heading_error_rad", 0.0)),
                     "rollout/speed_norm": float(last_step_info.get("speed_norm", 0.0)),
@@ -698,6 +836,8 @@ def main(_argv):
             ep_log: Dict[str, Any] = {
                 "rollout/episode_reward": episode_reward,
                 "rollout/episode_env_reward": episode_env_reward,
+                "rollout/episode_return": episode_reward,
+                "rollout/episode_env_return": episode_env_reward,
                 "rollout/episode_steps": episode_steps,
                 "rollout/success": float(info.get("success", False)),
                 "rollout/collision_count": float(info.get("collision_count", 0)),
@@ -759,6 +899,7 @@ def main(_argv):
                 simlingo_image=obs["simlingo_image"],
                 ego_state=obs["state"],
                 target_points=obs["target_points"],
+                routing_command=obs.get("routing_command", ""),
             )
         else:
             desired_speeds = next_desired_speeds

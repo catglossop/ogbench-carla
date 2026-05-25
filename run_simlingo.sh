@@ -19,6 +19,22 @@
 #
 #   # Offline W&B (no internet)
 #   WANDB_MODE=offline bash run_simlingo.sh --route parking-cut-in-001
+#
+# Candidate RL route shortlist from cross-policy disagreement/variance table.
+# Use the numeric id with --route, e.g.:
+#   bash run_simlingo.sh --route 3936 --steps 50000 --run-group SAC-route-shortlist
+#
+# Rank  Route id  Scenario                              Town    Wx  ORION  SteerVLA  SimLingo  Mean   Std    Range  Mean+Std
+# 0     3936      SignalizedJunctionLeftTurn_1          Town12  13  18.02  60.00     23.15     33.73  18.70  41.98  52.42
+# 2     3666      NonSignalizedJunctionRightTurn_1      Town13  21  25.35  60.00     36.00     40.45  14.49  34.65  54.94
+# 3     4183      SignalizedJunctionLeftTurn_1          Town12  0   36.00  60.00     36.00     44.00  11.31  24.00  55.31
+# 4     4468      SignalizedJunctionLeftTurn_1          Town12  25  22.92  60.00     42.00     41.64  15.14  37.08  56.78
+# 5     26408     MergerIntoSlowTrafficV2               Town06  3   60.00  45.50     6.40      37.30  22.64  53.60  59.94
+# 6     27506     EnterActorFlow_1                      Town05  23  60.00  60.00     60.00     60.00  0.00   0.00   60.00
+# 7     28099     SignalizedJunctionLeftTurnEnterFlow_1 Town04  22  60.00  60.00     60.00     60.00  0.00   0.00   60.00
+# 8     26966     SignalizedJunctionRightTurn_1         Town05  10  60.00  60.00     60.00     60.00  0.00   0.00   60.00
+# 9     28093     NonSignalizedJunctionLeftTurnEnterFlow_1 Town04 14 60.00  60.00     48.00     56.00  5.66   12.00  61.66
+# 10    2091      NonSignalizedJunctionLeftTurn_1       Town12  5   60.00  60.00     42.00     54.00  8.49   18.00  62.49
 
 set -euo pipefail
 
@@ -27,15 +43,23 @@ cd "$ROOT_DIR"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 SIMLINGO_CKPT="/home/celinet/simlingo_checkpoints/simlingo/checkpoints/epoch=013.ckpt"
+POLICY_MODE="single"
+HIGH_LEVEL_CKPT="/home/celinet/ogbench-carla/simlingo_checkpoints/2026_05_24_06_52_33_simlingo_seed1_bellman/checkpoints/epoch=013.ckpt"
+LOW_LEVEL_CKPT="/home/celinet/ogbench-carla/simlingo_checkpoints/2026_05_23_21_39_41_simlingo_ll_vla_meta_conditioned/checkpoints/epoch=029.ckpt"
+HIGH_LEVEL_HYDRA_CONFIG=""
+LOW_LEVEL_HYDRA_CONFIG=""
+HIERARCHICAL_SOURCE_ROOT=""
+HIGH_LEVEL_SOURCE_ROOT="/scratch/current/celinet/simlingo-steervla"
+LOW_LEVEL_SOURCE_ROOT="/scratch/current/celinet/simlingo-tian"
 ROUTE="bench2drive_00"
 STEPS="10000"
 WARMUP="500"
 LEARNING_STARTS="500"
-CHUNK_SIZE="10"
+CHUNK_SIZE="1"
 RES_SCALE="0.1"
 BATCH_SIZE="256"
 BUFFER_CAP="10000"
-UPDATES_PER_STEP="4"
+UPDATES_PER_STEP="10"
 ACTOR_LR="1e-4"
 CRITIC_LR="1e-4"
 SEED="0"
@@ -68,6 +92,7 @@ Usage: bash run_simlingo.sh [options] [-- extra args passed to main_carla_simlin
 
 Mode:
   --eval-only               Run base policy only, no SAC training
+  --policy-mode MODE        single|hierarchical. Default: single
   --debug-neg-speed         Replace reward with -speed (m/s) — SAC should brake
 
 Routing / environment:
@@ -98,6 +123,14 @@ Multi-instance (ports):
 Model:
   --checkpoint PATH         SimLingo checkpoint directory
                             Default: /home/celinet/simlingo_checkpoints/simlingo/checkpoints/epoch=013.ckpt
+  --high-checkpoint PATH    High-level checkpoint for --policy-mode hierarchical
+  --low-checkpoint PATH     Low-level checkpoint for --policy-mode hierarchical
+  --high-hydra-config PATH  High-level Hydra config for hierarchical mode
+  --low-hydra-config PATH   Low-level Hydra config for hierarchical mode
+  --hierarchical-source-root PATH
+                            Legacy override: same SimLingo source tree for both models
+  --high-source-root PATH   Source tree for high-level model
+  --low-source-root PATH    Source tree for low-level model
   --device DEVICE           Torch device. Default: cuda
   --chunk-size N            Waypoints per VLM call (1–10). Default: 10
 
@@ -108,7 +141,7 @@ SAC hyperparameters:
   --res-scale F             Residual action scale. Default: 0.1
   --batch-size N            SAC mini-batch size. Default: 256
   --buffer-cap N            Replay buffer capacity. Default: 10000
-  --updates-per-step N      SAC updates per env step. Default: 4
+  --updates-per-step N      SAC updates per env step / UTD ratio. Default: 10
   --actor-lr F              Actor learning rate. Default: 1e-4
   --critic-lr F             Critic learning rate. Default: 1e-4
   --gamma F                 Discount factor. Default: 0.97
@@ -147,10 +180,18 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --eval-only)           EVAL_ONLY="true"; shift ;;
+    --policy-mode)         POLICY_MODE="$2"; shift 2 ;;
     --debug-neg-speed)     DEBUG_NEG_SPEED="true"; shift ;;
     --route)               ROUTE="$2"; shift 2 ;;
     --carla-config)        CARLA_CFG="$2"; shift 2 ;;
     --checkpoint)          SIMLINGO_CKPT="$2"; shift 2 ;;
+    --high-checkpoint)     HIGH_LEVEL_CKPT="$2"; shift 2 ;;
+    --low-checkpoint)      LOW_LEVEL_CKPT="$2"; shift 2 ;;
+    --high-hydra-config)   HIGH_LEVEL_HYDRA_CONFIG="$2"; shift 2 ;;
+    --low-hydra-config)    LOW_LEVEL_HYDRA_CONFIG="$2"; shift 2 ;;
+    --hierarchical-source-root) HIERARCHICAL_SOURCE_ROOT="$2"; shift 2 ;;
+    --high-source-root)    HIGH_LEVEL_SOURCE_ROOT="$2"; shift 2 ;;
+    --low-source-root)     LOW_LEVEL_SOURCE_ROOT="$2"; shift 2 ;;
     --device)              DEVICE="$2"; shift 2 ;;
     --chunk-size)          CHUNK_SIZE="$2"; shift 2 ;;
     --steps)               STEPS="$2"; shift 2 ;;
@@ -300,6 +341,7 @@ fi
 # ── Build the argument list ───────────────────────────────────────────────────
 ARGS=(
   --simlingo_checkpoint="$SIMLINGO_CKPT"
+  --policy_mode="$POLICY_MODE"
   --route="$ROUTE"
   --carla_config="$CARLA_CFG"
   --device="$DEVICE"
@@ -313,6 +355,18 @@ ARGS=(
   --save_interval="$SAVE_INTERVAL"
   --save_video="$SAVE_VIDEO"
 )
+
+if [[ "$POLICY_MODE" == "hierarchical" ]]; then
+  ARGS+=(
+    --high_level_checkpoint="$HIGH_LEVEL_CKPT"
+    --low_level_checkpoint="$LOW_LEVEL_CKPT"
+    --high_level_hydra_config="$HIGH_LEVEL_HYDRA_CONFIG"
+    --low_level_hydra_config="$LOW_LEVEL_HYDRA_CONFIG"
+    --hierarchical_source_root="$HIERARCHICAL_SOURCE_ROOT"
+    --high_level_source_root="$HIGH_LEVEL_SOURCE_ROOT"
+    --low_level_source_root="$LOW_LEVEL_SOURCE_ROOT"
+  )
+fi
 
 ARGS+=(--gpu_rank="$GPU_RANK")
 
@@ -344,10 +398,14 @@ fi
 
 ARGS+=("${EXTRA_ARGS[@]}")
 
-echo "[run_simlingo.sh] route=$ROUTE  eval_only=$EVAL_ONLY  debug_neg_speed=$DEBUG_NEG_SPEED"
+echo "[run_simlingo.sh] route=$ROUTE  eval_only=$EVAL_ONLY  policy_mode=$POLICY_MODE  debug_neg_speed=$DEBUG_NEG_SPEED"
 echo "[run_simlingo.sh] steps=$STEPS  warmup=$WARMUP  chunk_size=$CHUNK_SIZE  res_scale=$RES_SCALE"
 echo "[run_simlingo.sh] wandb_mode=$WANDB_MODE  run_group=$RUN_GROUP"
 echo "[run_simlingo.sh] checkpoint=$SIMLINGO_CKPT"
+if [[ "$POLICY_MODE" == "hierarchical" ]]; then
+  echo "[run_simlingo.sh] high_checkpoint=$HIGH_LEVEL_CKPT"
+  echo "[run_simlingo.sh] low_checkpoint=$LOW_LEVEL_CKPT"
+fi
 echo "[run_simlingo.sh] carla_config=$CARLA_CFG"
 if [[ -n "$TRAIN_GPU" ]]; then
   echo "[run_simlingo.sh] train_gpu=$TRAIN_GPU  carla_gpu=$GPU_RANK"

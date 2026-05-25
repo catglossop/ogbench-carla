@@ -25,7 +25,7 @@ BATCH_SIZE = 256
 BUFFER_CAPACITY = 10_000
 LEARNING_STARTS = 500    # steps before SAC updates begin
 WARMUP_STEPS = 500       # steps using zero residual (base policy only)
-UPDATES_PER_STEP = 4     # gradient steps per env step
+UPDATES_PER_STEP = 10    # gradient steps per env step / UTD ratio
 
 # Carla leaderboard agent
 SIMLINGO_AGENT = "ogbench/carla/leaderboard_agents/simlingo_obs.py"

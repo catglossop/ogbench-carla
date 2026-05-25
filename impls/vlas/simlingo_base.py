@@ -22,12 +22,13 @@ Usage::
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import os
 import sys
 from collections import deque
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
@@ -150,13 +151,31 @@ VLM_FEATURE_DIM = _VLM_FEATURE_DIM  # public export
 _EGO_STATE_IDX_SPEED = 15
 
 
-def _build_model_from_hydra_config(hydra_cfg_path: Path, cache_dir: str):
+def _build_model_from_hydra_config(
+    hydra_cfg_path: Path,
+    cache_dir: str,
+    *,
+    source_root: Optional[str] = None,
+    model_type_override: Optional[str] = None,
+):
     """Instantiate DrivingModel using the training Hydra config."""
+    if source_root:
+        root = str(Path(source_root).resolve())
+        if root in sys.path:
+            sys.path.remove(root)
+        sys.path.insert(0, root)
+        for name in list(sys.modules):
+            if name == "simlingo_training" or name.startswith("simlingo_training."):
+                del sys.modules[name]
+    importlib.invalidate_caches()
+
     import hydra
     from omegaconf import OmegaConf
     from transformers import AutoProcessor
 
     cfg = OmegaConf.load(str(hydra_cfg_path))
+    if model_type_override is not None and "model_type" not in cfg.model:
+        cfg.model.model_type = model_type_override
     model_cfg = cfg.model
     data_cfg = cfg.data_module
 
@@ -196,36 +215,55 @@ class SimLingoBase:
         checkpoint_path: str,
         device: str = "cuda",
         cache_dir: Optional[str] = None,
+        hydra_config_path: Optional[str] = None,
+        source_root: Optional[str] = None,
+        model_type_override: Optional[str] = None,
+        prompt_mode: Optional[str] = None,
     ):
         self.device = torch.device(device)
-        ckpt_dir = Path(checkpoint_path)
+        ckpt_dir = _resolve_checkpoint_dir(checkpoint_path)
+        self.prompt_mode = prompt_mode
+        self.model_type = model_type_override
 
         if cache_dir is None:
             # Use simlingo's pretrained dir if it exists, else HF default cache
-            candidate = Path("/home/celinet/simlingo/pretrained")
+            candidates = []
+            if source_root:
+                candidates.append(Path(source_root) / "pretrained")
+            candidates.append(Path("/home/celinet/simlingo/pretrained"))
+            candidate = next((p for p in candidates if p.exists()), Path("/home/celinet/simlingo/pretrained"))
             cache_dir = str(candidate) if candidate.exists() else None
 
         # Search for Hydra config by walking up from the checkpoint dir
-        hydra_cfg_path = None
-        for ancestor in [ckpt_dir.parent, ckpt_dir.parent.parent, ckpt_dir.parent.parent.parent]:
-            candidate = ancestor / ".hydra" / "config.yaml"
-            if candidate.exists():
-                hydra_cfg_path = candidate
-                break
+        hydra_cfg_path = Path(hydra_config_path) if hydra_config_path else None
+        if hydra_cfg_path is None:
+            hydra_cfg_path = _find_checkpoint_config(ckpt_dir)
         if hydra_cfg_path is None:
             raise FileNotFoundError(
                 f"Hydra config.yaml not found in any ancestor of {ckpt_dir}"
             )
 
         print(f"[SimLingoBase] Loading model from {hydra_cfg_path} ...", flush=True)
-        model = _build_model_from_hydra_config(hydra_cfg_path, cache_dir)
+        model = _build_model_from_hydra_config(
+            hydra_cfg_path,
+            cache_dir,
+            source_root=source_root,
+            model_type_override=model_type_override,
+        )
 
         # Load consolidated checkpoint weights
         pt_path = ckpt_dir / "pytorch_model.pt"
-        if not pt_path.exists():
-            raise FileNotFoundError(f"pytorch_model.pt not found at {pt_path}")
-        print(f"[SimLingoBase] Loading weights from {pt_path} ...", flush=True)
-        state_dict = torch.load(str(pt_path), map_location="cpu")
+        ds_path = ckpt_dir / "checkpoint" / "mp_rank_00_model_states.pt"
+        if pt_path.exists():
+            weights_path = pt_path
+            print(f"[SimLingoBase] Loading weights from {weights_path} ...", flush=True)
+            state_dict = torch.load(str(weights_path), map_location="cpu")
+        elif ds_path.exists():
+            weights_path = ds_path
+            print(f"[SimLingoBase] Loading DeepSpeed module weights from {weights_path} ...", flush=True)
+            state_dict = torch.load(str(weights_path), map_location="cpu")["module"]
+        else:
+            raise FileNotFoundError(f"No pytorch_model.pt or DeepSpeed model state found under {ckpt_dir}")
         # pytorch_model.pt from zero_to_fp32 may have keys prefixed with 'module.'
         if all(k.startswith("module.") for k in state_dict):
             state_dict = {k[len("module."):]: v for k, v in state_dict.items()}
@@ -288,6 +326,10 @@ class SimLingoBase:
         # Cached last-inference outputs for video overlay
         self._last_speed_wps: Optional[np.ndarray] = None   # (10, 2) ego-frame
         self._last_route: Optional[np.ndarray] = None        # (20, 2) ego-frame
+        self._last_prompt_text: str = ""
+        self._last_language_text: str = ""
+        self._ego_history = deque(maxlen=20 * 10 + 2)
+        self._last_meta_action: str = ""
 
         print("[SimLingoBase] Ready.", flush=True)
 
@@ -384,25 +426,18 @@ class SimLingoBase:
         pixel_values = torch.stack([self._img_transform(p) for p in patches])  # (num_patches, 3, H, W)
         return pixel_values.unsqueeze(0)  # (1, num_patches, 3, H, W)
 
-    def _build_language_label(
+    def _build_language_label_from_prompt(
         self,
-        speed_ms: float,
-        target_points: np.ndarray,
+        prompt: str,
+        placeholder_values: Optional[dict[int, Any]] = None,
     ):
-        """Build the LanguageLabel for target_point_command mode (matches checkpoint training).
-
-        target_points: (2, 2) float32 ego-frame waypoints [current_tp, next_tp].
-        Prompt: "Current speed: X m/s. Target waypoint: <TARGET_POINT><TARGET_POINT>. What should the ego do next?"
-        """
         from simlingo_training.utils.custom_types import LanguageLabel
 
-        prompt_tp = "Target waypoint: <TARGET_POINT><TARGET_POINT>."
-        prompt = f"Current speed: {round(speed_ms, 1)} m/s. {prompt_tp} What should the ego do next?"
+        self._last_prompt_text = prompt
 
         IMG_START = "<img>"
         IMG_END = "</img>"
         IMG_CONTEXT = "<IMG_CONTEXT>"
-        # max_num=2, use_thumbnail=False → always 2 patches per image
         _NUM_PATCHES_IN_PROMPT = 2
         image_tokens = IMG_START + IMG_CONTEXT * self._num_image_token * _NUM_PATCHES_IN_PROMPT + IMG_END
 
@@ -410,7 +445,6 @@ class SimLingoBase:
         template.append_message(template.roles[0], f"<image>\n{prompt}")
         template.append_message(template.roles[1], None)
         query = template.get_prompt()
-        # Remove system prompt
         system_prompt = template.system_template.replace("{system_message}", template.system_message) + template.sep
         query = query.replace(system_prompt, "")
         query = query.replace("<image>", image_tokens, 1)
@@ -426,19 +460,65 @@ class SimLingoBase:
         phrase_valid = phrase_ids != tokenizer.pad_token_id
         phrase_mask = phrase_valid
 
-        # Build placeholder_values: maps <TARGET_POINT> token id → (2, 2) coords array
-        # Matches agent_simlingo.py lines 479-484
-        token_id = tokenizer.convert_tokens_to_ids('<TARGET_POINT>')
-        placeholder_values = [{token_id: target_points}]
-
         return LanguageLabel(
             phrase_ids=phrase_ids.to(self.device),
             phrase_valid=phrase_valid.to(self.device),
             phrase_mask=phrase_mask.to(self.device),
-            placeholder_values=placeholder_values,
+            placeholder_values=[placeholder_values or {}],
             language_string=[query],
             loss_masking=None,
         )
+
+    def _routing_prompt(self, routing_command: str) -> str:
+        rc = (routing_command or "").strip()
+        return rc if rc else "Command: follow the route."
+
+    def _ego_history_string(self) -> str:
+        if not self._ego_history:
+            return ""
+        entries = list(self._ego_history)
+        selected = []
+        for offset in (120, 80, 40):
+            selected.append(entries[-offset] if len(entries) >= offset else entries[0])
+        speed_str = " ".join(f"{s:.1f} m/s" for s, _h in selected)
+        heading_str = " ".join(f"{h:.1f} degrees" for _s, h in selected)
+        return f"Speed history: {speed_str} Heading history: {heading_str}\n"
+
+    def _build_hierarchical_language_label(
+        self,
+        speed_ms: float,
+        routing_command: str,
+        *,
+        meta_action: Optional[str] = None,
+    ):
+        speed = round(float(speed_ms), 1)
+        if self.prompt_mode == "hierarchical_hl":
+            prompt = f"{self._ego_history_string()}Current speed: {speed} m/s\n{self._routing_prompt(routing_command)}"
+        elif self.prompt_mode == "hierarchical_ll":
+            command = self._routing_prompt(routing_command)
+            meta = " ".join(str(meta_action or "Continue driving safely.").split())
+            prompt = f"Current speed: {speed} m/s. {command} {meta} Predict the waypoints."
+        else:
+            raise ValueError(f"Unsupported hierarchical prompt_mode={self.prompt_mode!r}")
+        return self._build_language_label_from_prompt(prompt)
+
+    def _build_language_label(
+        self,
+        speed_ms: float,
+        target_points: np.ndarray,
+    ):
+        """Build the LanguageLabel for target_point_command mode (matches checkpoint training).
+
+        target_points: (2, 2) float32 ego-frame waypoints [current_tp, next_tp].
+        Prompt: "Current speed: X m/s. Target waypoint: <TARGET_POINT><TARGET_POINT>. What should the ego do next?"
+        """
+        prompt_tp = "Target waypoint: <TARGET_POINT><TARGET_POINT>."
+        prompt = f"Current speed: {round(speed_ms, 1)} m/s. {prompt_tp} What should the ego do next?"
+
+        # Build placeholder_values: maps <TARGET_POINT> token id → (2, 2) coords array
+        # Matches agent_simlingo.py lines 479-484
+        token_id = self.model.tokenizer.convert_tokens_to_ids('<TARGET_POINT>')
+        return self._build_language_label_from_prompt(prompt, {token_id: target_points})
 
     def _compute_desired_speeds(self, speed_wps_np: np.ndarray) -> np.ndarray:
         """Extract the desired speed for each of the 10 predicted waypoints.
@@ -453,6 +533,37 @@ class SimLingoBase:
         desired_speeds[8] = desired_speeds[7]
         desired_speeds[9] = desired_speeds[7]
         return desired_speeds
+
+    def _decode_language_output(self, language) -> str:
+        """Return the model's generated driving-language text.
+
+        DrivingModel returns ``self.language`` as a list of already-decoded
+        strings during inference. Keep tensor decoding as a fallback for older
+        or alternate model wrappers.
+        """
+        if language is None:
+            return ""
+        if isinstance(language, str):
+            return language.strip()
+        if isinstance(language, (list, tuple)):
+            if not language:
+                return ""
+            first = language[0]
+            if isinstance(first, str):
+                return first.strip()
+            language = first
+        if isinstance(language, np.ndarray):
+            if language.size == 0:
+                return ""
+            if language.dtype.kind in {"U", "S", "O"}:
+                return str(language.reshape(-1)[0]).strip()
+            language = torch.as_tensor(language)
+        try:
+            lang_tensor = language.detach().cpu() if hasattr(language, "detach") else language
+            decoded = self.model.tokenizer.batch_decode(lang_tensor, skip_special_tokens=True)
+            return str(decoded[0]).strip() if decoded else ""
+        except Exception:
+            return ""
 
     def accel_for_desired_speed(self, desired_speed: float, current_speed: float) -> float:
         """PID throttle/brake for one CARLA tick.  Call once per tick, not per chunk.
@@ -504,6 +615,7 @@ class SimLingoBase:
         self._turn_controller._window = []
         self._turn_controller._saved_window = []
         self._last_route_interp = None
+        self._ego_history.clear()
 
     @torch.no_grad()
     def get_chunk_and_features(
@@ -511,6 +623,8 @@ class SimLingoBase:
         simlingo_image: np.ndarray,
         ego_state: np.ndarray,
         target_points: np.ndarray,
+        routing_command: str = "",
+        meta_action: Optional[str] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """VLM inference → (desired_speeds (10,), route_interp (N,2), vlm_features (896,)).
 
@@ -555,8 +669,15 @@ class SimLingoBase:
             cam_intrinsics = torch.eye(3, device=self.device).unsqueeze(0).float()
             cam_extrinsics = torch.eye(4, device=self.device).unsqueeze(0).float()
 
-        # ── Language label (target_point_command format) ──────────────────────
-        lang_label = self._build_language_label(speed_ms, target_points)
+        # ── Language label ────────────────────────────────────────────────────
+        if self.prompt_mode in {"hierarchical_hl", "hierarchical_ll"}:
+            lang_label = self._build_hierarchical_language_label(
+                speed_ms,
+                routing_command,
+                meta_action=meta_action,
+            )
+        else:
+            lang_label = self._build_language_label(speed_ms, target_points)
 
         # ── Target point tensor (first waypoint, shape (1, 2)) ────────────────
         tp_tensor = torch.from_numpy(target_points[0]).unsqueeze(0).float().to(self.device)
@@ -576,6 +697,10 @@ class SimLingoBase:
         # ── Forward pass ──────────────────────────────────────────────────────
         self._last_lm_features = None
         speed_wps, route, language = self.model(driving_input)
+        self._last_language_text = self._decode_language_output(language)
+        if self.prompt_mode == "hierarchical_hl":
+            self._last_meta_action = _extract_meta_action(self._last_language_text)
+        self._ego_history.append((speed_ms, _heading_degrees_from_state(ego_state)))
 
         # ── Extract VLM driving features ──────────────────────────────────────
         if self._last_lm_features is not None:
@@ -589,6 +714,8 @@ class SimLingoBase:
         # ── Waypoints → chunk ─────────────────────────────────────────────────
         if speed_wps is not None and route is not None:
             speed_wps_np = speed_wps[0].float().cpu().numpy()   # (10, 2)
+            if self.prompt_mode == "hierarchical_ll":
+                speed_wps_np = np.cumsum(speed_wps_np, axis=0)
             route_np = route[0].float().cpu().numpy()            # (20, 2)
             self._last_speed_wps = speed_wps_np
             self._last_route = route_np
@@ -609,6 +736,8 @@ class SimLingoBase:
         simlingo_image: np.ndarray,
         ego_state: np.ndarray,
         target_points: np.ndarray,
+        routing_command: str = "",
+        meta_action: Optional[str] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Single-step wrapper: VLM inference → (base_action (2,), vlm_features (896,)).
 
@@ -618,13 +747,193 @@ class SimLingoBase:
         + steer_for_speed() in the outer loop.
         """
         desired_speeds, _route_interp, vlm_features = self.get_chunk_and_features(
-            simlingo_image, ego_state, target_points
+            simlingo_image, ego_state, target_points, routing_command, meta_action
         )
         current_speed = float(ego_state[_EGO_STATE_IDX_SPEED])
         accel = self.accel_for_desired_speed(desired_speeds[0], current_speed)
         steer = self.steer_for_speed(current_speed)
         base_action = np.array([accel, steer], dtype=np.float32)
         return base_action, vlm_features
+
+
+class HierarchicalSimLingoPolicy:
+    """High-level SimLingo planner feeding a low-level SimLingo VLA controller."""
+
+    def __init__(
+        self,
+        high_checkpoint_path: str,
+        low_checkpoint_path: str,
+        device: str = "cuda",
+        high_hydra_config_path: Optional[str] = None,
+        low_hydra_config_path: Optional[str] = None,
+        source_root: Optional[str] = None,
+        high_source_root: Optional[str] = "/scratch/current/celinet/simlingo-steervla",
+        low_source_root: Optional[str] = "/scratch/current/celinet/simlingo-tian",
+        cache_dir: Optional[str] = None,
+    ):
+        if source_root is not None:
+            high_source_root = source_root
+            low_source_root = source_root
+        self.high = SimLingoBase(
+            high_checkpoint_path,
+            device=device,
+            cache_dir=cache_dir,
+            hydra_config_path=high_hydra_config_path,
+            source_root=high_source_root,
+            model_type_override="hl",
+            prompt_mode="hierarchical_hl",
+        )
+        self.low = SimLingoBase(
+            low_checkpoint_path,
+            device=device,
+            cache_dir=cache_dir,
+            hydra_config_path=low_hydra_config_path,
+            source_root=low_source_root,
+            model_type_override="ll",
+            prompt_mode="hierarchical_ll",
+        )
+
+        self._last_speed_wps = None
+        self._last_route = None
+        self._last_prompt_text = ""
+        self._last_language_text = ""
+        self._last_meta_action = ""
+        self._logged_debug_example = False
+
+    def _sync_overlay_state(self) -> None:
+        self._last_speed_wps = self.low._last_speed_wps
+        self._last_route = self.low._last_route
+        self._last_prompt_text = self.low._last_prompt_text
+        self._last_language_text = self.high._last_language_text
+        self._last_meta_action = self.high._last_meta_action
+
+    def reset_pid(self) -> None:
+        self.high.reset_pid()
+        self.low.reset_pid()
+
+    def accel_for_desired_speed(self, desired_speed: float, current_speed: float) -> float:
+        return self.low.accel_for_desired_speed(desired_speed, current_speed)
+
+    def steer_for_speed(self, current_speed: float) -> float:
+        return self.low.steer_for_speed(current_speed)
+
+    @property
+    def _WP_DILATION(self) -> int:
+        return self.low._WP_DILATION
+
+    @property
+    def _DATA_SAVE_FREQ(self) -> int:
+        return self.low._DATA_SAVE_FREQ
+
+    @torch.no_grad()
+    def get_chunk_and_features(
+        self,
+        simlingo_image: np.ndarray,
+        ego_state: np.ndarray,
+        target_points: np.ndarray,
+        routing_command: str = "",
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        self.high.get_chunk_and_features(
+            simlingo_image=simlingo_image,
+            ego_state=ego_state,
+            target_points=target_points,
+            routing_command=routing_command,
+        )
+        meta_action = self.high._last_meta_action or self.high._last_language_text or "Continue driving safely."
+        out = self.low.get_chunk_and_features(
+            simlingo_image=simlingo_image,
+            ego_state=ego_state,
+            target_points=target_points,
+            routing_command=routing_command,
+            meta_action=meta_action,
+        )
+        self._sync_overlay_state()
+        if not self._logged_debug_example:
+            print("[HierarchicalSimLingoPolicy] First HL prompt:", self.high._last_prompt_text, flush=True)
+            print("[HierarchicalSimLingoPolicy] First raw HL output:", self.high._last_language_text, flush=True)
+            print("[HierarchicalSimLingoPolicy] First parsed meta-action:", meta_action, flush=True)
+            print("[HierarchicalSimLingoPolicy] First LL prompt:", self.low._last_prompt_text, flush=True)
+            self._logged_debug_example = True
+        return out
+
+    @torch.no_grad()
+    def get_action_and_features(
+        self,
+        simlingo_image: np.ndarray,
+        ego_state: np.ndarray,
+        target_points: np.ndarray,
+        routing_command: str = "",
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        desired_speeds, _route_interp, vlm_features = self.get_chunk_and_features(
+            simlingo_image, ego_state, target_points, routing_command
+        )
+        current_speed = float(ego_state[_EGO_STATE_IDX_SPEED])
+        accel = self.accel_for_desired_speed(desired_speeds[0], current_speed)
+        steer = self.steer_for_speed(current_speed)
+        return np.array([accel, steer], dtype=np.float32), vlm_features
+
+
+def _extract_meta_action(text: str) -> str:
+    marker = "Driving Behavior:"
+    text = str(text or "").strip()
+    idx = text.find(marker)
+    if idx >= 0:
+        text = text[idx + len(marker):]
+    return " ".join(text.strip().split())
+
+
+def _heading_degrees_from_state(state: np.ndarray) -> float:
+    arr = np.asarray(state, dtype=np.float32).reshape(-1)
+    if arr.size > 14:
+        return float(np.degrees(arr[14]))
+    return 0.0
+
+
+def _resolve_checkpoint_dir(path: str) -> Path:
+    p = Path(path).expanduser()
+    if (p / "pytorch_model.pt").exists() or (p / "checkpoint" / "mp_rank_00_model_states.pt").exists():
+        return p
+    ckpts = p / "checkpoints"
+    if ckpts.exists():
+        epoch_dirs = sorted(
+            ckpts.glob("epoch=*.ckpt"),
+            key=lambda x: int(x.name.split("=")[1].split(".")[0]),
+        )
+        if epoch_dirs:
+            return epoch_dirs[-1]
+        if (ckpts / "last.ckpt").exists():
+            return ckpts / "last.ckpt"
+    return p
+
+
+def _find_checkpoint_config(ckpt_dir: Path) -> Optional[Path]:
+    run_dir_candidates = [
+        ckpt_dir.parent.parent if ckpt_dir.parent.name == "checkpoints" else None,
+        ckpt_dir.parent,
+        ckpt_dir.parent.parent,
+        ckpt_dir.parent.parent.parent,
+    ]
+    seen = set()
+    for ancestor in run_dir_candidates:
+        if ancestor is None:
+            continue
+        ancestor = ancestor.resolve()
+        if ancestor in seen:
+            continue
+        seen.add(ancestor)
+        for candidate in (
+            ancestor / ".hydra" / "config.yaml",
+            ancestor / "log" / "args.txt",
+            ancestor / "wandb" / "latest-run" / "files" / "config.yaml",
+        ):
+            if candidate.exists():
+                return candidate
+        wandb_dir = ancestor / "wandb"
+        if wandb_dir.exists():
+            matches = sorted(wandb_dir.glob("run-*/files/config.yaml"))
+            if matches:
+                return matches[-1]
+    return None
 
 
 

@@ -168,9 +168,9 @@ _SPEED_LIMITS_DIR = Path(__file__).resolve().parent.parent.parent / "impls" / "c
 
 DEFAULT_CRASH_STUCK_SPEED_THRESHOLD = 0.1
 DEFAULT_CRASH_STUCK_STEPS = 20
-DEFAULT_CRASH_STUCK_PENALTY = -1.0
-DEFAULT_COLLISION_EVENT_PENALTY = -5.0 # catastrophic - should update to make sure any contact is given negative reward
-DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -5.0 # should be pretty heavy
+DEFAULT_CRASH_STUCK_PENALTY = -100.0
+DEFAULT_COLLISION_EVENT_PENALTY = -100.0  # applied every step while bounding-box overlap is active
+DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -100.0
 DEFAULT_PROGRESS_REWARD_WEIGHT = 1.0
 # DEFAULT_CENTERING_REWARD_WEIGHT = 0.2
 # DEFAULT_HEADING_REWARD_WEIGHT = 0.2
@@ -178,7 +178,7 @@ DEFAULT_STEER_PENALTY_WEIGHT = 0.05
 DEFAULT_BRAKE_PENALTY_WEIGHT = 0.02
 DEFAULT_SPEED_LIMIT_PENALTY_WEIGHT = 0.1
 SUCCESS_BONUS = 5.0
-FAILURE_BONUS = -5.0
+FAILURE_BONUS = -100.0
 
 
 def _find_free_port(starting_port: int) -> int:
@@ -799,6 +799,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         )
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
+        self._raw_collision_sensor: Any | None = None
+        self._raw_collision_active: bool = False
 
         self._expert_controller_kind = str(self.carla_config.get("expert_controller", "") or "").strip().lower()
         self._expert_agent: Any | None = None
@@ -1005,6 +1007,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
     def _stop_active_scenario(self) -> None:
         if not self._scenario_active or self._evaluator is None:
             return
+        self._destroy_raw_collision_sensor()
         try:
             print("\033[1m> Stopping the route (wrapper)\033[0m", flush=True)
             self._evaluator.manager.stop_scenario()
@@ -1110,6 +1113,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._crash_stuck_ticks = 0
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
+        self._raw_collision_active = False
+        self._spawn_raw_collision_sensor()
 
     def _ego_actor(self) -> Optional[carla.Actor]:
         ev = self._evaluator
@@ -1549,13 +1554,19 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._prev_collision_count = collision_count
         self._prev_outside_route_value = outside_route_value
 
-        collision_pen = self._collision_event_penalty * float(collision_delta)
+        # Continuous collision penalty: apply every step while bounding boxes overlap,
+        # not only when a new collision event fires.
+        collision_contact_active = self._raw_collision_active
+        collision_penalty_active = collision_contact_active or (collision_delta > 0)
+        collision_pen = self._collision_event_penalty if collision_penalty_active else 0.0
         outside_route_pen = self._outside_route_event_penalty * float(outside_route_delta)
         reward += collision_pen + outside_route_pen
 
         terminal_bonus = 0.0
         info["collision_count"] = collision_count
         info["crash_stuck_ticks"] = self._crash_stuck_ticks
+        info["collision_penalty_active"] = bool(collision_penalty_active)
+        info["collision_contact_active"] = bool(collision_contact_active)
         info["outside_route_value"] = outside_route_value
         info["collision_delta"] = float(collision_delta)
         info["outside_route_delta"] = float(outside_route_delta)
@@ -1603,6 +1614,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         """Apply a pre-computed VehicleControl and run one leaderboard tick."""
         self._last_control = control
         self.evaluator.manager.pending_control = control
+        self._raw_collision_active = False
         try:
             running, tree_status = self.evaluator.manager.step_once()
         except Exception as e:
@@ -1774,10 +1786,12 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 self.evaluator.manager.scenario_duration_game,
                 crash_message,
             )
+            self._destroy_raw_collision_sensor()
             self._drain_pseudo_sensors()
             self.evaluator._cleanup()
             raise RuntimeError(f"Invalid sensors: {e}") from e
         except Exception:
+            self._destroy_raw_collision_sensor()
             self._drain_pseudo_sensors()
             self.evaluator._cleanup()
             raise
@@ -1814,6 +1828,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             control = _action_to_control(action)
         self._last_control = control
         self.evaluator.manager.pending_control = control
+        self._raw_collision_active = False
 
         try:
             running, tree_status = self.evaluator.manager.step_once()
@@ -1850,6 +1865,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
     def _finalize_route(self, entry_status: str, crash_message: str) -> None:
         if not self._scenario_active:
             return
+        self._destroy_raw_collision_sensor()
         config_index = self.evaluator.manager.route_index
         try:
             print("\033[1m> Stopping the route (wrapper)\033[0m", flush=True)
@@ -1876,6 +1892,36 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             # spawning a new server.  Calling setup() after JAX is initialized
             # triggers subprocess.Popen (Xvfb + CarlaUE4.sh), which forks while
             # JAX threads are live and can corrupt the msgpack RPC connection.
+
+    def _spawn_raw_collision_sensor(self) -> None:
+        """Attach a raw sensor.other.collision to the ego; sets _raw_collision_active each tick."""
+        ego = self._ego_actor()
+        if ego is None:
+            return
+        try:
+            world = self.evaluator.world
+            bp = world.get_blueprint_library().find("sensor.other.collision")
+            sensor = world.spawn_actor(bp, carla.Transform(), attach_to=ego)
+            sensor.listen(lambda _event: setattr(self, "_raw_collision_active", True))
+            self._raw_collision_sensor = sensor
+        except Exception as exc:
+            print(f"[raw_collision_sensor] spawn failed: {exc}", flush=True)
+            self._raw_collision_sensor = None
+
+    def _destroy_raw_collision_sensor(self) -> None:
+        """Stop and destroy the raw collision sensor before scenario teardown."""
+        sensor = self._raw_collision_sensor
+        self._raw_collision_sensor = None
+        if sensor is None:
+            return
+        try:
+            sensor.stop()
+        except Exception:
+            pass
+        try:
+            sensor.destroy()
+        except Exception:
+            pass
 
     def render(self):
         """Placeholder frame for evaluation video paths (avoid NotImplementedError)."""
