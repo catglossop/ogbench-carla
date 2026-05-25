@@ -100,6 +100,9 @@ flags.DEFINE_integer("updates_per_step", 10, "SAC gradient updates per env step 
 flags.DEFINE_integer("batch_size", 256, "SAC mini-batch size.")
 flags.DEFINE_integer("buffer_capacity", 10_000, "Replay buffer capacity.")
 flags.DEFINE_float("res_scale", 0.1, "Residual action scaling (final = base + scale*residual).")
+flags.DEFINE_integer("residual_clip_schedule_steps", 0,
+                     "Steps after warmup over which the residual clip limit ramps linearly from 0 to 1. "
+                     "0 = no schedule (full [-1, 1] range immediately after warmup).")
 flags.DEFINE_float("gamma", 0.97, "Discount factor.")
 flags.DEFINE_float("tau", 0.01, "Target network soft-update coefficient.")
 flags.DEFINE_float("actor_lr", 1e-4, "Actor learning rate.")
@@ -119,12 +122,19 @@ flags.DEFINE_string("carla_root", "/home/celinet/VLA_driving/software",
                     "Default is CARLA 0.9.15 which works with Town12.")
 flags.DEFINE_bool("debug_neg_speed_reward", False,
                   "Debug: replace env reward with -speed (m/s). SAC should learn to slow the car.")
+flags.DEFINE_bool("expert_debug", False,
+                  "Debug: drive with the CARLA expert action instead of base+residual (dagger_residual only).")
+flags.DEFINE_bool("expert_recover_debug", False,
+                  "Debug: run SimLingo for a random [70,200] ticks per episode, then switch to CARLA expert.")
 flags.DEFINE_string("run_group", "Debug", "W&B run group.")
 flags.DEFINE_enum("wandb_mode", "online", ["online", "offline", "disabled"], "W&B logging mode.")
 flags.DEFINE_integer("log_interval", 1, "Log training metrics to W&B every N episodes.")
 flags.DEFINE_integer("video_log_interval", 5, "Upload episode video to W&B every N episodes (0=never).")
 flags.DEFINE_integer("eval_episodes", 2, "Number of episodes to run in eval-only mode.")
 flags.DEFINE_integer("eval_step_limit", 4000, "Maximum CARLA ticks per eval episode.")
+flags.DEFINE_enum("training_mode", "sac_residual", ["sac_residual", "dagger_residual"],
+                  "Training mode: sac_residual (RL with env reward) or "
+                  "dagger_residual (BC with expert planner labels).")
 
 
 # ── Video overlay ─────────────────────────────────────────────────────────────
@@ -144,12 +154,15 @@ def _annotate_frame(
     env_reward_value: Optional[float] = None,
     info: Optional[Dict[str, Any]] = None,
     collision_events: int = 0,
+    expert_waypoints: Optional[np.ndarray] = None,
+    expert_action_2d: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Draw projected waypoints plus a black text panel like main_carla.py.
 
-    Green dots  = speed waypoints (from speed head)
-    Red dots    = route waypoints (from route head)
-    Blue dots   = GPS target waypoints (from obs)
+    Green dots   = speed waypoints (from speed head)
+    Red dots     = route waypoints (from route head)
+    Blue dots    = GPS target waypoints (from obs)
+    Yellow dots  = expert route waypoints (dagger mode only)
     """
     frame = np.asarray(image_rgb)
     if frame.dtype != np.uint8:
@@ -179,6 +192,8 @@ def _annotate_frame(
         _draw_pts(simlingo_base._last_route, (255, 0, 0, 255), r=2)        # red
         if target_points is not None:
             _draw_pts(target_points, (0, 0, 255, 255), r=5)                # blue
+        if expert_waypoints is not None:
+            _draw_pts(expert_waypoints, (255, 220, 0, 255), r=3)           # yellow
         frame = np.asarray(pil_img.convert("RGB"))
     except Exception:
         pass
@@ -192,6 +207,7 @@ def _annotate_frame(
     env_reward = "?" if env_reward_value is None else f"{env_reward_value:+.3f}"
     prompt = str(getattr(simlingo_base, "_last_prompt_text", "") or "")
     language = str(getattr(simlingo_base, "_last_language_text", "") or "")
+    meta_action = str(getattr(simlingo_base, "_last_meta_action", "") or "")
 
     def _clip_text(txt: str, max_chars: int = 142) -> str:
         txt = " ".join(str(txt).split())
@@ -219,12 +235,18 @@ def _annotate_frame(
         pen_crash = float(info.get("penalty_crash_stuck", 0.0))
         pen_term = float(info.get("reward_terminal", 0.0))
         contact = bool(info.get("collision_contact_active", False))
+
+        if expert_action_2d is not None:
+            expert_str = f"expert=({expert_action_2d[0]:+.2f},{expert_action_2d[1]:+.3f})"
+        else:
+            expert_str = ""
+
         lines = [
             f"Reward train={train_reward} env={env_reward} | speed={current_speed:.2f} m/s | collision={'YES' if collision_now else 'no'} c={collision_count} e={collision_events}",
-            f"Action base=({base_action[0]:+.2f},{base_action[1]:+.3f}) residual=({residual[0]:+.2f},{residual[1]:+.3f}) final=({final_action[0]:+.2f},{final_action[1]:+.3f})",
+            f"Action base=({base_action[0]:+.2f},{base_action[1]:+.3f}) residual=({residual[0]:+.2f},{residual[1]:+.3f}) final=({final_action[0]:+.2f},{final_action[1]:+.3f}){('  ' + expert_str) if expert_str else ''}",
+            f"Meta-action: {_clip_text(meta_action) if meta_action else '(none)'}",
             f"Prompt: {_clip_text(prompt)}",
             f"Reasoning: {_clip_text(language) if language else '(no language output)'}",
-            "Waypoints: green=speed head  red=route head  blue=GPS target",
             f"Pen: coll={pen_coll:+.1f}{'(bb)' if contact else ''}  route={pen_route:+.1f}  crash={pen_crash:+.1f}  term={pen_term:+.1f}",
         ]
         y = H + 15
@@ -315,12 +337,16 @@ class CarlaEnvProxy:
         img_bytes = base64.b64decode(wire["simlingo_image_b64"])
         img = np.frombuffer(img_bytes, dtype=np.uint8).reshape(wire["simlingo_image_shape"])
         tp_raw = wire.get("target_points", [[0.0, 0.0], [0.0, 0.0]])
-        return {
+        expert_raw = wire.get("expert_action")
+        obs = {
             "state": np.array(wire["state"], dtype=np.float32),
             "simlingo_image": img,
             "routing_command": wire["routing_command"],
             "target_points": np.array(tp_raw, dtype=np.float32),  # (2, 2) ego-frame
         }
+        if expert_raw is not None:
+            obs["expert_action"] = np.array(expert_raw, dtype=np.float32)
+        return obs
 
     def close(self):
         try:
@@ -376,6 +402,67 @@ def run_eval_episode(env: CarlaEnvProxy, simlingo_base, step_limit: int = 4000) 
         "outside_route": info.get("outside_route_value", 0.0),
         "route": FLAGS.route,
     }
+
+
+# ── DAgger expert action helpers ──────────────────────────────────────────────
+
+# Each waypoint in the expert chunk covers 5 CARLA ticks at 20 Hz = 0.25 s.
+_EXPERT_DT = 5.0 / 20.0
+
+
+def _expert_action_to_accel_steer(
+    expert_action_40d: np.ndarray,
+    simlingo_base,
+    current_speed: float,
+) -> np.ndarray:
+    """Convert a 40-D expert chunk to a single-tick (accel, steer) action.
+
+    expert_action_40d: (40,) = 10 steps × [dx_speed, dy_speed, dx_route, dy_route].
+    Each (dx, dy) is a displacement over dt = 0.25 s at the expert's target speed.
+    Returns a (2,) float32 [accel, steer] in [-1, 1].
+
+    Expert steer is computed from the expert's route waypoints via SimLingo's lateral
+    PID. The PID window and cached route are saved before and restored after so this
+    call has no side effects on simlingo_base state.
+    """
+    from vlas.simlingo_base import _interpolate_waypoints  # type: ignore
+
+    chunk = np.asarray(expert_action_40d, dtype=np.float32).reshape(10, 4)
+
+    # ── Expert accel from speed chunk first-step displacement ─────────────────
+    expert_target_speed = float(np.linalg.norm(chunk[0, :2])) / max(_EXPERT_DT, 1e-6)
+    expert_accel = simlingo_base.accel_for_desired_speed(expert_target_speed, current_speed)
+
+    # ── Expert steer from route chunk, without mutating PID state ─────────────
+    # _lateral_control and _turn_controller live on SimLingoBase, not on
+    # HierarchicalSimLingoPolicy. Unwrap to the underlying base (`.low` for
+    # hierarchical, self for single) before touching private attributes.
+    _base = getattr(simlingo_base, "low", simlingo_base)
+    tc = _base._turn_controller
+    saved_route_interp = _base._last_route_interp
+    tc.save_state()
+    try:
+        expert_route_wps = np.cumsum(chunk[:, 2:4], axis=0)  # (10, 2)
+        expert_steer = _base._lateral_control(expert_route_wps, current_speed)
+    except Exception:
+        expert_steer = simlingo_base.steer_for_speed(current_speed)
+    finally:
+        tc.load_state()
+        _base._last_route_interp = saved_route_interp
+
+    return np.array([expert_accel, expert_steer], dtype=np.float32)
+
+
+# ── Residual clip schedule ────────────────────────────────────────────────────
+
+def _residual_clip_limit(global_step: int, warmup_steps: int, schedule_steps: int) -> float:
+    """Linear ramp: 0 at end of warmup → 1 after schedule_steps post-warmup steps."""
+    if schedule_steps <= 0:
+        return 1.0
+    post_warmup = global_step - warmup_steps
+    if post_warmup <= 0:
+        return 0.0
+    return min(1.0, post_warmup / schedule_steps)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -580,6 +667,364 @@ def main(_argv):
         env.close()
         return
 
+    # ── DAgger residual training ──────────────────────────────────────────────
+    if FLAGS.training_mode == "dagger_residual":
+        from torch_agents.residual_sac import ResidualSACAgent, DaggerBuffer  # type: ignore
+        import torch
+
+        vlm_dim = VLM_FEATURE_DIM
+
+        agent = ResidualSACAgent(
+            vlm_feature_dim=vlm_dim,
+            action_dim=2,
+            hidden_dims=(256, 256, 256),
+            gamma=FLAGS.gamma,
+            tau=FLAGS.tau,
+            actor_lr=FLAGS.actor_lr,
+            critic_lr=FLAGS.critic_lr,
+            device=FLAGS.device,
+        )
+        buffer: Any = DaggerBuffer(capacity=FLAGS.buffer_capacity, vlm_dim=vlm_dim)
+
+        log_path = save_dir / "train_log.jsonl"
+        log_file = open(log_path, "w")
+
+        obs = initial_obs
+        simlingo_base.reset_pid()
+
+        episode_reward = 0.0
+        episode_env_reward = 0.0
+        episode_steps = 0
+        episode_collision_count = 0
+        episode_collision_events = 0
+        prev_collision_count = 0
+        num_episodes = 0
+        total_updates = 0
+
+        chunk_size = FLAGS.chunk_size
+        ticks_per_wp = simlingo_base._WP_DILATION * simlingo_base._DATA_SAVE_FREQ
+
+        desired_speeds, _route_interp, vlm_features = simlingo_base.get_chunk_and_features(
+            simlingo_image=obs["simlingo_image"],
+            ego_state=obs["state"],
+            target_points=obs["target_points"],
+            routing_command=obs.get("routing_command", ""),
+        )
+
+        print(f"[train/dagger] Starting DAgger BC training for {FLAGS.total_steps} steps "
+              f"(chunk_size={chunk_size}, ticks_per_wp={ticks_per_wp}) ...", flush=True)
+        t0 = time.time()
+        last_log_time = t0
+        last_bc_metrics: Dict[str, float] = {}
+        last_step_info: Dict[str, Any] = {}
+        last_drive_metrics = _ego_drive_metrics_from_state_vec(obs["state"])
+        last_env_reward = 0.0
+        last_actual_speed = float(obs["state"][15])
+        last_base_action = np.zeros(2, dtype=np.float32)
+        last_final_action = np.zeros(2, dtype=np.float32)
+        last_expert_action_2d = np.zeros(2, dtype=np.float32)
+        last_expert_residual_target = np.zeros(2, dtype=np.float32)
+        last_actor_output = np.zeros(2, dtype=np.float32)
+        last_collision_delta = 0
+        last_update_time = 0.0
+        video = _open_video(num_episodes)
+
+        _expert_recover_budget = int(np.random.randint(70, 201)) if FLAGS.expert_recover_debug else 0
+        if FLAGS.expert_recover_debug:
+            print(f"[expert_recover_debug] episode 0: SimLingo for {_expert_recover_budget} ticks then expert", flush=True)
+
+        # Capture the expert action for the initial obs (expert action at state s,
+        # used together with vlm_features which is also computed at state s).
+        current_expert_action_40d: Optional[np.ndarray] = obs.get("expert_action")
+
+        for global_step in range(FLAGS.total_steps):
+            t_sample_start = time.time()
+            in_warmup = global_step < FLAGS.warmup_steps
+            dagger_clip_limit = _residual_clip_limit(global_step, FLAGS.warmup_steps, FLAGS.residual_clip_schedule_steps)
+            if in_warmup:
+                # Warmup: execute base policy only (no residual)
+                residual_action = np.zeros(2, dtype=np.float32)
+            else:
+                # DAgger: execute deterministic actor mean (no exploration noise)
+                residual_action = agent.get_eval_action(vlm_features)
+                residual_action = np.clip(residual_action, -dagger_clip_limit, dagger_clip_limit)
+            last_actor_output = residual_action.copy()
+            t_sample_end = time.time()
+
+            # Capture speed and base action at the START of the chunk so that the
+            # expert residual uses the same state as vlm_features.
+            chunk_start_speed = float(obs["state"][15])
+            chunk_start_base_accel = simlingo_base.accel_for_desired_speed(desired_speeds[0], chunk_start_speed)
+            chunk_start_base_steer = simlingo_base.steer_for_speed(chunk_start_speed)
+            chunk_start_base_action = np.array([chunk_start_base_accel, chunk_start_base_steer], dtype=np.float32)
+
+            # Pre-compute expert route waypoints for video overlay (ego-frame cumsum of route deltas).
+            # These are computed before the chunk to match vlm_features timing.
+            _expert_route_wps_for_video: Optional[np.ndarray] = None
+            if current_expert_action_40d is not None and not np.allclose(current_expert_action_40d, 0.0):
+                try:
+                    _ec = current_expert_action_40d.reshape(10, 4)
+                    _expert_route_wps_for_video = np.cumsum(_ec[:, 2:4], axis=0)  # (10, 2) ego-frame
+                except Exception:
+                    pass
+
+            # Expert intervention debug: precompute expert action for this chunk.
+            _in_expert_recovery = FLAGS.expert_recover_debug and (episode_steps >= _expert_recover_budget)
+            _expert_debug_action: Optional[np.ndarray] = None
+            if (FLAGS.expert_debug or _in_expert_recovery) and current_expert_action_40d is not None:
+                if not np.allclose(current_expert_action_40d, 0.0):
+                    try:
+                        _expert_debug_action = np.clip(
+                            _expert_action_to_accel_steer(current_expert_action_40d, simlingo_base, chunk_start_speed),
+                            -1.0, 1.0,
+                        ).astype(np.float32)
+                    except Exception:
+                        pass
+
+            chunk_reward = 0.0
+            chunk_env_reward = 0.0
+            done = False
+            info: Dict[str, Any] = {}
+            t_step_start = time.time()
+            for k in range(chunk_size):
+                for _tick in range(ticks_per_wp):
+                    actual_speed = float(obs["state"][15])
+                    base_accel = simlingo_base.accel_for_desired_speed(desired_speeds[k], actual_speed)
+                    base_steer = simlingo_base.steer_for_speed(actual_speed)
+                    base_action = np.array([base_accel, base_steer], dtype=np.float32)
+                    if _expert_debug_action is not None:
+                        final_action = _expert_debug_action
+                    else:
+                        final_action = np.clip(
+                            base_action + FLAGS.res_scale * residual_action, -1.0, 1.0
+                        ).astype(np.float32)
+                    image_for_video = obs["simlingo_image"]
+                    target_points_for_video = obs.get("target_points")
+                    next_obs, reward, terminated, truncated, info = env.step(final_action)
+                    env_reward = float(reward)
+                    last_env_reward = env_reward
+                    last_actual_speed = actual_speed
+                    last_base_action = base_action
+                    last_final_action = final_action
+                    last_step_info = dict(info)
+                    last_drive_metrics = _ego_drive_metrics_from_state_vec(next_obs["state"])
+                    collision_count = int(info.get("collision_count", 0))
+                    last_collision_delta = max(0, collision_count - prev_collision_count)
+                    episode_collision_count = max(episode_collision_count, collision_count)
+                    episode_collision_events += last_collision_delta
+                    prev_collision_count = collision_count
+                    annotated = _annotate_frame(
+                        image_for_video,
+                        simlingo_base,
+                        target_points_for_video,
+                        actual_speed,
+                        base_action,
+                        residual_action,
+                        reward_value=float(reward),
+                        env_reward_value=env_reward,
+                        info=info,
+                        collision_events=last_collision_delta,
+                        expert_waypoints=_expert_route_wps_for_video,
+                        expert_action_2d=last_expert_action_2d if not np.allclose(last_expert_action_2d, 0.0) else None,
+                    )
+                    _write_frame(video, image_for_video, annotated)
+                    chunk_reward += reward
+                    chunk_env_reward += env_reward
+                    done = terminated or truncated
+                    obs = next_obs
+                    if done:
+                        break
+                if done:
+                    break
+            t_step_end = time.time()
+
+            # ── Compute expert action for the current state ───────────────────
+            # current_expert_action_40d was captured at the beginning of this step,
+            # matching vlm_features (both from state s before the chunk).
+            # chunk_start_speed and chunk_start_base_action align with that same state.
+            expert_action_2d: Optional[np.ndarray] = None
+            if current_expert_action_40d is not None:
+                ea_40d = current_expert_action_40d
+                if not np.allclose(ea_40d, 0.0):
+                    try:
+                        ea_2d = _expert_action_to_accel_steer(ea_40d, simlingo_base, chunk_start_speed)
+                        last_expert_action_2d = ea_2d
+                        last_expert_residual_target = np.clip(
+                            (ea_2d - chunk_start_base_action) / max(FLAGS.res_scale, 1e-6), -1.0, 1.0
+                        ).astype(np.float32)
+                        expert_action_2d = ea_2d
+                    except Exception as _ex:
+                        print(f"[dagger] expert action conversion failed: {_ex}", flush=True)
+
+            # ── Next VLM call ─────────────────────────────────────────────────
+            t_vlm_start = time.time()
+            next_desired_speeds, _next_route_interp, next_vlm_features = simlingo_base.get_chunk_and_features(
+                simlingo_image=obs["simlingo_image"],
+                ego_state=obs["state"],
+                target_points=obs["target_points"],
+                routing_command=obs.get("routing_command", ""),
+            )
+            t_vlm_end = time.time()
+
+            # ── Buffer add ────────────────────────────────────────────────────
+            if expert_action_2d is not None:
+                buffer.add(vlm_features, chunk_start_base_action, expert_action_2d)
+
+            episode_reward += chunk_reward
+            episode_env_reward += chunk_env_reward
+            episode_steps += 1
+
+            # ── BC updates ────────────────────────────────────────────────────
+            t_update_start = time.time()
+            if len(buffer) >= FLAGS.learning_starts and not in_warmup:
+                for _ in range(FLAGS.updates_per_step):
+                    batch = buffer.sample(FLAGS.batch_size, torch.device(FLAGS.device))
+                    last_bc_metrics = agent.bc_update(batch, res_scale=FLAGS.res_scale)
+                    total_updates += 1
+            t_update_end = time.time()
+            last_update_time = t_update_end - t_update_start
+
+            # ── Per-step W&B logging ──────────────────────────────────────────
+            if global_step % FLAGS.log_interval == 0:
+                step_log: Dict[str, Any] = {
+                    "time/steps_per_sec": FLAGS.log_interval / max(time.time() - last_log_time, 1e-6),
+                    "time/global_step": global_step,
+                    "time/sample_time": t_sample_end - t_sample_start,
+                    "time/step_time": t_step_end - t_step_start,
+                    "time/vlm_time": t_vlm_end - t_vlm_start,
+                    "time/update_time": last_update_time,
+                    "training/in_warmup": float(in_warmup),
+                    "training/buffer_size": len(buffer),
+                    "training/total_updates": total_updates,
+                    "reward/env_step": float(last_env_reward),
+                    "reward/chunk_env": float(chunk_env_reward),
+                    "rollout/current_episode_reward": float(episode_reward),
+                    "rollout/current_episode_env_return": float(episode_env_reward),
+                    "rollout/current_episode_steps": float(episode_steps),
+                    "rollout/actual_speed": float(last_actual_speed),
+                    "rollout/collision_count": float(last_step_info.get("collision_count", 0)),
+                    "rollout/collision_events": float(last_collision_delta),
+                    "rollout/episode_collision_events": float(episode_collision_events),
+                    "action/base_accel": float(last_base_action[0]),
+                    "action/base_steer": float(last_base_action[1]),
+                    "action/actor_accel": float(last_actor_output[0]),
+                    "action/actor_steer": float(last_actor_output[1]),
+                    "action/final_accel": float(last_final_action[0]),
+                    "action/final_steer": float(last_final_action[1]),
+                    "action/res_scale": float(FLAGS.res_scale),
+                    "action/residual_clip_limit": float(dagger_clip_limit),
+                    "dagger/expert_accel": float(last_expert_action_2d[0]),
+                    "dagger/expert_steer": float(last_expert_action_2d[1]),
+                    "dagger/expert_residual_accel": float(last_expert_residual_target[0]),
+                    "dagger/expert_residual_steer": float(last_expert_residual_target[1]),
+                    "dagger/expert_valid": float(expert_action_2d is not None),
+                    "dagger/buffer_size": len(buffer),
+                    "dagger/total_updates": total_updates,
+                    "dagger/bc_loss": float(last_bc_metrics.get("bc_loss", float("nan"))),
+                    "dagger/base_mse": float(last_bc_metrics.get("base_mse", float("nan"))),
+                    "dagger/residual_abs_mean": float(last_bc_metrics.get("residual_abs_mean", float("nan"))),
+                    "dagger/residual_abs_max": float(last_bc_metrics.get("residual_abs_max", float("nan"))),
+                    "simlingo/desired_speed_first": float(desired_speeds[0]),
+                    "simlingo/desired_speed_mean": float(np.mean(desired_speeds)),
+                    "simlingo/vlm_feature_norm": float(np.linalg.norm(vlm_features)),
+                }
+                step_log.update({f"rollout/{k}": float(v) for k, v in last_drive_metrics.items()})
+                if last_step_info.get("reward_total") is not None:
+                    step_log.update({
+                        "reward/env_total": float(last_step_info.get("reward_total", 0.0)),
+                        "reward/progress": float(last_step_info.get("reward_progress", 0.0)),
+                        "reward/penalty_collision": float(last_step_info.get("penalty_collision", 0.0)),
+                        "reward/penalty_outside_route": float(last_step_info.get("penalty_outside_route", 0.0)),
+                        "rollout/lane_offset_m": float(last_step_info.get("lane_offset_m", 0.0)),
+                        "rollout/speed_norm": float(last_step_info.get("speed_norm", 0.0)),
+                    })
+                wandb.log(step_log, step=global_step)
+                last_log_time = time.time()
+
+            # ── Episode end ───────────────────────────────────────────────────
+            if done:
+                num_episodes += 1
+                elapsed = time.time() - t0
+                log_entry = {
+                    "global_step": global_step,
+                    "episode": num_episodes,
+                    "episode_reward": episode_reward,
+                    "episode_env_reward": episode_env_reward,
+                    "episode_steps": episode_steps,
+                    "success": info.get("success", False),
+                    "collision_count": info.get("collision_count", 0),
+                    "collision_events": episode_collision_events,
+                    "elapsed_s": elapsed,
+                }
+                print(
+                    f"[step {global_step}] ep={num_episodes}  "
+                    f"R={episode_reward:.2f}  steps={episode_steps}  "
+                    f"success={info.get('success', False)}  "
+                    f"bc_updates={total_updates}",
+                    flush=True,
+                )
+                log_file.write(json.dumps(log_entry) + "\n")
+                log_file.flush()
+
+                ep_log: Dict[str, Any] = {
+                    "rollout/episode_reward": episode_reward,
+                    "rollout/episode_env_reward": episode_env_reward,
+                    "rollout/episode_return": episode_reward,
+                    "rollout/episode_env_return": episode_env_reward,
+                    "rollout/episode_steps": episode_steps,
+                    "rollout/success": float(info.get("success", False)),
+                    "rollout/collision_count": float(info.get("collision_count", 0)),
+                    "rollout/episode_collision_events": float(episode_collision_events),
+                    "rollout/outside_route": float(info.get("outside_route_value", 0.0)),
+                    "rollout/num_episodes": num_episodes,
+                }
+                if _frame_buffer and FLAGS.video_log_interval > 0 and num_episodes % FLAGS.video_log_interval == 0:
+                    frames_np = np.stack(_frame_buffer)
+                    ep_log["rollout/episode_video"] = wandb.Video(
+                        frames_np.transpose(0, 3, 1, 2), fps=20, format="mp4"
+                    )
+                wandb.log(ep_log, step=global_step)
+
+                _close_video(video)
+                obs, _ = env.reset()
+                simlingo_base.reset_pid()
+                episode_reward = 0.0
+                episode_env_reward = 0.0
+                episode_steps = 0
+                episode_collision_count = 0
+                episode_collision_events = 0
+                prev_collision_count = 0
+                if FLAGS.expert_recover_debug:
+                    _expert_recover_budget = int(np.random.randint(70, 201))
+                    print(f"[expert_recover_debug] episode {num_episodes}: SimLingo for {_expert_recover_budget} ticks then expert", flush=True)
+                video = _open_video(num_episodes)
+                desired_speeds, _route_interp, vlm_features = simlingo_base.get_chunk_and_features(
+                    simlingo_image=obs["simlingo_image"],
+                    ego_state=obs["state"],
+                    target_points=obs["target_points"],
+                    routing_command=obs.get("routing_command", ""),
+                )
+                current_expert_action_40d = obs.get("expert_action")
+            else:
+                desired_speeds = next_desired_speeds
+                vlm_features = next_vlm_features
+                # Advance expert action: use the expert from the new obs (next state)
+                current_expert_action_40d = obs.get("expert_action")
+
+            if global_step > 0 and global_step % FLAGS.save_interval == 0:
+                ckpt_path = str(save_dir / f"dagger_residual_{global_step}.pt")
+                agent.save(ckpt_path)
+                print(f"[step {global_step}] Saved checkpoint to {ckpt_path}", flush=True)
+
+        _close_video(video)
+        final_path = str(save_dir / "dagger_residual_final.pt")
+        agent.save(final_path)
+        log_file.close()
+        wandb.finish()
+        env.close()
+        print(f"\n[train/dagger] Done. Final checkpoint at {final_path}", flush=True)
+        return
+
     # ── Residual SAC training ─────────────────────────────────────────────────
     from torch_agents.residual_sac import ResidualSACAgent, ReplayBuffer  # type: ignore
     import torch
@@ -647,10 +1092,12 @@ def main(_argv):
         t_sample_start = time.time()
         # ── Rollout: execute chunk_size waypoints, ticks_per_wp ticks each ───
         in_warmup = global_step < FLAGS.warmup_steps
+        sac_clip_limit = _residual_clip_limit(global_step, FLAGS.warmup_steps, FLAGS.residual_clip_schedule_steps)
         if in_warmup:
             residual_action = np.zeros(2, dtype=np.float32)
         else:
             residual_action = agent.sample_actions(vlm_features)
+            residual_action = np.clip(residual_action, -sac_clip_limit, sac_clip_limit)
         t_sample_end = time.time()
 
         chunk_reward = 0.0
@@ -772,6 +1219,7 @@ def main(_argv):
                 "action/final_accel": float(last_final_action[0]),
                 "action/final_steer": float(last_final_action[1]),
                 "action/res_scale": float(FLAGS.res_scale),
+                "action/residual_clip_limit": float(sac_clip_limit),
                 "simlingo/desired_speed_first": float(desired_speeds[0]),
                 "simlingo/desired_speed_mean": float(np.mean(desired_speeds)),
                 "simlingo/desired_speed_min": float(np.min(desired_speeds)),

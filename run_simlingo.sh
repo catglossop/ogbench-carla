@@ -43,7 +43,7 @@ cd "$ROOT_DIR"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 SIMLINGO_CKPT="/home/celinet/simlingo_checkpoints/simlingo/checkpoints/epoch=013.ckpt"
-POLICY_MODE="single"
+POLICY_MODE="hierarchical"
 HIGH_LEVEL_CKPT="/home/celinet/ogbench-carla/simlingo_checkpoints/2026_05_24_06_52_33_simlingo_seed1_bellman/checkpoints/epoch=013.ckpt"
 LOW_LEVEL_CKPT="/home/celinet/ogbench-carla/simlingo_checkpoints/2026_05_23_21_39_41_simlingo_ll_vla_meta_conditioned/checkpoints/epoch=029.ckpt"
 HIGH_LEVEL_HYDRA_CONFIG=""
@@ -71,8 +71,11 @@ SAVE_INTERVAL="2000"
 DEVICE="cuda"
 CARLA_CFG="impls/configs/carla_config.yaml"
 SIMLINGO_PYTHON="/home/celinet/miniconda3/envs/simlingo/bin/python"
+TRAINING_MODE="sac_residual"
 EVAL_ONLY="false"
 DEBUG_NEG_SPEED="false"
+EXPERT_DEBUG="false"
+EXPERT_RECOVER_DEBUG="false"
 SAVE_VIDEO="true"
 DRY_RUN="false"
 TRAIN_GPU=""          # empty = preserve inherited CUDA_VISIBLE_DEVICES
@@ -92,8 +95,11 @@ Usage: bash run_simlingo.sh [options] [-- extra args passed to main_carla_simlin
 
 Mode:
   --eval-only               Run base policy only, no SAC training
+  --training-mode MODE      sac_residual|dagger_residual. Default: sac_residual
   --policy-mode MODE        single|hierarchical. Default: single
   --debug-neg-speed         Replace reward with -speed (m/s) — SAC should brake
+  --expert-debug            Drive with CARLA expert action instead of base+residual (dagger_residual only)
+  --expert-recover-debug    Run SimLingo for a random [70,200] ticks per episode, then switch to expert
 
 Routing / environment:
   --route NAME              Bench2Drive route (scenario name, file basename, or route id)
@@ -180,8 +186,11 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --eval-only)           EVAL_ONLY="true"; shift ;;
+    --training-mode|--training_mode) TRAINING_MODE="$2"; shift 2 ;;
     --policy-mode)         POLICY_MODE="$2"; shift 2 ;;
     --debug-neg-speed)     DEBUG_NEG_SPEED="true"; shift ;;
+    --expert-debug)        EXPERT_DEBUG="true"; shift ;;
+    --expert-recover-debug) EXPERT_RECOVER_DEBUG="true"; shift ;;
     --route)               ROUTE="$2"; shift 2 ;;
     --carla-config)        CARLA_CFG="$2"; shift 2 ;;
     --checkpoint)          SIMLINGO_CKPT="$2"; shift 2 ;;
@@ -378,6 +387,7 @@ fi
 if [[ "$EVAL_ONLY" == "true" ]]; then
   ARGS+=(--eval_only)
 else
+  ARGS+=(--training_mode="$TRAINING_MODE")
   ARGS+=(
     --total_steps="$STEPS"
     --warmup_steps="$WARMUP"
@@ -396,9 +406,17 @@ if [[ "$DEBUG_NEG_SPEED" == "true" ]]; then
   ARGS+=(--debug_neg_speed_reward)
 fi
 
+if [[ "$EXPERT_DEBUG" == "true" ]]; then
+  ARGS+=(--expert_debug)
+fi
+
+if [[ "$EXPERT_RECOVER_DEBUG" == "true" ]]; then
+  ARGS+=(--expert_recover_debug)
+fi
+
 ARGS+=("${EXTRA_ARGS[@]}")
 
-echo "[run_simlingo.sh] route=$ROUTE  eval_only=$EVAL_ONLY  policy_mode=$POLICY_MODE  debug_neg_speed=$DEBUG_NEG_SPEED"
+echo "[run_simlingo.sh] route=$ROUTE  eval_only=$EVAL_ONLY  training_mode=$TRAINING_MODE  policy_mode=$POLICY_MODE  debug_neg_speed=$DEBUG_NEG_SPEED  expert_debug=$EXPERT_DEBUG  expert_recover_debug=$EXPERT_RECOVER_DEBUG"
 echo "[run_simlingo.sh] steps=$STEPS  warmup=$WARMUP  chunk_size=$CHUNK_SIZE  res_scale=$RES_SCALE"
 echo "[run_simlingo.sh] wandb_mode=$WANDB_MODE  run_group=$RUN_GROUP"
 echo "[run_simlingo.sh] checkpoint=$SIMLINGO_CKPT"

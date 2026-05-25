@@ -88,12 +88,14 @@ def _obs_to_wire(obs: Dict[str, Any]) -> Dict[str, Any]:
     img = np.ascontiguousarray(obs["simlingo_image"])  # ensure C-contiguous uint8
     img_b64 = base64.b64encode(img.tobytes()).decode("ascii")
     tp = obs.get("target_points")
+    expert_action = obs.get("expert_action")
     return {
         "state": obs["state"].tolist(),
         "simlingo_image_b64": img_b64,
         "simlingo_image_shape": list(img.shape),
         "routing_command": obs["routing_command"],
         "target_points": tp.tolist() if tp is not None else [[0.0, 0.0], [0.0, 0.0]],
+        "expert_action": expert_action.tolist() if expert_action is not None else None,
     }
 
 

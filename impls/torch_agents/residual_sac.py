@@ -162,6 +162,42 @@ class ReplayBuffer:
         return self._size
 
 
+class DaggerBuffer:
+    """Ring buffer for DAgger BC training: stores (vlm_features, base_action, expert_action) triples.
+
+    base_action and expert_action are both in the environment's (accel, steer) space so
+    that the BC loss can be computed as MSE(clip(base + res_scale * tanh(mean), -1, 1), expert).
+    """
+
+    def __init__(self, capacity: int, vlm_dim: int = VLM_FEATURE_DIM, action_dim: int = ACTION_DIM):
+        self.capacity = capacity
+        self.vlm_dim = vlm_dim
+        self.action_dim = action_dim
+        self._obs = np.zeros((capacity, vlm_dim), dtype=np.float32)
+        self._base_actions = np.zeros((capacity, action_dim), dtype=np.float32)
+        self._expert_actions = np.zeros((capacity, action_dim), dtype=np.float32)
+        self._ptr = 0
+        self._size = 0
+
+    def add(self, obs: np.ndarray, base_action: np.ndarray, expert_action: np.ndarray) -> None:
+        self._obs[self._ptr] = obs
+        self._base_actions[self._ptr] = base_action
+        self._expert_actions[self._ptr] = expert_action
+        self._ptr = (self._ptr + 1) % self.capacity
+        self._size = min(self._size + 1, self.capacity)
+
+    def sample(self, batch_size: int, device: torch.device) -> Dict[str, torch.Tensor]:
+        idx = np.random.randint(0, self._size, size=batch_size)
+        return {
+            "obs": torch.from_numpy(self._obs[idx]).to(device),
+            "base_actions": torch.from_numpy(self._base_actions[idx]).to(device),
+            "expert_actions": torch.from_numpy(self._expert_actions[idx]).to(device),
+        }
+
+    def __len__(self) -> int:
+        return self._size
+
+
 # ── SAC agent ─────────────────────────────────────────────────────────────────
 
 class ResidualSACAgent:
@@ -283,6 +319,41 @@ class ResidualSACAgent:
             "alpha": float(self.alpha),
             "entropy": float(-log_probs.mean()),
             "q_mean": float(min_q_pi.mean()),
+        }
+
+    # ── DAgger BC update ──────────────────────────────────────────────────────
+
+    def bc_update(self, batch: Dict[str, torch.Tensor], res_scale: float = 0.1) -> Dict[str, float]:
+        """DAgger residual BC update.
+
+        Loss: MSE(clip(base + res_scale * tanh(mean), -1, 1), expert_action).
+        Matches the celine-branch formulation: gradient is on the final action,
+        not on the residual directly, so the loss correctly weights corrections
+        relative to what the base policy already contributes.
+        """
+        obs = batch["obs"]
+        base_actions = batch["base_actions"]
+        expert_actions = batch["expert_actions"]
+
+        mean, _ = self.actor(obs)
+        residual = torch.tanh(mean)
+        predicted = torch.clamp(base_actions + res_scale * residual, -1.0, 1.0)
+        bc_loss = F.mse_loss(predicted, expert_actions)
+
+        self.actor_opt.zero_grad()
+        bc_loss.backward()
+        self.actor_opt.step()
+
+        with torch.no_grad():
+            base_mse = F.mse_loss(base_actions, expert_actions)
+
+        return {
+            "bc_loss": float(bc_loss),
+            "base_mse": float(base_mse),
+            "residual_accel_mean": float(residual[:, 0].mean()),
+            "residual_steer_mean": float(residual[:, 1].mean()),
+            "residual_abs_mean": float(residual.abs().mean()),
+            "residual_abs_max": float(residual.abs().max()),
         }
 
     # ── Checkpointing ─────────────────────────────────────────────────────────
