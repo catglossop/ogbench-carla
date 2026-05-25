@@ -1445,7 +1445,10 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._prev_collision_count = collision_count
         self._prev_outside_route_value = outside_route_value
 
-        collision_pen = self._collision_event_penalty * float(collision_delta)
+        # Continuous collision penalty: apply every step while bounding boxes overlap,
+        collision_contact_active = self._active_actor_collision_contact()
+        collision_penalty_active = collision_contact_active or (collision_delta > 0)
+        collision_pen = self._collision_event_penalty if collision_penalty_active else 0.0
         outside_route_pen = self._outside_route_event_penalty * float(outside_route_delta)
         reward += collision_pen + outside_route_pen
 
@@ -1453,6 +1456,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         info["collision_count"] = collision_count
         info["route_progress_pct"] = self._route_completion_pct()
         info["crash_stuck_ticks"] = self._crash_stuck_ticks
+        info["collision_penalty_active"] = bool(collision_penalty_active)
+        info["collision_contact_active"] = bool(collision_contact_active)
         info["outside_route_value"] = outside_route_value
         info["collision_delta"] = float(collision_delta)
         info["outside_route_delta"] = float(outside_route_delta)
@@ -1777,6 +1782,111 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             # spawning a new server.  Calling setup() after JAX is initialized
             # triggers subprocess.Popen (Xvfb + CarlaUE4.sh), which forks while
             # JAX threads are live and can corrupt the msgpack RPC connection.
+
+
+    @staticmethod
+    def _bbox_at_prediction_step(actor: carla.Actor, step_seconds: float) -> Optional[carla.BoundingBox]:
+        try:
+            transform = actor.get_transform()
+            bbox = actor.bounding_box
+            velocity = actor.get_velocity()
+            angular_velocity = actor.get_angular_velocity()
+            transform.location = carla.Location(
+                x=float(transform.location.x + velocity.x * step_seconds),
+                y=float(transform.location.y + velocity.y * step_seconds),
+                z=float(transform.location.z + velocity.z * step_seconds),
+            )
+            transform.rotation = carla.Rotation(
+                pitch=float(transform.rotation.pitch + angular_velocity.x * step_seconds),
+                yaw=float(transform.rotation.yaw + angular_velocity.z * step_seconds),
+                roll=float(transform.rotation.roll + angular_velocity.y * step_seconds),
+            )
+            world_bbox = carla.BoundingBox(transform.transform(bbox.location), bbox.extent)
+            world_bbox.rotation = transform.rotation
+            return world_bbox
+        except Exception:
+            return None
+
+    @staticmethod
+    def _dot_product(vec1, vec2) -> float:
+        return float(vec1.x * vec2.x + vec1.y * vec2.y + vec1.z * vec2.z)
+
+    @staticmethod
+    def _cross_product(vec1, vec2):
+        return carla.Vector3D(
+            x=vec1.y * vec2.z - vec1.z * vec2.y,
+            y=vec1.z * vec2.x - vec1.x * vec2.z,
+            z=vec1.x * vec2.y - vec1.y * vec2.x,
+        )
+
+    @classmethod
+    def _has_separating_plane(cls, rel_pos, plane_normal, obb1, obb2) -> bool:
+        projection_distance = abs(cls._dot_product(rel_pos, plane_normal))
+        obb1_projection = (
+            abs(cls._dot_product(obb1.rotation.get_forward_vector() * obb1.extent.x, plane_normal))
+            + abs(cls._dot_product(obb1.rotation.get_right_vector() * obb1.extent.y, plane_normal))
+            + abs(cls._dot_product(obb1.rotation.get_up_vector() * obb1.extent.z, plane_normal))
+        )
+        obb2_projection = (
+            abs(cls._dot_product(obb2.rotation.get_forward_vector() * obb2.extent.x, plane_normal))
+            + abs(cls._dot_product(obb2.rotation.get_right_vector() * obb2.extent.y, plane_normal))
+            + abs(cls._dot_product(obb2.rotation.get_up_vector() * obb2.extent.z, plane_normal))
+        )
+        return projection_distance > obb1_projection + obb2_projection
+
+    @classmethod
+    def _obb_intersects(cls, obb1, obb2) -> bool:
+        rel_pos = obb2.location - obb1.location
+        axes = [
+            obb1.rotation.get_forward_vector(),
+            obb1.rotation.get_right_vector(),
+            obb1.rotation.get_up_vector(),
+            obb2.rotation.get_forward_vector(),
+            obb2.rotation.get_right_vector(),
+            obb2.rotation.get_up_vector(),
+        ]
+        axes.extend(
+            [
+                cls._cross_product(a1, a2)
+                for a1 in axes[:3]
+                for a2 in axes[3:]
+            ]
+        )
+        for axis in axes:
+            if abs(axis.x) < 1e-6 and abs(axis.y) < 1e-6 and abs(axis.z) < 1e-6:
+                continue
+            if cls._has_separating_plane(rel_pos, axis, obb1, obb2):
+                return False
+        return True
+
+    def _active_actor_collision_contact(self) -> bool:
+        """Return True if the ego bounding box currently overlaps any other actor."""
+        ego = self._ego_actor()
+        if ego is None:
+            return False
+        ego_bbox = self._bbox_at_prediction_step(ego, 0.0)
+        if ego_bbox is None:
+            return False
+        try:
+            actors = self.evaluator.world.get_actors()
+        except Exception:
+            return False
+        # Only check vehicles and walkers.
+        relevant_actors = [
+            actor
+            for actor in actors
+            if actor.id != ego.id and actor.is_alive and (
+                "vehicle" in actor.type_id
+                or "walker" in actor.type_id
+            )
+        ]
+        for actor in relevant_actors:
+            actor_bbox = self._bbox_at_prediction_step(actor, 0.0)
+            if actor_bbox is None:
+                continue
+            if self._obb_intersects(ego_bbox, actor_bbox):
+                return True
+        return False
 
     def render(self):
         """Placeholder frame for evaluation video paths (avoid NotImplementedError)."""
