@@ -116,8 +116,8 @@ flags.DEFINE_bool(
     "then switch to the PDM-Lite expert for the remainder of the episode.",
 )
 
-# flags.DEFINE_string("save_dir", "/raid/users/celine/carla_exps", "Save directory.")
-flags.DEFINE_string("save_dir", "/home/carla/exps", "Save directory.")
+flags.DEFINE_string("save_dir", "/raid/users/celine/carla_exps", "Save directory.")
+# flags.DEFINE_string("save_dir", "/home/carla/exps", "Save directory.")
 flags.DEFINE_string("restore_path", None, "Restore path for JAX agents.")
 flags.DEFINE_integer("restore_epoch", None, "Restore epoch.")
 
@@ -197,11 +197,12 @@ def _configure_jax_training_device(training_gpu_rank: int) -> None:
             flush=True,
         )
         return
-    if training_gpu_rank >= len(devs):
+    dev = next((d for d in devs if d.id == training_gpu_rank), None)
+    if dev is None:
+        ids = [d.id for d in devs]
         raise ValueError(
-            f"training_gpu_rank={training_gpu_rank} invalid: only {len(devs)} JAX GPU(s) visible: {devs}"
+            f"training_gpu_rank={training_gpu_rank} not found in JAX GPU IDs {ids}: {devs}"
         )
-    dev = devs[training_gpu_rank]
     jax.config.update("jax_default_device", dev)
     print(
         f"[main_carla] JAX default device -> {dev} (training_gpu_rank={training_gpu_rank})",
@@ -562,6 +563,17 @@ def run_online_carla(
     # Create replay buffer
     buffer = ReplayBuffer.create(example_transition, size=capacity)
     _buffer_keys = frozenset(example_transition.keys())
+
+    # Success buffer: stores transitions from successful episodes for OGPO+ BC loss.
+    # Only created when agent_config has a positive succ_buffer_capacity.
+    _succ_capacity = int(agent_config.get("succ_buffer_capacity", 0))
+    _succ_buffer: ReplayBuffer | None = (
+        ReplayBuffer.create(example_transition, size=_succ_capacity) if _succ_capacity > 0 else None
+    )
+    _use_succ_buffer = _succ_buffer is not None and agent_config.get("agent_name") == "ogpo"
+    _episode_buf_indices: list[int] = []
+    if _use_succ_buffer:
+        print(f"[main_carla] OGPO success buffer enabled (capacity={_succ_capacity})", flush=True)
 
     def _buffer_transition(raw_obs: dict, next_raw_obs: dict, **core) -> dict[str, np.ndarray]:
         """Build a transition dict whose keys match the replay buffer schema exactly."""
@@ -1037,6 +1049,8 @@ def run_online_carla(
             )
         )
         _last_buf_idx = int(buf_idx)
+        if _use_succ_buffer:
+            _episode_buf_indices.append(int(buf_idx))
         t_step_end = time.time()
         
         t_log_start = time.time()
@@ -1158,6 +1172,18 @@ def run_online_carla(
                 reset_vla_cache = getattr(getattr(agent, "vla_sample_fn", None), "reset_action_cache", None)
                 if reset_vla_cache is not None:
                     reset_vla_cache()
+            # Populate success buffer from this episode's transitions.
+            if _use_succ_buffer and done_info.get("success", False) and _episode_buf_indices:
+                for idx in _episode_buf_indices:
+                    t = {k: buffer._dict[k][idx] for k in buffer._dict}
+                    _succ_buffer.add_transition(t)
+                print(
+                    f"[main_carla] success buffer: +{len(_episode_buf_indices)} transitions "
+                    f"(total={_succ_buffer.size})",
+                    flush=True,
+                )
+            _episode_buf_indices = []
+
             obs_raw, _info = env.reset(seed=FLAGS.seed + episode_count)
             if raw_obs_holder is not None:
                 raw_obs_holder["obs"] = obs_raw
@@ -1263,12 +1289,17 @@ def run_online_carla(
                 t_update_start = time.time()
                 use_vla_update = getattr(agent, "vla_sample_fn", None) is not None
                 batch = buffer.sample(batch_size)
+                succ_batch = (
+                    _succ_buffer.sample(batch_size)
+                    if _use_succ_buffer and _succ_buffer.size >= batch_size
+                    else None
+                )
                 if _online_training_mode == "dagger":
                     _, update_info = agent.update_dagger(batch)
                 elif use_vla_update:
-                    _, update_info = agent.update_with_vla(batch)
+                    _, update_info = agent.update_with_vla(batch, succ_batch=succ_batch)
                 else:
-                    _, update_info = agent.update(batch)
+                    _, update_info = agent.update(batch, succ_batch=succ_batch)
                 _block_until_ready_tree((agent, update_info))
                 t_update_end = time.time()
                 update_times.append(t_update_end - t_update_start)
@@ -1445,11 +1476,12 @@ def main(_):
 
             agent_class = agents[config["agent_name"]]
             create_kwargs = {}
-            if config["agent_name"] == "dsrl" and vla_sample_fn is not None:
+            if config["agent_name"] in ("dsrl", "ogpo") and vla_sample_fn is not None:
                 create_kwargs["vla_sample_fn"] = vla_sample_fn
                 url = steervla_cfg.get("actor_url") if steervla_cfg else None
                 if not (url and str(url).strip()):
-                    create_kwargs["openpi_train_config"] = steervla_actor.train_cfg
+                    if config["agent_name"] == "dsrl":
+                        create_kwargs["openpi_train_config"] = steervla_actor.train_cfg
                     create_kwargs["steervla_actor"] = steervla_actor
 
             agent = agent_class.create(FLAGS.seed, ex_obs, ex_actions, config, **create_kwargs)

@@ -23,8 +23,8 @@ GIT_LFS_SKIP_SMUDGE=1 uv sync --extra all-gpu        # or --extra all-tpu
 WANDB_MODE=disabled uv run python impls/main_carla.py --list_routes=true | head -20
 
 # Online run on a single route (the canonical wrapper, handles tmp configs + GPU pinning)
-./run_carla.sh --train-gpu 2 --render-adapter 4 --carla-port 12045 \
-  --carla-streaming-port 12091 --tm-port 18019 --x-display-num 30
+# streaming-port, tm-port, and x-display-num auto-derive from carla-port (+1, +6000, formula)
+./run_carla.sh --train-gpu 2 --render-adapter 4 --carla-port 12045
 
 # Direct invocation (no wrapper)
 uv run python impls/main_carla.py \

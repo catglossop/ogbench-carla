@@ -8,3 +8,4 @@ exp/
 .idea/
 .ruff_cache/
 debug_noises/
+.run_carla/

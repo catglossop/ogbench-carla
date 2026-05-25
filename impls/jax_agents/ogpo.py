@@ -21,7 +21,8 @@ Flax module (see ``dsrl.py`` for the SteerVLA hook pattern).
 from __future__ import annotations
 
 import copy
-from typing import Any, Optional
+import time
+from typing import Any, Callable, Optional
 
 import distrax
 import flax
@@ -34,6 +35,12 @@ import optax
 from jax_agents.dsrl import CarlaObservationEncoder, Critic, FlowActor
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import MLP, default_init
+
+
+def _steervla():
+    """Deferred import: mirrors dsrl.py to avoid circular import at module load."""
+    import vlas.steervla as steervla_mod
+    return steervla_mod
 
 
 def _critic_obs_e(obs_e: jnp.ndarray, batch: dict, key: str) -> jnp.ndarray:
@@ -91,11 +98,99 @@ class OGPOAgent(flax.struct.PyTreeNode):
     rng: Any
     network: Any
     config: Any = nonpytree_field()
+    vla_sample_fn: Any = nonpytree_field()  # Optional callable: (obs, noise) -> action
+    steervla_actor: Any = nonpytree_field()  # Optional local SteerVLAActor for update_with_vla
 
     # ----- helpers -------------------------------------------------------- #
 
     def _encode_obs(self, params, observations):
         return self.network.select("obs_encoder")(observations, params=params)
+
+    @staticmethod
+    def _as_jax_pytree(x):
+        return jax.tree.map(lambda y: jnp.asarray(y), x)
+
+    def _clip_actions_to_env(self, actions: jnp.ndarray) -> jnp.ndarray:
+        """Flatten/clip VLA output to ``(B, vla_action_horizon * vla_action_dim)``."""
+        ah = int(self.config.get("vla_action_horizon", 10))
+        ad = int(self.config.get("vla_action_dim", 4))
+        flat_env = ah * ad
+        x = jnp.asarray(actions, dtype=jnp.float32)
+        if x.ndim == 3:
+            return x[:, :ah, :ad].reshape(x.shape[0], flat_env)
+        if x.ndim == 2 and x.shape[-1] == flat_env:
+            return x
+        raise ValueError(
+            f"Cannot clip actions shape {tuple(x.shape)} to env flat dim {flat_env} "
+            f"(vla_action_horizon={ah}, vla_action_dim={ad})."
+        )
+
+    def _as_noise_chunk(self, noise: jnp.ndarray) -> jnp.ndarray:
+        """Reshape flat noise ``(B, ah*ad)`` to chunk ``(B, ah, ad)`` for VLA."""
+        ah = int(self.config.get("vla_action_horizon", 10))
+        ad = int(self.config.get("vla_action_dim", 4))
+        return noise.reshape(noise.shape[0], ah, ad)
+
+    def _prepare_vla_batch(self, batch):
+        """Attach ``openpi_observation`` / ``next_openpi_observation`` to a replay batch."""
+        sv = _steervla()
+        if "openpi_state" in batch and "next_openpi_state" in batch:
+            openpi_obs = sv.openpi_observation_from_replay_batch(batch)
+            next_openpi_obs = sv.openpi_observation_from_replay_batch(batch, prefix="next_")
+            if self.steervla_actor is not None:
+                openpi_obs = self.steervla_actor.attach_replay_tokens(openpi_obs, batch)
+                next_openpi_obs = self.steervla_actor.attach_replay_tokens(
+                    next_openpi_obs, batch, prefix="next_"
+                )
+        else:
+            raw_obs = raw_next = None
+            if self.steervla_actor is not None and getattr(self.steervla_actor, "raw_obs_holder", None) is not None:
+                raw_obs = self.steervla_actor.raw_obs_holder.get("obs")
+                raw_next = self.steervla_actor.raw_obs_holder.get("next_obs")
+            openpi_obs = self.steervla_actor.build_observation_batch_numpy(
+                batch_size=batch["observations"].shape[0], raw=raw_obs
+            )
+            next_openpi_obs = self.steervla_actor.build_observation_batch_numpy(
+                batch_size=batch["next_observations"].shape[0], raw=raw_next
+            )
+            openpi_obs = sv.with_replay_cot_tokens(openpi_obs, batch)
+            next_openpi_obs = sv.with_replay_cot_tokens(next_openpi_obs, batch, prefix="next_")
+            if self.steervla_actor is not None:
+                openpi_obs = self.steervla_actor.attach_replay_tokens(openpi_obs, batch)
+                next_openpi_obs = self.steervla_actor.attach_replay_tokens(
+                    next_openpi_obs, batch, prefix="next_"
+                )
+        batch = dict(batch)
+        batch["openpi_observation"] = self._as_jax_pytree(openpi_obs)
+        batch["next_openpi_observation"] = self._as_jax_pytree(next_openpi_obs)
+        return batch
+
+    def _vla_forward(self, observations, openpi_observations, rng, noise=None):
+        """Eager VLA forward (PyTorch side); returns stop-gradient env actions."""
+        rng_n, rng_act = jax.random.split(rng)
+        if noise is None:
+            action_dim = int(self.config["action_dim"])
+            noise = (
+                jax.random.normal(rng_n, (observations.shape[0], action_dim))
+                * self.config["noise_scale"]
+            )
+        noise_chunk = self._as_noise_chunk(noise)
+        next_openpi_obs = self._as_jax_pytree(openpi_observations)
+        t0 = time.time()
+        next_actions = self.steervla_actor._sample_actions(
+            rng_act,
+            next_openpi_obs,
+            noise=noise_chunk,
+            image_keys=tuple(self.config.get("image_keys", ("base_0_rgb",))),
+            num_steps=int(self.config.get("vla_update_flow_steps", self.config.get("flow_steps", 10))),
+        )
+        next_actions = self.steervla_actor.postprocess_sampled_trajectory(
+            next_actions,
+            observation_state=next_openpi_obs.state,
+        )
+        jax.block_until_ready(next_actions)
+        print(f"[DEBUG - ogpo] _vla_forward: {time.time() - t0:.2f}s")
+        return jax.lax.stop_gradient(self._clip_actions_to_env(next_actions))
 
     def _flow_velocity(self, params, obs_e, actions, t):
         return self.network.select("flow")(obs_e, actions, t, params=params)
@@ -467,6 +562,19 @@ class OGPOAgent(flax.struct.PyTreeNode):
             actions = self._integrate_ode(params, obs_e, None, seed)
         return actions
 
+    def sample_actions_with_vla(self, observations, seed=None, temperature=1.0):
+        """Rollout via ``vla_sample_fn`` with random noise (no NoiseActor in OGPO)."""
+        if self.vla_sample_fn is None:
+            return self.sample_actions(observations, seed=seed, temperature=temperature)
+        seed = seed if seed is not None else self.rng
+        seed, noise_rng = jax.random.split(seed)
+        action_dim = int(self.config["action_dim"])
+        noise = (
+            jax.random.normal(noise_rng, (observations.shape[0], action_dim))
+            * self.config["noise_scale"]
+        )
+        return jnp.asarray(self.vla_sample_fn(observations, noise))
+
     @jax.jit
     def sample_actions_best_of_n(self, observations, seed=None, n=None):
         """Optional Best-of-N using target critic (Eq. 4.4)."""
@@ -493,15 +601,108 @@ class OGPOAgent(flax.struct.PyTreeNode):
         bidx = jnp.arange(batch)
         return flat[bidx, best_idx]
 
+    # ----- VLA update path ----------------------------------------------- #
+
+    def critic_loss_vla(self, batch, grad_params, rng, next_vla_actions):
+        """Critic TD loss with VLA-generated next-state actions as the bootstrap target."""
+        rng, agg_rng = jax.random.split(rng)
+        obs_e = self._encode_obs(grad_params, batch["observations"])
+        next_obs_e = self._encode_obs(self.network.params, batch["next_observations"])
+        next_q = self._q_target(batch, next_obs_e, next_vla_actions, agg_rng)
+        target_q = batch["rewards"] + self.config["discount"] * batch["masks"] * next_q
+        qs = self._q_all(grad_params, batch, obs_e, batch["actions"])
+        critic_loss = jnp.square(qs - target_q[None]).mean()
+        return critic_loss, {
+            "critic_loss": critic_loss,
+            "q_mean": qs.mean(),
+            "q_max": qs.max(),
+            "q_min": qs.min(),
+            "target_q": target_q.mean(),
+        }
+
+    def total_loss_vla(self, batch, grad_params, rng, next_vla_actions, succ_batch=None):
+        """total_loss variant that uses VLA next actions for the critic bootstrap."""
+        info = {}
+        rng, critic_rng, ppo_rng, score_rng, bc_rng = jax.random.split(rng, 5)
+
+        critic_loss, critic_info = self.critic_loss_vla(
+            batch, grad_params, critic_rng, next_vla_actions
+        )
+        for k, v in critic_info.items():
+            info[f"critic/{k}"] = v
+
+        ppo_loss, ppo_info = self.ppo_loss(batch, grad_params, ppo_rng)
+        for k, v in ppo_info.items():
+            info[f"actor/{k}"] = v
+
+        loss = critic_loss + ppo_loss
+
+        if self.config["train_score"]:
+            score_loss, score_info = self.score_loss(batch, grad_params, score_rng)
+            for k, v in score_info.items():
+                info[f"score/{k}"] = v
+            loss = loss + float(self.config["score_coeff"]) * score_loss
+
+        bc_coeff = float(self.config["bc_coeff"])
+        if succ_batch is not None and bc_coeff > 0.0:
+            bc_loss, bc_info = self.flow_bc_loss(succ_batch, grad_params, bc_rng)
+            for k, v in bc_info.items():
+                info[f"bc/{k}"] = v
+            loss = loss + bc_coeff * bc_loss
+
+        info["total_loss"] = loss
+        return loss, info
+
+    def update_with_vla(self, batch, succ_batch=None):
+        """Update using VLA next-state actions for the critic, PPO over local flow.
+
+        VLA forward runs eagerly (PyTorch); the jitted gradient step only sees the
+        precomputed stop-gradient ``next_vla_actions``.
+        """
+        new_rng, rng = jax.random.split(self.rng)
+        batch = self._prepare_vla_batch(batch)
+        rng, vla_rng = jax.random.split(rng)
+
+        next_vla_actions = self._vla_forward(
+            batch["next_observations"],
+            batch["next_openpi_observation"],
+            vla_rng,
+        )
+
+        def loss_fn(grad_params):
+            return self.total_loss_vla(
+                batch, grad_params, rng, next_vla_actions, succ_batch=succ_batch
+            )
+
+        new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
+        self.target_update(new_network, "critic")
+        self.ema_update(new_network, "flow", "ema_flow")
+        self.slow_ema_update(new_network)
+        return self.replace(network=new_network, rng=new_rng), info
+
     # ----- construction --------------------------------------------------- #
 
     @classmethod
-    def create(cls, seed: int, ex_observations, ex_actions, config):
+    def create(
+        cls,
+        seed: int,
+        ex_observations,
+        ex_actions,
+        config,
+        vla_sample_fn: Optional[Callable] = None,
+        steervla_actor: Any = None,
+    ):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng)
 
         obs_mode = str(config.get("observation_mode", "state"))
+        if obs_mode not in ("state", "image"):
+            raise ValueError(f"observation_mode must be 'state' or 'image', got {obs_mode!r}")
         image_encoder = str(config.get("image_encoder", "impala")).lower()
+        if image_encoder not in ("impala", "siglip"):
+            raise ValueError(f"image_encoder must be 'impala' or 'siglip', got {image_encoder!r}")
+        if obs_mode != "image" and image_encoder == "siglip":
+            raise ValueError("image_encoder='siglip' requires observation_mode='image'.")
         action_dim = int(ex_actions.shape[-1])
         config = dict(config)
         config["action_dim"] = action_dim
@@ -574,7 +775,13 @@ class OGPOAgent(flax.struct.PyTreeNode):
         if "modules_slow_flow" in network.params:
             network.params["modules_slow_flow"] = network.params["modules_flow"]
 
-        return cls(rng=rng, network=network, config=flax.core.FrozenDict(**config))
+        return cls(
+            rng=rng,
+            network=network,
+            config=flax.core.FrozenDict(**config),
+            vla_sample_fn=vla_sample_fn,
+            steervla_actor=steervla_actor,
+        )
 
 
 def get_config():

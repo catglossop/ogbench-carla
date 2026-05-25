@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-ROUTE="parking-cut-in-001"
+ROUTE=""
 ONLINE_STEPS="50000"
 SEED="0"
 RUN_GROUP="Debug"
@@ -13,19 +13,20 @@ EXPERT_DEBUG="false"
 EXPERT_RECOVER_DEBUG="false"
 WANDB_MODE="${WANDB_MODE:-online}"
 
-TRAIN_GPU_RANK="2"
-SIM_GPU_RANK="3"
+TRAIN_GPU_RANK="0"
+SIM_GPU_RANK="0"
 RENDER_ADAPTER=""
 CARLA_HOST="localhost"
 CARLA_PORT="2020"
-CARLA_STREAMING_2PORT="0"
-TM_PORT="8020"
+CARLA_STREAMING_PORT=""
+TM_PORT=""
 X_DISPLAY_NUM=""
 
-CRITIC_MODE="delta"
-TRAIN_MODE="dagger"
+CRITIC_MODE="none"
+TRAIN_MODE="rl"
+AGENT_MODE="ogpo"
 
-BASE_AGENT_CFG="impls/configs/steervla_dsrl_config.py"
+BASE_AGENT_CFG=""
 BASE_CARLA_CFG="impls/configs/carla_config.yaml"
 
 EXTRA_ARGS=()
@@ -51,9 +52,9 @@ Options:
 
   --carla-host HOST         CARLA host. Default: localhost
   --carla-port PORT         CARLA RPC port. Default: 2020
-  --carla-streaming-port P  CARLA streaming port. Default: auto (0)
-  --tm-port PORT            Traffic manager port. Default: 8020
-  --x-display-num N         Xvfb display number. Default: derived from carla port
+  --carla-streaming-port P  CARLA streaming port. Default: CARLA_PORT+1
+  --tm-port PORT            Traffic manager port. Default: CARLA_PORT+6000
+  --x-display-num N         Xvfb display number. Default: derived from CARLA_PORT
 
   --critic-mode MODE        one of:
                               none         -> no extra critic info
@@ -64,15 +65,22 @@ Options:
 
   --train-mode MODE         rl|dagger. Default: rl
 
-  --agent-config PATH       Base agent config. Default: impls/configs/steervla_dsrl_config.py
+  --agent-mode MODE         dsrl|ogpo. Default: dsrl
+                              dsrl  -> steervla_dsrl_config.py (SteerVLA + DSRL)
+                              ogpo  -> ogpo_carla_config.py    (standalone OGPO flow)
+                            Overridden by --agent-config if both are set.
+
+  --agent-config PATH       Base agent config (overrides --agent-mode).
+                            Default: derived from --agent-mode
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
   -h, --help                Show this help
 
 Examples:
   bash run_carla.sh --critic-mode delta-lang --train-gpu 0 --sim-gpu 4
-  bash run_carla.sh --route parking-cut-in-001 --carla-port 2002 --carla-streaming-port 2003 --tm-port 8002 --x-display-num 12
+  bash run_carla.sh --route parking-cut-in-001 --carla-port 2002
   bash run_carla.sh --critic-mode none --expert-debug true --save-buffer false
   bash run_carla.sh --train-mode dagger --critic-mode delta-lang
+  bash run_carla.sh --agent-mode ogpo --carla-port 2020 --train-gpu 0 --sim-gpu 4
 EOF
 }
 
@@ -96,6 +104,7 @@ while [[ $# -gt 0 ]]; do
     --x-display-num) X_DISPLAY_NUM="$2"; shift 2 ;;
     --critic-mode) CRITIC_MODE="$2"; shift 2 ;;
     --train-mode) TRAIN_MODE="$2"; shift 2 ;;
+    --agent-mode) AGENT_MODE="$2"; shift 2 ;;
     --agent-config) BASE_AGENT_CFG="$2"; shift 2 ;;
     --carla-config) BASE_CARLA_CFG="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -129,6 +138,19 @@ case "$TRAIN_MODE" in
     ;;
 esac
 
+# Resolve base agent config from --agent-mode if --agent-config was not given.
+if [[ -z "$BASE_AGENT_CFG" ]]; then
+  case "$AGENT_MODE" in
+    dsrl) BASE_AGENT_CFG="impls/configs/steervla_dsrl_config.py" ;;
+    ogpo) BASE_AGENT_CFG="impls/configs/ogpo_carla_config.py" ;;
+    *)
+      echo "Invalid --agent-mode: $AGENT_MODE" >&2
+      echo "Expected one of: dsrl, ogpo" >&2
+      exit 2
+      ;;
+  esac
+fi
+
 TMP_ROOT="$ROOT_DIR/.run_carla"
 mkdir -p "$TMP_ROOT"
 TMP_DIR="$(mktemp -d "$TMP_ROOT/run.XXXXXX")"
@@ -140,14 +162,15 @@ CARLA_CFG_TMP="$TMP_DIR/carla_config.yaml"
 BASE_AGENT_CFG_ABS="$(cd "$(dirname "$BASE_AGENT_CFG")" && pwd)/$(basename "$BASE_AGENT_CFG")"
 BASE_CARLA_CFG_ABS="$(cd "$(dirname "$BASE_CARLA_CFG")" && pwd)/$(basename "$BASE_CARLA_CFG")"
 
-if [[ -z "$X_DISPLAY_NUM" ]]; then
-  X_DISPLAY_NUM="$((10 + (CARLA_PORT % 90)))"
-fi
+CARLA_STREAMING_PORT="${CARLA_STREAMING_PORT:-$((CARLA_PORT + 1))}"
+TM_PORT="${TM_PORT:-$((CARLA_PORT + 6000))}"
+X_DISPLAY_NUM="${X_DISPLAY_NUM:-$((10 + (CARLA_PORT % 90)))}"
 
 if [[ -n "$RENDER_ADAPTER" ]]; then
   SIM_GPU_RANK="$RENDER_ADAPTER"
 fi
 
+if [[ "$AGENT_MODE" == "ogpo" ]]; then
 cat > "$AGENT_CFG_TMP" <<EOF
 from pathlib import Path
 import runpy
@@ -159,12 +182,34 @@ _BASE_GET_CONFIG = runpy.run_path(str(_BASE_PATH))["get_config"]
 def get_config():
     config = _BASE_GET_CONFIG()
     config.training_gpu_rank = ${TRAIN_GPU_RANK}
+    config.siglip_device = "cuda:${TRAIN_GPU_RANK}"
+    config.critic_feedback_mode = "${CRITIC_FEEDBACK_MODE}"
+    # grpo_num_samples, bc_coeff, etc. come from ogpo_carla_config.py base.
+    # online_training_mode is DSRL-specific; OGPO has no dagger mode.
+    if config.critic_feedback_mode == "none":
+        config.language_label_dim = 0
+    return config
+EOF
+else
+cat > "$AGENT_CFG_TMP" <<EOF
+from pathlib import Path
+import runpy
+
+_BASE_PATH = Path(r"${BASE_AGENT_CFG_ABS}")
+_BASE_GET_CONFIG = runpy.run_path(str(_BASE_PATH))["get_config"]
+
+
+def get_config():
+    config = _BASE_GET_CONFIG()
+    config.training_gpu_rank = ${TRAIN_GPU_RANK}
+    config.siglip_device = "cuda:${TRAIN_GPU_RANK}"
     config.critic_feedback_mode = "${CRITIC_FEEDBACK_MODE}"
     config.online_training_mode = "${TRAIN_MODE}"
     if config.critic_feedback_mode == "none":
         config.language_label_dim = 0
     return config
 EOF
+fi
 
 uv run python - <<EOF
 from pathlib import Path
@@ -183,7 +228,7 @@ Path(r"${CARLA_CFG_TMP}").write_text(yaml.safe_dump(cfg, sort_keys=False))
 EOF
 
 echo "[run_carla.sh] route=${ROUTE}"
-echo "[run_carla.sh] train_mode=${TRAIN_MODE}"
+echo "[run_carla.sh] agent_mode=${AGENT_MODE} train_mode=${TRAIN_MODE}"
 echo "[run_carla.sh] critic_mode=${CRITIC_FEEDBACK_MODE}"
 echo "[run_carla.sh] train_gpu_rank=${TRAIN_GPU_RANK} render_adapter=${SIM_GPU_RANK}"
 echo "[run_carla.sh] carla_host=${CARLA_HOST} carla_port=${CARLA_PORT} streaming_port=${CARLA_STREAMING_PORT} tm_port=${TM_PORT} x_display=:${X_DISPLAY_NUM}"
@@ -191,7 +236,7 @@ echo "[run_carla.sh] expert_debug=${EXPERT_DEBUG} expert_recover_debug=${EXPERT_
 echo "[run_carla.sh] temp agent config: ${AGENT_CFG_TMP}"
 echo "[run_carla.sh] temp carla config: ${CARLA_CFG_TMP}"
 
-WANDB_MODE="${WANDB_MODE}" uv run python impls/main_carla.py \
+WANDB_MODE="${WANDB_MODE}" OPENPI_DATA_HOME="/raid/users/celine/.cache/openpi" uv run python impls/main_carla.py \
   --agent="${AGENT_CFG_TMP}" \
   --carla_config="${CARLA_CFG_TMP}" \
   --route="${ROUTE}" \

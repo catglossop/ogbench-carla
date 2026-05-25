@@ -98,9 +98,10 @@ def restore_openpi_params_on_single_gpu(
     except RuntimeError:
         gpus = []
     if gpus:
-        idx = training_gpu_rank if training_gpu_rank >= 0 else 0
-        idx = min(max(idx, 0), len(gpus) - 1)
-        device = gpus[idx]
+        target_id = training_gpu_rank if training_gpu_rank >= 0 else 0
+        device = next((d for d in gpus if d.id == target_id), None)
+        if device is None:
+            device = gpus[min(max(target_id, 0), len(gpus) - 1)]
     else:
         device = jax.devices()[0]
     sharding = SingleDeviceSharding(device)
@@ -601,8 +602,10 @@ def _maybe_set_jax_default_gpu(training_gpu_rank: int) -> None:
         gpus = []
     if not gpus:
         return
-    idx = min(max(training_gpu_rank, 0), len(gpus) - 1)
-    jax.config.update("jax_default_device", gpus[idx])
+    dev = next((d for d in gpus if d.id == training_gpu_rank), None)
+    if dev is None:
+        dev = gpus[min(max(training_gpu_rank, 0), len(gpus) - 1)]
+    jax.config.update("jax_default_device", dev)
 
 
 class SteerVLAActor:
