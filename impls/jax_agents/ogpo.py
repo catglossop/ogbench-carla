@@ -44,6 +44,32 @@ def _steervla():
     return steervla_mod
 
 
+# Pi0-CoT action-expert attribute names at the top level of nnx.State.
+# Everything else (PaliGemma.llm + PaliGemma.img) is the frozen backbone.
+_VLA_ACTION_HEAD_NAMES: frozenset = frozenset(
+    ["action_in_proj", "time_mlp_in", "time_mlp_out", "action_out_proj"]
+)
+
+
+def _vla_state_split(full_state) -> tuple:
+    """Split nnx.State into (action_head_state, backbone_state) by top-level key.
+
+    Uses ``raw_mapping`` to avoid the double-wrapping that ``dict(state)``
+    produces when ``State.__getitem__`` re-wraps nested dicts in ``State``.
+    """
+    raw = full_state.raw_mapping
+    head = {k: raw[k] for k in raw if k in _VLA_ACTION_HEAD_NAMES}
+    backbone = {k: raw[k] for k in raw if k not in _VLA_ACTION_HEAD_NAMES}
+    return nnx.State(head), nnx.State(backbone)
+
+
+def _vla_merge_state(action_head_state, backbone_state) -> "nnx.State":
+    """Reconstruct full nnx.State from (action_head_state, backbone_state)."""
+    merged = dict(backbone_state.raw_mapping)
+    merged.update(action_head_state.raw_mapping)
+    return nnx.State(merged)
+
+
 def _critic_obs_e(obs_e: jnp.ndarray, batch: dict, key: str) -> jnp.ndarray:
     """Append optional language label for critic inputs (CARLA feedback modes)."""
     lang = batch.get(key)
@@ -104,10 +130,13 @@ class OGPOAgent(flax.struct.PyTreeNode):
     # VLA fine-tuning state (OGPO direct VLA PPO).  All None when VLA is frozen.
     vla_graphdef: Any = nonpytree_field()    # nnx.GraphDef — static, not a pytree
     vla_tx: Any = nonpytree_field()          # optax transform — static
-    vla_online_state: Any = None             # nnx.State pytree — live θ
-    vla_ema_state: Any = None               # nnx.State pytree — EMA θ̄
-    vla_slow_state: Any = None              # nnx.State pytree — slow θ̃ (chi2_reg)
-    vla_opt_state: Any = None              # optax optimizer state pytree
+    # Action-head-only states (action_in_proj / time_mlp_in / time_mlp_out / action_out_proj).
+    # The frozen backbone (PaliGemma) is in vla_backbone_state and never differentiated.
+    vla_online_state: Any = None             # nnx.State pytree — live θ (action head)
+    vla_ema_state: Any = None               # nnx.State pytree — EMA θ̄ (action head)
+    vla_slow_state: Any = None              # nnx.State pytree — slow θ̃ (chi2_reg, action head)
+    vla_opt_state: Any = None              # optax optimizer state (action head only)
+    vla_backbone_state: Any = None         # nnx.State pytree — frozen PaliGemma params
 
     # ----- helpers -------------------------------------------------------- #
 
@@ -211,92 +240,99 @@ class OGPOAgent(flax.struct.PyTreeNode):
 
     def _eval_vla_traj_log_probs_flat(
         self,
-        vla_state,
-        traj_gb,
-        kv_cache_gb,
-        prefix_mask_gb,
-        prefix_mask_nr_gb,
+        vla_action_head_state,
+        traj_g,
+        kv_cache,
+        prefix_mask,
+        prefix_mask_nr,
         sigma: float,
         num_steps: int,
     ):
-        """Evaluate sum of log pi(a_{k+1}|a_k,s) along `traj_gb` under `vla_state`.
+        """Evaluate sum of log pi(a_{k+1}|a_k,s) for ONE group's trajectory.
 
-        ``traj_gb`` shape ``(K+1, G*B, model_ah, model_ad)``.  Returns ``(G*B,)``
-        log-prob sums.  Differentiable w.r.t. ``vla_state`` when called inside
-        ``jax.grad`` — used for both new_log_probs (online state) and slow_log_probs
-        (constant slow EMA state).
+        ``traj_g`` shape ``(K+1, B, model_ah, model_ad)``; ``kv_cache`` is
+        B-sized (never tiled to G×B — that would OOM on a single GPU).
+        Returns ``(B,)`` log-prob sums.
+
+        Differentiable w.r.t. ``vla_action_head_state`` only — the action-expert
+        layers (``action_in_proj``, ``time_mlp_in/out``, ``action_out_proj``).
+        The frozen backbone (``vla_backbone_state``) is a closure constant; JAX
+        never computes or allocates gradients w.r.t. it, and the Adam optimizer
+        state only covers the action head (~few MB vs ~21 GB for the full model).
+        The prefix KV cache is stop-gradiented by ``compute_prefix_kv_for_ogpo``.
         """
-        import einops as _einops  # already installed; lazy to avoid top-level dep
+        import einops as _einops
         from openpi.models import pi0 as _openpi_pi0
 
-        model = nnx.merge(self.vla_graphdef, vla_state)
-        GB = traj_gb.shape[1]
-        ah = traj_gb.shape[2]
-        ad = traj_gb.shape[3]
+        # Merge live action-head params with frozen backbone to get a runnable model.
+        full_state = _vla_merge_state(vla_action_head_state, self.vla_backbone_state)
+        model = nnx.merge(self.vla_graphdef, full_state)
+        B = traj_g.shape[1]
+        ah = traj_g.shape[2]
+        ad = traj_g.shape[3]
         action_flat = ah * ad
         sigma_sq = float(sigma) ** 2
         log_norm = float(action_flat) * jnp.log(2.0 * jnp.pi * sigma_sq)
         dt = jnp.array(-1.0 / num_steps, dtype=jnp.float32)
 
+        # jax.checkpoint: recompute this step during backward instead of storing
+        # K copies of LLM activations.  Without it, scan stores K × (full LLM
+        # hidden states) = ~10 GB for K=10 steps on a Gemma-2B model.
+        @jax.checkpoint
         def step_fn(_, inputs):
             x_t, x_next, k = inputs
-            t_b = jnp.broadcast_to(jnp.array(1.0 - k / num_steps, dtype=jnp.float32), (GB,))
+            t_b = jnp.broadcast_to(jnp.array(1.0 - k / num_steps, dtype=jnp.float32), (B,))
             sfx_tok, sfx_mask, _, adarms = model._embed_action_suffix(None, x_t, t_b)
             sfx_ar = jnp.array([True] + [False] * (ah - 1))
             sfx_attn = _openpi_pi0.make_attn_mask(sfx_mask, sfx_ar)
-            a2p = _einops.repeat(prefix_mask_nr_gb, "b p -> b s p", s=sfx_tok.shape[1])
+            a2p = _einops.repeat(prefix_mask_nr, "b p -> b s p", s=sfx_tok.shape[1])
             full_mask = jnp.concatenate([a2p, sfx_attn], axis=-1)
-            pos = jnp.sum(prefix_mask_gb, axis=-1)[:, None] + jnp.cumsum(sfx_mask, axis=-1) - 1
+            pos = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(sfx_mask, axis=-1) - 1
             (_, sfx_out), _ = model.PaliGemma.llm(
                 [None, sfx_tok], mask=full_mask, positions=pos,
-                kv_cache=kv_cache_gb, adarms_cond=[None, adarms],
+                kv_cache=kv_cache, adarms_cond=[None, adarms],
             )
             v_t = model.action_out_proj(sfx_out[:, -ah:])
             mean = x_t + dt * v_t
-            diff = (x_next - mean).reshape(GB, action_flat)
+            diff = (x_next - mean).reshape(B, action_flat)
             log_p = -0.5 * (jnp.sum(diff ** 2, axis=-1) / sigma_sq + log_norm)
             return None, log_p
 
         _, log_probs_per_step = jax.lax.scan(
             step_fn, None,
-            (traj_gb[:-1], traj_gb[1:], jnp.arange(num_steps, dtype=jnp.float32)),
+            (traj_g[:-1], traj_g[1:], jnp.arange(num_steps, dtype=jnp.float32)),
         )
-        return log_probs_per_step.sum(axis=0)  # (G*B,)
+        return log_probs_per_step.sum(axis=0)  # (B,)
 
     def _vla_ppo_loss(
         self,
         vla_online_state,
-        traj_gb,
-        old_lp_gb,
-        advantages,
-        kv_cache_gb,
-        prefix_mask_gb,
-        prefix_mask_nr_gb,
+        traj_g,
+        old_lp_g,
+        adv_g,
+        kv_cache,
+        prefix_mask,
+        prefix_mask_nr,
         sigma: float,
         num_steps: int,
-        n_group: int,
-        batch_size: int,
         clip_eps: float,
     ):
-        """PPO loss over VLA denoising trajectories, differentiable w.r.t. ``vla_online_state``.
+        """PPO loss for ONE group (B samples), differentiable w.r.t. ``vla_online_state``.
 
-        All trajectory/advantage inputs are stop-gradiented from the caller.
-        ``vla_online_state`` is the sole differentiated argument.
+        The caller accumulates gradients across all G groups.  Using one group
+        at a time keeps the KV cache at B-size (no G×B tiling → no OOM).
         """
-        new_lp_gb = self._eval_vla_traj_log_probs_flat(
-            vla_online_state, traj_gb, kv_cache_gb,
-            prefix_mask_gb, prefix_mask_nr_gb, sigma, num_steps,
+        new_lp_g = self._eval_vla_traj_log_probs_flat(
+            vla_online_state, traj_g, kv_cache, prefix_mask, prefix_mask_nr, sigma, num_steps,
         )
-        new_log_probs = new_lp_gb.reshape(n_group, batch_size)
-        old_log_probs = old_lp_gb.reshape(n_group, batch_size)
-        ratio = jnp.exp(new_log_probs - old_log_probs)
-        pg1 = -advantages * ratio
-        pg2 = -advantages * jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
-        ppo_loss = jnp.maximum(pg1, pg2).mean()
-        return ppo_loss, {
-            "ppo_loss": ppo_loss,
-            "advantage_mean": advantages.mean(),
-            "approx_kl": (old_log_probs - new_log_probs).mean(),
+        ratio = jnp.exp(new_lp_g - old_lp_g)
+        pg1 = -adv_g * ratio
+        pg2 = -adv_g * jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
+        ppo_g = jnp.maximum(pg1, pg2).mean()
+        return ppo_g, {
+            "ppo_loss": ppo_g,
+            "advantage_mean": adv_g.mean(),
+            "approx_kl": (old_lp_g - new_lp_g).mean(),
             "clip_frac": (jnp.abs(ratio - 1.0) > clip_eps).mean(),
             "ratio_mean": ratio.mean(),
         }
@@ -871,8 +907,8 @@ class OGPOAgent(flax.struct.PyTreeNode):
         info.update(critic_info)
 
         if do_vla_ppo:
-            # ── 3-4. Prefix KV + G*B trajectory sampling from EMA VLA ──────── #
-            rng, kv_rng, traj_rng, ppo_rng = jax.random.split(rng, 4)
+            # ── 3. Prefix KV cache (B-sized, never tiled to G×B) ─────────────── #
+            rng, traj_rng = jax.random.split(rng)
             image_keys = tuple(self.config.get("image_keys", ("base_0_rgb",)))
             n_group = int(self.config["grpo_num_samples"])
             batch_size = batch["observations"].shape[0]
@@ -886,85 +922,114 @@ class OGPOAgent(flax.struct.PyTreeNode):
             cfg_ad = int(self.config.get("vla_action_dim", 4))
             clip_eps = float(self.config["clip_epsilon"])
 
+            # Merge EMA action head with frozen backbone for rollouts + KV cache.
+            # The backbone is never updated so it's identical in all three copies
+            # (online / ema / slow); we only maintain separate action-head copies.
+            ema_full_state = _vla_merge_state(self.vla_ema_state, self.vla_backbone_state)
+
+            # B-sized KV cache — NOT tiled to G×B.  Each group reuses this cache.
             kv_cache, prefix_mask, prefix_mask_nr = (
                 self.steervla_actor.compute_prefix_kv_for_ogpo(
-                    self.vla_graphdef, self.vla_ema_state,
+                    self.vla_graphdef, ema_full_state,
                     batch["openpi_observation"], image_keys,
                 )
             )
 
-            # Tile prefix to G*B for batched trajectory sampling
-            kv_cache_gb = jax.tree_util.tree_map(
-                lambda x: jnp.tile(x, [n_group] + [1] * (x.ndim - 1)), kv_cache
-            )
-            prefix_mask_gb = jnp.tile(prefix_mask, [n_group, 1])
-            prefix_mask_nr_gb = jnp.tile(prefix_mask_nr, [n_group, 1])
-            noise_gb = jax.random.normal(traj_rng, (n_group * batch_size, model_ah, model_ad))
-
-            # Sample G*B trajectories from EMA VLA state (all stop-gradiented)
-            traj_gb, old_lp_gb = self.steervla_actor.sample_sde_trajectory_for_ppo(
-                self.vla_graphdef, self.vla_ema_state,
-                kv_cache_gb, prefix_mask_gb, prefix_mask_nr_gb,
-                noise_gb, rng=traj_rng, sigma=sigma, num_steps=num_steps,
-            )
-            # traj_gb  : (K+1, G*B, model_ah, model_ad) — stop-grad
-            # old_lp_gb: (G*B,)                          — stop-grad
+            # ── 4. Sample G trajectories serially (one B-batch at a time) ────── #
+            g_rngs = jax.random.split(traj_rng, n_group)
+            trajs = []      # list of (K+1, B, ah, ad)
+            old_lps = []    # list of (B,)
+            for g in range(n_group):
+                noise_g = jax.random.normal(g_rngs[g], (batch_size, model_ah, model_ad))
+                traj_g, lp_g = self.steervla_actor.sample_sde_trajectory_for_ppo(
+                    self.vla_graphdef, ema_full_state,
+                    kv_cache, prefix_mask, prefix_mask_nr,
+                    noise_g, rng=g_rngs[g], sigma=sigma, num_steps=num_steps,
+                )
+                trajs.append(traj_g)
+                old_lps.append(lp_g)
 
             # ── 5a. Q-advantages from target critic ─────────────────────────── #
-            old_log_probs = old_lp_gb.reshape(n_group, batch_size)
-
-            final_env_gb = (
-                traj_gb[-1, :, :cfg_ah, :cfg_ad]
-                .reshape(n_group * batch_size, cfg_ah * cfg_ad)
-                .clip(-1.0, 1.0)
-            )
-            final_env = final_env_gb.reshape(n_group, batch_size, cfg_ah * cfg_ad)
-
             obs_e = jax.lax.stop_gradient(
                 self._encode_obs(new_network.params, batch["observations"])
             )
             critic_in_obs = _critic_obs_e(obs_e, batch, "language_label")
 
+            final_env = jnp.stack(
+                [
+                    traj[-1, :, :cfg_ah, :cfg_ad]
+                    .reshape(batch_size, cfg_ah * cfg_ad)
+                    .clip(-1.0, 1.0)
+                    for traj in trajs
+                ],
+                axis=0,
+            )  # (G, B, A_env)
+
             q_ensemble = jax.vmap(
                 lambda ag: new_network.select("target_critic")(critic_in_obs, ag)
-            )(final_env)                                 # (G, M, B)
+            )(final_env)                                  # (G, M, B)
             q_ensemble = jnp.transpose(q_ensemble, (1, 0, 2))  # (M, G, B)
             baseline = jnp.mean(q_ensemble, axis=1, keepdims=True)
             adv_ensemble = q_ensemble - baseline
-
             if self.config["conservative_advantage"]:
                 advantages = _conservative_advantage(adv_ensemble)
             else:
-                advantages = jnp.mean(adv_ensemble, axis=0)   # (G, B)
+                advantages = jnp.mean(adv_ensemble, axis=0)  # (G, B)
 
-            # ── 5b. Chi2 penalty (slow EMA policy) ──────────────────────────── #
+            # ── 5b. Chi2 penalty: slow-EMA log-probs per group ──────────────── #
             if self.config.get("chi2_reg", False) and self.vla_slow_state is not None:
-                slow_lp_gb = self._eval_vla_traj_log_probs_flat(
-                    self.vla_slow_state, traj_gb,
-                    kv_cache_gb, prefix_mask_gb, prefix_mask_nr_gb, sigma, num_steps,
-                )
-                slow_log_probs = slow_lp_gb.reshape(n_group, batch_size)
+                slow_lps = [
+                    self._eval_vla_traj_log_probs_flat(
+                        self.vla_slow_state, trajs[g],
+                        kv_cache, prefix_mask, prefix_mask_nr, sigma, num_steps,
+                    )
+                    for g in range(n_group)
+                ]
+                slow_log_probs = jnp.stack(slow_lps, axis=0)  # (G, B)
+                old_log_probs_stacked = jnp.stack(old_lps, axis=0)
                 beta = float(self.config["chi2_beta_init"]) * jnp.std(q_ensemble)
-                advantages = advantages - beta * jnp.exp(old_log_probs - slow_log_probs)
+                advantages = advantages - beta * jnp.exp(
+                    old_log_probs_stacked - slow_log_probs
+                )
 
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-            # ── 6. VLA PPO gradient step ─────────────────────────────────────── #
-            def vla_loss_fn(vla_online_state):
-                return self._vla_ppo_loss(
-                    vla_online_state, traj_gb, old_lp_gb, advantages,
-                    kv_cache_gb, prefix_mask_gb, prefix_mask_nr_gb,
-                    sigma, num_steps, n_group, batch_size, clip_eps,
+            # ── 6. Gradient accumulation: one backward pass per group ─────────── #
+            # Defining group_loss_fn ONCE (outside the loop) so JAX compiles it
+            # on the first call and reuses the cached XLA computation for the
+            # remaining G−1 groups.  Only per-group values are explicit args;
+            # kv_cache / prefix_mask / sigma / self are stable closures.
+            def group_loss_fn(state, traj_g, old_lp_g, adv_g):
+                loss, aux = self._vla_ppo_loss(
+                    state, traj_g, old_lp_g, adv_g,
+                    kv_cache, prefix_mask, prefix_mask_nr, sigma, num_steps, clip_eps,
                 )
+                return loss / n_group, aux
 
-            (_, ppo_info), grads = jax.value_and_grad(vla_loss_fn, has_aux=True)(
-                self.vla_online_state
-            )
-            jax.block_until_ready(grads)
+            grad_fn = jax.value_and_grad(group_loss_fn, has_aux=True)
+
+            total_grads = None
+            all_ppo_info = []
+            for g in range(n_group):
+                (loss_g, info_g), grads_g = grad_fn(
+                    self.vla_online_state, trajs[g], old_lps[g], advantages[g]
+                )
+                jax.block_until_ready(grads_g)
+                total_grads = (
+                    grads_g
+                    if total_grads is None
+                    else jax.tree_util.tree_map(lambda a, b: a + b, total_grads, grads_g)
+                )
+                all_ppo_info.append(info_g)
+
+            ppo_info = {
+                k: jnp.mean(jnp.stack([d[k] for d in all_ppo_info]))
+                for k in all_ppo_info[0]
+            }
             info.update({f"vla/{k}": v for k, v in ppo_info.items()})
 
             # ── 7. Apply optax update + EMA ──────────────────────────────────── #
-            updates, new_vla_opt_state = self.vla_tx.update(grads, self.vla_opt_state)
+            updates, new_vla_opt_state = self.vla_tx.update(total_grads, self.vla_opt_state)
             new_vla_online_state = optax.apply_updates(self.vla_online_state, updates)
 
             tau_ema = 1.0 - float(self.config["ema_decay"])
@@ -1102,22 +1167,27 @@ class OGPOAgent(flax.struct.PyTreeNode):
             network.params["modules_slow_flow"] = network.params["modules_flow"]
 
         # ── VLA fine-tuning state ─────────────────────────────────────────── #
-        # Initialise when a local SteerVLAActor is provided.  The graphdef is
-        # static (non-pytree); online/ema/slow states are JAX pytrees.
+        # Only the action expert layers are trained (action_in_proj, time_mlp_in,
+        # time_mlp_out, action_out_proj).  The PaliGemma backbone is frozen and
+        # stored separately as ``vla_backbone_state`` — it is never differentiated
+        # and never included in the optimizer state, saving ~21 GB of Adam m/v.
         if steervla_actor is not None and getattr(steervla_actor, "_local_ready", False):
-            vla_graphdef, vla_init_state = nnx.split(steervla_actor.model)
-            vla_online_state = vla_init_state
+            vla_graphdef, vla_init_full_state = nnx.split(steervla_actor.model)
+            # Split: action-head params (trainable) + backbone params (frozen).
+            vla_action_head_state, vla_backbone_state = _vla_state_split(vla_init_full_state)
             # Deep copy via tree_map so ema/slow start at the same weights but
             # are independent pytrees (updates don't alias online_state).
-            vla_ema_state = jax.tree_util.tree_map(lambda x: x, vla_init_state)
+            vla_online_state = vla_action_head_state
+            vla_ema_state = jax.tree_util.tree_map(lambda x: x, vla_action_head_state)
             vla_slow_state = (
-                jax.tree_util.tree_map(lambda x: x, vla_init_state)
+                jax.tree_util.tree_map(lambda x: x, vla_action_head_state)
                 if config.get("chi2_reg", False)
                 else None
             )
             vla_lr = float(config.get("vla_lr", config["lr"]))
             vla_tx = optax.adam(learning_rate=vla_lr)
-            vla_opt_state = vla_tx.init(vla_init_state)
+            # Optimizer state only for action-head (~few MB vs ~21 GB for full model).
+            vla_opt_state = vla_tx.init(vla_action_head_state)
         else:
             vla_graphdef = None
             vla_tx = None
@@ -1125,6 +1195,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
             vla_ema_state = None
             vla_slow_state = None
             vla_opt_state = None
+            vla_backbone_state = None
 
         return cls(
             rng=rng,
@@ -1138,6 +1209,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
             vla_ema_state=vla_ema_state,
             vla_slow_state=vla_slow_state,
             vla_opt_state=vla_opt_state,
+            vla_backbone_state=vla_backbone_state,
         )
 
 
