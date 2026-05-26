@@ -21,7 +21,6 @@ Flax module (see ``dsrl.py`` for the SteerVLA hook pattern).
 from __future__ import annotations
 
 import copy
-import time
 from typing import Any, Callable, Optional
 
 import distrax
@@ -222,7 +221,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
         noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
         noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(noise_chunk)
         next_openpi_obs = self._as_jax_pytree(openpi_observations)
-        t0 = time.time()
         next_actions = self.steervla_actor._sample_actions(
             rng_act,
             next_openpi_obs,
@@ -234,8 +232,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
             next_actions,
             observation_state=next_openpi_obs.state,
         )
-        jax.block_until_ready(next_actions)
-        print(f"[DEBUG - ogpo] _vla_forward: {time.time() - t0:.2f}s")
         return jax.lax.stop_gradient(self._clip_actions_to_env(next_actions))
 
     def _eval_vla_traj_log_probs_flat(
@@ -303,39 +299,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
             (traj_g[:-1], traj_g[1:], jnp.arange(num_steps, dtype=jnp.float32)),
         )
         return log_probs_per_step.sum(axis=0)  # (B,)
-
-    def _vla_ppo_loss(
-        self,
-        vla_online_state,
-        traj_g,
-        old_lp_g,
-        adv_g,
-        kv_cache,
-        prefix_mask,
-        prefix_mask_nr,
-        sigma: float,
-        num_steps: int,
-        clip_eps: float,
-    ):
-        """PPO loss for ONE group (B samples), differentiable w.r.t. ``vla_online_state``.
-
-        The caller accumulates gradients across all G groups.  Using one group
-        at a time keeps the KV cache at B-size (no G×B tiling → no OOM).
-        """
-        new_lp_g = self._eval_vla_traj_log_probs_flat(
-            vla_online_state, traj_g, kv_cache, prefix_mask, prefix_mask_nr, sigma, num_steps,
-        )
-        ratio = jnp.exp(new_lp_g - old_lp_g)
-        pg1 = -adv_g * ratio
-        pg2 = -adv_g * jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
-        ppo_g = jnp.maximum(pg1, pg2).mean()
-        return ppo_g, {
-            "ppo_loss": ppo_g,
-            "advantage_mean": adv_g.mean(),
-            "approx_kl": (old_lp_g - new_lp_g).mean(),
-            "clip_frac": (jnp.abs(ratio - 1.0) > clip_eps).mean(),
-            "ratio_mean": ratio.mean(),
-        }
 
     def _flow_velocity(self, params, obs_e, actions, t):
         return self.network.select("flow")(obs_e, actions, t, params=params)
@@ -935,19 +898,31 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 )
             )
 
-            # ── 4. Sample G trajectories serially (one B-batch at a time) ────── #
+            # ── 4. Sample G trajectories via jax.lax.scan (no Python loop) ────── #
+            # Serial over groups (one B-batch at a time) keeps kv_cache at B-size.
+            # Using scan instead of a Python for-loop means the XLA runtime executes
+            # all G iterations as one continuous GPU program — no Python dispatch
+            # gaps between groups.
             g_rngs = jax.random.split(traj_rng, n_group)
-            trajs = []      # list of (K+1, B, ah, ad)
-            old_lps = []    # list of (B,)
-            for g in range(n_group):
-                noise_g = jax.random.normal(g_rngs[g], (batch_size, model_ah, model_ad))
+            # Use per-group keys for noise to match original per-group sampling behavior.
+            all_noises = jax.vmap(
+                lambda k: jax.random.normal(k, (batch_size, model_ah, model_ad))
+            )(g_rngs)
+
+            def sample_one_group(_, noise_rng):
+                noise_g, rng_g = noise_rng
                 traj_g, lp_g = self.steervla_actor.sample_sde_trajectory_for_ppo(
                     self.vla_graphdef, ema_full_state,
                     kv_cache, prefix_mask, prefix_mask_nr,
-                    noise_g, rng=g_rngs[g], sigma=sigma, num_steps=num_steps,
+                    noise_g, rng=rng_g, sigma=sigma, num_steps=num_steps,
                 )
-                trajs.append(traj_g)
-                old_lps.append(lp_g)
+                return None, (traj_g, lp_g)
+
+            _, (trajs_stacked, old_lps_stacked) = jax.lax.scan(
+                sample_one_group, None, (all_noises, g_rngs)
+            )
+            # trajs_stacked:  (G, K+1, B, model_ah, model_ad)  stop-gradient
+            # old_lps_stacked: (G, B)                           stop-gradient
 
             # ── 5a. Q-advantages from target critic ─────────────────────────── #
             obs_e = jax.lax.stop_gradient(
@@ -955,14 +930,11 @@ class OGPOAgent(flax.struct.PyTreeNode):
             )
             critic_in_obs = _critic_obs_e(obs_e, batch, "language_label")
 
-            final_env = jnp.stack(
-                [
-                    traj[-1, :, :cfg_ah, :cfg_ad]
-                    .reshape(batch_size, cfg_ah * cfg_ad)
-                    .clip(-1.0, 1.0)
-                    for traj in trajs
-                ],
-                axis=0,
+            # trajs_stacked[:, -1] is the denoised final action for each group.
+            final_env = (
+                trajs_stacked[:, -1, :, :cfg_ah, :cfg_ad]
+                .reshape(n_group, batch_size, cfg_ah * cfg_ad)
+                .clip(-1.0, 1.0)
             )  # (G, B, A_env)
 
             q_ensemble = jax.vmap(
@@ -976,56 +948,53 @@ class OGPOAgent(flax.struct.PyTreeNode):
             else:
                 advantages = jnp.mean(adv_ensemble, axis=0)  # (G, B)
 
-            # ── 5b. Chi2 penalty: slow-EMA log-probs per group ──────────────── #
+            # ── 5b. Chi2 penalty via jax.lax.scan ───────────────────────────── #
             if self.config.get("chi2_reg", False) and self.vla_slow_state is not None:
-                slow_lps = [
-                    self._eval_vla_traj_log_probs_flat(
-                        self.vla_slow_state, trajs[g],
+                def compute_slow_lp(_, traj_g):
+                    lp = self._eval_vla_traj_log_probs_flat(
+                        self.vla_slow_state, traj_g,
                         kv_cache, prefix_mask, prefix_mask_nr, sigma, num_steps,
                     )
-                    for g in range(n_group)
-                ]
-                slow_log_probs = jnp.stack(slow_lps, axis=0)  # (G, B)
-                old_log_probs_stacked = jnp.stack(old_lps, axis=0)
+                    return None, lp
+
+                _, slow_log_probs = jax.lax.scan(
+                    compute_slow_lp, None, trajs_stacked
+                )  # (G, B)
                 beta = float(self.config["chi2_beta_init"]) * jnp.std(q_ensemble)
                 advantages = advantages - beta * jnp.exp(
-                    old_log_probs_stacked - slow_log_probs
+                    old_lps_stacked - slow_log_probs
                 )
 
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-            # ── 6. Gradient accumulation: one backward pass per group ─────────── #
-            # Defining group_loss_fn ONCE (outside the loop) so JAX compiles it
-            # on the first call and reuses the cached XLA computation for the
-            # remaining G−1 groups.  Only per-group values are explicit args;
-            # kv_cache / prefix_mask / sigma / self are stable closures.
-            def group_loss_fn(state, traj_g, old_lp_g, adv_g):
-                loss, aux = self._vla_ppo_loss(
-                    state, traj_g, old_lp_g, adv_g,
-                    kv_cache, prefix_mask, prefix_mask_nr, sigma, num_steps, clip_eps,
-                )
-                return loss / n_group, aux
+            # ── 6. Single value_and_grad over all G groups ───────────────────── #
+            # Action head is tiny (~4 Linear layers) so no gradient accumulation
+            # is needed.  Compute new log-probs for all G groups via an inner scan
+            # (sequential over groups, bounded memory), then backprop once.
+            def full_ppo_loss(state):
+                def eval_group_lp(_, traj_g):
+                    new_lp = self._eval_vla_traj_log_probs_flat(
+                        state, traj_g, kv_cache, prefix_mask, prefix_mask_nr,
+                        sigma, num_steps,
+                    )
+                    return None, new_lp
 
-            grad_fn = jax.value_and_grad(group_loss_fn, has_aux=True)
+                _, new_lps = jax.lax.scan(eval_group_lp, None, trajs_stacked)  # (G, B)
+                ratio = jnp.exp(new_lps - old_lps_stacked)
+                pg1 = -advantages * ratio
+                pg2 = -advantages * jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
+                ppo_loss = jnp.maximum(pg1, pg2).mean()
+                return ppo_loss, {
+                    "ppo_loss": ppo_loss,
+                    "advantage_mean": advantages.mean(),
+                    "approx_kl": (old_lps_stacked - new_lps).mean(),
+                    "clip_frac": (jnp.abs(ratio - 1.0) > clip_eps).mean(),
+                    "ratio_mean": ratio.mean(),
+                }
 
-            total_grads = None
-            all_ppo_info = []
-            for g in range(n_group):
-                (loss_g, info_g), grads_g = grad_fn(
-                    self.vla_online_state, trajs[g], old_lps[g], advantages[g]
-                )
-                jax.block_until_ready(grads_g)
-                total_grads = (
-                    grads_g
-                    if total_grads is None
-                    else jax.tree_util.tree_map(lambda a, b: a + b, total_grads, grads_g)
-                )
-                all_ppo_info.append(info_g)
-
-            ppo_info = {
-                k: jnp.mean(jnp.stack([d[k] for d in all_ppo_info]))
-                for k in all_ppo_info[0]
-            }
+            (_, ppo_info), total_grads = jax.value_and_grad(
+                full_ppo_loss, has_aux=True
+            )(self.vla_online_state)
             info.update({f"vla/{k}": v for k, v in ppo_info.items()})
 
             # ── 7. Apply optax update + EMA ──────────────────────────────────── #
