@@ -28,13 +28,13 @@ def get_config():
     # Online CARLA defaults (tuned for PPO group sampling cost)
     config.batch_size = 64
     config.buffer_capacity = 5_000
-    config.warmup_steps = 0
+    config.warmup_steps = 500
     config.updates_per_step = 1
     config.enable_updates = True
     config.image_log_curr_interval = 10
 
     # Paper-canonical PPO hyperparameters (OGPO, Sec. 4)
-    config.grpo_num_samples = 32
+    config.grpo_num_samples = 16
     config.clip_epsilon = 0.01
     config.ema_decay = 0.995
     config.conservative_advantage = True

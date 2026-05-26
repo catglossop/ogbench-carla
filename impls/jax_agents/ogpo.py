@@ -843,20 +843,42 @@ class OGPOAgent(flax.struct.PyTreeNode):
             and self.vla_ema_state is not None
         )
 
+        # ── Step 0: Extract config vars + ema_full_state (shared by steps 1 & 3) #
+        if do_vla_ppo:
+            image_keys = tuple(self.config.get("image_keys", ("base_0_rgb",)))
+            batch_size = batch["observations"].shape[0]
+            model_ah = int(self.steervla_actor.model.action_horizon)
+            model_ad = int(self.steervla_actor.model.action_dim)
+            cfg_ah = int(self.config.get("vla_action_horizon", 10))
+            cfg_ad = int(self.config.get("vla_action_dim", 4))
+            sigma = float(self.config.get("sde_sigma", 0.1))
+            num_steps = int(self.config.get("vla_update_flow_steps", self.config.get("flow_steps", 10)))
+            ema_full_state = _vla_merge_state(self.vla_ema_state, self.vla_backbone_state)
+
         # ── 1. VLA next-state actions for critic bootstrap ─────────────────── #
         rng, vr_rng, critic_rng = jax.random.split(rng, 3)
         if do_vla_ppo and self.config.get("q_variance_reduction", False):
             n_vr = int(self.config.get("n_vr_samples", 4))
+            # Compute next-obs KV cache ONCE; reuse across all n_vr VR samples.
+            kv_next, mask_next, mask_nr_next = self.steervla_actor.compute_prefix_kv_for_ogpo(
+                self.vla_graphdef, ema_full_state, batch["next_openpi_observation"], image_keys,
+            )
             vr_rngs = jax.random.split(vr_rng, n_vr)
-            next_vla_actions = jnp.stack(
-                [
-                    self._vla_forward(
-                        batch["next_observations"], batch["next_openpi_observation"], vr_rngs[i]
-                    )
-                    for i in range(n_vr)
-                ],
-                axis=0,
-            )  # (n_vr, B, A_env)
+            vr_noises = jax.vmap(
+                lambda k: jax.random.normal(k, (batch_size, model_ah, model_ad))
+            )(vr_rngs)
+
+            def _sample_one_vr(_, noise_rng):
+                noise_i, rng_i = noise_rng
+                traj_i, _ = self.steervla_actor.sample_sde_trajectory_for_ppo(
+                    self.vla_graphdef, ema_full_state,
+                    kv_next, mask_next, mask_nr_next,
+                    noise_i, rng=rng_i, sigma=sigma, num_steps=num_steps,
+                )
+                final = traj_i[-1, :, :cfg_ah, :cfg_ad].reshape(batch_size, cfg_ah * cfg_ad).clip(-1.0, 1.0)
+                return None, final
+
+            _, next_vla_actions = jax.lax.scan(_sample_one_vr, None, (vr_noises, vr_rngs))  # (n_vr, B, A_env)
         else:
             next_vla_actions = self._vla_forward(
                 batch["next_observations"], batch["next_openpi_observation"], vr_rng
@@ -873,25 +895,11 @@ class OGPOAgent(flax.struct.PyTreeNode):
         if do_vla_ppo:
             # ── 3. Prefix KV cache (B-sized, never tiled to G×B) ─────────────── #
             rng, traj_rng = jax.random.split(rng)
-            image_keys = tuple(self.config.get("image_keys", ("base_0_rgb",)))
             n_group = int(self.config["grpo_num_samples"])
-            batch_size = batch["observations"].shape[0]
-            model_ah = int(self.steervla_actor.model.action_horizon)
-            model_ad = int(self.steervla_actor.model.action_dim)
-            sigma = float(self.config.get("sde_sigma", 0.1))
-            num_steps = int(
-                self.config.get("vla_update_flow_steps", self.config.get("flow_steps", 10))
-            )
-            cfg_ah = int(self.config.get("vla_action_horizon", 10))
-            cfg_ad = int(self.config.get("vla_action_dim", 4))
             clip_eps = float(self.config["clip_epsilon"])
 
-            # Merge EMA action head with frozen backbone for rollouts + KV cache.
-            # The backbone is never updated so it's identical in all three copies
-            # (online / ema / slow); we only maintain separate action-head copies.
-            ema_full_state = _vla_merge_state(self.vla_ema_state, self.vla_backbone_state)
-
             # B-sized KV cache — NOT tiled to G×B.  Each group reuses this cache.
+            # ema_full_state was already computed in step 0 above.
             kv_cache, prefix_mask, prefix_mask_nr = (
                 self.steervla_actor.compute_prefix_kv_for_ogpo(
                     self.vla_graphdef, ema_full_state,

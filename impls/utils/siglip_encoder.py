@@ -31,6 +31,7 @@ class SigLIPEncoder:
         self._processor = None
         self._lock = threading.Lock()
         self._embedding_dim: Optional[int] = None
+        self._text_cache: dict[str, np.ndarray] = {}
 
     def setup(self) -> None:
         if self._model is not None:
@@ -66,6 +67,8 @@ class SigLIPEncoder:
         cleaned = clean_cot_text(text)
         if not cleaned:
             return np.zeros(self.embedding_dim, dtype=np.float32)
+        if cleaned in self._text_cache:
+            return self._text_cache[cleaned]
 
         import torch
 
@@ -77,7 +80,9 @@ class SigLIPEncoder:
                 embeds = self._model.get_text_features(**inputs)
                 embeds = self._normalize(embeds)
 
-        return embeds.detach().cpu().numpy()[0].astype(np.float32)
+        result = embeds.detach().cpu().numpy()[0].astype(np.float32)
+        self._text_cache[cleaned] = result
+        return result
 
     def encode_observation(
         self,

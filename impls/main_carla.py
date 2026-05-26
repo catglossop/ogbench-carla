@@ -962,14 +962,7 @@ def run_online_carla(
             _block_until_ready_tree(action_jax)
             action = np.asarray(action_jax[0])
             last_policy_action = action
-            if (
-                obs_mode == "image"
-                and image_encoder == "siglip"
-                and siglip_include_prompt_subtask
-            ):
-                step_obs = _extract_agent_obs(env, obs_raw, obs_mode, **_extract_obs_kwargs)
-            else:
-                step_obs = obs
+            step_obs = obs
             if steervla_actor is not None and _last_buf_idx is not None:
                 from vlas.steervla import openpi_cot_replay_fields_from_raw
 
