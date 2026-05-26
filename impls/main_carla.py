@@ -46,6 +46,7 @@ remains free for CARLA's ``PythonAPI/carla/agents`` (navigation, etc.).
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import random
@@ -308,6 +309,11 @@ def _resolve_wandb_mode() -> str:
     if FLAGS.wandb_mode is not None:
         return FLAGS.wandb_mode
     return os.environ.get("WANDB_MODE", "online")
+
+
+def _hostify_tree(tree):
+    """Materialize a pytree on host to avoid retaining per-step device scalars."""
+    return jax.tree_util.tree_map(jax.device_get, tree)
 
 # List routes and exit  
 def _list_routes_and_exit() -> None:
@@ -1122,6 +1128,9 @@ def run_online_carla(
             step_wb["reward/penalty_brake"] = float(info.get("penalty_brake", 0.0))
             step_wb["reward/penalty_speed_limit"] = float(info.get("penalty_speed_limit", 0.0))
             step_wb["reward/penalty_crash_stuck"] = float(info.get("penalty_crash_stuck", 0.0))
+            step_wb["reward/penalty_traffic_violation"] = float(info.get("penalty_traffic_violation", 0.0))
+            step_wb["rollout/traffic_violation_count"] = float(info.get("traffic_violation_count", 0.0))
+            step_wb["rollout/traffic_violation_delta"] = float(info.get("traffic_violation_delta", 0.0))
             step_wb["rollout/lane_offset_m"] = float(info.get("lane_offset_m", 0.0))
             step_wb["rollout/heading_error_rad"] = float(info.get("heading_error_rad", 0.0))
             step_wb["rollout/speed_norm"] = float(info.get("speed_norm", 0.0))
@@ -1162,6 +1171,12 @@ def run_online_carla(
             # Finish pending JAX work, then reset CARLA immediately.
             if agent is not None:
                 _block_until_ready_tree(agent)
+                try:
+                    from jax_agents.ogpo import _maybe_log_jax_memory as _ogpo_mem_log
+
+                    _ogpo_mem_log("episode_done_before_reset", episode_count=episode_count)
+                except Exception:
+                    pass
                 reset_vla_cache = getattr(getattr(agent, "vla_sample_fn", None), "reset_action_cache", None)
                 if reset_vla_cache is not None:
                     reset_vla_cache()
@@ -1178,6 +1193,16 @@ def run_online_carla(
             _episode_buf_indices = []
 
             obs_raw, _info = env.reset(seed=FLAGS.seed + episode_count)
+            try:
+                from jax_agents.ogpo import _maybe_log_jax_memory as _ogpo_mem_log
+
+                _ogpo_mem_log(
+                    "episode_after_reset",
+                    episode_count=episode_count,
+                    image_shape=tuple(np.asarray(obs_raw["image"]).shape) if isinstance(obs_raw, dict) and "image" in obs_raw else "?",
+                )
+            except Exception:
+                pass
             if raw_obs_holder is not None:
                 raw_obs_holder["obs"] = obs_raw
                 raw_obs_holder["next_obs"] = obs_raw
@@ -1222,6 +1247,12 @@ def run_online_carla(
                 )
                 rollout_log["rollout/final_step_penalty_crash_stuck"] = float(
                     done_info.get("penalty_crash_stuck", 0.0)
+                )
+                rollout_log["rollout/final_step_penalty_traffic_violation"] = float(
+                    done_info.get("penalty_traffic_violation", 0.0)
+                )
+                rollout_log["rollout/episode_traffic_violation_count"] = float(
+                    done_info.get("traffic_violation_count", 0.0)
                 )
                 rollout_log["rollout/final_step_success"] = float(bool(done_info.get("success", False)))
             if FLAGS.expert_recover_debug:
@@ -1288,12 +1319,16 @@ def run_online_carla(
                     else None
                 )
                 if _online_training_mode == "dagger":
-                    _, update_info = agent.update_dagger(batch)
+                    agent, update_info = agent.update_dagger(batch)
                 elif use_vla_update:
-                    _, update_info = agent.update_with_vla(batch, succ_batch=succ_batch)
+                    agent, update_info = agent.update_with_vla(batch, succ_batch=succ_batch)
                 else:
-                    _, update_info = agent.update(batch, succ_batch=succ_batch)
-                _block_until_ready_tree((agent, update_info))
+                    agent, update_info = agent.update(batch, succ_batch=succ_batch)
+                _block_until_ready_tree(agent)
+                update_info = _hostify_tree(update_info)
+                if os.environ.get("OGPO_FORCE_GC_EACH_UPDATE", "").strip().lower() in ("1", "true", "yes", "on"):
+                    del batch, succ_batch
+                    gc.collect()
                 t_update_end = time.time()
                 update_times.append(t_update_end - t_update_start)
             last_update_info = update_info
@@ -1413,9 +1448,13 @@ def main(_):
         if obs_mode == "image" and image_encoder == "siglip":
             from utils.siglip_encoder import SigLIPEncoder
 
+            _tr_rank = int(config.get("training_gpu_rank", -1))
+            _siglip_device = config.get("siglip_device") or (
+                f"cuda:{_tr_rank}" if _tr_rank >= 0 else None
+            )
             siglip_encoder = SigLIPEncoder(
                 model_id=str(config.get("siglip_model_id", "google/siglip2-so400m-patch14-384")),
-                device=config.get("siglip_device"),
+                device=_siglip_device,
             )
             siglip_encoder.setup()
             config.siglip_embed_dim = int(siglip_encoder.embedding_dim)

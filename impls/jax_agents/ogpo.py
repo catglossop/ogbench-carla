@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 from typing import Any, Callable, Optional
 
 import distrax
@@ -96,6 +97,29 @@ def _conservative_advantage(adv_ensemble: jnp.ndarray) -> jnp.ndarray:
     min_adv = jnp.min(adv_ensemble, axis=0)
     max_adv = jnp.max(adv_ensemble, axis=0)
     return jnp.where(min_adv > 0.0, min_adv, jnp.where(max_adv < 0.0, max_adv, 0.0))
+
+
+def _maybe_log_jax_memory(tag: str, **extra: Any) -> None:
+    """Best-effort device-memory probe, enabled with ``OGPO_JAX_MEM_DEBUG=1``."""
+    if os.environ.get("OGPO_JAX_MEM_DEBUG", "").strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    try:
+        live = list(jax.live_arrays())
+        total_bytes = 0
+        samples: list[str] = []
+        for arr in live[:6]:
+            nbytes = int(getattr(arr, "nbytes", 0))
+            total_bytes += nbytes
+            samples.append(f"{tuple(arr.shape)}:{arr.dtype}")
+        extra_str = " ".join(f"{k}={v}" for k, v in extra.items())
+        print(
+            f"[ogpo][jax-mem] {tag} live_arrays={len(live)} "
+            f"tracked_bytes={total_bytes / (1024 ** 2):.1f}MiB "
+            f"samples={samples} {extra_str}".rstrip(),
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[ogpo][jax-mem] {tag} probe_failed={exc}", flush=True)
 
 
 class ScoreNetwork(nn.Module):
@@ -818,6 +842,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
         info["total_loss"] = loss
         return loss, info
 
+    @jax.jit
     def update_with_vla(self, batch, succ_batch=None):
         """OGPO update: VR critic with VLA next-state actions + VLA PPO gradient step.
 
@@ -836,6 +861,11 @@ class OGPOAgent(flax.struct.PyTreeNode):
         new_rng, rng = jax.random.split(self.rng)
         batch = self._prepare_vla_batch(batch)
         info = {}
+        _maybe_log_jax_memory(
+            "update_start",
+            batch_size=batch["observations"].shape[0],
+            image_shape=tuple(batch["openpi_observation"].images["base_0_rgb"].shape),
+        )
 
         do_vla_ppo = (
             self.vla_graphdef is not None
@@ -863,6 +893,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
             kv_next, mask_next, mask_nr_next = self.steervla_actor.compute_prefix_kv_for_ogpo(
                 self.vla_graphdef, ema_full_state, batch["next_openpi_observation"], image_keys,
             )
+            _maybe_log_jax_memory("after_next_prefix")
             vr_rngs = jax.random.split(vr_rng, n_vr)
             vr_noises = jax.vmap(
                 lambda k: jax.random.normal(k, (batch_size, model_ah, model_ad))
@@ -879,6 +910,9 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 return None, final
 
             _, next_vla_actions = jax.lax.scan(_sample_one_vr, None, (vr_noises, vr_rngs))  # (n_vr, B, A_env)
+            # Free next-obs KV cache — both KV caches live simultaneously would OOM.
+            del kv_next, mask_next, mask_nr_next
+            _maybe_log_jax_memory("after_next_action_scan")
         else:
             next_vla_actions = self._vla_forward(
                 batch["next_observations"], batch["next_openpi_observation"], vr_rng
@@ -891,6 +925,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
         new_network, critic_info = self.network.apply_loss_fn(loss_fn=critic_loss_fn)
         self.target_update(new_network, "critic")
         info.update(critic_info)
+        _maybe_log_jax_memory("after_critic_update")
 
         if do_vla_ppo:
             # ── 3. Prefix KV cache (B-sized, never tiled to G×B) ─────────────── #
@@ -906,6 +941,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
                     batch["openpi_observation"], image_keys,
                 )
             )
+            _maybe_log_jax_memory("after_current_prefix")
 
             # ── 4. Sample G trajectories via jax.lax.scan (no Python loop) ────── #
             # Serial over groups (one B-batch at a time) keeps kv_cache at B-size.
@@ -1040,6 +1076,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
 
         self.ema_update(new_network, "flow", "ema_flow")
         self.slow_ema_update(new_network)
+        _maybe_log_jax_memory("update_end")
         return self.replace(
             network=new_network,
             rng=new_rng,
