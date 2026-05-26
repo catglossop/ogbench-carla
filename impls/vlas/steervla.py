@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 import re
 import time
 from pathlib import Path
@@ -988,7 +989,7 @@ class SteerVLAActor:
         model_ad = int(self.model.action_dim)
         action_flat = model_ah * model_ad
         sigma_sq = float(sigma) ** 2
-        log_norm = action_flat * float(jnp.log(2.0 * jnp.pi * sigma_sq))
+        log_norm = action_flat * math.log(2.0 * math.pi * sigma_sq)
 
         def step_fn(carry, k):
             x_t, rng_c = carry

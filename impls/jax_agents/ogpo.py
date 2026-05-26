@@ -21,6 +21,7 @@ Flax module (see ``dsrl.py`` for the SteerVLA hook pattern).
 from __future__ import annotations
 
 import copy
+import math
 from typing import Any, Callable, Optional
 
 import distrax
@@ -268,7 +269,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
         ad = traj_g.shape[3]
         action_flat = ah * ad
         sigma_sq = float(sigma) ** 2
-        log_norm = float(action_flat) * jnp.log(2.0 * jnp.pi * sigma_sq)
+        log_norm = float(action_flat) * math.log(2.0 * math.pi * sigma_sq)
         dt = jnp.array(-1.0 / num_steps, dtype=jnp.float32)
 
         # jax.checkpoint: recompute this step during backward instead of storing
