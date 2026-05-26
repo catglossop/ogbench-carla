@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional
 import distrax
 import flax
 import flax.linen as nn
+import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import ml_collections
@@ -98,8 +99,15 @@ class OGPOAgent(flax.struct.PyTreeNode):
     rng: Any
     network: Any
     config: Any = nonpytree_field()
-    vla_sample_fn: Any = nonpytree_field()  # Optional callable: (obs, noise) -> action
+    vla_sample_fn: Any = nonpytree_field()   # Optional callable: (obs, noise) -> action
     steervla_actor: Any = nonpytree_field()  # Optional local SteerVLAActor for update_with_vla
+    # VLA fine-tuning state (OGPO direct VLA PPO).  All None when VLA is frozen.
+    vla_graphdef: Any = nonpytree_field()    # nnx.GraphDef — static, not a pytree
+    vla_tx: Any = nonpytree_field()          # optax transform — static
+    vla_online_state: Any = None             # nnx.State pytree — live θ
+    vla_ema_state: Any = None               # nnx.State pytree — EMA θ̄
+    vla_slow_state: Any = None              # nnx.State pytree — slow θ̃ (chi2_reg)
+    vla_opt_state: Any = None              # optax optimizer state pytree
 
     # ----- helpers -------------------------------------------------------- #
 
@@ -168,19 +176,28 @@ class OGPOAgent(flax.struct.PyTreeNode):
     def _vla_forward(self, observations, openpi_observations, rng, noise=None):
         """Eager VLA forward (PyTorch side); returns stop-gradient env actions."""
         rng_n, rng_act = jax.random.split(rng)
+        batch_size = observations.shape[0]
         if noise is None:
             action_dim = int(self.config["action_dim"])
             noise = (
-                jax.random.normal(rng_n, (observations.shape[0], action_dim))
+                jax.random.normal(rng_n, (batch_size, action_dim))
                 * self.config["noise_scale"]
             )
-        noise_chunk = self._as_noise_chunk(noise)
+        # Build full-model-size noise tensor so model.action_in_proj sees the right shape.
+        # Mirrors steervla.py::flow_sample: zeros(model_ah, model_ad) then write cfg chunk.
+        model_ah = int(self.steervla_actor.model.action_horizon)
+        model_ad = int(self.steervla_actor.model.action_dim)
+        cfg_ah = min(int(self.config.get("vla_action_horizon", 10)), model_ah)
+        cfg_ad = min(int(self.config.get("vla_action_dim", 4)), model_ad)
+        noise_chunk = self._as_noise_chunk(noise)[:, :cfg_ah, :cfg_ad]
+        noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
+        noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(noise_chunk)
         next_openpi_obs = self._as_jax_pytree(openpi_observations)
         t0 = time.time()
         next_actions = self.steervla_actor._sample_actions(
             rng_act,
             next_openpi_obs,
-            noise=noise_chunk,
+            noise=noise_full,
             image_keys=tuple(self.config.get("image_keys", ("base_0_rgb",))),
             num_steps=int(self.config.get("vla_update_flow_steps", self.config.get("flow_steps", 10))),
         )
@@ -191,6 +208,98 @@ class OGPOAgent(flax.struct.PyTreeNode):
         jax.block_until_ready(next_actions)
         print(f"[DEBUG - ogpo] _vla_forward: {time.time() - t0:.2f}s")
         return jax.lax.stop_gradient(self._clip_actions_to_env(next_actions))
+
+    def _eval_vla_traj_log_probs_flat(
+        self,
+        vla_state,
+        traj_gb,
+        kv_cache_gb,
+        prefix_mask_gb,
+        prefix_mask_nr_gb,
+        sigma: float,
+        num_steps: int,
+    ):
+        """Evaluate sum of log pi(a_{k+1}|a_k,s) along `traj_gb` under `vla_state`.
+
+        ``traj_gb`` shape ``(K+1, G*B, model_ah, model_ad)``.  Returns ``(G*B,)``
+        log-prob sums.  Differentiable w.r.t. ``vla_state`` when called inside
+        ``jax.grad`` — used for both new_log_probs (online state) and slow_log_probs
+        (constant slow EMA state).
+        """
+        import einops as _einops  # already installed; lazy to avoid top-level dep
+        from openpi.models import pi0 as _openpi_pi0
+
+        model = nnx.merge(self.vla_graphdef, vla_state)
+        GB = traj_gb.shape[1]
+        ah = traj_gb.shape[2]
+        ad = traj_gb.shape[3]
+        action_flat = ah * ad
+        sigma_sq = float(sigma) ** 2
+        log_norm = float(action_flat) * jnp.log(2.0 * jnp.pi * sigma_sq)
+        dt = jnp.array(-1.0 / num_steps, dtype=jnp.float32)
+
+        def step_fn(_, inputs):
+            x_t, x_next, k = inputs
+            t_b = jnp.broadcast_to(jnp.array(1.0 - k / num_steps, dtype=jnp.float32), (GB,))
+            sfx_tok, sfx_mask, _, adarms = model._embed_action_suffix(None, x_t, t_b)
+            sfx_ar = jnp.array([True] + [False] * (ah - 1))
+            sfx_attn = _openpi_pi0.make_attn_mask(sfx_mask, sfx_ar)
+            a2p = _einops.repeat(prefix_mask_nr_gb, "b p -> b s p", s=sfx_tok.shape[1])
+            full_mask = jnp.concatenate([a2p, sfx_attn], axis=-1)
+            pos = jnp.sum(prefix_mask_gb, axis=-1)[:, None] + jnp.cumsum(sfx_mask, axis=-1) - 1
+            (_, sfx_out), _ = model.PaliGemma.llm(
+                [None, sfx_tok], mask=full_mask, positions=pos,
+                kv_cache=kv_cache_gb, adarms_cond=[None, adarms],
+            )
+            v_t = model.action_out_proj(sfx_out[:, -ah:])
+            mean = x_t + dt * v_t
+            diff = (x_next - mean).reshape(GB, action_flat)
+            log_p = -0.5 * (jnp.sum(diff ** 2, axis=-1) / sigma_sq + log_norm)
+            return None, log_p
+
+        _, log_probs_per_step = jax.lax.scan(
+            step_fn, None,
+            (traj_gb[:-1], traj_gb[1:], jnp.arange(num_steps, dtype=jnp.float32)),
+        )
+        return log_probs_per_step.sum(axis=0)  # (G*B,)
+
+    def _vla_ppo_loss(
+        self,
+        vla_online_state,
+        traj_gb,
+        old_lp_gb,
+        advantages,
+        kv_cache_gb,
+        prefix_mask_gb,
+        prefix_mask_nr_gb,
+        sigma: float,
+        num_steps: int,
+        n_group: int,
+        batch_size: int,
+        clip_eps: float,
+    ):
+        """PPO loss over VLA denoising trajectories, differentiable w.r.t. ``vla_online_state``.
+
+        All trajectory/advantage inputs are stop-gradiented from the caller.
+        ``vla_online_state`` is the sole differentiated argument.
+        """
+        new_lp_gb = self._eval_vla_traj_log_probs_flat(
+            vla_online_state, traj_gb, kv_cache_gb,
+            prefix_mask_gb, prefix_mask_nr_gb, sigma, num_steps,
+        )
+        new_log_probs = new_lp_gb.reshape(n_group, batch_size)
+        old_log_probs = old_lp_gb.reshape(n_group, batch_size)
+        ratio = jnp.exp(new_log_probs - old_log_probs)
+        pg1 = -advantages * ratio
+        pg2 = -advantages * jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
+        ppo_loss = jnp.maximum(pg1, pg2).mean()
+        return ppo_loss, {
+            "ppo_loss": ppo_loss,
+            "advantage_mean": advantages.mean(),
+            "approx_kl": (old_log_probs - new_log_probs).mean(),
+            "clip_frac": (jnp.abs(ratio - 1.0) > clip_eps).mean(),
+            "ratio_mean": ratio.mean(),
+        }
 
     def _flow_velocity(self, params, obs_e, actions, t):
         return self.network.select("flow")(obs_e, actions, t, params=params)
@@ -648,11 +757,23 @@ class OGPOAgent(flax.struct.PyTreeNode):
     # ----- VLA update path ----------------------------------------------- #
 
     def critic_loss_vla(self, batch, grad_params, rng, next_vla_actions):
-        """Critic TD loss with VLA-generated next-state actions as the bootstrap target."""
+        """Critic TD loss with VLA bootstrap targets.
+
+        ``next_vla_actions`` shape:
+        - ``(B, A_env)`` — standard (single next-state action per transition)
+        - ``(n_vr, B, A_env)`` — Q-variance-reduction: average Q over n_vr samples
+          per next state (paper Sec. 4, Eq. 4.3).
+        """
         rng, agg_rng = jax.random.split(rng)
         obs_e = self._encode_obs(grad_params, batch["observations"])
         next_obs_e = self._encode_obs(self.network.params, batch["next_observations"])
-        next_q = self._q_target(batch, next_obs_e, next_vla_actions, agg_rng)
+        if next_vla_actions.ndim == 3:
+            # VR critic: average Q-targets over n_vr next-state samples
+            def q_for_i(na_i):
+                return self._q_target(batch, next_obs_e, na_i, jax.random.fold_in(agg_rng, 0))
+            next_q = jnp.mean(jax.vmap(q_for_i)(next_vla_actions), axis=0)
+        else:
+            next_q = self._q_target(batch, next_obs_e, next_vla_actions, agg_rng)
         target_q = batch["rewards"] + self.config["discount"] * batch["masks"] * next_q
         qs = self._q_all(grad_params, batch, obs_e, batch["actions"])
         critic_loss = jnp.square(qs - target_q[None]).mean()
@@ -698,38 +819,192 @@ class OGPOAgent(flax.struct.PyTreeNode):
         return loss, info
 
     def update_with_vla(self, batch, succ_batch=None):
-        """Update using VLA next-state actions for the critic, PPO over local flow.
+        """OGPO update: VR critic with VLA next-state actions + VLA PPO gradient step.
 
-        VLA forward runs eagerly (PyTorch); the jitted gradient steps only see the
-        precomputed stop-gradient ``next_vla_actions``.
+        When ``vla_online_state`` is initialised (VLA fine-tuning mode):
+          1. Sample n_vr VLA next-state actions from EMA VLA state → VR critic.
+          2. Update critic (Eq. 4.1 + Eq. 4.3 VR).
+          3. Compute prefix KV cache from EMA VLA state (frozen prefix; gradient
+             flows only through action-expert layers).
+          4. Sample G*B denoising trajectories from EMA VLA state (stop-grad).
+          5. Compute Q-advantages from target critic; apply chi2 penalty if enabled.
+          6. ``jax.value_and_grad`` PPO loss w.r.t. online VLA state.
+          7. Apply optax update; EMA and slow-EMA updates for VLA state.
+
+        Falls back to FlowActor PPO when VLA state is not initialised.
         """
         new_rng, rng = jax.random.split(self.rng)
         batch = self._prepare_vla_batch(batch)
-        rng, vla_rng, critic_rng, actor_rng = jax.random.split(rng, 4)
         info = {}
 
-        next_vla_actions = self._vla_forward(
-            batch["next_observations"],
-            batch["next_openpi_observation"],
-            vla_rng,
+        do_vla_ppo = (
+            self.vla_graphdef is not None
+            and self.vla_online_state is not None
+            and self.vla_ema_state is not None
         )
 
-        # UPDATEQ with VLA bootstrap actions (Algorithm 5).
+        # ── 1. VLA next-state actions for critic bootstrap ─────────────────── #
+        rng, vr_rng, critic_rng = jax.random.split(rng, 3)
+        if do_vla_ppo and self.config.get("q_variance_reduction", False):
+            n_vr = int(self.config.get("n_vr_samples", 4))
+            vr_rngs = jax.random.split(vr_rng, n_vr)
+            next_vla_actions = jnp.stack(
+                [
+                    self._vla_forward(
+                        batch["next_observations"], batch["next_openpi_observation"], vr_rngs[i]
+                    )
+                    for i in range(n_vr)
+                ],
+                axis=0,
+            )  # (n_vr, B, A_env)
+        else:
+            next_vla_actions = self._vla_forward(
+                batch["next_observations"], batch["next_openpi_observation"], vr_rng
+            )  # (B, A_env)
+
+        # ── 2. Critic update ────────────────────────────────────────────────── #
         def critic_loss_fn(grad_params):
             return self.critic_loss_vla(batch, grad_params, critic_rng, next_vla_actions)
+
         new_network, critic_info = self.network.apply_loss_fn(loss_fn=critic_loss_fn)
         self.target_update(new_network, "critic")
         info.update(critic_info)
 
-        # UPDATEIGP (Algorithm 6): actor-only backward pass.
-        def actor_loss_fn(grad_params):
-            return self.actor_loss(batch, grad_params, actor_rng, succ_batch=succ_batch)
-        new_network, actor_info = new_network.apply_loss_fn(loss_fn=actor_loss_fn)
-        info.update(actor_info)
+        if do_vla_ppo:
+            # ── 3-4. Prefix KV + G*B trajectory sampling from EMA VLA ──────── #
+            rng, kv_rng, traj_rng, ppo_rng = jax.random.split(rng, 4)
+            image_keys = tuple(self.config.get("image_keys", ("base_0_rgb",)))
+            n_group = int(self.config["grpo_num_samples"])
+            batch_size = batch["observations"].shape[0]
+            model_ah = int(self.steervla_actor.model.action_horizon)
+            model_ad = int(self.steervla_actor.model.action_dim)
+            sigma = float(self.config.get("sde_sigma", 0.1))
+            num_steps = int(
+                self.config.get("vla_update_flow_steps", self.config.get("flow_steps", 10))
+            )
+            cfg_ah = int(self.config.get("vla_action_horizon", 10))
+            cfg_ad = int(self.config.get("vla_action_dim", 4))
+            clip_eps = float(self.config["clip_epsilon"])
+
+            kv_cache, prefix_mask, prefix_mask_nr = (
+                self.steervla_actor.compute_prefix_kv_for_ogpo(
+                    self.vla_graphdef, self.vla_ema_state,
+                    batch["openpi_observation"], image_keys,
+                )
+            )
+
+            # Tile prefix to G*B for batched trajectory sampling
+            kv_cache_gb = jax.tree_util.tree_map(
+                lambda x: jnp.tile(x, [n_group] + [1] * (x.ndim - 1)), kv_cache
+            )
+            prefix_mask_gb = jnp.tile(prefix_mask, [n_group, 1])
+            prefix_mask_nr_gb = jnp.tile(prefix_mask_nr, [n_group, 1])
+            noise_gb = jax.random.normal(traj_rng, (n_group * batch_size, model_ah, model_ad))
+
+            # Sample G*B trajectories from EMA VLA state (all stop-gradiented)
+            traj_gb, old_lp_gb = self.steervla_actor.sample_sde_trajectory_for_ppo(
+                self.vla_graphdef, self.vla_ema_state,
+                kv_cache_gb, prefix_mask_gb, prefix_mask_nr_gb,
+                noise_gb, rng=traj_rng, sigma=sigma, num_steps=num_steps,
+            )
+            # traj_gb  : (K+1, G*B, model_ah, model_ad) — stop-grad
+            # old_lp_gb: (G*B,)                          — stop-grad
+
+            # ── 5a. Q-advantages from target critic ─────────────────────────── #
+            old_log_probs = old_lp_gb.reshape(n_group, batch_size)
+
+            final_env_gb = (
+                traj_gb[-1, :, :cfg_ah, :cfg_ad]
+                .reshape(n_group * batch_size, cfg_ah * cfg_ad)
+                .clip(-1.0, 1.0)
+            )
+            final_env = final_env_gb.reshape(n_group, batch_size, cfg_ah * cfg_ad)
+
+            obs_e = jax.lax.stop_gradient(
+                self._encode_obs(new_network.params, batch["observations"])
+            )
+            critic_in_obs = _critic_obs_e(obs_e, batch, "language_label")
+
+            q_ensemble = jax.vmap(
+                lambda ag: new_network.select("target_critic")(critic_in_obs, ag)
+            )(final_env)                                 # (G, M, B)
+            q_ensemble = jnp.transpose(q_ensemble, (1, 0, 2))  # (M, G, B)
+            baseline = jnp.mean(q_ensemble, axis=1, keepdims=True)
+            adv_ensemble = q_ensemble - baseline
+
+            if self.config["conservative_advantage"]:
+                advantages = _conservative_advantage(adv_ensemble)
+            else:
+                advantages = jnp.mean(adv_ensemble, axis=0)   # (G, B)
+
+            # ── 5b. Chi2 penalty (slow EMA policy) ──────────────────────────── #
+            if self.config.get("chi2_reg", False) and self.vla_slow_state is not None:
+                slow_lp_gb = self._eval_vla_traj_log_probs_flat(
+                    self.vla_slow_state, traj_gb,
+                    kv_cache_gb, prefix_mask_gb, prefix_mask_nr_gb, sigma, num_steps,
+                )
+                slow_log_probs = slow_lp_gb.reshape(n_group, batch_size)
+                beta = float(self.config["chi2_beta_init"]) * jnp.std(q_ensemble)
+                advantages = advantages - beta * jnp.exp(old_log_probs - slow_log_probs)
+
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+            # ── 6. VLA PPO gradient step ─────────────────────────────────────── #
+            def vla_loss_fn(vla_online_state):
+                return self._vla_ppo_loss(
+                    vla_online_state, traj_gb, old_lp_gb, advantages,
+                    kv_cache_gb, prefix_mask_gb, prefix_mask_nr_gb,
+                    sigma, num_steps, n_group, batch_size, clip_eps,
+                )
+
+            (_, ppo_info), grads = jax.value_and_grad(vla_loss_fn, has_aux=True)(
+                self.vla_online_state
+            )
+            jax.block_until_ready(grads)
+            info.update({f"vla/{k}": v for k, v in ppo_info.items()})
+
+            # ── 7. Apply optax update + EMA ──────────────────────────────────── #
+            updates, new_vla_opt_state = self.vla_tx.update(grads, self.vla_opt_state)
+            new_vla_online_state = optax.apply_updates(self.vla_online_state, updates)
+
+            tau_ema = 1.0 - float(self.config["ema_decay"])
+            new_vla_ema_state = jax.tree_util.tree_map(
+                lambda p, e: tau_ema * p + (1.0 - tau_ema) * e,
+                new_vla_online_state, self.vla_ema_state,
+            )
+            if self.config.get("chi2_reg", False) and self.vla_slow_state is not None:
+                tau_slow = 1.0 - float(self.config["slow_ema_decay"])
+                new_vla_slow_state = jax.tree_util.tree_map(
+                    lambda p, s: tau_slow * p + (1.0 - tau_slow) * s,
+                    new_vla_online_state, self.vla_slow_state,
+                )
+            else:
+                new_vla_slow_state = self.vla_slow_state
+
+        else:
+            # Fall back to FlowActor PPO when VLA state is not initialised
+            rng, actor_rng = jax.random.split(rng)
+
+            def actor_loss_fn(grad_params):
+                return self.actor_loss(batch, grad_params, actor_rng, succ_batch=succ_batch)
+
+            new_network, actor_info = new_network.apply_loss_fn(loss_fn=actor_loss_fn)
+            info.update(actor_info)
+            new_vla_online_state = self.vla_online_state
+            new_vla_ema_state = self.vla_ema_state
+            new_vla_slow_state = self.vla_slow_state
+            new_vla_opt_state = self.vla_opt_state
 
         self.ema_update(new_network, "flow", "ema_flow")
         self.slow_ema_update(new_network)
-        return self.replace(network=new_network, rng=new_rng), info
+        return self.replace(
+            network=new_network,
+            rng=new_rng,
+            vla_online_state=new_vla_online_state,
+            vla_ema_state=new_vla_ema_state,
+            vla_slow_state=new_vla_slow_state,
+            vla_opt_state=new_vla_opt_state,
+        ), info
 
     # ----- construction --------------------------------------------------- #
 
@@ -826,12 +1101,43 @@ class OGPOAgent(flax.struct.PyTreeNode):
         if "modules_slow_flow" in network.params:
             network.params["modules_slow_flow"] = network.params["modules_flow"]
 
+        # ── VLA fine-tuning state ─────────────────────────────────────────── #
+        # Initialise when a local SteerVLAActor is provided.  The graphdef is
+        # static (non-pytree); online/ema/slow states are JAX pytrees.
+        if steervla_actor is not None and getattr(steervla_actor, "_local_ready", False):
+            vla_graphdef, vla_init_state = nnx.split(steervla_actor.model)
+            vla_online_state = vla_init_state
+            # Deep copy via tree_map so ema/slow start at the same weights but
+            # are independent pytrees (updates don't alias online_state).
+            vla_ema_state = jax.tree_util.tree_map(lambda x: x, vla_init_state)
+            vla_slow_state = (
+                jax.tree_util.tree_map(lambda x: x, vla_init_state)
+                if config.get("chi2_reg", False)
+                else None
+            )
+            vla_lr = float(config.get("vla_lr", config["lr"]))
+            vla_tx = optax.adam(learning_rate=vla_lr)
+            vla_opt_state = vla_tx.init(vla_init_state)
+        else:
+            vla_graphdef = None
+            vla_tx = None
+            vla_online_state = None
+            vla_ema_state = None
+            vla_slow_state = None
+            vla_opt_state = None
+
         return cls(
             rng=rng,
             network=network,
             config=flax.core.FrozenDict(**config),
             vla_sample_fn=vla_sample_fn,
             steervla_actor=steervla_actor,
+            vla_graphdef=vla_graphdef,
+            vla_tx=vla_tx,
+            vla_online_state=vla_online_state,
+            vla_ema_state=vla_ema_state,
+            vla_slow_state=vla_slow_state,
+            vla_opt_state=vla_opt_state,
         )
 
 
@@ -894,5 +1200,8 @@ def get_config():
             training_gpu_rank=-1,
             frame_stack=ml_collections.config_dict.placeholder(int),
             dataset_class="ReplayBuffer",
+            # VLA fine-tuning (OGPO direct VLA PPO)
+            vla_lr=3e-5,           # learning rate for VLA action-expert update
+            vla_update_flow_steps=10,  # denoising steps used in PPO trajectory eval
         )
     )

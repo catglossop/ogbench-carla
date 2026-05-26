@@ -43,6 +43,12 @@ def get_config():
     config.n_vr_samples = 4
     config.critic_agg = "subsample"
 
+    # χ² regularization: recommended for pixel-based tasks (OGPO paper Sec. 4, Appendix E.2).
+    # Maintains a slow EMA policy (τ_slow=0.999 ≪ τ_ema=0.995) and penalizes drift from it.
+    config.chi2_reg = True
+    config.chi2_beta_init = 1.0
+    config.slow_ema_decay = 0.999
+
     # VLA action space: chunk layout matching SteerVLA output
     config.vla_action_horizon = 10
     config.vla_action_dim = 4

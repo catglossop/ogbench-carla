@@ -874,7 +874,155 @@ class SteerVLAActor:
         """Public wrapper for DSRL / training-time VLA forwards."""
         out = self._postprocess_action_trajectory(trajectory, observation_state=observation_state)
         return jnp.asarray(out, dtype=jnp.float32)
-    
+
+    # ------------------------------------------------------------------
+    # OGPO VLA fine-tuning helpers
+    # ------------------------------------------------------------------
+
+    def get_nnx_state(self):
+        """Return (graphdef, state) of the Pi0-CoT NNX model for OGPO VLA fine-tuning."""
+        assert self._local_ready, "get_nnx_state() requires a local checkpoint (not remote)"
+        return nnx.split(self.model)
+
+    def compute_prefix_kv_for_ogpo(
+        self,
+        vla_graphdef,
+        vla_state,
+        openpi_obs,
+        image_keys: tuple[str, ...],
+    ):
+        """Compute frozen prefix KV cache for OGPO PPO log-prob re-evaluation.
+
+        Reconstructs Pi0-CoT from explicit NNX state, runs the prefix forward
+        (images + prompt + reasoning + subtask) once, and returns stop-gradiented
+        ``(kv_cache, prefix_mask, prefix_mask_no_reasoning)`` shared across all
+        n_group denoising trajectory evaluations.
+        """
+        model = nnx.merge(vla_graphdef, vla_state)
+        observation = _openpi_model.preprocess_observation(
+            None, openpi_obs, train=False, image_keys=tuple(image_keys)
+        )
+        batch_size = observation.state.shape[0]
+
+        img_tokens, img_masks, img_ar = model._embed_images(observation)
+        n_img = sum(t.shape[1] for t in img_tokens)
+        prompt_emb = model._embed_text_tokens(observation.tokenized_prompt)
+        n_prompt = prompt_emb.shape[1]
+        reasoning_emb = model._embed_text_tokens(observation.tokenized_reasoning)
+        n_reasoning = reasoning_emb.shape[1]
+        subtask_emb = model._embed_text_tokens(observation.tokenized_subtask)
+        n_subtask = subtask_emb.shape[1]
+
+        prefix_parts = img_tokens + [prompt_emb, reasoning_emb, subtask_emb]
+        prefix_mask_parts = img_masks + [
+            observation.tokenized_prompt_mask,
+            observation.tokenized_reasoning_mask,
+            observation.tokenized_subtask_mask,
+        ]
+        prefix_ar_list = img_ar + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask
+
+        n_fast = 0
+        if getattr(model, "_use_fast_tokens", False) and observation.tokenized_fast is not None:
+            fast_emb = model._embed_text_tokens(observation.tokenized_fast)
+            prefix_parts.append(fast_emb)
+            prefix_mask_parts.append(observation.tokenized_fast_mask)
+            prefix_ar_list += [True] * fast_emb.shape[1]
+            n_fast = observation.tokenized_fast.shape[1]
+
+        prefix_tokens = jnp.concatenate(prefix_parts, axis=1)
+        prefix_mask = jnp.concatenate(prefix_mask_parts, axis=1)
+        prefix_len = prefix_mask.shape[1]
+        prefix_ar = jnp.array(prefix_ar_list)
+
+        empty_sfx_mask = jnp.zeros((batch_size, 0), dtype=jnp.bool_)
+        empty_sfx_ar = jnp.array([], dtype=jnp.bool_)
+        prefix_attn_mask = model._build_attention_mask(
+            prefix_mask, prefix_ar, empty_sfx_mask, empty_sfx_ar,
+            n_img, n_prompt, n_subtask, n_reasoning, n_fast, 0,
+        )
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = model.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        reasoning_start = n_img + n_prompt
+        col_is_reasoning = (
+            (jnp.arange(prefix_len) >= reasoning_start)
+            & (jnp.arange(prefix_len) < reasoning_start + n_reasoning)
+        )
+        prefix_mask_no_reasoning = prefix_mask & ~col_is_reasoning[None, :]
+
+        return (
+            jax.lax.stop_gradient(kv_cache),
+            jax.lax.stop_gradient(prefix_mask),
+            jax.lax.stop_gradient(prefix_mask_no_reasoning),
+        )
+
+    def sample_sde_trajectory_for_ppo(
+        self,
+        vla_graphdef,
+        vla_state,
+        kv_cache,
+        prefix_mask,
+        prefix_mask_no_reasoning,
+        noise_full: jax.Array,
+        rng: jax.Array,
+        sigma: float,
+        num_steps: int,
+    ) -> tuple:
+        """Sample an SDE denoising trajectory from an explicit VLA NNX state.
+
+        Designed for OGPO PPO: run with EMA state to produce stop-gradiented
+        (old) trajectories and their log-probs under the EMA policy.
+
+        ``noise_full`` may have batch-size B or G*B (when all groups are batched
+        together for efficiency; caller is responsible for tiling ``kv_cache``).
+
+        Returns stop-gradiented:
+          trajectory : (K+1, B, model_ah, model_ad)
+          log_prob_sum : (B,)
+        """
+        import einops as _einops
+
+        model = nnx.merge(vla_graphdef, vla_state)
+        batch_size = noise_full.shape[0]
+        model_ah = int(self.model.action_horizon)
+        model_ad = int(self.model.action_dim)
+        action_flat = model_ah * model_ad
+        sigma_sq = float(sigma) ** 2
+        log_norm = action_flat * float(jnp.log(2.0 * jnp.pi * sigma_sq))
+
+        def step_fn(carry, k):
+            x_t, rng_c = carry
+            rng_c, srng = jax.random.split(rng_c)
+            t = jnp.array(1.0 - k / num_steps, dtype=jnp.float32)
+            t_b = jnp.broadcast_to(t, (batch_size,))
+            dt = jnp.array(-1.0 / num_steps, dtype=jnp.float32)
+
+            sfx_tok, sfx_mask, _, adarms = model._embed_action_suffix(None, x_t, t_b)
+            sfx_ar = jnp.array([True] + [False] * (model_ah - 1))
+            sfx_attn = _openpi_pi0.make_attn_mask(sfx_mask, sfx_ar)
+            a2p = _einops.repeat(prefix_mask_no_reasoning, "b p -> b s p", s=sfx_tok.shape[1])
+            full_mask = jnp.concatenate([a2p, sfx_attn], axis=-1)
+            pos = (
+                jnp.sum(prefix_mask, axis=-1)[:, None]
+                + jnp.cumsum(sfx_mask, axis=-1) - 1
+            )
+            (_, sfx_out), _ = model.PaliGemma.llm(
+                [None, sfx_tok], mask=full_mask, positions=pos,
+                kv_cache=kv_cache, adarms_cond=[None, adarms],
+            )
+            v_t = model.action_out_proj(sfx_out[:, -model_ah:])
+            mean = x_t + dt * v_t
+            x_prev = mean + sigma * jax.random.normal(srng, x_t.shape)
+            diff = (x_prev - mean).reshape(batch_size, action_flat)
+            log_p = -0.5 * (jnp.sum(diff ** 2, axis=-1) / sigma_sq + log_norm)
+            return (x_prev, rng_c), (x_prev, log_p)
+
+        (_, _), (action_seq, log_probs) = jax.lax.scan(
+            step_fn, (noise_full, rng), jnp.arange(num_steps)
+        )
+        trajectory = jnp.concatenate([noise_full[None], action_seq], axis=0)  # (K+1, B, ah, ad)
+        return jax.lax.stop_gradient(trajectory), jax.lax.stop_gradient(log_probs.sum(axis=0))
+
     def flow_sample(self, rng, openpi_observation, input_noise):
         batch_size = int(openpi_observation.state.shape[0])
         cot_out = self._sample_or_reuse_cot(rng, openpi_observation, batch_size)
