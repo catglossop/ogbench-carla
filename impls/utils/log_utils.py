@@ -50,8 +50,11 @@ def get_exp_name(seed):
     return exp_name
 
 
+_REDACTED_FLAG_SUBSTRINGS = ("api_key", "secret", "password", "token")
+
+
 def get_flag_dict():
-    """Return the dictionary of flags."""
+    """Return the dictionary of flags, with sensitive values redacted."""
     flag_dict = {k: getattr(flags.FLAGS, k) for k in flags.FLAGS if '.' not in k}
     for k in flag_dict:
         value = flag_dict[k]
@@ -61,6 +64,9 @@ def get_flag_dict():
             except Exception:
                 # Unresolved placeholders (e.g. _ErrorConfig) can fail conversion.
                 value = str(value)
+        if any(sub in k.lower() for sub in _REDACTED_FLAG_SUBSTRINGS):
+            flag_dict[k] = "<redacted>"
+            continue
         try:
             import json
             json.dumps(value)

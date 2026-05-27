@@ -36,6 +36,9 @@
 # 9     28093     NonSignalizedJunctionLeftTurnEnterFlow_1 Town04 14 60.00  60.00     48.00     56.00  5.66   12.00  61.66
 # 10    2091      NonSignalizedJunctionLeftTurn_1       Town12  5   60.00  60.00     42.00     54.00  8.49   18.00  62.49
 
+# run simlingo + steervla on a couple seeds for these routes
+# then get the residual sac going 
+
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,8 +46,8 @@ cd "$ROOT_DIR"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 SIMLINGO_CKPT="/home/celinet/simlingo_checkpoints/simlingo/checkpoints/epoch=013.ckpt"
-POLICY_MODE="hierarchical"
-HIGH_LEVEL_CKPT="/home/celinet/ogbench-carla/simlingo_checkpoints/2026_05_24_06_52_33_simlingo_seed1_bellman/checkpoints/epoch=013.ckpt"
+POLICY_MODE="single"
+HIGH_LEVEL_CKPT="/home/celinet/ogbench-carla/simlingo_checkpoints/2026_05_24_06_52_33_simlingo_seed1_bellman/checkpoints/epoch=019.ckpt"
 LOW_LEVEL_CKPT="/home/celinet/ogbench-carla/simlingo_checkpoints/2026_05_23_21_39_41_simlingo_ll_vla_meta_conditioned/checkpoints/epoch=029.ckpt"
 HIGH_LEVEL_HYDRA_CONFIG=""
 LOW_LEVEL_HYDRA_CONFIG=""
@@ -52,32 +55,57 @@ HIERARCHICAL_SOURCE_ROOT=""
 HIGH_LEVEL_SOURCE_ROOT="/scratch/current/celinet/simlingo-steervla"
 LOW_LEVEL_SOURCE_ROOT="/scratch/current/celinet/simlingo-tian"
 ROUTE="bench2drive_00"
-STEPS="10000"
+STEPS="3000"
 WARMUP="500"
-LEARNING_STARTS="500"
+LEARNING_STARTS="200"  # normalizer collects stats for 200 steps before freezing and before SAC updates begin
 CHUNK_SIZE="1"
-RES_SCALE="0.1"
+RES_SCALE="0.6"
 BATCH_SIZE="256"
 BUFFER_CAP="10000"
-UPDATES_PER_STEP="10"
+UPDATES_PER_STEP="4"
 ACTOR_LR="1e-4"
 CRITIC_LR="1e-4"
+RESIDUAL_CLIP_SCHEDULE_STEPS="500" # "1000"
+COLLISION_EVENT_PENALTY=""
+COLLISION_CONTACT_PENALTY=""
+OUTSIDE_ROUTE_EVENT_PENALTY=""
+TRAFFIC_VIOLATION_PENALTY=""
+CRASH_STUCK_PENALTY=""
+PROGRESS_REWARD_WEIGHT=""
+STEER_PENALTY_WEIGHT=""
+BRAKE_PENALTY_WEIGHT=""
+SPEED_LIMIT_PENALTY_WEIGHT=""
+SUCCESS_BONUS=""
+FAILURE_BONUS=""
 SEED="0"
 RUN_GROUP="Debug"
+WANDB_PROJECT="OGBench-CARLA-SimLingo"
+WANDB_RUN_NAME=""
 WANDB_MODE="${WANDB_MODE:-online}"
-LOG_INTERVAL="1"
+LOG_INTERVAL="10"
 VIDEO_LOG_INTERVAL="1"
 SAVE_INTERVAL="2000"
+EVAL_EPISODES="1"
+EVAL_STEP_LIMIT="2000"
 DEVICE="cuda"
 CARLA_CFG="impls/configs/carla_config.yaml"
 SIMLINGO_PYTHON="/home/celinet/miniconda3/envs/simlingo/bin/python"
 TRAINING_MODE="sac_residual"
+OBS_MODE="encoder"
+ACTOR_L2_REG="0" #"1e-3"
+TERMINATE_ON_INFRACTION="false"
 EVAL_ONLY="false"
+INCLUDE_EGO_STATE="true"
 DEBUG_NEG_SPEED="false"
+DEBUG_TARGET_SPEED=""
 EXPERT_DEBUG="false"
 EXPERT_RECOVER_DEBUG="false"
 SAVE_VIDEO="true"
 DRY_RUN="false"
+USE_GEMINI_COACH="false"
+GEMINI_MODEL="gemini-3.5-flash"
+GEMINI_API_KEY=""
+COACH_ACTION_CHUNK_STEPS="10"
 TRAIN_GPU=""          # empty = preserve inherited CUDA_VISIBLE_DEVICES
 CARLA_HOST=""         # empty = use yaml value
 CARLA_PORT=""         # empty = use yaml value
@@ -95,9 +123,12 @@ Usage: bash run_simlingo.sh [options] [-- extra args passed to main_carla_simlin
 
 Mode:
   --eval-only               Run base policy only, no SAC training
+  --terminate-on-infraction Terminate episode on collision, traffic violation, or off-route
   --training-mode MODE      sac_residual|dagger_residual. Default: sac_residual
   --policy-mode MODE        single|hierarchical. Default: single
+  --no-ego-state            Disable ego state vector input to actor/critic (on by default)
   --debug-neg-speed         Replace reward with -speed (m/s) — SAC should brake
+  --debug-target-speed F    Replace reward with -|speed - F| (m/s). E.g. 5.0 → SAC should hold 5 m/s
   --expert-debug            Drive with CARLA expert action instead of base+residual (dagger_residual only)
   --expert-recover-debug    Run SimLingo for a random [70,200] ticks per episode, then switch to expert
 
@@ -150,8 +181,25 @@ SAC hyperparameters:
   --updates-per-step N      SAC updates per env step / UTD ratio. Default: 10
   --actor-lr F              Actor learning rate. Default: 1e-4
   --critic-lr F             Critic learning rate. Default: 1e-4
+  --obs-mode MODE           Observation mode: vlm_hidden|encoder. Default: encoder
+  --actor-l2-reg F          L2 regularization for the actor. Default: 1e-4
   --gamma F                 Discount factor. Default: 0.97
   --tau F                   Target network tau. Default: 0.01
+  --residual-clip-schedule-steps N
+                            Ramp residual clip from 0 to 1 after warmup over N steps
+
+Reward coefficients:
+  --collision-event-penalty F
+  --collision-contact-penalty F
+  --outside-route-event-penalty F
+  --traffic-violation-penalty F
+  --crash-stuck-penalty F
+  --progress-reward-weight F
+  --steer-penalty-weight F
+  --brake-penalty-weight F
+  --speed-limit-penalty-weight F
+  --success-bonus F
+  --failure-bonus F
 
 Logging:
   --run-group NAME          W&B run group. Default: Debug
@@ -161,6 +209,13 @@ Logging:
   --save-interval N         Save SAC checkpoint every N steps. Default: 2000
   --no-video                Disable local mp4 saving
   --dry-run                 Print resolved config/command without launching
+
+Gemini VLM coach:
+  --use-gemini-coach        Enable Gemini VLM coach (retroactive critic label backfill)
+  --gemini-model MODEL      Gemini model to use. Default: gemini-2.0-flash
+  --gemini-api-key KEY      Gemini API key (or set GEMINI_API_KEY env var)
+  --coach-action-chunk-steps N
+                            SAC global-steps per coach action chunk. Default: 10
 
   -h, --help                Show this help
 
@@ -187,8 +242,13 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --eval-only)           EVAL_ONLY="true"; shift ;;
     --training-mode|--training_mode) TRAINING_MODE="$2"; shift 2 ;;
+    --obs-mode|--obs_mode)        OBS_MODE="$2"; shift 2 ;;
+    --actor-l2-reg|--actor_l2_reg) ACTOR_L2_REG="$2"; shift 2 ;;
+    --terminate-on-infraction|--terminate_on_infraction) TERMINATE_ON_INFRACTION="true"; shift ;;
     --policy-mode)         POLICY_MODE="$2"; shift 2 ;;
+    --no-ego-state)        INCLUDE_EGO_STATE="false"; shift ;;
     --debug-neg-speed)     DEBUG_NEG_SPEED="true"; shift ;;
+    --debug-target-speed)  DEBUG_TARGET_SPEED="$2"; shift 2 ;;
     --expert-debug)        EXPERT_DEBUG="true"; shift ;;
     --expert-recover-debug) EXPERT_RECOVER_DEBUG="true"; shift ;;
     --route)               ROUTE="$2"; shift 2 ;;
@@ -214,13 +274,33 @@ while [[ $# -gt 0 ]]; do
     --critic-lr)           CRITIC_LR="$2"; shift 2 ;;
     --gamma)               GAMMA="${2}"; shift 2 ;;
     --tau)                 TAU="${2}"; shift 2 ;;
+    --residual-clip-schedule-steps|--residual_clip_schedule_steps) RESIDUAL_CLIP_SCHEDULE_STEPS="$2"; shift 2 ;;
+    --collision-event-penalty|--collision_event_penalty) COLLISION_EVENT_PENALTY="$2"; shift 2 ;;
+    --collision-contact-penalty|--collision_contact_penalty) COLLISION_CONTACT_PENALTY="$2"; shift 2 ;;
+    --outside-route-event-penalty|--outside_route_event_penalty) OUTSIDE_ROUTE_EVENT_PENALTY="$2"; shift 2 ;;
+    --traffic-violation-penalty|--traffic_violation_penalty) TRAFFIC_VIOLATION_PENALTY="$2"; shift 2 ;;
+    --crash-stuck-penalty|--crash_stuck_penalty) CRASH_STUCK_PENALTY="$2"; shift 2 ;;
+    --progress-reward-weight|--progress_reward_weight) PROGRESS_REWARD_WEIGHT="$2"; shift 2 ;;
+    --steer-penalty-weight|--steer_penalty_weight) STEER_PENALTY_WEIGHT="$2"; shift 2 ;;
+    --brake-penalty-weight|--brake_penalty_weight) BRAKE_PENALTY_WEIGHT="$2"; shift 2 ;;
+    --speed-limit-penalty-weight|--speed_limit_penalty_weight) SPEED_LIMIT_PENALTY_WEIGHT="$2"; shift 2 ;;
+    --success-bonus|--success_bonus) SUCCESS_BONUS="$2"; shift 2 ;;
+    --failure-bonus|--failure_bonus) FAILURE_BONUS="$2"; shift 2 ;;
     --run-group)           RUN_GROUP="$2"; shift 2 ;;
+    --wandb-project)       WANDB_PROJECT="$2"; shift 2 ;;
+    --wandb-run-name)      WANDB_RUN_NAME="$2"; shift 2 ;;
     --wandb-mode)          WANDB_MODE="$2"; shift 2 ;;
     --log-interval)        LOG_INTERVAL="$2"; shift 2 ;;
     --video-log-interval)  VIDEO_LOG_INTERVAL="$2"; shift 2 ;;
     --save-interval)       SAVE_INTERVAL="$2"; shift 2 ;;
+    --eval-episodes)       EVAL_EPISODES="$2"; shift 2 ;;
+    --eval-step-limit)     EVAL_STEP_LIMIT="$2"; shift 2 ;;
     --seed)                SEED="$2"; shift 2 ;;
     --no-video)            SAVE_VIDEO="false"; shift ;;
+    --use-gemini-coach)    USE_GEMINI_COACH="true"; shift ;;
+    --gemini-model)        GEMINI_MODEL="$2"; shift 2 ;;
+    --gemini-api-key)      GEMINI_API_KEY="$2"; shift 2 ;;
+    --coach-action-chunk-steps) COACH_ACTION_CHUNK_STEPS="$2"; shift 2 ;;
     --dry-run)             DRY_RUN="true"; shift ;;
     --instance)            INSTANCE="$2"; shift 2 ;;
     --gpu)                 TRAIN_GPU="$2"; GPU_RANK="$2"; shift 2 ;;
@@ -270,13 +350,25 @@ if [[ -n "$INSTANCE" ]]; then
   fi
 fi
 
+# Auto-derive CARLA port from GPU rank if no explicit port was given.
+# GPU N → port 2000+10*N, so GPUs 0-7 get ports 2000,2010,…,2070 (no conflicts).
+if [[ -z "$CARLA_PORT" ]]; then
+  _gpu_for_port="${GPU_RANK:-${TRAIN_GPU:-}}"
+  if [[ -n "$_gpu_for_port" ]]; then
+    CARLA_PORT=$(( 2000 + 10 * _gpu_for_port ))
+  fi
+fi
+
 if [[ -n "$RENDER_ADAPTER" ]]; then
   GPU_RANK="$RENDER_ADAPTER"
 fi
 
 TMP_CFG=""
 NEEDS_TMP_CFG="false"
-for _v in "$CARLA_HOST" "$CARLA_PORT" "$CARLA_STREAMING_PORT" "$CARLA_TM_PORT" "$X_DISPLAY_NUM" "$GPU_RANK"; do
+for _v in "$CARLA_HOST" "$CARLA_PORT" "$CARLA_STREAMING_PORT" "$CARLA_TM_PORT" "$X_DISPLAY_NUM" "$GPU_RANK" \
+          "$COLLISION_EVENT_PENALTY" "$COLLISION_CONTACT_PENALTY" "$OUTSIDE_ROUTE_EVENT_PENALTY" \
+          "$TRAFFIC_VIOLATION_PENALTY" "$CRASH_STUCK_PENALTY" "$PROGRESS_REWARD_WEIGHT" "$STEER_PENALTY_WEIGHT" \
+          "$BRAKE_PENALTY_WEIGHT" "$SPEED_LIMIT_PENALTY_WEIGHT" "$SUCCESS_BONUS" "$FAILURE_BONUS"; do
   if [[ -n "$_v" ]]; then
     NEEDS_TMP_CFG="true"
   fi
@@ -302,13 +394,21 @@ if [[ "$NEEDS_TMP_CFG" == "true" ]]; then
   trap 'rm -rf "$TMP_DIR"' EXIT
 
   "$SIMLINGO_PYTHON" - "$CARLA_CFG" "$TMP_CFG" \
-    "$CARLA_HOST" "$CARLA_PORT" "$CARLA_STREAMING_PORT" "$CARLA_TM_PORT" "$X_DISPLAY_NUM" "$GPU_RANK" <<'PY'
+    "$CARLA_HOST" "$CARLA_PORT" "$CARLA_STREAMING_PORT" "$CARLA_TM_PORT" "$X_DISPLAY_NUM" "$GPU_RANK" \
+    "$COLLISION_EVENT_PENALTY" "$COLLISION_CONTACT_PENALTY" "$OUTSIDE_ROUTE_EVENT_PENALTY" \
+    "$TRAFFIC_VIOLATION_PENALTY" "$CRASH_STUCK_PENALTY" "$PROGRESS_REWARD_WEIGHT" "$STEER_PENALTY_WEIGHT" \
+    "$BRAKE_PENALTY_WEIGHT" "$SPEED_LIMIT_PENALTY_WEIGHT" "$SUCCESS_BONUS" "$FAILURE_BONUS" <<'PY'
 import sys
 from pathlib import Path
 
 import yaml
 
-base_path, out_path, host, port, streaming_port, tm_port, x_display_num, gpu_rank = sys.argv[1:9]
+(
+    base_path, out_path, host, port, streaming_port, tm_port, x_display_num, gpu_rank,
+    collision_event_penalty, collision_contact_penalty, outside_route_event_penalty,
+    traffic_violation_penalty, crash_stuck_penalty, progress_reward_weight, steer_penalty_weight,
+    brake_penalty_weight, speed_limit_penalty_weight, success_bonus, failure_bonus,
+) = sys.argv[1:20]
 cfg = yaml.safe_load(Path(base_path).read_text())
 
 if host:
@@ -325,6 +425,23 @@ if x_display_num:
     cfg["x_display_num"] = int(x_display_num)
 if gpu_rank:
     cfg["gpu_rank"] = int(gpu_rank)
+
+reward_overrides = {
+    "collision_event_penalty": collision_event_penalty,
+    "collision_contact_penalty": collision_contact_penalty,
+    "outside_route_event_penalty": outside_route_event_penalty,
+    "traffic_violation_penalty": traffic_violation_penalty,
+    "crash_stuck_penalty": crash_stuck_penalty,
+    "progress_reward_weight": progress_reward_weight,
+    "steer_penalty_weight": steer_penalty_weight,
+    "brake_penalty_weight": brake_penalty_weight,
+    "speed_limit_penalty_weight": speed_limit_penalty_weight,
+    "success_bonus": success_bonus,
+    "failure_bonus": failure_bonus,
+}
+for key, value in reward_overrides.items():
+    if value:
+        cfg[key] = float(value)
 
 Path(out_path).write_text(yaml.safe_dump(cfg, sort_keys=False))
 PY
@@ -356,8 +473,13 @@ ARGS=(
   --device="$DEVICE"
   --chunk_size="$CHUNK_SIZE"
   --res_scale="$RES_SCALE"
+  --obs_mode="$OBS_MODE"
+  --actor_l2_reg="$ACTOR_L2_REG"
+  --include_ego_state="$INCLUDE_EGO_STATE"
+  --terminate_on_infraction="$TERMINATE_ON_INFRACTION"
   --seed="$SEED"
   --run_group="$RUN_GROUP"
+  --wandb_project="$WANDB_PROJECT"
   --wandb_mode="$WANDB_MODE"
   --log_interval="$LOG_INTERVAL"
   --video_log_interval="$VIDEO_LOG_INTERVAL"
@@ -384,8 +506,10 @@ if [[ -n "$CARLA_PORT" ]]; then
   ARGS+=(--save_dir="./logs/simlingo_residual_port${CARLA_PORT}")
 fi
 
+[[ -n "$WANDB_RUN_NAME" ]] && ARGS+=(--wandb_run_name="$WANDB_RUN_NAME")
+
 if [[ "$EVAL_ONLY" == "true" ]]; then
-  ARGS+=(--eval_only)
+  ARGS+=(--eval_only --eval_episodes="$EVAL_EPISODES" --eval_step_limit="$EVAL_STEP_LIMIT")
 else
   ARGS+=(--training_mode="$TRAINING_MODE")
   ARGS+=(
@@ -400,10 +524,15 @@ else
   )
   [[ -n "${GAMMA:-}" ]] && ARGS+=(--gamma="$GAMMA")
   [[ -n "${TAU:-}" ]]   && ARGS+=(--tau="$TAU")
+  [[ -n "$RESIDUAL_CLIP_SCHEDULE_STEPS" ]] && ARGS+=(--residual_clip_schedule_steps="$RESIDUAL_CLIP_SCHEDULE_STEPS")
 fi
 
 if [[ "$DEBUG_NEG_SPEED" == "true" ]]; then
   ARGS+=(--debug_neg_speed_reward)
+fi
+
+if [[ -n "$DEBUG_TARGET_SPEED" ]]; then
+  ARGS+=(--debug_target_speed_reward="$DEBUG_TARGET_SPEED")
 fi
 
 if [[ "$EXPERT_DEBUG" == "true" ]]; then
@@ -414,10 +543,20 @@ if [[ "$EXPERT_RECOVER_DEBUG" == "true" ]]; then
   ARGS+=(--expert_recover_debug)
 fi
 
+if [[ "$USE_GEMINI_COACH" == "true" ]]; then
+  ARGS+=(--use_gemini_coach)
+  ARGS+=(--gemini_model="$GEMINI_MODEL")
+  ARGS+=(--coach_action_chunk_steps="$COACH_ACTION_CHUNK_STEPS")
+  _gemini_key="${GEMINI_API_KEY:-${GOOGLE_API_KEY:-}}"
+  if [[ -n "$_gemini_key" ]]; then
+    ARGS+=(--gemini_api_key="$_gemini_key")
+  fi
+fi
+
 ARGS+=("${EXTRA_ARGS[@]}")
 
-echo "[run_simlingo.sh] route=$ROUTE  eval_only=$EVAL_ONLY  training_mode=$TRAINING_MODE  policy_mode=$POLICY_MODE  debug_neg_speed=$DEBUG_NEG_SPEED  expert_debug=$EXPERT_DEBUG  expert_recover_debug=$EXPERT_RECOVER_DEBUG"
-echo "[run_simlingo.sh] steps=$STEPS  warmup=$WARMUP  chunk_size=$CHUNK_SIZE  res_scale=$RES_SCALE"
+echo "[run_simlingo.sh] route=$ROUTE  eval_only=$EVAL_ONLY  training_mode=$TRAINING_MODE  policy_mode=$POLICY_MODE  debug_neg_speed=$DEBUG_NEG_SPEED  debug_target_speed=${DEBUG_TARGET_SPEED:-off}  expert_debug=$EXPERT_DEBUG  expert_recover_debug=$EXPERT_RECOVER_DEBUG"
+echo "[run_simlingo.sh] steps=$STEPS  warmup=$WARMUP  chunk_size=$CHUNK_SIZE  res_scale=$RES_SCALE  obs_mode=$OBS_MODE  actor_l2_reg=$ACTOR_L2_REG"
 echo "[run_simlingo.sh] wandb_mode=$WANDB_MODE  run_group=$RUN_GROUP"
 echo "[run_simlingo.sh] checkpoint=$SIMLINGO_CKPT"
 if [[ "$POLICY_MODE" == "hierarchical" ]]; then
@@ -425,6 +564,9 @@ if [[ "$POLICY_MODE" == "hierarchical" ]]; then
   echo "[run_simlingo.sh] low_checkpoint=$LOW_LEVEL_CKPT"
 fi
 echo "[run_simlingo.sh] carla_config=$CARLA_CFG"
+if [[ "$USE_GEMINI_COACH" == "true" ]]; then
+  echo "[run_simlingo.sh] gemini_coach=enabled  model=$GEMINI_MODEL  chunk_steps=$COACH_ACTION_CHUNK_STEPS"
+fi
 if [[ -n "$TRAIN_GPU" ]]; then
   echo "[run_simlingo.sh] train_gpu=$TRAIN_GPU  carla_gpu=$GPU_RANK"
 else
@@ -432,6 +574,9 @@ else
 fi
 if [[ -n "$CARLA_PORT" ]]; then
   echo "[run_simlingo.sh] carla_host=${CARLA_HOST:-<yaml>}  carla_port=$CARLA_PORT  tm_port=$CARLA_TM_PORT  streaming_port=$CARLA_STREAMING_PORT  x_display=:${X_DISPLAY_NUM}"
+fi
+if [[ -n "$COLLISION_EVENT_PENALTY$COLLISION_CONTACT_PENALTY$OUTSIDE_ROUTE_EVENT_PENALTY$TRAFFIC_VIOLATION_PENALTY$CRASH_STUCK_PENALTY$PROGRESS_REWARD_WEIGHT$STEER_PENALTY_WEIGHT$BRAKE_PENALTY_WEIGHT$SPEED_LIMIT_PENALTY_WEIGHT$SUCCESS_BONUS$FAILURE_BONUS" ]]; then
+  echo "[run_simlingo.sh] reward_overrides collision_event=$COLLISION_EVENT_PENALTY collision_contact=$COLLISION_CONTACT_PENALTY outside_route=$OUTSIDE_ROUTE_EVENT_PENALTY traffic_violation=$TRAFFIC_VIOLATION_PENALTY crash_stuck=$CRASH_STUCK_PENALTY progress=$PROGRESS_REWARD_WEIGHT success=$SUCCESS_BONUS failure=$FAILURE_BONUS"
 fi
 echo ""
 

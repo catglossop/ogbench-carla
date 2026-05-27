@@ -81,6 +81,8 @@ flags.DEFINE_string("carla_config", None, "Path to carla_config.yaml.")
 flags.DEFINE_integer("gpu_rank", 0, "CARLA rendering GPU rank.")
 flags.DEFINE_string("carla_root", "/home/celinet/VLA_driving/software",
                     "Path to CARLA root dir (sets CARLA_ROOT env var if not already set).")
+flags.DEFINE_bool("terminate_on_infraction", False,
+                  "Terminate episode immediately on collision, traffic violation, or off-route event.")
 
 
 def _obs_to_wire(obs: Dict[str, Any]) -> Dict[str, Any]:
@@ -110,6 +112,7 @@ def _make_env(carla_config, route):
     from ogbench.carla.carla_utils import CarlaBench2DriveWrapper
     cfg = dict(carla_config)
     cfg["gpu_rank"] = FLAGS.gpu_rank
+    cfg["terminate_on_infraction"] = FLAGS.terminate_on_infraction
     simlingo_agent = str(
         _REPO_ROOT / "ogbench" / "carla" / "leaderboard_agents" / "simlingo_obs.py"
     )

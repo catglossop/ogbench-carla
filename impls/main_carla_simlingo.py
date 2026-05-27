@@ -80,6 +80,37 @@ def _ego_drive_metrics_from_state_vec(state: Any) -> Dict[str, float]:
         "control_brake": float(s[_EGO_STATE_IDX_BRAKE]),
     }
 
+# Indices into the 19-dim ego-state slice (obs["state"][6:], orientation dropped).
+# Layout: vel(3), avel(3), acc(3), speed(1), throttle(1), steer(1), brake(1), routing_onehot(6)
+_NORM_IDX_SPEED      = 9   # speed        (m/s)
+_NORM_IDX_VEL_X      = 0   # longitudinal velocity (m/s)
+_NORM_IDX_AVEL_Z     = 5   # yaw rate     (deg/s)
+_NORM_IDX_STEER_CTRL = 11  # last-applied steer
+
+
+def _state_norm_wandb_log(agent: Any) -> Dict[str, float]:
+    """Return a flat dict of state-normalizer diagnostics for wandb.
+
+    Logs the count (to see when freezing occurs), aggregate std statistics
+    across all 22 dims, and the std for the two highest-variance dims (yaw
+    and speed) that motivated the normalizer in the first place.
+    """
+    n = getattr(agent, "state_normalizer", None)
+    if n is None:
+        return {}
+    std = n.std  # (22,) float32
+    return {
+        "state_norm/n_samples":      float(n._count),
+        "state_norm/std_mean":       float(std.mean()),
+        "state_norm/std_min":        float(std.min()),
+        "state_norm/std_max":        float(std.max()),
+        "state_norm/std_vel_x":      float(std[_NORM_IDX_VEL_X]),
+        "state_norm/std_avel_z":     float(std[_NORM_IDX_AVEL_Z]),
+        "state_norm/std_speed":      float(std[_NORM_IDX_SPEED]),
+        "state_norm/std_steer_ctrl": float(std[_NORM_IDX_STEER_CTRL]),
+    }
+
+
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("simlingo_checkpoint", None, "Path to SimLingo epoch=013.ckpt directory.")
@@ -107,10 +138,14 @@ flags.DEFINE_float("gamma", 0.97, "Discount factor.")
 flags.DEFINE_float("tau", 0.01, "Target network soft-update coefficient.")
 flags.DEFINE_float("actor_lr", 1e-4, "Actor learning rate.")
 flags.DEFINE_float("critic_lr", 1e-4, "Critic learning rate.")
+flags.DEFINE_float("actor_l2_reg", 0.0, "L2 regularization coefficient for the residual actor parameters.")
 flags.DEFINE_string("save_dir", "./logs/simlingo_residual", "Directory for checkpoints and logs.")
 flags.DEFINE_integer("save_interval", 2000, "Save residual SAC checkpoint every N steps.")
 flags.DEFINE_integer("seed", 0, "Random seed.")
 flags.DEFINE_integer("chunk_size", 10, "Waypoints to execute per VLM call (1–10). 1 = VLM every tick; 10 = full predicted chunk.")
+flags.DEFINE_enum("obs_mode", "vlm_hidden", ["vlm_hidden", "encoder"],
+                  "Observation for the residual SAC. 'vlm_hidden': 896-dim mean-pooled LLM last hidden states "
+                  "(current default). 'encoder': 1792-dim = mean-pool(vision_encoder_tokens) ++ mean-pool(prompt_embeds).")
 flags.DEFINE_bool("save_video", True, "Write per-episode mp4 videos of the simlingo camera feed.")
 flags.DEFINE_string("carla_config", None, "Path to carla_config.yaml.")
 flags.DEFINE_string("device", "cuda", "Torch device for SimLingo and residual SAC.")
@@ -120,13 +155,22 @@ flags.DEFINE_string("server_conda_env", "simlingo", "conda env for the CARLA env
 flags.DEFINE_string("carla_root", "/home/celinet/VLA_driving/software",
                     "CARLA root dir (forwarded to env server as CARLA_ROOT). "
                     "Default is CARLA 0.9.15 which works with Town12.")
+flags.DEFINE_bool("include_ego_state", True,
+                  "Include the 25-dim ego state vector as explicit input to the actor and critic.")
 flags.DEFINE_bool("debug_neg_speed_reward", False,
                   "Debug: replace env reward with -speed (m/s). SAC should learn to slow the car.")
+flags.DEFINE_float("debug_target_speed_reward", 0.0,
+                   "Debug: replace env reward with -|speed - target| (m/s). 0 = disabled. "
+                   "E.g. 5.0 → SAC should learn to drive at 5 m/s.")
 flags.DEFINE_bool("expert_debug", False,
                   "Debug: drive with the CARLA expert action instead of base+residual (dagger_residual only).")
+flags.DEFINE_bool("terminate_on_infraction", False,
+                  "Terminate the episode immediately when a collision, traffic violation, or off-route event occurs.")
 flags.DEFINE_bool("expert_recover_debug", False,
                   "Debug: run SimLingo for a random [70,200] ticks per episode, then switch to CARLA expert.")
 flags.DEFINE_string("run_group", "Debug", "W&B run group.")
+flags.DEFINE_string("wandb_project", "OGBench-CARLA-SimLingo", "W&B project name.")
+flags.DEFINE_string("wandb_run_name", None, "W&B run name. If None, auto-generates from route + seed.")
 flags.DEFINE_enum("wandb_mode", "online", ["online", "offline", "disabled"], "W&B logging mode.")
 flags.DEFINE_integer("log_interval", 1, "Log training metrics to W&B every N episodes.")
 flags.DEFINE_integer("video_log_interval", 5, "Upload episode video to W&B every N episodes (0=never).")
@@ -135,6 +179,20 @@ flags.DEFINE_integer("eval_step_limit", 4000, "Maximum CARLA ticks per eval epis
 flags.DEFINE_enum("training_mode", "sac_residual", ["sac_residual", "dagger_residual"],
                   "Training mode: sac_residual (RL with env reward) or "
                   "dagger_residual (BC with expert planner labels).")
+
+# ── Gemini coach flags ─────────────────────────────────────────────────────────
+flags.DEFINE_bool("use_gemini_coach", False,
+                  "Enable Gemini VLM coach: after each episode Gemini reviews the rollout "
+                  "video and assigns per-step delta-commentary BoW labels that are "
+                  "backfilled into the replay buffer to condition the critic.")
+flags.DEFINE_string("gemini_api_key", "",
+                    "Gemini API key. Falls back to GEMINI_API_KEY env var.")
+flags.DEFINE_string("gemini_model", "gemini-2.0-flash",
+                    "Gemini model name for VLM coaching.")
+flags.DEFINE_integer("coach_action_chunk_steps", 10,
+                     "Number of SAC global_steps per coach action chunk. "
+                     "Each chunk gets one lateral/longitudinal feedback label. "
+                     "Default: 10 steps ≈ 2.5 s of driving.")
 
 
 # ── Video overlay ─────────────────────────────────────────────────────────────
@@ -232,9 +290,11 @@ def _annotate_frame(
 
         pen_coll = float(info.get("penalty_collision", 0.0))
         pen_route = float(info.get("penalty_outside_route", 0.0))
+        pen_traf = float(info.get("penalty_traffic_violation", 0.0))
         pen_crash = float(info.get("penalty_crash_stuck", 0.0))
         pen_term = float(info.get("reward_terminal", 0.0))
         contact = bool(info.get("collision_contact_active", False))
+        traf_count = int(info.get("traffic_violation_count", 0))
 
         if expert_action_2d is not None:
             expert_str = f"expert=({expert_action_2d[0]:+.2f},{expert_action_2d[1]:+.3f})"
@@ -247,7 +307,7 @@ def _annotate_frame(
             f"Meta-action: {_clip_text(meta_action) if meta_action else '(none)'}",
             f"Prompt: {_clip_text(prompt)}",
             f"Reasoning: {_clip_text(language) if language else '(no language output)'}",
-            f"Pen: coll={pen_coll:+.1f}{'(bb)' if contact else ''}  route={pen_route:+.1f}  crash={pen_crash:+.1f}  term={pen_term:+.1f}",
+            f"Pen: coll={pen_coll:+.1f}{'(bb)' if contact else ''}  route={pen_route:+.1f}  traf={pen_traf:+.1f}(n={traf_count})  crash={pen_crash:+.1f}  term={pen_term:+.1f}",
         ]
         y = H + 15
         for line in lines:
@@ -271,6 +331,7 @@ class CarlaEnvProxy:
         gpu_rank: int,
         server_conda_env: str = "simlingo",
         carla_root: str = "/home/celinet/VLA_driving/software",
+        terminate_on_infraction: bool = False,
     ):
         server_script = str(_IMPLS_ROOT / "carla_env_server.py")
         # Launch server in the same simlingo conda env (Python 3.8 + carla 0.9.15).
@@ -286,6 +347,8 @@ class CarlaEnvProxy:
         ]
         if carla_config:
             cmd.append(f"--carla_config={carla_config}")
+        if terminate_on_infraction:
+            cmd.append("--terminate_on_infraction")
 
         print(f"[CarlaEnvProxy] Launching server: {' '.join(cmd)}", flush=True)
         child_env = os.environ.copy()
@@ -481,9 +544,9 @@ def main(_argv):
     exp_name = get_exp_name(FLAGS.seed)
     save_dir_base = FLAGS.save_dir
     setup_wandb(
-        project="OGBench-CARLA-SimLingo",
+        project=FLAGS.wandb_project,
         group=FLAGS.run_group,
-        name=f"{FLAGS.route}_{exp_name}",
+        name=FLAGS.wandb_run_name if FLAGS.wandb_run_name else f"{FLAGS.route}_{exp_name}",
         mode=FLAGS.wandb_mode,
     )
     FLAGS.save_dir = str(Path(save_dir_base) / wandb.run.project / FLAGS.run_group / exp_name)
@@ -493,7 +556,7 @@ def main(_argv):
 
     # ── Load SimLingo base policy ─────────────────────────────────────────────
     print(f"[main] Loading SimLingo policy (mode={FLAGS.policy_mode}) ...", flush=True)
-    from vlas.simlingo_base import HierarchicalSimLingoPolicy, SimLingoBase, VLM_FEATURE_DIM  # type: ignore
+    from vlas.simlingo_base import HierarchicalSimLingoPolicy, SimLingoBase, VLM_FEATURE_DIM, VLM_ENCODER_FEATURE_DIM  # type: ignore
     if FLAGS.policy_mode == "hierarchical":
         simlingo_base = HierarchicalSimLingoPolicy(
             high_checkpoint_path=FLAGS.high_level_checkpoint,
@@ -517,6 +580,7 @@ def main(_argv):
         gpu_rank=FLAGS.gpu_rank,
         server_conda_env=FLAGS.server_conda_env,
         carla_root=FLAGS.carla_root,
+        terminate_on_infraction=FLAGS.terminate_on_infraction,
     )
 
     # Read the initial obs that the server sends after startup
@@ -525,6 +589,25 @@ def main(_argv):
     init_line = env._readline()
     init_resp = json.loads(init_line)
     initial_obs = CarlaEnvProxy._wire_to_obs(init_resp["obs"])
+
+    def _get_features(obs):
+        """Return (desired_speeds, route_interp, obs_features) based on obs_mode flag."""
+        desired_speeds, route_interp, vlm_feats = simlingo_base.get_chunk_and_features(
+            simlingo_image=obs["simlingo_image"],
+            ego_state=obs["state"],
+            target_points=obs["target_points"],
+            routing_command=obs.get("routing_command", ""),
+        )
+        if FLAGS.obs_mode == "encoder":
+            obs_features = simlingo_base.get_encoder_features(
+                simlingo_image=obs["simlingo_image"],
+                ego_state=obs["state"],
+                target_points=obs["target_points"],
+                routing_command=obs.get("routing_command", ""),
+            )
+        else:
+            obs_features = vlm_feats
+        return desired_speeds, route_interp, obs_features
 
     # ── Video helper ──────────────────────────────────────────────────────────
     video_dir = save_dir / "videos"
@@ -630,23 +713,29 @@ def main(_argv):
                         break
 
             _close_video(video)
+            driving_score = float(info.get("driving_score", 0.0))
             stats = {
                 "episode_reward": episode_reward,
+                "driving_score": driving_score,
                 "steps": steps,
                 "success": info.get("success", False),
                 "collision_count": info.get("collision_count", 0),
                 "outside_route": info.get("outside_route_value", 0.0),
+                "traffic_violations": info.get("traffic_violation_count", 0),
                 "route": FLAGS.route,
             }
             results.append(stats)
             print(
                 f"[eval] ep={ep_idx+1}  reward={stats['episode_reward']:.2f}"
+                f"  driving_score={driving_score:.2f}"
                 f"  steps={stats['steps']}  success={stats['success']}"
-                f"  collisions={stats['collision_count']}",
+                f"  collisions={stats['collision_count']}"
+                f"  traffic_violations={stats['traffic_violations']}",
                 flush=True,
             )
             wb_log = {
                 "eval/episode_reward": episode_reward,
+                "eval/driving_score": driving_score,
                 "eval/steps": steps,
                 "eval/success": float(stats["success"]),
                 "eval/collision_count": float(stats["collision_count"]),
@@ -669,11 +758,12 @@ def main(_argv):
 
     # ── DAgger residual training ──────────────────────────────────────────────
     if FLAGS.training_mode == "dagger_residual":
-        from torch_agents.residual_sac import ResidualSACAgent, DaggerBuffer  # type: ignore
+        from torch_agents.residual_sac import ResidualSACAgent, DaggerBuffer, EGO_STATE_DIM  # type: ignore
         import torch
 
-        vlm_dim = VLM_FEATURE_DIM
+        vlm_dim = VLM_FEATURE_DIM if FLAGS.obs_mode == "vlm_hidden" else VLM_ENCODER_FEATURE_DIM
 
+        _state_dim = EGO_STATE_DIM if FLAGS.include_ego_state else 0
         agent = ResidualSACAgent(
             vlm_feature_dim=vlm_dim,
             action_dim=2,
@@ -683,8 +773,10 @@ def main(_argv):
             actor_lr=FLAGS.actor_lr,
             critic_lr=FLAGS.critic_lr,
             device=FLAGS.device,
+            actor_l2_reg=FLAGS.actor_l2_reg,
+            state_dim=_state_dim,
         )
-        buffer: Any = DaggerBuffer(capacity=FLAGS.buffer_capacity, vlm_dim=vlm_dim)
+        buffer: Any = DaggerBuffer(capacity=FLAGS.buffer_capacity, vlm_dim=vlm_dim, state_dim=_state_dim)
 
         log_path = save_dir / "train_log.jsonl"
         log_file = open(log_path, "w")
@@ -704,12 +796,7 @@ def main(_argv):
         chunk_size = FLAGS.chunk_size
         ticks_per_wp = simlingo_base._WP_DILATION * simlingo_base._DATA_SAVE_FREQ
 
-        desired_speeds, _route_interp, vlm_features = simlingo_base.get_chunk_and_features(
-            simlingo_image=obs["simlingo_image"],
-            ego_state=obs["state"],
-            target_points=obs["target_points"],
-            routing_command=obs.get("routing_command", ""),
-        )
+        desired_speeds, _route_interp, vlm_features = _get_features(obs)
 
         print(f"[train/dagger] Starting DAgger BC training for {FLAGS.total_steps} steps "
               f"(chunk_size={chunk_size}, ticks_per_wp={ticks_per_wp}) ...", flush=True)
@@ -741,22 +828,24 @@ def main(_argv):
             t_sample_start = time.time()
             in_warmup = global_step < FLAGS.warmup_steps
             dagger_clip_limit = _residual_clip_limit(global_step, FLAGS.warmup_steps, FLAGS.residual_clip_schedule_steps)
+            # Capture speed and base action at the START of the chunk so that the
+            # expert residual uses the same state as vlm_features.
+            chunk_start_speed = float(obs["state"][15])
+            chunk_start_state = obs["state"][6:].copy()
+            if global_step < FLAGS.learning_starts:
+                agent.update_state_normalizer(chunk_start_state)
+            chunk_start_base_accel = simlingo_base.accel_for_desired_speed(desired_speeds[0], chunk_start_speed)
+            chunk_start_base_steer = simlingo_base.steer_for_speed(chunk_start_speed)
+            chunk_start_base_action = np.array([chunk_start_base_accel, chunk_start_base_steer], dtype=np.float32)
             if in_warmup:
                 # Warmup: execute base policy only (no residual)
                 residual_action = np.zeros(2, dtype=np.float32)
             else:
                 # DAgger: execute deterministic actor mean (no exploration noise)
-                residual_action = agent.get_eval_action(vlm_features)
+                residual_action = agent.get_eval_action(vlm_features, chunk_start_base_action, chunk_start_state)
                 residual_action = np.clip(residual_action, -dagger_clip_limit, dagger_clip_limit)
             last_actor_output = residual_action.copy()
             t_sample_end = time.time()
-
-            # Capture speed and base action at the START of the chunk so that the
-            # expert residual uses the same state as vlm_features.
-            chunk_start_speed = float(obs["state"][15])
-            chunk_start_base_accel = simlingo_base.accel_for_desired_speed(desired_speeds[0], chunk_start_speed)
-            chunk_start_base_steer = simlingo_base.steer_for_speed(chunk_start_speed)
-            chunk_start_base_action = np.array([chunk_start_base_accel, chunk_start_base_steer], dtype=np.float32)
 
             # Pre-compute expert route waypoints for video overlay (ego-frame cumsum of route deltas).
             # These are computed before the chunk to match vlm_features timing.
@@ -790,7 +879,14 @@ def main(_argv):
                 for _tick in range(ticks_per_wp):
                     actual_speed = float(obs["state"][15])
                     base_accel = simlingo_base.accel_for_desired_speed(desired_speeds[k], actual_speed)
-                    base_steer = simlingo_base.steer_for_speed(actual_speed)
+                    # Bug fix: reuse chunk_start_base_action[1] at tick 0 so the actor
+                    # input steer (chunk_start_base_action) matches the executed steer.
+                    # A second steer_for_speed() call here would advance the PID window
+                    # again, producing a different value from what the actor saw.
+                    if k == 0 and _tick == 0:
+                        base_steer = chunk_start_base_action[1]
+                    else:
+                        base_steer = simlingo_base.steer_for_speed(actual_speed)
                     base_action = np.array([base_accel, base_steer], dtype=np.float32)
                     if _expert_debug_action is not None:
                         final_action = _expert_debug_action
@@ -858,17 +954,12 @@ def main(_argv):
 
             # ── Next VLM call ─────────────────────────────────────────────────
             t_vlm_start = time.time()
-            next_desired_speeds, _next_route_interp, next_vlm_features = simlingo_base.get_chunk_and_features(
-                simlingo_image=obs["simlingo_image"],
-                ego_state=obs["state"],
-                target_points=obs["target_points"],
-                routing_command=obs.get("routing_command", ""),
-            )
+            next_desired_speeds, _next_route_interp, next_vlm_features = _get_features(obs)
             t_vlm_end = time.time()
 
             # ── Buffer add ────────────────────────────────────────────────────
             if expert_action_2d is not None:
-                buffer.add(vlm_features, chunk_start_base_action, expert_action_2d)
+                buffer.add(vlm_features, chunk_start_base_action, chunk_start_state, expert_action_2d)
 
             episode_reward += chunk_reward
             episode_env_reward += chunk_env_reward
@@ -927,6 +1018,8 @@ def main(_argv):
                     "simlingo/desired_speed_first": float(desired_speeds[0]),
                     "simlingo/desired_speed_mean": float(np.mean(desired_speeds)),
                     "simlingo/vlm_feature_norm": float(np.linalg.norm(vlm_features)),
+                    "simlingo/obs_mode": FLAGS.obs_mode,
+                    "simlingo/obs_dim": float(vlm_dim),
                 }
                 step_log.update({f"rollout/{k}": float(v) for k, v in last_drive_metrics.items()})
                 if last_step_info.get("reward_total") is not None:
@@ -935,9 +1028,12 @@ def main(_argv):
                         "reward/progress": float(last_step_info.get("reward_progress", 0.0)),
                         "reward/penalty_collision": float(last_step_info.get("penalty_collision", 0.0)),
                         "reward/penalty_outside_route": float(last_step_info.get("penalty_outside_route", 0.0)),
+                        "reward/penalty_traffic_violation": float(last_step_info.get("penalty_traffic_violation", 0.0)),
+                        "rollout/traffic_violation_count": float(last_step_info.get("traffic_violation_count", 0)),
                         "rollout/lane_offset_m": float(last_step_info.get("lane_offset_m", 0.0)),
                         "rollout/speed_norm": float(last_step_info.get("speed_norm", 0.0)),
                     })
+                step_log.update(_state_norm_wandb_log(agent))
                 wandb.log(step_log, step=global_step)
                 last_log_time = time.time()
 
@@ -998,12 +1094,7 @@ def main(_argv):
                     _expert_recover_budget = int(np.random.randint(70, 201))
                     print(f"[expert_recover_debug] episode {num_episodes}: SimLingo for {_expert_recover_budget} ticks then expert", flush=True)
                 video = _open_video(num_episodes)
-                desired_speeds, _route_interp, vlm_features = simlingo_base.get_chunk_and_features(
-                    simlingo_image=obs["simlingo_image"],
-                    ego_state=obs["state"],
-                    target_points=obs["target_points"],
-                    routing_command=obs.get("routing_command", ""),
-                )
+                desired_speeds, _route_interp, vlm_features = _get_features(obs)
                 current_expert_action_40d = obs.get("expert_action")
             else:
                 desired_speeds = next_desired_speeds
@@ -1026,10 +1117,49 @@ def main(_argv):
         return
 
     # ── Residual SAC training ─────────────────────────────────────────────────
-    from torch_agents.residual_sac import ResidualSACAgent, ReplayBuffer  # type: ignore
+    from torch_agents.residual_sac import ResidualSACAgent, ReplayBuffer, EGO_STATE_DIM  # type: ignore
     import torch
 
-    vlm_dim = VLM_FEATURE_DIM  # 896
+    vlm_dim = VLM_FEATURE_DIM if FLAGS.obs_mode == "vlm_hidden" else VLM_ENCODER_FEATURE_DIM
+
+    _state_dim = EGO_STATE_DIM if FLAGS.include_ego_state else 0
+    chunk_size = FLAGS.chunk_size  # waypoints per VLM call (1–10)
+    # Each predicted waypoint covers WP_DILATION * DATA_SAVE_FREQ CARLA ticks.
+    ticks_per_wp = simlingo_base._WP_DILATION * simlingo_base._DATA_SAVE_FREQ  # = 5
+
+    # ── Gemini coach session (optional) ───────────────────────────────────────
+    _coach_session = None
+    _coach_label_dim = 0
+    if FLAGS.use_gemini_coach:
+        import os as _os
+        from coaches.online_vlm_coach import OnlineVLMSession  # type: ignore
+        from coaches.expert_label import NUM_DELTA_COMMENTARY_WORDS  # type: ignore
+        _coach_label_dim = NUM_DELTA_COMMENTARY_WORDS  # 17-dim delta-commentary BoW
+        if FLAGS.gemini_api_key:
+            _os.environ["GEMINI_API_KEY"] = FLAGS.gemini_api_key
+        _chunk_duration_sec = FLAGS.coach_action_chunk_steps * ticks_per_wp / 20.0
+        _coach_session = OnlineVLMSession(
+            {
+                "provider": "gemini",
+                "gemini_model": FLAGS.gemini_model,
+                "query_every_n_episode_steps": 0,   # only query at episode end
+                "query_on_episode_end": True,
+                "video_fps": 20.0,
+                "video_frame_stride": ticks_per_wp,  # one trajectory record per global_step
+                "action_chunk_steps": FLAGS.coach_action_chunk_steps,
+                "action_chunk_duration_sec": _chunk_duration_sec,
+                "bad_event_radius_chunks": 2,
+                "annotate_video": False,
+                "save_artifacts": True,
+            },
+            save_dir=save_dir,
+        )
+        print(
+            f"[main] Gemini coach enabled: model={FLAGS.gemini_model}  "
+            f"label_dim={_coach_label_dim}  chunk_steps={FLAGS.coach_action_chunk_steps}  "
+            f"chunk_dur={_chunk_duration_sec:.2f}s",
+            flush=True,
+        )
 
     agent = ResidualSACAgent(
         vlm_feature_dim=vlm_dim,
@@ -1040,8 +1170,13 @@ def main(_argv):
         actor_lr=FLAGS.actor_lr,
         critic_lr=FLAGS.critic_lr,
         device=FLAGS.device,
+        actor_l2_reg=FLAGS.actor_l2_reg,
+        res_scale=FLAGS.res_scale,
+        state_dim=_state_dim,
+        ticks_per_wp=ticks_per_wp,
+        coach_label_dim=_coach_label_dim,
     )
-    buffer = ReplayBuffer(capacity=FLAGS.buffer_capacity, vlm_dim=vlm_dim)
+    buffer = ReplayBuffer(capacity=FLAGS.buffer_capacity, vlm_dim=vlm_dim, state_dim=_state_dim, coach_label_dim=_coach_label_dim)
 
     log_path = save_dir / "train_log.jsonl"
     log_file = open(log_path, "w")
@@ -1058,19 +1193,19 @@ def main(_argv):
     num_episodes = 0
     total_updates = 0
 
-    chunk_size = FLAGS.chunk_size  # waypoints per VLM call (1–10)
-    # Each predicted waypoint covers WP_DILATION * DATA_SAVE_FREQ CARLA ticks.
-    ticks_per_wp = simlingo_base._WP_DILATION * simlingo_base._DATA_SAVE_FREQ  # = 5
-
     # Initial VLM call so the loop starts with features ready.
-    desired_speeds, _route_interp, vlm_features = simlingo_base.get_chunk_and_features(
-        simlingo_image=obs["simlingo_image"],
-        ego_state=obs["state"],
-        target_points=obs["target_points"],
-        routing_command=obs.get("routing_command", ""),
-    )
+    desired_speeds, _route_interp, vlm_features = _get_features(obs)
 
-    reward_mode = "neg_speed" if FLAGS.debug_neg_speed_reward else "env"
+    # Coach: begin the first episode before the training loop starts.
+    if _coach_session is not None:
+        _coach_session.begin_episode(episode_count=0, route_name=FLAGS.route or "")
+
+    if FLAGS.debug_neg_speed_reward:
+        reward_mode = "neg_speed"
+    elif FLAGS.debug_target_speed_reward > 0.0:
+        reward_mode = f"target_speed_{FLAGS.debug_target_speed_reward:.1f}"
+    else:
+        reward_mode = "env"
     print(f"[train] Starting residual SAC training for {FLAGS.total_steps} steps "
           f"(chunk_size={chunk_size}, ticks_per_wp={ticks_per_wp}, "
           f"reward_mode={reward_mode}) ...", flush=True)
@@ -1093,15 +1228,28 @@ def main(_argv):
         # ── Rollout: execute chunk_size waypoints, ticks_per_wp ticks each ───
         in_warmup = global_step < FLAGS.warmup_steps
         sac_clip_limit = _residual_clip_limit(global_step, FLAGS.warmup_steps, FLAGS.residual_clip_schedule_steps)
+        current_speed = float(obs["state"][15])
+        current_obs_state = obs["state"][6:].copy()
+        # Only update normalizer stats before learning starts (i.e. during the
+        # random/zero-residual phase).  Freezing after that keeps the state
+        # representation consistent for every (s, a, r, s') tuple in the buffer.
+        if global_step < FLAGS.learning_starts:
+            agent.update_state_normalizer(current_obs_state)
+        current_base_action = np.array([
+            simlingo_base.accel_for_desired_speed(desired_speeds[0], current_speed),
+            simlingo_base.steer_for_speed(current_speed),
+        ], dtype=np.float32)
         if in_warmup:
             residual_action = np.zeros(2, dtype=np.float32)
         else:
-            residual_action = agent.sample_actions(vlm_features)
+            residual_action = agent.sample_actions(vlm_features, current_base_action, current_obs_state)
             residual_action = np.clip(residual_action, -sac_clip_limit, sac_clip_limit)
         t_sample_end = time.time()
 
         chunk_reward = 0.0
+        chunk_reward_discounted = 0.0  # gamma-weighted sum stored in the replay buffer
         chunk_env_reward = 0.0
+        _tick_gamma = 1.0  # gamma^tick, for proper multi-step Bellman target
         done = False
         info: Dict[str, Any] = {}
         t_step_start = time.time()
@@ -1109,7 +1257,15 @@ def main(_argv):
             for _tick in range(ticks_per_wp):
                 actual_speed = float(obs["state"][15])
                 base_accel = simlingo_base.accel_for_desired_speed(desired_speeds[k], actual_speed)
-                base_steer = simlingo_base.steer_for_speed(actual_speed)
+                # Bug fix: at the first tick reuse the steer that was already computed
+                # above (PID call #1 = what the actor saw).  Calling steer_for_speed()
+                # again here would be PID call #2, advancing _window a second time and
+                # producing a different steer value — making the actor input steer ≠
+                # the steer actually executed at tick 0.
+                if k == 0 and _tick == 0:
+                    base_steer = current_base_action[1]
+                else:
+                    base_steer = simlingo_base.steer_for_speed(actual_speed)
                 base_action = np.array([base_accel, base_steer], dtype=np.float32)
                 final_action = np.clip(
                     base_action + FLAGS.res_scale * residual_action, -1.0, 1.0
@@ -1120,6 +1276,12 @@ def main(_argv):
                 env_reward = float(reward)
                 if FLAGS.debug_neg_speed_reward:
                     reward = -float(next_obs["state"][15])
+                elif FLAGS.debug_target_speed_reward > 0.0:
+                    speed_error = abs(float(next_obs["state"][15]) - FLAGS.debug_target_speed_reward)
+                    on_target_bonus = 100.0 if speed_error < 0.1 else 0.0
+                    # steer_penalty = max(0.0, abs(float(final_action[1])) - 0.5)
+                    steer_penalty = 0.0
+                    reward = -speed_error + on_target_bonus - steer_penalty
                 last_env_reward = env_reward
                 last_train_reward = float(reward)
                 last_actual_speed = actual_speed
@@ -1145,7 +1307,12 @@ def main(_argv):
                     collision_events=last_collision_delta,
                 )
                 _write_frame(video, image_for_video, annotated)
+                # Coach: record every CARLA tick as a video frame.
+                if _coach_session is not None:
+                    _coach_session.record_frame(annotated)
                 chunk_reward += reward
+                chunk_reward_discounted += _tick_gamma * reward
+                _tick_gamma *= FLAGS.gamma
                 chunk_env_reward += env_reward
                 done = terminated or truncated
                 obs = next_obs
@@ -1157,18 +1324,47 @@ def main(_argv):
 
         # ── Next VLM call (for replay buffer and next iteration) ─────────────
         t_vlm_start = time.time()
-        next_desired_speeds, _next_route_interp, next_vlm_features = simlingo_base.get_chunk_and_features(
-            simlingo_image=obs["simlingo_image"],
-            ego_state=obs["state"],
-            target_points=obs["target_points"],
-            routing_command=obs.get("routing_command", ""),
-        )
+        next_desired_speeds, _next_route_interp, next_vlm_features = _get_features(obs)
         t_vlm_end = time.time()
-        buffer.add(vlm_features, next_vlm_features, residual_action, chunk_reward, done)
+        next_actual_speed = float(obs["state"][15])
+        next_base_action = np.array([
+            simlingo_base.accel_for_desired_speed(next_desired_speeds[0], next_actual_speed),
+            simlingo_base.steer_for_speed(next_actual_speed),
+        ], dtype=np.float32)
+        actor_chosen_final_action = np.clip(
+            current_base_action + FLAGS.res_scale * residual_action, -1.0, 1.0
+        ).astype(np.float32)
+        buffer.add(
+            vlm_features, next_vlm_features,
+            current_base_action, next_base_action,
+            actor_chosen_final_action,
+            current_obs_state, obs["state"][6:],
+            chunk_reward_discounted, done,  # discounted: r0 + γ·r1 + … + γ^(n-1)·r_{n-1}
+        )
 
         episode_reward += chunk_reward
         episode_env_reward += chunk_env_reward
         episode_steps += 1
+
+        # Coach: record buffer index + trajectory step (1-indexed episode_steps).
+        if _coach_session is not None:
+            _coach_session.track_buffer_transition(
+                buffer_index=buffer.last_ptr,
+                episode_step=episode_steps,
+            )
+            _coach_session.record_trajectory_step({
+                "step": global_step,
+                "episode_step": episode_steps,
+                "ego_speed_mps": float(last_actual_speed),
+                "control_throttle": float(max(0.0, last_final_action[0])),
+                "control_steer": float(last_final_action[1]),
+                "control_brake": float(max(0.0, -last_final_action[0])),
+                "collision": bool(last_collision_delta > 0),
+                "route_progress_pct": float(last_step_info.get("route_completion_pct", 0.0)),
+                "in_video": True,
+                "video_frame_index": (episode_steps - 1) * ticks_per_wp,
+                "video_timestamp_sec": (episode_steps - 1) * ticks_per_wp / 20.0,
+            })
 
         # ── SAC updates ───────────────────────────────────────────────────────
         t_update_start = time.time()
@@ -1192,7 +1388,7 @@ def main(_argv):
                 "training/in_warmup": float(in_warmup),
                 "training/buffer_size": len(buffer),
                 "training/total_updates": total_updates,
-                "reward/mode_is_neg_speed": float(FLAGS.debug_neg_speed_reward),
+                "reward/mode": reward_mode,
                 "reward/train": float(last_train_reward),
                 "reward/env_step": float(last_env_reward),
                 "reward/chunk_train": float(chunk_reward),
@@ -1225,13 +1421,15 @@ def main(_argv):
                 "simlingo/desired_speed_min": float(np.min(desired_speeds)),
                 "simlingo/desired_speed_max": float(np.max(desired_speeds)),
                 "simlingo/vlm_feature_norm": float(np.linalg.norm(vlm_features)),
+                "simlingo/obs_mode": FLAGS.obs_mode,
+                "simlingo/obs_dim": float(vlm_dim),
             }
             step_log.update({f"rollout/{k}": float(v) for k, v in last_drive_metrics.items()})
             if last_step_info.get("reward_total") is not None:
                 step_log.update({
                     # Keep reward/total aligned with the reward optimized by SAC.
                     # Raw CARLA reward remains available as reward/env_total.
-                    "reward/total": float(last_train_reward) if FLAGS.debug_neg_speed_reward else float(last_step_info.get("reward_total", 0.0)),
+                    "reward/total": float(last_train_reward) if reward_mode != "env" else float(last_step_info.get("reward_total", 0.0)),
                     "reward/env_total": float(last_step_info.get("reward_total", 0.0)),
                     "reward/progress": float(last_step_info.get("reward_progress", 0.0)),
                     "reward/centering": float(last_step_info.get("reward_centering", 0.0)),
@@ -1239,6 +1437,8 @@ def main(_argv):
                     "reward/terminal": float(last_step_info.get("reward_terminal", 0.0)),
                     "reward/penalty_collision": float(last_step_info.get("penalty_collision", 0.0)),
                     "reward/penalty_outside_route": float(last_step_info.get("penalty_outside_route", 0.0)),
+                    "reward/penalty_traffic_violation": float(last_step_info.get("penalty_traffic_violation", 0.0)),
+                    "rollout/traffic_violation_count": float(last_step_info.get("traffic_violation_count", 0)),
                     "reward/penalty_steer": float(last_step_info.get("penalty_steer", 0.0)),
                     "reward/penalty_brake": float(last_step_info.get("penalty_brake", 0.0)),
                     "reward/penalty_speed_limit": float(last_step_info.get("penalty_speed_limit", 0.0)),
@@ -1253,12 +1453,21 @@ def main(_argv):
                 })
             if last_sac_metrics:
                 step_log.update({f"training/{k}": v for k, v in last_sac_metrics.items()})
+            step_log.update(_state_norm_wandb_log(agent))
             wandb.log(step_log, step=global_step)
             last_log_time = time.time()
 
         # ── Episode end ───────────────────────────────────────────────────────
         if done:
             num_episodes += 1
+
+            # Coach: query Gemini at episode end, backfill replay buffer labels,
+            # then reset the session so the next episode starts clean.
+            if _coach_session is not None:
+                _coach_session.maybe_query(episode_step=episode_steps, done_info=info, force=True, global_step=global_step)
+                _coach_session.backfill_buffer(buffer, global_step=global_step)
+                _coach_session.reset_episode()
+
             elapsed = time.time() - t0
             log_entry = {
                 "global_step": global_step,
@@ -1299,7 +1508,7 @@ def main(_argv):
             }
             if info.get("reward_total") is not None:
                 ep_log.update({
-                    "reward/total": float(episode_reward) if FLAGS.debug_neg_speed_reward else float(info.get("reward_total", 0.0)),
+                    "reward/total": float(episode_reward) if reward_mode != "env" else float(info.get("reward_total", 0.0)),
                     "reward/env_total": float(info.get("reward_total", 0.0)),
                     "reward/progress": float(info.get("reward_progress", 0.0)),
                     "reward/centering": float(info.get("reward_centering", 0.0)),
@@ -1343,12 +1552,11 @@ def main(_argv):
             episode_collision_events = 0
             prev_collision_count = 0
             video = _open_video(num_episodes)
-            desired_speeds, _route_interp, vlm_features = simlingo_base.get_chunk_and_features(
-                simlingo_image=obs["simlingo_image"],
-                ego_state=obs["state"],
-                target_points=obs["target_points"],
-                routing_command=obs.get("routing_command", ""),
-            )
+            desired_speeds, _route_interp, vlm_features = _get_features(obs)
+
+            # Coach: begin the next episode after env reset.
+            if _coach_session is not None:
+                _coach_session.begin_episode(episode_count=num_episodes, route_name=FLAGS.route or "")
         else:
             desired_speeds = next_desired_speeds
             vlm_features = next_vlm_features

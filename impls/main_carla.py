@@ -848,11 +848,11 @@ def run_online_carla(
                 t_update_start = time.time()
                 batch = buffer.sample(batch_size)
                 if _online_training_mode == "dagger":
-                    _, update_info = agent.update_dagger(batch)
+                    agent, update_info = agent.update_dagger(batch)
                 elif getattr(agent, "vla_sample_fn", None) is not None:
-                    _, update_info = agent.update_with_vla(batch)
+                    agent, update_info = agent.update_with_vla(batch)
                 else:
-                    _, update_info = agent.update(batch)
+                    agent, update_info = agent.update(batch)
                 _block_until_ready_tree((agent, update_info))
                 t_update_end = time.time()
                 update_times.append(t_update_end - t_update_start)

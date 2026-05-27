@@ -32,6 +32,7 @@ from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 
@@ -147,6 +148,8 @@ _DRIVING_TOKEN_LEN = 30
 # InternVL2-1B Qwen2 backbone hidden size
 _VLM_FEATURE_DIM = 896
 VLM_FEATURE_DIM = _VLM_FEATURE_DIM  # public export
+_VLM_VISION_CLS_DIM = 1024  # InternVisionModel CLS token hidden size
+VLM_ENCODER_FEATURE_DIM = _VLM_VISION_CLS_DIM + _VLM_FEATURE_DIM  # 1920: L2(vision CLS) ++ L2(prompt embed mean)
 # EGO_STATE_IDX_SPEED is index 15 in the 25-dim state vector
 _EGO_STATE_IDX_SPEED = 15
 
@@ -379,6 +382,13 @@ class SimLingoBase:
             return tokenizer.added_tokens_encoder.get("<|im_end|>", tokenizer.eos_token_id)
         else:
             return tokenizer.eos_token_id
+
+    def _get_embed_tokens(self):
+        """Return the LM token embedding layer (frozen, same path as _register_feature_hook)."""
+        lm = self.model.language_model.model  # PeftModel
+        if hasattr(lm, "base_model"):
+            lm = lm.base_model.model  # Qwen2ForCausalLM
+        return lm.model.embed_tokens  # Qwen2Model.embed_tokens
 
     def _register_feature_hook(self) -> None:
         """Hook the inner transformer to capture last-layer hidden states.
@@ -756,6 +766,49 @@ class SimLingoBase:
         return base_action, vlm_features
 
 
+    @torch.no_grad()
+    def get_encoder_features(
+        self,
+        simlingo_image: np.ndarray,
+        ego_state: np.ndarray,
+        target_points: np.ndarray,
+        routing_command: str = "",
+    ) -> np.ndarray:
+        """L2-normalized InternVL2 vision CLS token + L2-normalized prompt embeddings → (1920,) float32.
+
+        Uses the frozen InternVisionModel CLS token (1024-dim) and mean-pooled LM token
+        embeddings (896-dim), each L2-normalized, then concatenated. No LLM forward pass.
+        """
+        speed_ms = float(ego_state[_EGO_STATE_IDX_SPEED])
+        target_points = np.asarray(target_points, dtype=np.float32).reshape(2, 2)
+
+        # ── Vision encoder CLS token (before mlp1 projector, no LLM) ─────────────
+        pixel_values = self._preprocess_image(simlingo_image)  # (1, num_patches, 3, H, W)
+        num_patches = pixel_values.shape[1]
+        C, H, W = pixel_values.shape[2], pixel_values.shape[3], pixel_values.shape[4]
+        pixel_values_flat = pixel_values.view(num_patches, C, H, W).to(self.device).to(torch.bfloat16)
+        internvl_model = self.model.vision_model.image_encoder.model
+        vision_out = internvl_model.vision_model(pixel_values_flat)
+        cls_tokens = vision_out.last_hidden_state[:, 0, :].float()  # (num_patches, 1024)
+        image_embed = cls_tokens.mean(dim=0)                        # (1024,)
+        image_embed = F.normalize(image_embed, dim=-1).cpu().numpy()  # L2-normalize
+
+        # ── Prompt token embeddings (LM embedding layer, L2-normalized) ───────────
+        if self.prompt_mode in {"hierarchical_hl", "hierarchical_ll"}:
+            prompt_text = self._routing_prompt(routing_command)
+        else:
+            prompt_text = f"Current speed: {round(speed_ms, 1)} m/s. {self._routing_prompt(routing_command)} What should the ego do next?"
+
+        tokenizer = self.model.tokenizer
+        tokens = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+        prompt_ids = tokens["input_ids"].to(self.device)
+        embed_tokens = self._get_embed_tokens()
+        prompt_embed = embed_tokens(prompt_ids).float().mean(dim=1).squeeze(0)  # (896,)
+        prompt_embed = F.normalize(prompt_embed, dim=-1).cpu().numpy()          # L2-normalize
+
+        return np.concatenate([image_embed, prompt_embed])  # (1920,)
+
+
 class HierarchicalSimLingoPolicy:
     """High-level SimLingo planner feeding a low-level SimLingo VLA controller."""
 
@@ -871,6 +924,15 @@ class HierarchicalSimLingoPolicy:
         accel = self.accel_for_desired_speed(desired_speeds[0], current_speed)
         steer = self.steer_for_speed(current_speed)
         return np.array([accel, steer], dtype=np.float32), vlm_features
+
+    def get_encoder_features(
+        self,
+        simlingo_image: np.ndarray,
+        ego_state: np.ndarray,
+        target_points: np.ndarray,
+        routing_command: str = "",
+    ) -> np.ndarray:
+        return self.low.get_encoder_features(simlingo_image, ego_state, target_points, routing_command)
 
 
 def _extract_meta_action(text: str) -> str:
