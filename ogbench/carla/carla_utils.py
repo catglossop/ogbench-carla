@@ -79,6 +79,37 @@ def ensure_carla_python_api_on_path() -> None:
 
 ensure_carla_python_api_on_path()
 
+
+def warn_if_carla_root_mismatched(route_source: str, cfg: Dict[str, Any]) -> None:
+    """Log a clear warning if the active CARLA install can't serve this route's assets.
+
+    Fail2Drive routes reference static props (``brickwall``, ``walkingkid``,
+    ``ampel`` etc.) that vanilla CARLA 0.9.16 doesn't ship — those scenarios
+    silently fail to spawn the intended obstacle. ``run_simlingo_fail2drive.sh``
+    switches ``CARLA_ROOT`` automatically; this catches the case where someone
+    invoked the script directly without doing that.
+    """
+    if route_source != "fail2drive":
+        return
+    f2d_root = cfg.get("fail2drive_carla_root")
+    if not f2d_root:
+        return
+    current_root = os.environ.get("CARLA_ROOT", "")
+    current_api = os.environ.get("CARLA_PYTHON_API_ROOT", "")
+    f2d_root_resolved = str(Path(str(f2d_root)).expanduser().resolve())
+    if (
+        current_root
+        and Path(current_root).resolve() != Path(f2d_root_resolved)
+        and not current_api.startswith(f2d_root_resolved)
+    ):
+        print(
+            f"\033[93m[fail2drive] WARNING: route is from Fail2Drive but CARLA_ROOT="
+            f"{current_root!r} is not the Fail2Drive install ({f2d_root_resolved!r}). "
+            f"Assets like static.prop.brickwall / walkingkid may be missing — set "
+            f"CARLA_ROOT={f2d_root_resolved} (and relaunch the CARLA server from there).\033[0m"
+        )
+
+
 import carla
 from leaderboard.autoagents.agent_wrapper import AgentError, TickRuntimeError, validate_sensor_configuration
 from leaderboard.envs.sensor_interface import SensorConfigurationInvalid
@@ -97,6 +128,15 @@ from leaderboard.leaderboard_evaluator import (
     get_weather_id,
     sensors_to_icons,
 )
+
+# Register fail2drive scenario classes (ImageOnObject / ObscuredStopSign /
+# RoadBlocked / etc.) with the leaderboard's discovery now that srunner +
+# leaderboard are importable. Faithful to the fail2drive source — see
+# ``ogbench/carla/fail2drive_compat.py``. No-op if the fail2drive package
+# isn't installed.
+from ogbench.carla.fail2drive_compat import apply as _apply_fail2drive_compat
+
+_apply_fail2drive_compat()
 
 from ogbench.carla.route_registry import RouteEntry, find_route
 from ogbench.carla.leaderboard_agents.observation_only import (
@@ -760,6 +800,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         super().__init__()
         self.carla_config = dict(carla_config)
         self.route_entry: RouteEntry = _resolve_route(self.carla_config, route)
+        warn_if_carla_root_mismatched(self.route_entry.source, self.carla_config)
 
         self._evaluator: Optional[LeaderboardEvaluator] = None
         self._args: Optional[SimpleNamespace] = None
@@ -1059,7 +1100,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         args.agent_config = self._base_agent_config
 
         route_name = f"{config.name}_rep{config.repetition_index}"
-        scenario_name = config.scenario_configs[0].name
+        scenario_name = config.scenario_configs[0].name if config.scenario_configs else "NoScenario"
         town_name = str(config.town)
         weather_id = get_weather_id(config.weather[0][1])
         current_time = datetime.now().strftime("%m_%d_%H_%M_%S")

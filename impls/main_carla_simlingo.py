@@ -152,9 +152,9 @@ flags.DEFINE_string("device", "cuda", "Torch device for SimLingo and residual SA
 flags.DEFINE_integer("gpu_rank", 0, "CARLA rendering GPU rank.")
 # conda env name for the carla_env_server.py subprocess (must have carla 0.9.15 installed).
 flags.DEFINE_string("server_conda_env", "simlingo", "conda env for the CARLA env server process.")
-flags.DEFINE_string("carla_root", "/home/celinet/VLA_driving/software",
+flags.DEFINE_string("carla_root", os.environ.get("CARLA_ROOT", "/home/celinet/fail2drive/f2d_carla"),
                     "CARLA root dir (forwarded to env server as CARLA_ROOT). "
-                    "Default is CARLA 0.9.15 which works with Town12.")
+                    "Defaults to $CARLA_ROOT env var, then ~/fail2drive/f2d_carla.")
 flags.DEFINE_bool("include_ego_state", True,
                   "Include the 25-dim ego state vector as explicit input to the actor and critic.")
 flags.DEFINE_bool("debug_neg_speed_reward", False,
