@@ -213,7 +213,7 @@ DEFAULT_COLLISION_EVENT_PENALTY = -20.0  # legacy: applied while contact is acti
 DEFAULT_COLLISION_CONTACT_PENALTY = None  # float | None; if None, uses legacy collision_event_penalty
 DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -20.0
 DEFAULT_TRAFFIC_VIOLATION_PENALTY = -20.0  # per new RunningStop or RunningRedLight event
-DEFAULT_PROGRESS_REWARD_WEIGHT = 1.0
+DEFAULT_PROGRESS_REWARD_WEIGHT = 5.0
 DEFAULT_TERMINATE_ON_INFRACTION = False
 # DEFAULT_CENTERING_REWARD_WEIGHT = 0.2
 # DEFAULT_HEADING_REWARD_WEIGHT = 0.2
@@ -1969,7 +1969,10 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
 
     def _update_crash_stuck_state(self, speed: float) -> Tuple[bool, int]:
         collision_count = self._collision_count()
-        if collision_count > 0 and speed < self._crash_stuck_speed_threshold:
+        # Use active contact (_raw_collision_active) rather than cumulative collision_count so
+        # that legitimate stops (stop signs, traffic lights) after a prior collision don't
+        # spuriously trigger crash_stuck termination.
+        if self._raw_collision_active and speed < self._crash_stuck_speed_threshold:
             self._crash_stuck_ticks += 1
         else:
             self._crash_stuck_ticks = 0

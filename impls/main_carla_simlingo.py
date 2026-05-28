@@ -1050,12 +1050,14 @@ def main(_argv):
                     "success": info.get("success", False),
                     "collision_count": info.get("collision_count", 0),
                     "collision_events": episode_collision_events,
+                    "termination_reason": info.get("termination_reason", "leaderboard"),
                     "elapsed_s": elapsed,
                 }
                 print(
                     f"[step {global_step}] ep={num_episodes}  "
                     f"R={episode_reward:.2f}  steps={episode_steps}  "
                     f"success={info.get('success', False)}  "
+                    f"term={info.get('termination_reason', 'leaderboard')}  "
                     f"bc_updates={total_updates}",
                     flush=True,
                 )
@@ -1478,12 +1480,14 @@ def main(_argv):
                 "success": info.get("success", False),
                 "collision_count": info.get("collision_count", 0),
                 "collision_events": episode_collision_events,
+                "termination_reason": info.get("termination_reason", "leaderboard"),
                 "elapsed_s": elapsed,
             }
             print(
                 f"[step {global_step}] ep={num_episodes}  "
                 f"R={episode_reward:.2f}  steps={episode_steps}  "
                 f"success={info.get('success', False)}  "
+                f"term={info.get('termination_reason', 'leaderboard')}  "
                 f"updates={total_updates}",
                 flush=True,
             )
