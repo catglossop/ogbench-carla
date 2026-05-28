@@ -485,8 +485,10 @@ class DSRLAgent(flax.struct.PyTreeNode):
     def sample_actions_with_vla(self, observations, seed=None, temperature=1.0):
         """Rollout path only: when ``vla_sample_fn`` is set, map noise through VLA instead of BC flow.
 
-        With ``config.debug_noise=True``, the attached SteerVLAActor runs a best-of-N search over
-        random flow-matching noises on each fresh VLA query (open-loop cache hits are unchanged).
+        With ``config.debug_noise=True``, the attached SteerVLAActor samples many random flow-matching
+        noises on each fresh VLA query. With ``use_best_noise=True`` it executes the slowest candidate;
+        with ``use_best_noise=False`` it logs noise distributions and uses the actor's sampled noise.
+        Open-loop cache hits are unchanged in both modes.
         """
         if self.vla_sample_fn is None:
             return self.sample_actions(observations, seed=seed, temperature=temperature)
@@ -1033,7 +1035,9 @@ def get_config():
             debug_task=False,
             # Rollout-only: sample many random VLA flow noises and pick the slowest chunk.
             debug_noise=True,
-            debug_noise_samples=50,
+            debug_noise_samples=15,
+            debug_noise_log_every_n_steps=5,
+            use_best_noise=True,
         )
     )
     return config

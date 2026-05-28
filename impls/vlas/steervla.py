@@ -641,7 +641,14 @@ class SteerVLAActor:
         fixed_subtask_text: Optional[str] = None,
         fixed_reasoning_text: Optional[str] = None,
         debug_noise: bool = False,
-        debug_noise_samples: int = 100,
+        debug_noise_samples: int = 15,
+        use_best_noise: bool = True,
+        debug_noise_log_every_n_steps: int = 5,
+        debug_noise_run_name: str | None = None,
+        debug_noise_save_root: str | Path | None = None,
+        debug_noise_route_name: str = "?",
+        debug_noise_episode: int = 0,
+        debug_noise_episode_step: int = 0,
     ) -> None:
         self.actor_url = actor_url
         self._remote: Optional[RemoteActor] = None
@@ -668,6 +675,15 @@ class SteerVLAActor:
         )
         self.debug_noise = bool(debug_noise)
         self.debug_noise_samples = max(1, int(debug_noise_samples))
+        self.use_best_noise = bool(use_best_noise)
+        self.debug_noise_log_every_n_steps = max(1, int(debug_noise_log_every_n_steps))
+        self.debug_noise_run_name = debug_noise_run_name
+        self.debug_noise_save_root = (
+            Path(debug_noise_save_root) if debug_noise_save_root is not None else None
+        )
+        self.debug_noise_route_name = str(debug_noise_route_name)
+        self.debug_noise_episode = int(debug_noise_episode)
+        self.debug_noise_episode_step = int(debug_noise_episode_step)
         self.prompt_state_dim = steervla_prompt_state_dim(include_ego_history=include_ego_history)
         self._call_counter = 0
         self._cached_action_chunk: np.ndarray | None = None
@@ -1279,6 +1295,49 @@ class SteerVLAActor:
         first_step = traj_np[:, 0, : int(self.action_dim)]
         return jax.device_put(jnp.asarray(first_step, dtype=jnp.float32), self._jax_device)
 
+    @staticmethod
+    def _sanitize_debug_path_component(name: str) -> str:
+        s = str(name).strip() or "unknown"
+        s = re.sub(r"[^\w\-.]+", "_", s)
+        return s[:120]
+
+    def set_debug_noise_context(
+        self,
+        *,
+        run_name: str | None = None,
+        save_root: str | Path | None = None,
+        route_name: str | None = None,
+        episode: int | None = None,
+        episode_step: int | None = None,
+    ) -> None:
+        """Update where debug-noise plots and npz logs are written (per run / route / episode)."""
+        if run_name is not None:
+            self.debug_noise_run_name = str(run_name)
+        if save_root is not None:
+            self.debug_noise_save_root = Path(save_root)
+        if route_name is not None:
+            self.debug_noise_route_name = str(route_name)
+        if episode is not None:
+            self.debug_noise_episode = int(episode)
+        if episode_step is not None:
+            self.debug_noise_episode_step = int(episode_step)
+
+    def _should_log_debug_noise_plot(self) -> bool:
+        step = int(self.debug_noise_episode_step)
+        every = int(self.debug_noise_log_every_n_steps)
+        return step > 0 and step % every == 0
+
+    def _debug_noise_artifact_dir(self) -> Path:
+        run_name = self._sanitize_debug_path_component(
+            self.debug_noise_run_name or "run"
+        )
+        route = self._sanitize_debug_path_component(self.debug_noise_route_name)
+        ep = int(self.debug_noise_episode)
+        root = self.debug_noise_save_root or Path("debug_noises")
+        out_dir = root / "debug_noises" / f"{run_name}_{route}" / f"ep{ep:04d}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
     def _debug_speed_score_from_flat(self, flat_action: Any) -> float:
         """First-step speed delta magnitude (``delta_xy`` cols 0:2); lower means slower."""
         ah = int(self.action_horizon)
@@ -1291,15 +1350,30 @@ class SteerVLAActor:
         speed_xy_final = np.cumsum(speed_xy, axis=0)[-1, :2]
         return float(np.linalg.norm(speed_xy_final))
 
-    def _sample_best_of_random_noises(self, batch_size: int, _noise_jax: jax.Array) -> jnp.ndarray:
-        """Rollout debug: try many random noises and pick the slowest action chunk."""
+    def _debug_xy_cumsum_from_flat(self, flat_action: Any) -> np.ndarray:
+        """Cumulative ``delta_xy`` in meters, shape ``(action_horizon, 2)``."""
+        ah = int(self.action_horizon)
+        ad = int(self.action_dim)
+        flat = np.asarray(jax.device_get(flat_action), dtype=np.float32).reshape(-1)
+        expected = ah * ad
+        if flat.size != expected:
+            return np.full((ah, 2), np.nan, dtype=np.float64)
+        deltas = flat.reshape(ah, ad)[:, :2].astype(np.float64)
+        return np.cumsum(deltas, axis=0)
+
+    def _sample_best_of_random_noises(self, batch_size: int, noise_jax: jax.Array) -> jnp.ndarray:
+        """Debug rollout: sample random noises, log distributions, optionally pick the slowest chunk."""
+        if not self.use_best_noise and not self._should_log_debug_noise_plot():
+            return self._forward_pi0(batch_size, noise_jax, raw=None)
+
         import matplotlib.pyplot as plt
+
         n = int(self.debug_noise_samples)
         self._call_counter += 1
         rng = jax.random.PRNGKey(self._call_counter)
         rng, samp_rng = jax.random.split(rng)
 
-        ref_noise = np.asarray(jax.device_get(_noise_jax), dtype=np.float32)
+        ref_noise = np.asarray(jax.device_get(noise_jax), dtype=np.float32)
         if ref_noise.ndim == 1:
             ref_noise = ref_noise.reshape(1, -1)
         noise_dim = int(ref_noise.shape[-1])
@@ -1314,78 +1388,202 @@ class SteerVLAActor:
         best_score = float("inf")
         best_idx = -1
         scores: list[float] = []
+        xy_avgs: list[tuple[float, float]] = []
+        xy_cumsum_steps: list[np.ndarray] = []
         for i in range(n):
             noise_i = jnp.asarray(candidate_noises[i], dtype=jnp.float32)
             out = self._forward_pi0(batch_size, noise_i, raw=None)
             score = self._debug_speed_score_from_flat(out)
             scores.append(score)
-            if score < best_score:
+            cumsum_xy = self._debug_xy_cumsum_from_flat(out)
+            xy_cumsum_steps.append(cumsum_xy)
+            final_xy = cumsum_xy[-1]
+            xy_avgs.append((float(final_xy[0]), float(final_xy[1])))
+            if self.use_best_noise and score < best_score:
                 best_score = score
                 best_out = out
                 best_idx = i
-        
-        fig, ax = plt.subplots()
+
         scores_arr = np.asarray(scores, dtype=np.float64)
+        xy_arr = np.asarray(xy_avgs, dtype=np.float64)
+        xy_cumsum_arr = np.stack(xy_cumsum_steps, axis=0)
         score_mean = float(np.mean(scores_arr))
         score_std = float(np.std(scores_arr))
         score_max = float(np.max(scores_arr))
         score_min = float(np.min(scores_arr))
 
-        ax.scatter(range(n), scores_arr, alpha=0.75, label="candidates")
-        if best_idx >= 0:
-            ax.scatter(
-                [best_idx],
-                [scores_arr[best_idx]],
-                color="red",
-                s=80,
-                zorder=3,
-                label=f"best ({best_idx})",
-            )
-        ax.axhline(score_mean, color="C1", linestyle="-", linewidth=1.5, label="mean")
-        ax.axhline(score_max, color="C2", linestyle="--", linewidth=1.2, label="max")
-        ax.axhline(score_min, color="C3", linestyle="--", linewidth=1.2, label="min")
-        ax.axhspan(
-            score_mean - score_std,
-            score_mean + score_std,
-            color="C1",
-            alpha=0.15,
-            label="±1 std",
-        )
-        stats_text = (
-            f"mean = {score_mean:.4f}\n"
-            f"std  = {score_std:.4f}\n"
-            f"max  = {score_max:.4f}\n"
-            f"min  = {score_min:.4f}"
-        )
-        ax.text(
-            0.02,
-            0.98,
-            stats_text,
-            transform=ax.transAxes,
-            va="top",
-            ha="left",
-            fontsize=9,
-            bbox={"boxstyle": "round", "facecolor": "wheat", "alpha": 0.85},
-        )
-        ax.set_title("debug_noise speed scores (lower = slower)")
-        ax.set_xlabel("Candidate")
-        ax.set_ylabel("Speed score (||cumsum delta_xy||)")
-        ax.legend(loc="upper right", fontsize=8)
-        fig.tight_layout()
-        os.makedirs("debug_noises", exist_ok=True)
-        plt.savefig(f"debug_noises/debug_noise_scores_{self._call_counter}.png")
-        plt.close()
+        should_log_plot = self._should_log_debug_noise_plot()
+        plot_path: Path | None = None
+        npz_path: Path | None = None
+        if should_log_plot:
+            fig, (ax_score, ax_xy) = plt.subplots(1, 2, figsize=(13, 5))
 
+            ax_score.scatter(range(n), scores_arr, alpha=0.75, label="candidates")
+            if self.use_best_noise and best_idx >= 0:
+                ax_score.scatter(
+                    [best_idx],
+                    [scores_arr[best_idx]],
+                    color="red",
+                    s=80,
+                    zorder=3,
+                    label=f"best ({best_idx})",
+                )
+            ax_score.axhline(score_mean, color="C1", linestyle="-", linewidth=1.5, label="mean")
+            ax_score.axhline(score_max, color="C2", linestyle="--", linewidth=1.2, label="max")
+            ax_score.axhline(score_min, color="C3", linestyle="--", linewidth=1.2, label="min")
+            ax_score.axhspan(
+                score_mean - score_std,
+                score_mean + score_std,
+                color="C1",
+                alpha=0.15,
+                label="±1 std",
+            )
+            stats_text = (
+                f"mean = {score_mean:.4f}\n"
+                f"std  = {score_std:.4f}\n"
+                f"max  = {score_max:.4f}\n"
+                f"min  = {score_min:.4f}"
+            )
+            ax_score.text(
+                0.02,
+                0.98,
+                stats_text,
+                transform=ax_score.transAxes,
+                va="top",
+                ha="left",
+                fontsize=9,
+                bbox={"boxstyle": "round", "facecolor": "wheat", "alpha": 0.85},
+            )
+            ax_score.set_title("Speed score (lower = slower)")
+            ax_score.set_xlabel("Candidate")
+            ax_score.set_ylabel("||cumsum delta_xy||")
+            ax_score.legend(loc="upper right", fontsize=8)
+
+            cmap = plt.get_cmap("tab20", max(n, 1))
+            valid_cumsum_mask = np.isfinite(xy_cumsum_arr).all(axis=(1, 2))
+            final_points: list[np.ndarray] = []
+            for i in range(n):
+                if not valid_cumsum_mask[i]:
+                    continue
+                cumsum_xy = xy_cumsum_arr[i]
+                color = cmap(i % cmap.N)
+                ax_xy.plot(
+                    cumsum_xy[:, 0],
+                    cumsum_xy[:, 1],
+                    color=color,
+                    alpha=0.55,
+                    linewidth=1.2,
+                    zorder=2,
+                )
+                ax_xy.scatter(
+                    cumsum_xy[:, 0],
+                    cumsum_xy[:, 1],
+                    color=[color],
+                    alpha=0.35,
+                    s=14,
+                    edgecolors="none",
+                    zorder=2,
+                )
+                final_xy = cumsum_xy[-1]
+                final_points.append(final_xy)
+                marker_edge = "red" if i == best_idx else "black"
+                marker_lw = 1.0 if i == best_idx else 0.35
+                ax_xy.scatter(
+                    final_xy[0],
+                    final_xy[1],
+                    color=color,
+                    marker="D",
+                    s=52,
+                    edgecolors=marker_edge,
+                    linewidths=marker_lw,
+                    zorder=4,
+                )
+                ax_xy.annotate(
+                    f"c{i}",
+                    (final_xy[0], final_xy[1]),
+                    xytext=(4, 4),
+                    textcoords="offset points",
+                    fontsize=7,
+                    color=color,
+                    fontweight="bold" if i == best_idx else "normal",
+                )
+
+            if final_points:
+                finals = np.stack(final_points, axis=0)
+                overall_mean = finals.mean(axis=0)
+                ax_xy.scatter(
+                    overall_mean[0],
+                    overall_mean[1],
+                    color="black",
+                    marker="X",
+                    s=90,
+                    linewidths=1.5,
+                    zorder=5,
+                )
+                ax_xy.annotate(
+                    "overall",
+                    (overall_mean[0], overall_mean[1]),
+                    xytext=(5, -10),
+                    textcoords="offset points",
+                    fontsize=8,
+                    color="black",
+                    fontweight="bold",
+                )
+
+            ax_xy.axhline(0.0, color="0.7", linewidth=0.8)
+            ax_xy.axvline(0.0, color="0.7", linewidth=0.8)
+            ax_xy.set_title("Cumulative delta_xy per candidate")
+            ax_xy.set_xlabel("x (m)")
+            ax_xy.set_ylabel("y (m)")
+            ax_xy.set_aspect("equal", adjustable="datalim")
+
+            mode_label = "best_of_n" if self.use_best_noise else "log_only"
+            fig.suptitle(
+                f"debug_noise call={self._call_counter} step={self.debug_noise_episode_step} "
+                f"mode={mode_label} route={self.debug_noise_route_name} "
+                f"ep={self.debug_noise_episode}",
+                fontsize=10,
+            )
+            fig.tight_layout()
+
+            artifact_dir = self._debug_noise_artifact_dir()
+            stem = f"debug_noise_step{self.debug_noise_episode_step:04d}_{self._call_counter:04d}"
+            plot_path = artifact_dir / f"{stem}.png"
+            npz_path = artifact_dir / f"{stem}.npz"
+            fig.savefig(plot_path)
+            plt.close(fig)
+
+            np.savez(
+                npz_path,
+                candidate_noises=candidate_noises,
+                scores=scores_arr,
+                xy_final=xy_arr,
+                xy_cumsum=xy_cumsum_arr,
+                ref_noise=ref_noise,
+                best_idx=np.int32(best_idx),
+                use_best_noise=np.bool_(self.use_best_noise),
+                call_counter=np.int32(self._call_counter),
+                episode=np.int32(self.debug_noise_episode),
+                episode_step=np.int32(self.debug_noise_episode_step),
+                route_name=np.array(self.debug_noise_route_name),
+            )
+
+        best_speed_str = f"{best_score:.4f}" if best_idx >= 0 else "n/a"
+        plot_msg = f" plot={plot_path} npz={npz_path}" if should_log_plot else " plot=skipped"
         print(
-            f"[debug_noise] candidates={n} best_idx={best_idx} "
-            f"best_speed_delta_xy={best_score:.4f} "
+            f"[debug_noise] step={self.debug_noise_episode_step} candidates={n} "
+            f"use_best_noise={self.use_best_noise} "
+            f"best_idx={best_idx} best_speed_delta_xy={best_speed_str} "
             f"mean={score_mean:.4f} std={score_std:.4f} "
-            f"min={score_min:.4f} max={score_max:.4f}",
+            f"min={score_min:.4f} max={score_max:.4f}{plot_msg}",
             flush=True,
         )
-        if best_out is None:
-            raise RuntimeError("debug_noise search failed to produce any action.")
-        return jnp.asarray(best_out)
+
+        if self.use_best_noise:
+            if best_out is None:
+                raise RuntimeError("debug_noise search failed to produce any action.")
+            return jnp.asarray(best_out)
+        return self._forward_pi0(batch_size, noise_jax, raw=None)
 
     def __call__(self, observations_jax: jax.Array, noise_jax: jax.Array) -> jax.Array:
         """DSRL ``vla_sample_fn``: map encoder observations + noise to CARLA actions.
@@ -1502,7 +1700,11 @@ def create_steervla_pi0_cot_sample_fn(
         fixed_subtask_text=steervla_cfg.get("fixed_subtask_text"),
         fixed_reasoning_text=steervla_cfg.get("fixed_reasoning_text"),
         debug_noise=bool(steervla_cfg.get("debug_noise", False)),
-        debug_noise_samples=int(steervla_cfg.get("debug_noise_samples", 100)),
+        debug_noise_samples=int(steervla_cfg.get("debug_noise_samples", 15)),
+        use_best_noise=bool(steervla_cfg.get("use_best_noise", True)),
+        debug_noise_log_every_n_steps=int(
+            steervla_cfg.get("debug_noise_log_every_n_steps", 5)
+        ),
     )
 
     if url_clean:

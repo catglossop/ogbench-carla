@@ -47,13 +47,16 @@ def get_config():
     config.warmup_use_random_actions = False
     config.updates_per_step = 5
     # Set to false for rollout-only runs (no RL gradient updates).
-    config.enable_updates = True
+    config.enable_updates = False
     config.buffer_capacity = 1_000
     # When true, RL updates use reward = -ego_speed (m/s) instead of env reward.
     config.debug_task = False
     # Rollout-only: best-of-N random VLA noises minimizing first-step speed delta_xy.
     config.debug_noise = False
-    config.debug_noise_samples = 20
+    config.debug_noise_samples = 8
+    config.debug_noise_log_every_n_steps = 10
+    # When debug_noise=True: if True, execute the slowest candidate; if False, log only and use actor noise.
+    config.use_best_noise = False
     config.image_log_curr_interval = 10
     config.critic_action_dim = 4
     config.vla_action_dim = 4
@@ -122,7 +125,9 @@ def get_config():
             # Local OpenPI inference (ignored when actor_url is set):
             actor_config="pi05_steervla_cot_simplified_reasoning",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
-            checkpoint="/home/carla/.cache/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",
+            # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260525_202139/8000",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260526_175924/2000",
+            # checkpoint="/home/carla/.cache/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/2000",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning_20260512_144250/50000",
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,

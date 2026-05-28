@@ -18,6 +18,15 @@ Don't run `pip install` — this project uses `uv`. Python is pinned to `>=3.11,
 ```bash
 # Install (pick your platform)
 GIT_LFS_SKIP_SMUDGE=1 uv sync --extra all-gpu        # or --extra all-tpu
+# Bench2Drive-only or Fail2Drive-only environments:
+#   uv sync --extra all-b2d-gpu   (or all-b2d-tpu)
+#   uv sync --extra all-f2d-gpu   (or all-f2d-tpu)
+# To keep the two side-by-side in separate venv subdirectories, point uv at
+# a different env path per stack (bench2drive and fail2drive ship conflicting
+# srunner/scenario files, so a shared .venv will only ever hold one of them):
+#   UV_PROJECT_ENVIRONMENT=ogbench-b2d uv sync --extra all-b2d-gpu
+#   UV_PROJECT_ENVIRONMENT=ogbench-f2d uv sync --extra all-f2d-gpu
+# Then run with the matching env, e.g. `ogbench-b2d/bin/python impls/main_carla.py ...`
 
 # List available Bench2Drive routes
 WANDB_MODE=disabled uv run python impls/main_carla.py --list_routes=true | head -20
