@@ -99,8 +99,10 @@ flags.DEFINE_string(
 flags.DEFINE_string(
     "route",
     None,
-    "Bench2Drive route: scenario-name (parking-cut-in-001), file basename "
-    "(bench2drive_007), or route id (1711). See --list_routes=true.",
+    "Bench2Drive or Fail2Drive route. Accepts scenario-name "
+    "(parking-cut-in-001, base-pedestrians-on-road-0085), file basename "
+    "(bench2drive_007, Base_PedestriansOnRoad_0085), or route id "
+    "(1711 for bench2drive; f2d:85 for fail2drive). See --list_routes=true.",
 )
 flags.DEFINE_bool("list_routes", False, "Print all known routes and exit.")
 flags.DEFINE_bool(
@@ -308,15 +310,24 @@ def _resolve_wandb_mode() -> str:
         return FLAGS.wandb_mode
     return os.environ.get("WANDB_MODE", "online")
 
-# List routes and exit  
+# List routes and exit
 def _list_routes_and_exit() -> None:
     from ogbench.carla.route_registry import list_routes
 
     entries = list_routes()
-    print(f"# {len(entries)} Bench2Drive routes")
-    print(f"{'scenario_name':<48} {'file_name':<24} {'route_id':<8} {'town':<10} {'scenario_type'}")
+    b2d_count = sum(1 for e in entries if e.source == "bench2drive")
+    f2d_count = sum(1 for e in entries if e.source == "fail2drive")
+    print(f"# {len(entries)} routes ({b2d_count} bench2drive, {f2d_count} fail2drive)")
+    header = (
+        f"{'source':<12} {'scenario_name':<48} {'file_name':<32} "
+        f"{'route_id':<10} {'town':<10} {'scenario_type'}"
+    )
+    print(header)
     for e in entries:
-        print(f"{e.scenario_name:<48} {e.file_name:<24} {e.route_id:<8} {e.town:<10} {e.scenario_type}")
+        print(
+            f"{e.source:<12} {e.scenario_name:<48} {e.file_name:<32} "
+            f"{e.route_id:<10} {e.town:<10} {e.scenario_type}"
+        )
 
 
 def _steervla_action_execution_cfg(steervla_cfg) -> dict[str, Any] | None:
@@ -424,6 +435,7 @@ def run_online_carla(
 
     capacity = int(agent_config.get("buffer_capacity", 5_000))
     warmup = int(agent_config.get("warmup_steps", 1000))
+    warmup_expo = int(agent_config.get("warmup_expo_steps", 0))
     updates_per_step = int(agent_config.get("updates_per_step", 1))
     batch_size = int(agent_config.get("batch_size", 256))
     enable_updates = bool(agent_config.get("enable_updates", True))
@@ -434,8 +446,18 @@ def run_online_carla(
     if not enable_updates:
         print("[main_carla] enable_updates=False: rollout-only (no RL gradient updates)", flush=True)
     if warmup > 0 and agent is not None and not FLAGS.expert_debug:
-        policy_src = "rollout policy (no RL updates)"
-        print(f"[main_carla] warmup: {warmup} steps using {policy_src}", flush=True)
+        print(f"[main_carla] warmup: no RL updates while step < {warmup}", flush=True)
+    if warmup_expo > 0:
+        if warmup_expo <= warmup:
+            raise ValueError(
+                f"warmup_expo_steps ({warmup_expo}) must be greater than warmup_steps ({warmup})."
+            )
+        if agent is not None and hasattr(agent, "set_edit_actor_rollout_enabled"):
+            print(
+                f"[main_carla] EXPO warmup: RL updates from step {warmup}, "
+                f"VLA-only rollout until step > {warmup_expo}",
+                flush=True,
+            )
     
     # Get openpi fields from raw observation
     def _openpi_fields_from_raw(raw: dict | None) -> dict[str, np.ndarray]:
@@ -599,6 +621,20 @@ def run_online_carla(
     last_video_critic_text: str = ""
     trajectory_dir = os.path.join(FLAGS.save_dir, "trajectories")
     os.makedirs(trajectory_dir, exist_ok=True)
+
+    def _sync_steervla_debug_noise_context(route_name: str) -> None:
+        if steervla_actor is None or not steervla_actor.debug_noise:
+            return
+        steervla_actor.set_debug_noise_context(
+            run_name=exp_name,
+            save_root=FLAGS.save_dir,
+            route_name=route_name,
+            episode=max(0, episode_count),
+        )
+
+    _sync_steervla_debug_noise_context(
+        str(FLAGS.route or obs_raw.get("routing_command", "?") if isinstance(obs_raw, dict) else "?")
+    )
     if _vlm_coach is not None:
         _vlm_coach.begin_episode(
             episode_count=max(1, episode_count),
@@ -935,13 +971,23 @@ def run_online_carla(
         _in_expert_recovery = FLAGS.expert_recover_debug and (episode_steps >= _vla_steps_budget)
         if FLAGS.expert_recover_debug and (episode_steps == _vla_steps_budget):
             env.reinit_expert()
-        in_warmup = warmup > 0 and step <= warmup
+        in_warmup = warmup > 0 and step < warmup
+        in_expo_warmup = (
+            warmup_expo > 0
+            and step <= warmup_expo
+            and agent is not None
+            and hasattr(agent, "set_edit_actor_rollout_enabled")
+        )
+        if agent is not None and hasattr(agent, "set_edit_actor_rollout_enabled"):
+            agent.set_edit_actor_rollout_enabled(step > warmup_expo)
         if (
             obs_mode == "image"
             and image_encoder == "siglip"
             and siglip_include_prompt_subtask
         ):
             obs = _extract_agent_obs(env, obs_raw, obs_mode, **_extract_obs_kwargs)
+        if steervla_actor is not None and steervla_actor.debug_noise:
+            steervla_actor.debug_noise_episode_step = episode_steps + 1
         if FLAGS.expert_debug or _in_expert_recovery or agent is None:
             action = np.zeros(env.action_space.shape, dtype=np.float32)
             step_obs = obs
@@ -1139,6 +1185,7 @@ def run_online_carla(
         step_wb["time/step_time"] = t_step_end - t_step_start
         step_wb["time/log_time"] = t_log_end - t_log_start
         step_wb["training/in_warmup"] = float(in_warmup)
+        step_wb["training/in_expo_warmup"] = float(in_expo_warmup)
         step_wb["training/enable_updates"] = float(enable_updates)
 
         wandb.log(step_wb, step=step)
@@ -1240,6 +1287,7 @@ def run_online_carla(
                     episode_count=episode_count,
                     route_name=done_route,
                 )
+            _sync_steervla_debug_noise_context(done_route)
             episode_collision_count = 0
             episode_collision_events = 0
             prev_collision_count = 0
@@ -1264,11 +1312,11 @@ def run_online_carla(
                 use_vla_update = getattr(agent, "vla_sample_fn", None) is not None
                 batch = buffer.sample(batch_size)
                 if _online_training_mode == "dagger":
-                    _, update_info = agent.update_dagger(batch)
+                    agent, update_info = agent.update_dagger(batch)
                 elif use_vla_update:
-                    _, update_info = agent.update_with_vla(batch)
+                    agent, update_info = agent.update_with_vla(batch)
                 else:
-                    _, update_info = agent.update(batch)
+                    agent, update_info = agent.update(batch)
                 _block_until_ready_tree((agent, update_info))
                 t_update_end = time.time()
                 update_times.append(t_update_end - t_update_start)
@@ -1421,11 +1469,17 @@ def main(_):
                     raise ValueError("SteerVLA rollout enabled but vla_sample_fn could not be built.")
                 vla_sample_fn, steervla_actor = vla_bundle
                 steervla_actor.debug_noise = bool(config.get("debug_noise", False))
-                steervla_actor.debug_noise_samples = int(config.get("debug_noise_samples", 100))
+                steervla_actor.debug_noise_samples = int(config.get("debug_noise_samples", 15))
+                steervla_actor.use_best_noise = bool(config.get("use_best_noise", True))
+                steervla_actor.debug_noise_log_every_n_steps = int(
+                    config.get("debug_noise_log_every_n_steps", 5)
+                )
                 if steervla_actor.debug_noise:
                     print(
                         f"[main_carla] debug_noise enabled: "
-                        f"{steervla_actor.debug_noise_samples} random noises per fresh VLA query",
+                        f"{steervla_actor.debug_noise_samples} random noises per fresh VLA query, "
+                        f"log plots every {steervla_actor.debug_noise_log_every_n_steps} env steps, "
+                        f"use_best_noise={steervla_actor.use_best_noise}",
                         flush=True,
                     )
 
@@ -1446,6 +1500,13 @@ def main(_):
             agent_class = agents[config["agent_name"]]
             create_kwargs = {}
             if config["agent_name"] == "dsrl" and vla_sample_fn is not None:
+                create_kwargs["vla_sample_fn"] = vla_sample_fn
+                url = steervla_cfg.get("actor_url") if steervla_cfg else None
+                if not (url and str(url).strip()):
+                    create_kwargs["openpi_train_config"] = steervla_actor.train_cfg
+                    create_kwargs["steervla_actor"] = steervla_actor
+                
+            if config["agent_name"] == "expo" and vla_sample_fn is not None:
                 create_kwargs["vla_sample_fn"] = vla_sample_fn
                 url = steervla_cfg.get("actor_url") if steervla_cfg else None
                 if not (url and str(url).strip()):
