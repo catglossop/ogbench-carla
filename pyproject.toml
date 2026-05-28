@@ -53,9 +53,11 @@ train-tpu = [
 carla = [
     "bench2drive @ git+https://github.com/catglossop/Bench2Drive.git",
     "openpi @ git+https://github.com/catglossop/steervla-pi.git",
+    "fail2drive @ git+https://github.com/catglossop/fail2drive.git",
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
 ]
+
 dev = [
     "ruff",
 ]

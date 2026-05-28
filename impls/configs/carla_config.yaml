@@ -1,15 +1,35 @@
 # CARLA / Bench2Drive runtime configuration.
 #
 # Routes are NOT specified here. Pick a route on the command line:
-#   --route=parking-cut-in-001        (scenario-style name)
-#   --route=bench2drive_007           (file basename)
-#   --route=1711                      (XML <route id="...">)
+#   --route=parking-cut-in-001        (Bench2Drive scenario-style name)
+#   --route=bench2drive_007           (Bench2Drive file basename)
+#   --route=1711                      (Bench2Drive <route id>)
+#   --route=base-image-on-object-0040 (Fail2Drive scenario-style name)
+#   --route=Base_ImageOnObject_0040   (Fail2Drive file basename)
+#   --route=f2d:40                    (Fail2Drive <route id>)
 # See `python impls/main_carla.py --list_routes=true` for the full list.
 #
 # CARLA Python API + navigation agents live under PythonAPI/carla. Export before Python starts:
 #   export CARLA_PYTHON_API_ROOT=/home/carla/carla-0-9-16/PythonAPI/carla
 # or:
 #   export CARLA_ROOT=/home/carla/carla-0-9-16
+#
+# Fail2Drive routes reference custom static props (brickwall, walkingkid, ampel,
+# autobahn, dirt, graffiti, screenshot1/2, smiley, snow, stickers, walkingkidlarge)
+# that vanilla CARLA 0.9.16 doesn't ship out of the box. They live in
+# ``WallAssets/``, ``ImageAssets/``, ``StopOcclusions/`` (+ AnimalVarietyPack /
+# FarmAnimalsPack / AfricanAnimalsPack for the Animals scenarios) — six asset
+# packs from Fail2Drive's HuggingFace simulator drop (SimonGer/fail2drive
+# ::fail2drive_simulator.tar.gz). These packs have been copied into the vanilla
+# 0.9.16 CarlaUE4/Content/ tree, so the standard 0.9.16 server registers them
+# at boot via the existing ``*.Package.json`` discovery mechanism. The 0.9.16
+# Python client talks to the 0.9.16 server cleanly.
+#
+# ``fail2drive_carla_root`` below is for users who keep Fail2Drive's standalone
+# 0.9.15 CARLA install separate. Leave empty (the default) to keep CARLA_ROOT
+# pinned to vanilla 0.9.16 for every route.
+
+fail2drive_carla_root: ''
 
 host: localhost
 port: 2001
