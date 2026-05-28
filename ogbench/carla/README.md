@@ -120,6 +120,9 @@ There are a couple levers to pull to optimize the speed a bit:
 
 To add fail2drive routes, first pull down the f2d_content_pack.zip (see our slack channel)
 
-Then run install_f2d
+Then run `install_f2d_content.sh`: 
+```
+./install_f2d_content.sh <CARLA_ROOT> <ZIP_PATH>
+```
 
 
