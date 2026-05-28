@@ -116,7 +116,10 @@ There are a couple levers to pull to optimize the speed a bit:
 - `actions_per_cot`: int - how many actions to execute before getting new CoT (speed)
 
 
+## Fail2Drive routes: 
 
+To add fail2drive routes, first pull down the f2d_content_pack.zip (see our slack channel)
 
+Then run install_f2d
 
 
