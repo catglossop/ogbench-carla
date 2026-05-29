@@ -130,7 +130,9 @@ flags.DEFINE_integer("learning_starts", 500, "Buffer size threshold before updat
 flags.DEFINE_integer("updates_per_step", 10, "SAC gradient updates per env step / UTD ratio.")
 flags.DEFINE_integer("batch_size", 256, "SAC mini-batch size.")
 flags.DEFINE_integer("buffer_capacity", 10_000, "Replay buffer capacity.")
-flags.DEFINE_float("res_scale", 0.1, "Residual action scaling (final = base + scale*residual).")
+flags.DEFINE_float("res_scale", 0.1, "Legacy: sets both res_scale_accel and res_scale_steer when non-zero.")
+flags.DEFINE_float("res_scale_accel", 2.0, "Residual scale for accel dimension.")
+flags.DEFINE_float("res_scale_steer", 0.6, "Residual scale for steer dimension.")
 flags.DEFINE_integer("residual_clip_schedule_steps", 0,
                      "Steps after warmup over which the residual clip limit ramps linearly from 0 to 1. "
                      "0 = no schedule (full [-1, 1] range immediately after warmup).")
@@ -193,6 +195,22 @@ flags.DEFINE_integer("coach_action_chunk_steps", 10,
                      "Number of SAC global_steps per coach action chunk. "
                      "Each chunk gets one lateral/longitudinal feedback label. "
                      "Default: 10 steps ≈ 2.5 s of driving.")
+flags.DEFINE_integer("coach_query_freq", 0,
+                     "Query the Gemini coach every N episode steps mid-episode "
+                     "(0 = episode end only). E.g. 50 = query after every 50 steps "
+                     "as well as at episode end. Each query backfills only the new "
+                     "transitions since the previous query.")
+flags.DEFINE_enum("coach_label_mode", "bow", ["bow", "vlm_embed", "vlm_embed_raw"],
+                  "How to encode Gemini coach feedback for the critic. "
+                  "'bow': 17-dim delta-commentary bag-of-words (default). "
+                  "'vlm_embed': 896-dim VLM embedding of the structured "
+                  "lateral/longitudinal/detail phrase from Gemini call 2. "
+                  "'vlm_embed_raw': 896-dim VLM embedding of the raw "
+                  "description+correction text from Gemini call 1 (no schema compression).")
+flags.DEFINE_bool("coach_embed_plot", False,
+                  "After each episode backfill, run PCA on the coach label embeddings "
+                  "and log a 2-D scatter plot to wandb (coach/embedding_pca). "
+                  "Only meaningful when coach_label_mode is vlm_embed or vlm_embed_raw.")
 
 
 # ── Video overlay ─────────────────────────────────────────────────────────────
@@ -258,9 +276,14 @@ def _annotate_frame(
 
     info = info or {}
     collision_count = int(info.get("collision_count", 0))
-    collision_now = bool(collision_events > 0 or collision_count > 0)
+    collision_contact = bool(info.get("collision_contact_active", False))
+    # Only show COLLISION banner when a new event fired this step or raw contact is active.
+    # Do NOT use cumulative collision_count — that would make the banner persist for the
+    # rest of the episode after any prior collision, masking steps where no penalty applies.
+    collision_now = bool(collision_events > 0 or collision_contact)
     residual = residual_action if residual_action is not None else np.zeros(2, dtype=np.float32)
-    final_action = np.clip(base_action + FLAGS.res_scale * residual, -1.0, 1.0)
+    _rs = np.array([FLAGS.res_scale_accel, FLAGS.res_scale_steer], dtype=np.float32)
+    final_action = np.clip(base_action + _rs * residual, -1.0, 1.0)
     train_reward = "?" if reward_value is None else f"{reward_value:+.3f}"
     env_reward = "?" if env_reward_value is None else f"{env_reward_value:+.3f}"
     prompt = str(getattr(simlingo_base, "_last_prompt_text", "") or "")
@@ -278,7 +301,8 @@ def _annotate_frame(
 
         cv2.line(annotated, (0, H), (W - 1, H), (255, 255, 255), 1)
         if collision_now:
-            label = f"COLLISION c={collision_count} e={collision_events}"
+            collision_pen = float(info.get("penalty_collision", 0.0))
+            label = f"COLLISION c={collision_count} Δ={collision_events} pen={collision_pen:+.0f}"
             (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
             x1 = W - 8
             x0 = max(8, x1 - tw - 12)
@@ -533,6 +557,8 @@ def _residual_clip_limit(global_step: int, warmup_steps: int, schedule_steps: in
 def main(_argv):
     np.random.seed(FLAGS.seed)
 
+    _res_scale_vec = np.array([FLAGS.res_scale_accel, FLAGS.res_scale_steer], dtype=np.float32)
+
     if FLAGS.policy_mode == "single" and FLAGS.simlingo_checkpoint is None:
         raise ValueError("--simlingo_checkpoint is required.")
     if FLAGS.policy_mode == "hierarchical" and (FLAGS.high_level_checkpoint is None or FLAGS.low_level_checkpoint is None):
@@ -670,6 +696,7 @@ def main(_argv):
             steps = 0
             info: Dict[str, Any] = {}
             video = _open_video(ep_idx)
+            eval_prev_collision_count = 0
 
             print(f"\n[eval] Episode {ep_idx + 1} / {FLAGS.eval_episodes}", flush=True)
             done = False
@@ -692,6 +719,8 @@ def main(_argv):
                         image_for_video = obs["simlingo_image"]
                         target_points_for_video = obs.get("target_points")
                         obs, reward, terminated, truncated, info = env.step(action)
+                        eval_collision_delta = max(0, int(info.get("collision_count", 0)) - eval_prev_collision_count)
+                        eval_prev_collision_count = int(info.get("collision_count", 0))
                         annotated = _annotate_frame(
                             image_for_video,
                             simlingo_base,
@@ -701,7 +730,7 @@ def main(_argv):
                             reward_value=float(reward),
                             env_reward_value=float(reward),
                             info=info,
-                            collision_events=int(info.get("collision_count", 0)),
+                            collision_events=eval_collision_delta,
                         )
                         _write_frame(video, image_for_video, annotated)
                         episode_reward += reward
@@ -892,7 +921,7 @@ def main(_argv):
                         final_action = _expert_debug_action
                     else:
                         final_action = np.clip(
-                            base_action + FLAGS.res_scale * residual_action, -1.0, 1.0
+                            base_action + _res_scale_vec * residual_action, -1.0, 1.0
                         ).astype(np.float32)
                     image_for_video = obs["simlingo_image"]
                     target_points_for_video = obs.get("target_points")
@@ -946,7 +975,7 @@ def main(_argv):
                         ea_2d = _expert_action_to_accel_steer(ea_40d, simlingo_base, chunk_start_speed)
                         last_expert_action_2d = ea_2d
                         last_expert_residual_target = np.clip(
-                            (ea_2d - chunk_start_base_action) / max(FLAGS.res_scale, 1e-6), -1.0, 1.0
+                            (ea_2d - chunk_start_base_action) / np.maximum(_res_scale_vec, 1e-6), -1.0, 1.0
                         ).astype(np.float32)
                         expert_action_2d = ea_2d
                     except Exception as _ex:
@@ -970,7 +999,7 @@ def main(_argv):
             if len(buffer) >= FLAGS.learning_starts and not in_warmup:
                 for _ in range(FLAGS.updates_per_step):
                     batch = buffer.sample(FLAGS.batch_size, torch.device(FLAGS.device))
-                    last_bc_metrics = agent.bc_update(batch, res_scale=FLAGS.res_scale)
+                    last_bc_metrics = agent.bc_update(batch, res_scale=_res_scale_vec)
                     total_updates += 1
             t_update_end = time.time()
             last_update_time = t_update_end - t_update_start
@@ -1002,7 +1031,8 @@ def main(_argv):
                     "action/actor_steer": float(last_actor_output[1]),
                     "action/final_accel": float(last_final_action[0]),
                     "action/final_steer": float(last_final_action[1]),
-                    "action/res_scale": float(FLAGS.res_scale),
+                    "action/res_scale_accel": float(FLAGS.res_scale_accel),
+                    "action/res_scale_steer": float(FLAGS.res_scale_steer),
                     "action/residual_clip_limit": float(dagger_clip_limit),
                     "dagger/expert_accel": float(last_expert_action_2d[0]),
                     "dagger/expert_steer": float(last_expert_action_2d[1]),
@@ -1136,7 +1166,12 @@ def main(_argv):
         import os as _os
         from coaches.online_vlm_coach import OnlineVLMSession  # type: ignore
         from coaches.expert_label import NUM_DELTA_COMMENTARY_WORDS  # type: ignore
-        _coach_label_dim = NUM_DELTA_COMMENTARY_WORDS  # 17-dim delta-commentary BoW
+        if FLAGS.coach_label_mode in ("vlm_embed", "vlm_embed_raw"):
+            _coach_label_dim = vlm_dim  # 896-dim frozen Qwen2 token embedding
+            _text_encoder = simlingo_base.encode_text
+        else:
+            _coach_label_dim = NUM_DELTA_COMMENTARY_WORDS  # 17-dim delta-commentary BoW
+            _text_encoder = None
         if FLAGS.gemini_api_key:
             _os.environ["GEMINI_API_KEY"] = FLAGS.gemini_api_key
         _chunk_duration_sec = FLAGS.coach_action_chunk_steps * ticks_per_wp / 20.0
@@ -1144,7 +1179,7 @@ def main(_argv):
             {
                 "provider": "gemini",
                 "gemini_model": FLAGS.gemini_model,
-                "query_every_n_episode_steps": 0,   # only query at episode end
+                "query_every_n_episode_steps": FLAGS.coach_query_freq,
                 "query_on_episode_end": True,
                 "video_fps": 20.0,
                 "video_frame_stride": ticks_per_wp,  # one trajectory record per global_step
@@ -1155,11 +1190,16 @@ def main(_argv):
                 "save_artifacts": True,
             },
             save_dir=save_dir,
+            text_encoder=_text_encoder,
+            use_raw_description=(FLAGS.coach_label_mode == "vlm_embed_raw"),
+            plot_embeddings=FLAGS.coach_embed_plot,
         )
+        _query_freq_str = f"every {FLAGS.coach_query_freq} steps" if FLAGS.coach_query_freq > 0 else "episode end only"
         print(
             f"[main] Gemini coach enabled: model={FLAGS.gemini_model}  "
-            f"label_dim={_coach_label_dim}  chunk_steps={FLAGS.coach_action_chunk_steps}  "
-            f"chunk_dur={_chunk_duration_sec:.2f}s",
+            f"label_mode={FLAGS.coach_label_mode}  label_dim={_coach_label_dim}  "
+            f"chunk_steps={FLAGS.coach_action_chunk_steps}  "
+            f"chunk_dur={_chunk_duration_sec:.2f}s  query_freq={_query_freq_str}",
             flush=True,
         )
 
@@ -1173,7 +1213,7 @@ def main(_argv):
         critic_lr=FLAGS.critic_lr,
         device=FLAGS.device,
         actor_l2_reg=FLAGS.actor_l2_reg,
-        res_scale=FLAGS.res_scale,
+        res_scale=_res_scale_vec,
         state_dim=_state_dim,
         ticks_per_wp=ticks_per_wp,
         coach_label_dim=_coach_label_dim,
@@ -1270,7 +1310,7 @@ def main(_argv):
                     base_steer = simlingo_base.steer_for_speed(actual_speed)
                 base_action = np.array([base_accel, base_steer], dtype=np.float32)
                 final_action = np.clip(
-                    base_action + FLAGS.res_scale * residual_action, -1.0, 1.0
+                    base_action + _res_scale_vec * residual_action, -1.0, 1.0
                 ).astype(np.float32)
                 image_for_video = obs["simlingo_image"]
                 target_points_for_video = obs.get("target_points")
@@ -1334,7 +1374,7 @@ def main(_argv):
             simlingo_base.steer_for_speed(next_actual_speed),
         ], dtype=np.float32)
         actor_chosen_final_action = np.clip(
-            current_base_action + FLAGS.res_scale * residual_action, -1.0, 1.0
+            current_base_action + _res_scale_vec * residual_action, -1.0, 1.0
         ).astype(np.float32)
         buffer.add(
             vlm_features, next_vlm_features,
@@ -1362,11 +1402,17 @@ def main(_argv):
                 "control_steer": float(last_final_action[1]),
                 "control_brake": float(max(0.0, -last_final_action[0])),
                 "collision": bool(last_collision_delta > 0),
+                "collision_active": bool(last_step_info.get("collision_contact_active", False)),
                 "route_progress_pct": float(last_step_info.get("route_completion_pct", 0.0)),
                 "in_video": True,
                 "video_frame_index": (episode_steps - 1) * ticks_per_wp,
                 "video_timestamp_sec": (episode_steps - 1) * ticks_per_wp / 20.0,
             })
+            # Mid-episode query: only when not done (episode end handles that separately).
+            if not done and _coach_session.maybe_query(
+                episode_step=episode_steps, done_info=None, force=False, global_step=global_step
+            ):
+                _coach_session.backfill_buffer(buffer, global_step=global_step)
 
         # ── SAC updates ───────────────────────────────────────────────────────
         t_update_start = time.time()
@@ -1416,7 +1462,8 @@ def main(_argv):
                 "action/residual_norm": float(np.linalg.norm(residual_action)),
                 "action/final_accel": float(last_final_action[0]),
                 "action/final_steer": float(last_final_action[1]),
-                "action/res_scale": float(FLAGS.res_scale),
+                "action/res_scale_accel": float(FLAGS.res_scale_accel),
+                "action/res_scale_steer": float(FLAGS.res_scale_steer),
                 "action/residual_clip_limit": float(sac_clip_limit),
                 "simlingo/desired_speed_first": float(desired_speeds[0]),
                 "simlingo/desired_speed_mean": float(np.mean(desired_speeds)),

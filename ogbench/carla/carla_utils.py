@@ -213,12 +213,12 @@ DEFAULT_COLLISION_EVENT_PENALTY = -20.0  # legacy: applied while contact is acti
 DEFAULT_COLLISION_CONTACT_PENALTY = None  # float | None; if None, uses legacy collision_event_penalty
 DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -20.0
 DEFAULT_TRAFFIC_VIOLATION_PENALTY = -20.0  # per new RunningStop or RunningRedLight event
-DEFAULT_PROGRESS_REWARD_WEIGHT = 5.0
+DEFAULT_PROGRESS_REWARD_WEIGHT = 5.0 # 5.0
 DEFAULT_TERMINATE_ON_INFRACTION = False
 # DEFAULT_CENTERING_REWARD_WEIGHT = 0.2
 # DEFAULT_HEADING_REWARD_WEIGHT = 0.2
-DEFAULT_STEER_PENALTY_WEIGHT = 0.05
-DEFAULT_BRAKE_PENALTY_WEIGHT = 0.02
+DEFAULT_STEER_PENALTY_WEIGHT = 0.0 # 0.05
+DEFAULT_BRAKE_PENALTY_WEIGHT = 0.0 # 0.02
 DEFAULT_SPEED_LIMIT_PENALTY_WEIGHT = 0.1
 SUCCESS_BONUS = 50.0
 FAILURE_BONUS = -20.0
@@ -861,6 +861,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._prev_traffic_violation_count = 0
         self._raw_collision_sensor: Any | None = None
         self._raw_collision_active: bool = False
+        self._collision_recently_active: bool = False
         self._last_route_completion = 0.0
         self._route_progress_xyz: Optional[np.ndarray] = None
         self._route_progress_s: Optional[np.ndarray] = None
@@ -1183,6 +1184,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._prev_outside_route_value = 0.0
         self._prev_traffic_violation_count = 0
         self._raw_collision_active = False
+        self._collision_recently_active = False
         self._last_route_completion = 0.0
         self._init_route_progress_cache()
         self._spawn_raw_collision_sensor()
@@ -1969,10 +1971,18 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
 
     def _update_crash_stuck_state(self, speed: float) -> Tuple[bool, int]:
         collision_count = self._collision_count()
-        # Use active contact (_raw_collision_active) rather than cumulative collision_count so
-        # that legitimate stops (stop signs, traffic lights) after a prior collision don't
-        # spuriously trigger crash_stuck termination.
-        if self._raw_collision_active and speed < self._crash_stuck_speed_threshold:
+        # Latch: set on any new collision event, cleared only when the car gets back up
+        # to speed (i.e. it has physically freed itself).  This avoids two failure modes:
+        # (a) using raw _raw_collision_active alone: CARLA collision sensor fires on new
+        #     contact events, not continuously, so a wedged car stops generating events
+        #     and stuck_ticks never accumulates.
+        # (b) using cumulative collision_count: a stop sign/traffic light after any prior
+        #     collision would spuriously trigger crash_stuck.
+        if self._raw_collision_active:
+            self._collision_recently_active = True
+        if speed >= self._crash_stuck_speed_threshold:
+            self._collision_recently_active = False
+        if self._collision_recently_active and speed < self._crash_stuck_speed_threshold:
             self._crash_stuck_ticks += 1
         else:
             self._crash_stuck_ticks = 0

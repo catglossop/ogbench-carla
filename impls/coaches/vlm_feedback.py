@@ -77,19 +77,40 @@ def load_metadata(metadata_path: str | Path) -> dict[str, Any]:
 
 def build_coaching_prompt(metadata: dict[str, Any]) -> str:
     """Prompt shared by Gemini and Perceptron coaches."""
-    metadata_block = json.dumps(metadata, indent=2) if metadata else "{}"
+    # Summarise metadata compactly: top-level fields + collision events only.
+    # The full steps array is omitted from the prompt to stay within token budgets.
+    summary_keys = ("episode", "route", "episode_steps", "success",
+                    "termination_reason", "collision_events")
+    summary = {k: metadata[k] for k in summary_keys if k in metadata}
+    metadata_block = json.dumps(summary, indent=2) if summary else "{}"
+
+    collision_events = metadata.get("collision_events", [])
+    if collision_events:
+        collision_lines = "\n".join(
+            f"  t={e.get('video_timestamp_sec', '?'):.2f}s  "
+            f"new_event={e.get('new_event')}  contact_active={e.get('contact_active')}"
+            for e in collision_events
+        )
+        collision_section = (
+            f"\nCollision log (from on-board sensors — cross-reference with the video):\n"
+            f"{collision_lines}\n"
+        )
+    else:
+        collision_section = "\nNo collisions were recorded by the on-board sensors.\n"
+
     return textwrap.dedent(
         f"""
         You are reviewing a driving rollout video for an autonomous vehicle policy.
 
-        Optional metadata (may be empty for now):
+        Episode summary:
         ```json
         {metadata_block}
         ```
-
+        {collision_section}
         Watch the full video and identify moments where driving behavior was clearly
         good or clearly bad (lane keeping, speed, turns, collisions/near-misses,
-        stopping, yielding, etc.).
+        stopping, yielding, etc.). The collision log above shows ground-truth sensor
+        data — use it to anchor your feedback to the correct timestamps.
 
         Return ONLY valid JSON with this schema (no markdown fences):
         {{

@@ -14,6 +14,7 @@ from coaches.action_chunk_feedback import (
     DEFAULT_BAD_EVENT_RADIUS_CHUNKS,
     DEFAULT_CHUNK_DURATION_SEC,
     language_label_for_episode_step,
+    raw_text_for_chunk_index,
 )
 from coaches.vlm_feedback import (
     annotate_video,
@@ -70,6 +71,9 @@ class OnlineVLMSession:
         *,
         save_dir: str | Path,
         action_chunk_steps: int = DEFAULT_ACTION_CHUNK_STEPS,
+        text_encoder: Any = None,
+        use_raw_description: bool = False,
+        plot_embeddings: bool = False,
     ) -> None:
         self.cfg = _as_config_dict(vlm_cfg)
         self.save_dir = Path(save_dir)
@@ -97,6 +101,13 @@ class OnlineVLMSession:
             self.provider,  # type: ignore[arg-type]
             model=self.gemini_model,
         )
+        # Optional callable (str) -> np.ndarray for VLM-embedding the feedback text.
+        # When None, the 17-dim delta-commentary BoW is used instead.
+        self._text_encoder = text_encoder
+        # When True, encode raw description+correction from the nearest BAD event
+        # instead of the structured lateral/longitudinal/detail phrase.
+        self._use_raw_description = use_raw_description and (text_encoder is not None)
+        self._plot_embeddings = plot_embeddings
 
         self.reset_episode()
 
@@ -108,8 +119,14 @@ class OnlineVLMSession:
         self.episode_buffer_indices: list[int] = []
         self.episode_step_for_buffer: list[int] = []
         self.chunk_feedback_json: dict[str, Any] | None = None
+        # Per-window feedback: list of (step_offset, chunk_feedback_json) where
+        # step_offset is the number of trajectory steps already queried before this window.
+        self._chunk_feedback_windows: list[tuple[int, dict[str, Any]]] = []
         self.latest_events: list[Any] = []
         self._last_query_episode_step = 0
+        self._backfill_cursor = 0
+        self._frames_cursor = 0
+        self._traj_cursor = 0
 
     def begin_episode(self, *, episode_count: int, route_name: str) -> None:
         self.episode_count = int(episode_count)
@@ -126,26 +143,47 @@ class OnlineVLMSession:
         self.episode_buffer_indices.append(int(buffer_index))
         self.episode_step_for_buffer.append(int(episode_step))
 
-    def _build_metadata(self, *, done_info: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _build_metadata(
+        self,
+        traj_steps: list[dict[str, Any]],
+        *,
+        done_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         done_info = done_info or {}
+
+        # Compact collision event list so Gemini sees it without parsing all steps.
+        # Each entry marks a timestamp where either a new collision fired or bounding-box
+        # contact was actively ongoing.
+        collision_events: list[dict[str, Any]] = []
+        for s in traj_steps:
+            if s.get("collision") or s.get("collision_active"):
+                collision_events.append({
+                    "video_timestamp_sec": s.get("video_timestamp_sec"),
+                    "episode_step": s.get("episode_step"),
+                    "new_event": bool(s.get("collision")),
+                    "contact_active": bool(s.get("collision_active")),
+                })
+
         return {
             "episode": self.episode_count,
             "route": self.route_name,
-            "episode_steps": len(self.trajectory_steps),
+            "episode_steps": len(traj_steps),
             "video_fps": self.video_fps,
             "video_frame_stride": self.video_frame_stride,
             "success": done_info.get("success"),
             "termination_reason": done_info.get("termination_reason"),
             "scenario_tree_status": done_info.get("scenario_tree_status"),
-            "steps": self.trajectory_steps,
+            "collision_events": collision_events,
+            "steps": traj_steps,
         }
 
     def should_query(self, episode_step: int, *, force: bool = False) -> bool:
         if force:
-            return self.query_on_episode_end and len(self.frames) > 0
+            # Only query if there are unqueried frames remaining.
+            return self.query_on_episode_end and len(self.frames) > self._frames_cursor
         if self.query_every_n_episode_steps <= 0:
             return False
-        if episode_step <= 0 or len(self.frames) == 0:
+        if episode_step <= 0 or len(self.frames) <= self._frames_cursor:
             return False
         if episode_step % self.query_every_n_episode_steps != 0:
             return False
@@ -173,19 +211,24 @@ class OnlineVLMSession:
         final: bool,
         global_step: int | None = None,
     ) -> None:
+        # Slice to only the frames and steps not yet sent to Gemini.
+        frames_window = self.frames[self._frames_cursor:]
+        traj_window = self.trajectory_steps[self._traj_cursor:]
+        step_offset = self._traj_cursor  # absolute episode steps before this window
+
         tag = f"ep{self.episode_count:04d}_step{episode_step:04d}{'_final' if final else ''}"
         work_dir = self.artifact_dir / tag
         work_dir.mkdir(parents=True, exist_ok=True)
 
         video_path = work_dir / "rollout.mp4"
-        write_frames_to_mp4(self.frames, video_path, fps=self.video_fps)
-        metadata = self._build_metadata(done_info=done_info)
+        write_frames_to_mp4(frames_window, video_path, fps=self.video_fps)
+        metadata = self._build_metadata(traj_window, done_info=done_info)
         metadata_path = work_dir / "trajectory.json"
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
         print(
-            f"[online_vlm_coach] querying {self.provider} on {len(self.frames)} frames "
-            f"({len(self.trajectory_steps)} steps) -> {work_dir}",
+            f"[online_vlm_coach] querying {self.provider} on {len(frames_window)} frames "
+            f"({len(traj_window)} steps, offset={step_offset}) -> {work_dir}",
             flush=True,
         )
 
@@ -210,8 +253,15 @@ class OnlineVLMSession:
             chunk_duration_sec=self.action_chunk_duration_sec,
             bad_event_radius_chunks=self.bad_event_radius_chunks,
         )
-        self.chunk_feedback_json = chunk_json
+
+        # Store window with its step offset for windowed lookup in backfill.
+        self._chunk_feedback_windows.append((step_offset, chunk_json))
+        self.chunk_feedback_json = chunk_json  # keep latest for logging/compat
         self.latest_events = events
+
+        # Advance cursors so the next query starts from here.
+        self._frames_cursor = len(self.frames)
+        self._traj_cursor = len(self.trajectory_steps)
 
         chunk_out = work_dir / "chunk_feedback.json"
         chunk_out.write_text(json.dumps(chunk_json, indent=2), encoding="utf-8")
@@ -279,28 +329,56 @@ class OnlineVLMSession:
         wandb.log(log, step=global_step)
 
     def language_label_for_episode_step(self, episode_step: int) -> tuple[str, np.ndarray]:
-        return language_label_for_episode_step(
-            self.chunk_feedback_json,
-            episode_step,
-            action_chunk_steps=self.action_chunk_steps,
+        # Search windows in order; convert to window-relative step for lookup.
+        # chunk_feedback_json stores chunk indices relative to the window start,
+        # so we subtract the window's step_offset before calling the lookup.
+        for step_offset, cfj in self._chunk_feedback_windows:
+            window_size = int(cfj.get("episode_steps", 0))
+            window_step = episode_step - step_offset
+            if 1 <= window_step <= window_size:
+                if self._use_raw_description:
+                    chunk_index = max(0, (window_step - 1) // self.action_chunk_steps)
+                    text = raw_text_for_chunk_index(
+                        cfj, chunk_index, bad_event_radius_chunks=self.bad_event_radius_chunks
+                    )
+                    return text, self._text_encoder(text)
+                text, bow = language_label_for_episode_step(
+                    cfj, window_step, action_chunk_steps=self.action_chunk_steps
+                )
+                if self._text_encoder is not None:
+                    return text, self._text_encoder(text)
+                return text, bow
+        # No window matched: no feedback for this step.
+        if self._text_encoder is not None:
+            return "", self._text_encoder("")
+        text, bow = language_label_for_episode_step(
+            None, episode_step, action_chunk_steps=self.action_chunk_steps
         )
+        return text, bow
 
     def backfill_buffer(self, buffer: Any, *, global_step: int | None = None) -> None:
-        """Write coach labels for all transitions recorded this episode."""
-        if not self.episode_buffer_indices:
+        """Write coach labels for transitions recorded since the last backfill call.
+
+        Uses a cursor so mid-episode calls only label new transitions, and a
+        final episode-end call labels any remainder without re-writing earlier slots.
+        """
+        new_indices = self.episode_buffer_indices[self._backfill_cursor:]
+        new_steps = self.episode_step_for_buffer[self._backfill_cursor:]
+        if not new_indices:
             return
         if self.chunk_feedback_json is None:
             print("[online_vlm_coach] skip backfill: no chunk feedback yet", flush=True)
             return
-        for buf_idx, ep_step in zip(self.episode_buffer_indices, self.episode_step_for_buffer):  # strict= requires Python 3.10+
+        for buf_idx, ep_step in zip(new_indices, new_steps):
             _text, bow = self.language_label_for_episode_step(ep_step)
             buffer.update_at(int(buf_idx), coach_label=bow)
+        self._backfill_cursor += len(new_indices)
         n_labeled = sum(
             1
-            for ep_step in self.episode_step_for_buffer
+            for ep_step in new_steps
             if self.language_label_for_episode_step(ep_step)[1].any()
         )
-        n_total = len(self.episode_buffer_indices)
+        n_total = len(new_indices)
         print(
             f"[online_vlm_coach] backfilled {n_total} transitions ({n_labeled} non-zero labels)",
             flush=True,
@@ -319,3 +397,75 @@ class OnlineVLMSession:
                 )
         except ImportError:
             pass
+
+        if self._plot_embeddings:
+            self._log_embedding_plot(global_step=global_step)
+
+    def _log_embedding_plot(self, *, global_step: int | None = None) -> None:
+        """PCA scatter of all episode label vectors logged to wandb.
+
+        Collects every transition's label embedding, projects to 2D via PCA
+        (numpy SVD, no sklearn required), and uploads as a wandb image.
+        Points near a BAD event are coloured by episode step; steps with no
+        coaching signal are shown in muted blue.
+        """
+        try:
+            import wandb  # type: ignore
+            import matplotlib  # type: ignore
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt  # type: ignore
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+
+        if not self.episode_buffer_indices:
+            return
+
+        # Re-derive all labels for the full episode (cheap — just array lookup).
+        vecs = []
+        steps = []
+        for ep_step in self.episode_step_for_buffer:
+            _text, label = self.language_label_for_episode_step(ep_step)
+            vecs.append(label)
+            steps.append(ep_step)
+
+        vecs_arr = np.stack(vecs)       # (N, D)
+        steps_arr = np.array(steps)     # (N,)
+        is_nonzero = np.any(vecs_arr != 0, axis=1)
+
+        if vecs_arr.shape[0] < 2 or vecs_arr.shape[1] < 2:
+            return
+
+        # PCA to 2D (numpy-only: centre → SVD → project).
+        centred = vecs_arr - vecs_arr.mean(axis=0)
+        try:
+            _, _, Vt = np.linalg.svd(centred, full_matrices=False)
+            proj = centred @ Vt[:2].T   # (N, 2)
+        except np.linalg.LinAlgError:
+            return
+
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.scatter(
+            proj[~is_nonzero, 0], proj[~is_nonzero, 1],
+            c="steelblue", s=15, alpha=0.35, label="no event",
+        )
+        if is_nonzero.any():
+            sc = ax.scatter(
+                proj[is_nonzero, 0], proj[is_nonzero, 1],
+                c=steps_arr[is_nonzero], cmap="Reds", s=40, zorder=2,
+                label="near BAD event",
+            )
+            plt.colorbar(sc, ax=ax, label="episode step")
+        ax.set_xlabel("PC 1")
+        ax.set_ylabel("PC 2")
+        mode = "raw" if self._use_raw_description else "structured"
+        ax.set_title(
+            f"Coach label embeddings — ep {self.episode_count} ({mode}, "
+            f"D={vecs_arr.shape[1]}, N={vecs_arr.shape[0]})"
+        )
+        ax.legend(fontsize=8)
+        plt.tight_layout()
+
+        wandb.log({"coach/embedding_pca": wandb.Image(fig)}, step=global_step)
+        plt.close(fig)

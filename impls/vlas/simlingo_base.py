@@ -808,6 +808,22 @@ class SimLingoBase:
 
         return np.concatenate([image_embed, prompt_embed])  # (1920,)
 
+    @torch.no_grad()
+    def encode_text(self, text: str) -> np.ndarray:
+        """Embed arbitrary text through the frozen LM token embedding layer.
+
+        Tokenizes ``text``, mean-pools over token embeddings, and L2-normalizes.
+        Returns a (896,) float32 vector; empty text returns a zero vector.
+        Same embedding path used by get_encoder_features for the prompt component.
+        """
+        if not text.strip():
+            return np.zeros(_VLM_FEATURE_DIM, dtype=np.float32)
+        tokenizer = self.model.tokenizer
+        token_ids = tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(self.device)
+        embed = self._get_embed_tokens()(token_ids).float().mean(dim=1).squeeze(0)  # (896,)
+        embed = F.normalize(embed, dim=-1)
+        return embed.cpu().numpy()
+
 
 class HierarchicalSimLingoPolicy:
     """High-level SimLingo planner feeding a low-level SimLingo VLA controller."""
@@ -933,6 +949,9 @@ class HierarchicalSimLingoPolicy:
         routing_command: str = "",
     ) -> np.ndarray:
         return self.low.get_encoder_features(simlingo_image, ego_state, target_points, routing_command)
+
+    def encode_text(self, text: str) -> np.ndarray:
+        return self.high.encode_text(text)
 
 
 def _extract_meta_action(text: str) -> str:

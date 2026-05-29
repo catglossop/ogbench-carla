@@ -381,6 +381,33 @@ def chunk_feedback_to_language_label(
     return text, delta_commentary_to_bow(text)
 
 
+def raw_text_for_chunk_index(
+    chunk_feedback_json: dict[str, Any],
+    chunk_index: int,
+    *,
+    bad_event_radius_chunks: int = DEFAULT_BAD_EVENT_RADIUS_CHUNKS,
+) -> str:
+    """Return the concatenated description + correction from the nearest BAD event
+    within ``bad_event_radius_chunks`` of ``chunk_index``, or "" if none nearby.
+
+    Uses the raw first-pass Gemini text rather than the structured lateral/longitudinal
+    encoding, so nothing is lost to the constrained schema.
+    """
+    bad_events = chunk_feedback_json.get("bad_events", [])
+    nearby = [
+        e for e in bad_events
+        if abs(int(e.get("center_chunk_index", -9999)) - chunk_index) <= bad_event_radius_chunks
+    ]
+    if not nearby:
+        return ""
+    nearest = min(nearby, key=lambda e: abs(int(e.get("center_chunk_index", 0)) - chunk_index))
+    desc = str(nearest.get("description", "")).strip()
+    corr = str(nearest.get("correction", "")).strip()
+    if desc and corr:
+        return f"{desc} {corr}"
+    return desc or corr
+
+
 def language_label_for_episode_step(
     chunk_feedback_json: dict[str, Any] | None,
     episode_step: int,

@@ -428,7 +428,7 @@ class ResidualSACAgent:
         target_entropy: Optional[float] = None,
         device: str = "cuda",
         actor_l2_reg: float = 0.0,
-        res_scale: float = 0.1,
+        res_scale=0.1,
         state_dim: int = EGO_STATE_DIM,
         ticks_per_wp: int = 1,
         coach_label_dim: int = 0,
@@ -450,7 +450,7 @@ class ResidualSACAgent:
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_target.requires_grad_(False)
 
-        self.res_scale = res_scale
+        self.res_scale = torch.as_tensor(res_scale, dtype=torch.float32).to(self.device)
 
         self.actor_opt = Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_opt = Adam(self.critic.parameters(), lr=critic_lr)
@@ -582,7 +582,7 @@ class ResidualSACAgent:
 
     # ── DAgger BC update ──────────────────────────────────────────────────────
 
-    def bc_update(self, batch: Dict[str, torch.Tensor], res_scale: float = 0.1) -> Dict[str, float]:
+    def bc_update(self, batch: Dict[str, torch.Tensor], res_scale=0.1) -> Dict[str, float]:
         """DAgger residual BC update.
 
         Loss: MSE(clip(base + res_scale * tanh(mean), -1, 1), expert_action).
@@ -600,7 +600,8 @@ class ResidualSACAgent:
 
         mean, _ = self.actor(obs, base_actions, states)
         residual = torch.tanh(mean)
-        predicted = torch.clamp(base_actions + res_scale * residual, -1.0, 1.0)
+        _rs = torch.as_tensor(res_scale, dtype=torch.float32).to(base_actions.device)
+        predicted = torch.clamp(base_actions + _rs * residual, -1.0, 1.0)
         bc_loss = F.mse_loss(predicted, expert_actions)
 
         self.actor_opt.zero_grad()
