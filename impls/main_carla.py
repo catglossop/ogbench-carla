@@ -369,6 +369,7 @@ def _build_vla_sample_fn(
     raw_carla_obs_holder: dict | None,
     *,
     training_gpu_rank: int = -1,
+    noise_scale: float = 1.0,
 ):
     """Construct ``(obs, noise) -> action`` using OpenPI Pi0-CoT SteerVLA (:mod:`vlas.steervla`)."""
     if not steervla_cfg.get("enabled", False):
@@ -390,6 +391,7 @@ def _build_vla_sample_fn(
             steervla_cfg,
             raw_carla_obs_holder,
             training_gpu_rank=training_gpu_rank,
+            noise_scale=noise_scale,
         )
 
     if not steervla_cfg.get("checkpoint"):
@@ -404,6 +406,7 @@ def _build_vla_sample_fn(
         steervla_cfg,
         raw_carla_obs_holder,
         training_gpu_rank=training_gpu_rank,
+        noise_scale=noise_scale,
     )
 
 
@@ -437,6 +440,9 @@ def run_online_carla(
     warmup = int(agent_config.get("warmup_steps", 1000))
     warmup_expo = int(agent_config.get("warmup_expo_steps", 0))
     updates_per_step = int(agent_config.get("updates_per_step", 1))
+    update_interval = int(agent_config.get("update_interval", 1))
+    if update_interval < 1:
+        raise ValueError(f"update_interval must be >= 1, got {update_interval}")
     batch_size = int(agent_config.get("batch_size", 256))
     enable_updates = bool(agent_config.get("enable_updates", True))
     if FLAGS.enable_updates is not None:
@@ -447,6 +453,8 @@ def run_online_carla(
         print("[main_carla] enable_updates=False: rollout-only (no RL gradient updates)", flush=True)
     if warmup > 0 and agent is not None and not FLAGS.expert_debug:
         print(f"[main_carla] warmup: no RL updates while step < {warmup}", flush=True)
+    if update_interval > 1 and agent is not None and enable_updates:
+        print(f"[main_carla] RL updates every {update_interval} env steps", flush=True)
     if warmup_expo > 0:
         if warmup_expo <= warmup:
             raise ValueError(
@@ -1305,8 +1313,8 @@ def run_online_carla(
             and agent is not None
             and not in_warmup
             and buffer.size >= batch_size
+            and step % update_interval == 0
         ):
-            
             for _ in range(updates_per_step):
                 t_update_start = time.time()
                 use_vla_update = getattr(agent, "vla_sample_fn", None) is not None
@@ -1463,7 +1471,10 @@ def main(_):
             tr_rank = int(config.get("training_gpu_rank", -1))
             if use_steervla_rollout:
                 vla_bundle = _build_vla_sample_fn(
-                    steervla_cfg, raw_carla_holder, training_gpu_rank=tr_rank
+                    steervla_cfg,
+                    raw_carla_holder,
+                    training_gpu_rank=tr_rank,
+                    noise_scale=float(config.get("noise_scale", 1.0)),
                 )
                 if vla_bundle is None:
                     raise ValueError("SteerVLA rollout enabled but vla_sample_fn could not be built.")
@@ -1474,6 +1485,7 @@ def main(_):
                 steervla_actor.debug_noise_log_every_n_steps = int(
                     config.get("debug_noise_log_every_n_steps", 5)
                 )
+                steervla_actor.noise_scale = float(config.get("noise_scale", 1.0))
                 if steervla_actor.debug_noise:
                     print(
                         f"[main_carla] debug_noise enabled: "

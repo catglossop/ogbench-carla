@@ -649,6 +649,7 @@ class SteerVLAActor:
         debug_noise_route_name: str = "?",
         debug_noise_episode: int = 0,
         debug_noise_episode_step: int = 0,
+        noise_scale: float = 1.0,
     ) -> None:
         self.actor_url = actor_url
         self._remote: Optional[RemoteActor] = None
@@ -684,6 +685,7 @@ class SteerVLAActor:
         self.debug_noise_route_name = str(debug_noise_route_name)
         self.debug_noise_episode = int(debug_noise_episode)
         self.debug_noise_episode_step = int(debug_noise_episode_step)
+        self.noise_scale = float(noise_scale)
         self.prompt_state_dim = steervla_prompt_state_dim(include_ego_history=include_ego_history)
         self._call_counter = 0
         self._cached_action_chunk: np.ndarray | None = None
@@ -888,42 +890,41 @@ class SteerVLAActor:
         out = self._postprocess_action_trajectory(trajectory, observation_state=observation_state)
         return jnp.asarray(out, dtype=jnp.float32)
     
-    def flow_sample(self, rng, openpi_observation, input_noise):
-        batch_size = int(openpi_observation.state.shape[0])
-        cot_out = self._sample_or_reuse_cot(rng, openpi_observation, batch_size)
-        obs_full = _merge_cot_output_into_observation(openpi_observation, cot_out)
+    # def flow_sample(self, rng, openpi_observation, input_noise):
+    #     batch_size = int(openpi_observation.state.shape[0])
+    #     cot_out = self._sample_or_reuse_cot(rng, openpi_observation, batch_size)
+    #     obs_full = _merge_cot_output_into_observation(openpi_observation, cot_out)
         
-        # Construct the noise
-        model_ah = int(self.model.action_horizon)
-        model_ad = int(self.model.action_dim)
-        cfg_ah = min(int(self.action_horizon), model_ah)
-        cfg_ad = min(int(self.action_dim), model_ad)
-        noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
-        if input_noise.ndim == 3:
-            noise_chunk = input_noise[:, :cfg_ah, :cfg_ad]
-        elif int(input_noise.shape[-1]) == int(self.action_horizon) * int(self.action_dim):
-            noise_chunk = input_noise.reshape(batch_size, int(self.action_horizon), int(self.action_dim))[:, :cfg_ah, :cfg_ad]
-        else:
-            noise_chunk = input_noise[:, None, :cfg_ad]
-            write_ah = 1
-        noise_full = noise_full.at[:, :write_ah, :cfg_ad].set(noise_chunk)
+    #     # Construct the noise
+    #     model_ah = int(self.model.action_horizon)
+    #     model_ad = int(self.model.action_dim)
+    #     cfg_ah = min(int(self.action_horizon), model_ah)
+    #     cfg_ad = min(int(self.action_dim), model_ad)
+    #     noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
+    #     if input_noise.ndim == 3:
+    #         noise_chunk = input_noise[:, :cfg_ah, :cfg_ad]
+    #     elif int(input_noise.shape[-1]) == int(self.action_horizon) * int(self.action_dim):
+    #         noise_chunk = input_noise.reshape(batch_size, int(self.action_horizon), int(self.action_dim))[:, :cfg_ah, :cfg_ad]
+    #     else:
+    #         noise_chunk = input_noise[:, None, :cfg_ad]
+    #         write_ah = 1
+    #     noise_full = noise_full.at[:, :write_ah, :cfg_ad].set(noise_chunk)
         
-        # Sample the actions
-        traj = self._sample_actions(
-            rng,
-            obs_full,
-            noise=noise_full,
-            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-            num_steps=int(self.sample_actions_num_steps),
-        )
-        traj_np = self._postprocess_action_trajectory(
-            traj,
-            observation_state=openpi_observation.state,
-        )
-        target_dim = int(self.action_dim)
-        first_step = traj_np[:, 0, :target_dim]
-        out = jnp.asarray(first_step, dtype=jnp.float32)
-        return out
+    #     traj = self._sample_actions(
+    #         rng,
+    #         obs_full,
+    #         noise=noise_full,
+    #         image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+    #         num_steps=int(self.sample_actions_num_steps),
+    #     )
+    #     traj_np = self._postprocess_action_trajectory(
+    #         traj,
+    #         observation_state=openpi_observation.state,
+    #     )
+    #     target_dim = int(self.action_dim)
+    #     first_step = traj_np[:, 0, :target_dim]
+    #     out = jnp.asarray(first_step, dtype=jnp.float32)
+    #     return out
 
     def _routing_for_raw(self, raw: Dict[str, Any]) -> str:
         rc = raw.get("routing_command")
@@ -1392,7 +1393,7 @@ class SteerVLAActor:
         xy_cumsum_steps: list[np.ndarray] = []
         for i in range(n):
             noise_i = jnp.asarray(candidate_noises[i], dtype=jnp.float32)
-            out = self._forward_pi0(batch_size, noise_i, raw=None)
+            out = self._forward_pi0(batch_size, noise_i * self.noise_scale, raw=None)
             score = self._debug_speed_score_from_flat(out)
             scores.append(score)
             cumsum_xy = self._debug_xy_cumsum_from_flat(out)
@@ -1597,7 +1598,7 @@ class SteerVLAActor:
             # Cache-hit path still corresponds to a real env step with a fresh `raw_obs_holder["obs"]`.
             # Re-stash the currently reused CoT so replay capture for this step remains aligned.
             if (
-                batch_size == 1
+                batch_size == 1 
                 and self._cached_cot is not None
                 and self.raw_obs_holder is not None
                 and isinstance(self.raw_obs_holder.get("obs"), dict)
@@ -1644,6 +1645,7 @@ class SteerVLAActor:
         rng = jax.random.PRNGKey(self._call_counter)
         rng_noise, rng_act = jax.random.split(rng)
         noise_jax = jax.random.normal(rng_noise, (1, self.model.action_dim), dtype=jnp.float32)
+        noise_jax = noise_jax * jnp.asarray(self.noise_scale, dtype=jnp.float32)
         actions = self._forward_pi0(1, noise_jax, raw=state, rng=rng_act, force_accel_steer=True)
         self._mark_action_served(1)
         return np.asarray(jax.device_get(actions[0]), dtype=np.float32)
@@ -1675,6 +1677,7 @@ def create_steervla_pi0_cot_sample_fn(
     raw_obs_holder: MutableMapping[str, Any],
     *,
     training_gpu_rank: int = -1,
+    noise_scale: float = 1.0,
 ) -> Callable[[jax.Array, jax.Array], jax.Array]:
     """Build ``vla_sample_fn`` for :class:`jax_agents.dsrl.DSRLAgent`."""
     srank = steervla_cfg.get("training_gpu_rank", None)
@@ -1705,6 +1708,7 @@ def create_steervla_pi0_cot_sample_fn(
         debug_noise_log_every_n_steps=int(
             steervla_cfg.get("debug_noise_log_every_n_steps", 5)
         ),
+        noise_scale=float(steervla_cfg.get("noise_scale", noise_scale)),
     )
 
     if url_clean:

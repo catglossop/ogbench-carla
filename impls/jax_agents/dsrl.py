@@ -990,6 +990,8 @@ def get_config():
             # Env steps with policy rollouts but no RL updates (see main_carla.run_online_carla).
             warmup_steps=1000,
             updates_per_step=1,
+            # Run RL gradient updates every N env steps (1 = every step).
+            update_interval=1,
             # If false, main_carla collects rollouts but skips RL gradient updates.
             enable_updates=True,
             buffer_capacity=100_000,

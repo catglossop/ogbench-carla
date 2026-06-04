@@ -203,12 +203,11 @@ _SPEED_LIMITS_DIR = Path(__file__).resolve().parent.parent.parent / "impls" / "c
 
 DEFAULT_CRASH_STUCK_SPEED_THRESHOLD = 0.1
 DEFAULT_CRASH_STUCK_STEPS = 20
-DEFAULT_CRASH_STUCK_PENALTY = -1.0
-DEFAULT_COLLISION_EVENT_PENALTY = -5.0 # catastrophic - should update to make sure any contact is given negative reward
-DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -5.0 # should be pretty heavy
-DEFAULT_PROGRESS_REWARD_WEIGHT = 1.0
-# DEFAULT_CENTERING_REWARD_WEIGHT = 0.2
-# DEFAULT_HEADING_REWARD_WEIGHT = 0.2
+DEFAULT_CRASH_STUCK_PENALTY = -5.0
+DEFAULT_COLLISION_EVENT_PENALTY = -1.0 # catastrophic - should update to make sure any contact is given negative reward
+DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -1.0 # should be pretty heavy
+DEFAULT_PROGRESS_REWARD_WEIGHT = 2.0
+
 DEFAULT_STEER_PENALTY_WEIGHT = 0.05
 DEFAULT_BRAKE_PENALTY_WEIGHT = 0.02
 DEFAULT_SPEED_LIMIT_PENALTY_WEIGHT = 0.1
@@ -760,6 +759,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         )
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
+        self._prev_route_progress_pct = 0.0
         self._max_episode_steps = int(
             self.carla_config.get("max_episode_steps", DEFAULT_MAX_EPISODE_STEPS)
         )
@@ -1071,6 +1071,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._crash_stuck_ticks = 0
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
+        self._prev_route_progress_pct = 0.0
 
     def _ego_actor(self) -> Optional[carla.Actor]:
         ev = self._evaluator
@@ -1467,7 +1468,10 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         steer_pen = self._steer_penalty_weight * abs(float(getattr(self._last_control, "steer", 0.0)))
         brake_pen = self._brake_penalty_weight * float(getattr(self._last_control, "brake", 0.0))
         speed_limit_pen = self._speed_limit_penalty_weight * overspeed_frac
-        progress_reward = self._progress_reward_weight * speed_norm * centering_factor * heading_factor
+        route_progress_pct = self._route_completion_pct()
+        route_progress_delta = max(0.0, route_progress_pct - self._prev_route_progress_pct)
+        self._prev_route_progress_pct = route_progress_pct
+        progress_reward = self._progress_reward_weight * route_progress_delta / 100.0
         # centering_reward = self._centering_reward_weight * centering_factor
         # heading_reward = self._heading_reward_weight * heading_factor
 
@@ -1496,7 +1500,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
 
         terminal_bonus = 0.0
         info["collision_count"] = collision_count
-        info["route_progress_pct"] = self._route_completion_pct()
+        info["route_progress_pct"] = route_progress_pct
+        info["route_progress_delta"] = route_progress_delta
         info["crash_stuck_ticks"] = self._crash_stuck_ticks
         info["outside_route_value"] = outside_route_value
         info["collision_delta"] = float(collision_delta)

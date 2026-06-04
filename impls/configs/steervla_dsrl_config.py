@@ -24,8 +24,6 @@ Action-expert-only fine-tuning must be done in OpenPI (``TrainConfig.freeze_filt
 not inside DSRL's Flax losses yet.
 """
 
-from __future__ import annotations
-
 import ml_collections
 
 from jax_agents import dsrl as dsrl_agent
@@ -35,19 +33,20 @@ def get_config():
     config = dsrl_agent.get_config()
 
     config.lr = 3e-4
-    config.batch_size = 16
-    config.flow_steps = 10
+    config.batch_size = 32
     # Denoise steps for frozen VLA forwards during RL updates (rollout uses steervla.sample_actions_num_steps).
     config.vla_update_flow_steps = 5
-    config.noise_scale = 1.0
+    config.noise_scale = 4.0
     config.alpha = 0.1
     # Collect transitions with the rollout policy (SteerVLA / DSRL) but skip RL updates.
     config.warmup_steps = 0
     # If True, use env.action_space.sample() during warmup instead of the policy.
     config.warmup_use_random_actions = False
     config.updates_per_step = 5
+    # Run RL gradient updates every N env steps (still ``updates_per_step`` per update).
+    config.update_interval = 10
     # Set to false for rollout-only runs (no RL gradient updates).
-    config.enable_updates = False
+    config.enable_updates = True
     config.buffer_capacity = 1_000
     # When true, RL updates use reward = -ego_speed (m/s) instead of env reward.
     config.debug_task = False
@@ -126,9 +125,8 @@ def get_config():
             actor_config="pi05_steervla_cot_simplified_reasoning",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260525_202139/8000",
-            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260526_175924/2000",
-            # checkpoint="/home/carla/.cache/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/2000",
-            # checkpoint="gs://cat-logs/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning_20260512_144250/50000",
+            # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260526_175924/4000",
+            checkpoint="/home/carla/.cache/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/6000",
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,
             include_ego_history=False,
@@ -146,7 +144,7 @@ def get_config():
             # CoT again. With actions_per_model_query=5, this reuses CoT across two action chunks.
             actions_per_cot=1,
             output_action_format="DELTA_XY_T_DELTA_XY_SPACE",
-            sample_actions_num_steps=10,
+            sample_actions_num_steps=10, # default is 10
             # When set, skip sample_cot and teacher-force CoT like inspect_outputs.ipynb.
             # fixed_subtask_text="The vehicle follows the route with steady lane keeping, normally maintaining its current speed.",
             # fixed_reasoning_text="Follow the route.",
