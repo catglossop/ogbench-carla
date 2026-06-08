@@ -170,6 +170,9 @@ flags.DEFINE_bool("terminate_on_infraction", False,
                   "Terminate the episode immediately when a collision, traffic violation, or off-route event occurs.")
 flags.DEFINE_bool("expert_recover_debug", False,
                   "Debug: run SimLingo for a random [70,200] ticks per episode, then switch to CARLA expert.")
+flags.DEFINE_bool("use_expert_in_critic", False,
+                  "Feed the expert planner's (accel, steer) action as additional input to the SAC critic. "
+                  "The expert action is read from obs['expert_action'] (provided by the CARLA env server).")
 flags.DEFINE_string("run_group", "Debug", "W&B run group.")
 flags.DEFINE_string("wandb_project", "OGBench-CARLA-SimLingo", "W&B project name.")
 flags.DEFINE_string("wandb_run_name", None, "W&B run name. If None, auto-generates from route + seed.")
@@ -1203,6 +1206,8 @@ def main(_argv):
             flush=True,
         )
 
+    _expert_action_dim = 2 if FLAGS.use_expert_in_critic else 0
+
     agent = ResidualSACAgent(
         vlm_feature_dim=vlm_dim,
         action_dim=2,
@@ -1217,8 +1222,15 @@ def main(_argv):
         state_dim=_state_dim,
         ticks_per_wp=ticks_per_wp,
         coach_label_dim=_coach_label_dim,
+        expert_action_dim=_expert_action_dim,
     )
-    buffer = ReplayBuffer(capacity=FLAGS.buffer_capacity, vlm_dim=vlm_dim, state_dim=_state_dim, coach_label_dim=_coach_label_dim)
+    buffer = ReplayBuffer(
+        capacity=FLAGS.buffer_capacity,
+        vlm_dim=vlm_dim,
+        state_dim=_state_dim,
+        coach_label_dim=_coach_label_dim,
+        expert_action_dim=_expert_action_dim,
+    )
 
     log_path = save_dir / "train_log.jsonl"
     log_file = open(log_path, "w")
@@ -1264,6 +1276,8 @@ def main(_argv):
     last_collision_delta = 0
     last_update_time = 0.0
     video = _open_video(num_episodes)
+    current_expert_action_40d: Optional[np.ndarray] = obs.get("expert_action")
+    last_expert_action_2d = np.zeros(2, dtype=np.float32)
 
     for global_step in range(FLAGS.total_steps):
         t_sample_start = time.time()
@@ -1376,12 +1390,23 @@ def main(_argv):
         actor_chosen_final_action = np.clip(
             current_base_action + _res_scale_vec * residual_action, -1.0, 1.0
         ).astype(np.float32)
+        _sac_expert_2d: Optional[np.ndarray] = None
+        if FLAGS.use_expert_in_critic and current_expert_action_40d is not None:
+            if not np.allclose(current_expert_action_40d, 0.0):
+                try:
+                    _sac_expert_2d = _expert_action_to_accel_steer(
+                        current_expert_action_40d, simlingo_base, current_speed
+                    )
+                    last_expert_action_2d = _sac_expert_2d
+                except Exception as _ex:
+                    print(f"[critic_mode] expert action conversion failed: {_ex}", flush=True)
         buffer.add(
             vlm_features, next_vlm_features,
             current_base_action, next_base_action,
             actor_chosen_final_action,
             current_obs_state, obs["state"][6:],
             chunk_reward_discounted, done,  # discounted: r0 + γ·r1 + … + γ^(n-1)·r_{n-1}
+            expert_action=_sac_expert_2d,
         )
 
         episode_reward += chunk_reward
@@ -1465,6 +1490,9 @@ def main(_argv):
                 "action/res_scale_accel": float(FLAGS.res_scale_accel),
                 "action/res_scale_steer": float(FLAGS.res_scale_steer),
                 "action/residual_clip_limit": float(sac_clip_limit),
+                "action/expert_accel": float(last_expert_action_2d[0]),
+                "action/expert_steer": float(last_expert_action_2d[1]),
+                "action/expert_valid": float(_sac_expert_2d is not None),
                 "simlingo/desired_speed_first": float(desired_speeds[0]),
                 "simlingo/desired_speed_mean": float(np.mean(desired_speeds)),
                 "simlingo/desired_speed_min": float(np.min(desired_speeds)),

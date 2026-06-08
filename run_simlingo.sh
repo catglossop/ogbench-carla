@@ -59,7 +59,8 @@ STEPS="3000"
 WARMUP="500"
 LEARNING_STARTS="200"  # normalizer collects stats for 200 steps before freezing and before SAC updates begin
 CHUNK_SIZE="1"
-RES_SCALE="0.6"
+RES_SCALE_ACCEL="2.0"
+RES_SCALE_STEER="0.6"
 BATCH_SIZE="256"
 BUFFER_CAP="10000"
 UPDATES_PER_STEP="4"
@@ -175,7 +176,9 @@ SAC hyperparameters:
   --steps N                 Total env steps. Default: 10000
   --warmup N                Warmup steps (random/zero residual). Default: 500
   --learning-starts N       Buffer threshold before updates. Default: 500
-  --res-scale F             Residual action scale. Default: 0.1
+  --res-scale F             Set both residual scales (accel+steer) to F
+  --res-scale-accel F       Residual scale for acceleration. Default: 2.0
+  --res-scale-steer F       Residual scale for steering. Default: 0.6
   --batch-size N            SAC mini-batch size. Default: 256
   --buffer-cap N            Replay buffer capacity. Default: 10000
   --updates-per-step N      SAC updates per env step / UTD ratio. Default: 10
@@ -266,7 +269,9 @@ while [[ $# -gt 0 ]]; do
     --steps)               STEPS="$2"; shift 2 ;;
     --warmup)              WARMUP="$2"; shift 2 ;;
     --learning-starts)     LEARNING_STARTS="$2"; shift 2 ;;
-    --res-scale)           RES_SCALE="$2"; shift 2 ;;
+    --res-scale)           RES_SCALE_ACCEL="$2"; RES_SCALE_STEER="$2"; shift 2 ;;
+    --res-scale-accel)     RES_SCALE_ACCEL="$2"; shift 2 ;;
+    --res-scale-steer)     RES_SCALE_STEER="$2"; shift 2 ;;
     --batch-size)          BATCH_SIZE="$2"; shift 2 ;;
     --buffer-cap)          BUFFER_CAP="$2"; shift 2 ;;
     --updates-per-step)    UPDATES_PER_STEP="$2"; shift 2 ;;
@@ -472,7 +477,8 @@ ARGS=(
   --carla_config="$CARLA_CFG"
   --device="$DEVICE"
   --chunk_size="$CHUNK_SIZE"
-  --res_scale="$RES_SCALE"
+  --res_scale_accel="$RES_SCALE_ACCEL"
+  --res_scale_steer="$RES_SCALE_STEER"
   --obs_mode="$OBS_MODE"
   --actor_l2_reg="$ACTOR_L2_REG"
   --include_ego_state="$INCLUDE_EGO_STATE"
@@ -556,7 +562,7 @@ fi
 ARGS+=("${EXTRA_ARGS[@]}")
 
 echo "[run_simlingo.sh] route=$ROUTE  eval_only=$EVAL_ONLY  training_mode=$TRAINING_MODE  policy_mode=$POLICY_MODE  debug_neg_speed=$DEBUG_NEG_SPEED  debug_target_speed=${DEBUG_TARGET_SPEED:-off}  expert_debug=$EXPERT_DEBUG  expert_recover_debug=$EXPERT_RECOVER_DEBUG"
-echo "[run_simlingo.sh] steps=$STEPS  warmup=$WARMUP  chunk_size=$CHUNK_SIZE  res_scale=$RES_SCALE  obs_mode=$OBS_MODE  actor_l2_reg=$ACTOR_L2_REG"
+echo "[run_simlingo.sh] steps=$STEPS  warmup=$WARMUP  chunk_size=$CHUNK_SIZE  res_scale_accel=$RES_SCALE_ACCEL  res_scale_steer=$RES_SCALE_STEER  obs_mode=$OBS_MODE  actor_l2_reg=$ACTOR_L2_REG"
 echo "[run_simlingo.sh] wandb_mode=$WANDB_MODE  run_group=$RUN_GROUP"
 echo "[run_simlingo.sh] checkpoint=$SIMLINGO_CKPT"
 if [[ "$POLICY_MODE" == "hierarchical" ]]; then

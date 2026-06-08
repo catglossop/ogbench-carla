@@ -197,11 +197,13 @@ class ResidualCritic(nn.Module):
         action_dim: int = ACTION_DIM,
         state_dim: int = EGO_STATE_DIM,
         coach_label_dim: int = 0,
+        expert_action_dim: int = 0,
     ):
         super().__init__()
         self.state_dim = state_dim
         self.coach_label_dim = coach_label_dim
-        in_dim = vlm_feature_dim + action_dim + action_dim + state_dim + coach_label_dim
+        self.expert_action_dim = expert_action_dim
+        in_dim = vlm_feature_dim + action_dim + action_dim + state_dim + coach_label_dim + expert_action_dim
         self.q1 = _mlp(in_dim, list(hidden_dims), 1)
         self.q2 = _mlp(in_dim, list(hidden_dims), 1)
 
@@ -212,12 +214,15 @@ class ResidualCritic(nn.Module):
         action: torch.Tensor,
         state: Optional[torch.Tensor],
         coach_label: Optional[torch.Tensor] = None,
+        expert_action: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         parts = [vlm_features, base_action, action]
         if self.state_dim > 0 and state is not None:
             parts.append(state)
         if self.coach_label_dim > 0 and coach_label is not None:
             parts.append(coach_label)
+        if self.expert_action_dim > 0 and expert_action is not None:
+            parts.append(expert_action)
         return torch.cat(parts, dim=-1)
 
     def forward(
@@ -227,8 +232,9 @@ class ResidualCritic(nn.Module):
         action: torch.Tensor,
         state: Optional[torch.Tensor] = None,
         coach_label: Optional[torch.Tensor] = None,
+        expert_action: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = self._cat_inputs(vlm_features, base_action, action, state, coach_label)
+        x = self._cat_inputs(vlm_features, base_action, action, state, coach_label, expert_action)
         return self.q1(x), self.q2(x)
 
     def min_q(
@@ -238,8 +244,9 @@ class ResidualCritic(nn.Module):
         action: torch.Tensor,
         state: Optional[torch.Tensor] = None,
         coach_label: Optional[torch.Tensor] = None,
+        expert_action: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        q1, q2 = self(vlm_features, base_action, action, state, coach_label)
+        q1, q2 = self(vlm_features, base_action, action, state, coach_label, expert_action)
         return torch.min(q1, q2)
 
 
@@ -266,12 +273,14 @@ class ReplayBuffer:
         action_dim: int = ACTION_DIM,
         state_dim: int = EGO_STATE_DIM,
         coach_label_dim: int = 0,
+        expert_action_dim: int = 0,
     ):
         self.capacity = capacity
         self.vlm_dim = vlm_dim
         self.action_dim = action_dim
         self.state_dim = state_dim
         self.coach_label_dim = coach_label_dim
+        self.expert_action_dim = expert_action_dim
         self._obs = np.zeros((capacity, vlm_dim), dtype=np.float32)
         self._next_obs = np.zeros((capacity, vlm_dim), dtype=np.float32)
         self._final_actions = np.zeros((capacity, action_dim), dtype=np.float32)
@@ -285,6 +294,10 @@ class ReplayBuffer:
             self._coach_labels = np.zeros((capacity, coach_label_dim), dtype=np.float32)
         else:
             self._coach_labels = None
+        if expert_action_dim > 0:
+            self._expert_actions = np.zeros((capacity, expert_action_dim), dtype=np.float32)
+        else:
+            self._expert_actions = None
         self._ptr = 0
         self._size = 0
 
@@ -304,6 +317,7 @@ class ReplayBuffer:
         next_state: np.ndarray,
         reward: float,
         done: bool,
+        expert_action: Optional[np.ndarray] = None,
     ) -> None:
         self._obs[self._ptr] = obs
         self._next_obs[self._ptr] = next_obs
@@ -317,6 +331,8 @@ class ReplayBuffer:
         self._dones[self._ptr, 0] = float(done)
         if self._coach_labels is not None:
             self._coach_labels[self._ptr] = 0.0  # zeroed until coach backfill
+        if self._expert_actions is not None:
+            self._expert_actions[self._ptr] = expert_action if expert_action is not None else 0.0
         self._ptr = (self._ptr + 1) % self.capacity
         self._size = min(self._size + 1, self.capacity)
 
@@ -350,6 +366,8 @@ class ReplayBuffer:
             batch["next_states"] = torch.from_numpy(self._next_states[idx]).to(device)
         if self._coach_labels is not None:
             batch["coach_labels"] = torch.from_numpy(self._coach_labels[idx]).to(device)
+        if self._expert_actions is not None:
+            batch["expert_actions"] = torch.from_numpy(self._expert_actions[idx]).to(device)
         return batch
 
     def __len__(self) -> int:
@@ -432,6 +450,7 @@ class ResidualSACAgent:
         state_dim: int = EGO_STATE_DIM,
         ticks_per_wp: int = 1,
         coach_label_dim: int = 0,
+        expert_action_dim: int = 0,
     ):
         self.gamma = gamma
         # Each SAC "step" covers ticks_per_wp CARLA ticks.  The Bellman discount
@@ -441,12 +460,13 @@ class ResidualSACAgent:
         self.action_dim = action_dim
         self.state_dim = state_dim
         self.coach_label_dim = coach_label_dim
+        self.expert_action_dim = expert_action_dim
         self.device = torch.device(device)
         self.actor_l2_reg = actor_l2_reg
 
         self.actor = ResidualActor(vlm_feature_dim, list(hidden_dims), action_dim, state_dim).to(self.device)
-        self.critic = ResidualCritic(vlm_feature_dim, list(hidden_dims), action_dim, state_dim, coach_label_dim).to(self.device)
-        self.critic_target = ResidualCritic(vlm_feature_dim, list(hidden_dims), action_dim, state_dim, coach_label_dim).to(self.device)
+        self.critic = ResidualCritic(vlm_feature_dim, list(hidden_dims), action_dim, state_dim, coach_label_dim, expert_action_dim).to(self.device)
+        self.critic_target = ResidualCritic(vlm_feature_dim, list(hidden_dims), action_dim, state_dim, coach_label_dim, expert_action_dim).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_target.requires_grad_(False)
 
@@ -521,6 +541,9 @@ class ResidualSACAgent:
         # The same label is used for both current and next state since labels are
         # assigned per episode chunk and are consistent within a rollout window.
         coach_labels = batch.get("coach_labels")
+        # Expert planner action: (B, expert_action_dim) or None when critic mode is disabled.
+        # Same action used for both s_t and s_{t+1} (smooth between consecutive steps).
+        expert_actions = batch.get("expert_actions")
 
         # Normalise raw ego-state tensors from the replay buffer.
         if self.state_normalizer is not None:
@@ -533,11 +556,11 @@ class ResidualSACAgent:
         with torch.no_grad():
             next_residuals, next_log_probs = self.actor.sample(next_obs, next_base_actions, next_states)
             next_final = torch.clamp(next_base_actions + self.res_scale * next_residuals, -1.0, 1.0)
-            q1_t, q2_t = self.critic_target(next_obs, next_base_actions, next_final, next_states, coach_labels)
+            q1_t, q2_t = self.critic_target(next_obs, next_base_actions, next_final, next_states, coach_labels, expert_actions)
             min_q_t = torch.min(q1_t, q2_t)
             y = rewards + self.effective_gamma * (1.0 - dones) * (min_q_t - self.alpha.detach() * next_log_probs)
 
-        q1, q2 = self.critic(obs, base_actions, final_actions, states, coach_labels)
+        q1, q2 = self.critic(obs, base_actions, final_actions, states, coach_labels, expert_actions)
         critic_loss = F.mse_loss(q1, y) + F.mse_loss(q2, y)
 
         self.critic_opt.zero_grad()
@@ -547,7 +570,7 @@ class ResidualSACAgent:
         # ── Actor update ──────────────────────────────────────────────────────
         pi, log_probs = self.actor.sample(obs, base_actions, states)
         pi_final = torch.clamp(base_actions + self.res_scale * pi, -1.0, 1.0)
-        q1_pi, q2_pi = self.critic(obs, base_actions, pi_final, states, coach_labels)
+        q1_pi, q2_pi = self.critic(obs, base_actions, pi_final, states, coach_labels, expert_actions)
         min_q_pi = torch.min(q1_pi, q2_pi)
         actor_loss = (self.alpha.detach() * log_probs - min_q_pi).mean()
         l2_loss = torch.tensor(0.0)
