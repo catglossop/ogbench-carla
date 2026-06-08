@@ -1,0 +1,298 @@
+{
+  "episode": 1,
+  "route": "parking-cut-in-001",
+  "episode_steps": 256,
+  "action_chunk_steps": 10,
+  "action_chunk_duration_sec": 0.5,
+  "bad_event_radius_chunks": 2,
+  "bad_events": [
+    {
+      "timestamp_sec": 5.2,
+      "description": "The ego vehicle collides with a red vehicle cutting in from the left lane because it fails to brake and maintains a high throttle.",
+      "correction": "Decelerate immediately and adjust right to yield to the cutting-in vehicle.",
+      "center_chunk_index": 10
+    },
+    {
+      "timestamp_sec": 10.2,
+      "description": "The ego vehicle remains stuck against the red vehicle, continuously applying throttle and steering left into the obstacle, resulting in another collision.",
+      "correction": "Decelerate, shift to reverse, and adjust steering to clear the obstacle safely.",
+      "center_chunk_index": 20
+    }
+  ],
+  "action_chunks": [
+    {
+      "chunk_index": 0,
+      "episode_step_start": 1,
+      "episode_step_end": 10,
+      "video_time_start_sec": 0.0,
+      "video_time_end_sec": 0.5,
+      "near_bad_event": false,
+      "feedback": null
+    },
+    {
+      "chunk_index": 1,
+      "episode_step_start": 11,
+      "episode_step_end": 20,
+      "video_time_start_sec": 0.5,
+      "video_time_end_sec": 1.0,
+      "near_bad_event": false,
+      "feedback": null
+    },
+    {
+      "chunk_index": 2,
+      "episode_step_start": 21,
+      "episode_step_end": 30,
+      "video_time_start_sec": 1.0,
+      "video_time_end_sec": 1.5,
+      "near_bad_event": false,
+      "feedback": null
+    },
+    {
+      "chunk_index": 3,
+      "episode_step_start": 31,
+      "episode_step_end": 40,
+      "video_time_start_sec": 1.5,
+      "video_time_end_sec": 2.0,
+      "near_bad_event": false,
+      "feedback": null
+    },
+    {
+      "chunk_index": 4,
+      "episode_step_start": 41,
+      "episode_step_end": 50,
+      "video_time_start_sec": 2.0,
+      "video_time_end_sec": 2.5,
+      "near_bad_event": false,
+      "feedback": null
+    },
+    {
+      "chunk_index": 5,
+      "episode_step_start": 51,
+      "episode_step_end": 60,
+      "video_time_start_sec": 2.5,
+      "video_time_end_sec": 3.0,
+      "near_bad_event": false,
+      "feedback": null
+    },
+    {
+      "chunk_index": 6,
+      "episode_step_start": 61,
+      "episode_step_end": 70,
+      "video_time_start_sec": 3.0,
+      "video_time_end_sec": 3.5,
+      "near_bad_event": false,
+      "feedback": null
+    },
+    {
+      "chunk_index": 7,
+      "episode_step_start": 71,
+      "episode_step_end": 80,
+      "video_time_start_sec": 3.5,
+      "video_time_end_sec": 4.0,
+      "near_bad_event": false,
+      "feedback": null
+    },
+    {
+      "chunk_index": 8,
+      "episode_step_start": 81,
+      "episode_step_end": 90,
+      "video_time_start_sec": 4.0,
+      "video_time_end_sec": 4.5,
+      "near_bad_event": true,
+      "feedback": {
+        "lateral": "adjust right",
+        "longitudinal": "decelerate",
+        "detail": "Begin decelerating early to yield to the left-side cut-in."
+      }
+    },
+    {
+      "chunk_index": 9,
+      "episode_step_start": 91,
+      "episode_step_end": 100,
+      "video_time_start_sec": 4.5,
+      "video_time_end_sec": 5.0,
+      "near_bad_event": true,
+      "feedback": {
+        "lateral": "adjust right",
+        "longitudinal": "decelerate",
+        "detail": "Brake and adjust right to avoid the incoming vehicle."
+      }
+    },
+    {
+      "chunk_index": 10,
+      "episode_step_start": 101,
+      "episode_step_end": 110,
+      "video_time_start_sec": 5.0,
+      "video_time_end_sec": 5.5,
+      "near_bad_event": true,
+      "feedback": {
+        "lateral": "adjust right",
+        "longitudinal": "decelerate",
+        "detail": "Decelerate immediately and yield to the cutting-in vehicle."
+      }
+    },
+    {
+      "chunk_index": 11,
+      "episode_step_start": 111,
+      "episode_step_end": 120,
+      "video_time_start_sec": 5.5,
+      "video_time_end_sec": 6.0,
+      "near_bad_event": true,
+      "feedback": {
+        "lateral": "adjust right",
+        "longitudinal": "decelerate",
+        "detail": "Maintain deceleration and keep right to clear the obstacle."
+      }
+    },
+    {
+      "chunk_index": 12,
+      "episode_step_start": 121,
+      "episode_step_end": 130,
+      "video_time_start_sec": 6.0,
+      "video_time_end_sec": 6.5,
+      "near_bad_event": true,
+      "feedback": {
+        "lateral": null,
+        "longitudinal": "decelerate",
+        "detail": "Bring the vehicle to a stop and hold position."
+      }
+    },
+    {
+      "chunk_index": 13,
+      "episode_step_start": 131,
+      "episode_step_end": 140,
+      "video_time_start_sec": 6.5,
+      "video_time_end_sec": 7.0,
+      "near_bad_event": false,
+      "feedback": null
+    },
+    {
+      "chunk_index": 14,
+      "episode_step_start": 141,
+      "episode_step_end": 150,
+      "video_time_start_sec": 7.0,
+      "video_time_end_sec": 7.5,
+      "near_bad_event": false,
+      "feedback": null
+    },
+    {
+      "chunk_index": 15,
+      "episode_step_start": 151,
+      "episode_step_end": 160,
+      "video_time_start_sec": 7.5,
+      "video_time_end_sec": 8.0,
+      "near_bad_event": false,
+      "feedback": null
+    },
+    {
+      "chunk_index": 16,
+      "episode_step_start": 161,
+      "episode_step_end": 170,
+      "video_time_start_sec": 8.0,
+      "video_time_end_sec": 8.5,
+      "near_bad_event": false,
+      "feedback": null
+    },
+    {
+      "chunk_index": 17,
+      "episode_step_start": 171,
+      "episode_step_end": 180,
+      "video_time_start_sec": 8.5,
+      "video_time_end_sec": 9.0,
+      "near_bad_event": false,
+      "feedback": null
+    },
+    {
+      "chunk_index": 18,
+      "episode_step_start": 181,
+      "episode_step_end": 190,
+      "video_time_start_sec": 9.0,
+      "video_time_end_sec": 9.5,
+      "near_bad_event": true,
+      "feedback": {
+        "lateral": "adjust right",
+        "longitudinal": "decelerate",
+        "detail": "Decelerate and prepare to steer away from the red vehicle."
+      }
+    },
+    {
+      "chunk_index": 19,
+      "episode_step_start": 191,
+      "episode_step_end": 200,
+      "video_time_start_sec": 9.5,
+      "video_time_end_sec": 10.0,
+      "near_bad_event": true,
+      "feedback": {
+        "lateral": "adjust right",
+        "longitudinal": "decelerate",
+        "detail": "Decelerate to stop pushing into the obstacle and steer right."
+      }
+    },
+    {
+      "chunk_index": 20,
+      "episode_step_start": 201,
+      "episode_step_end": 210,
+      "video_time_start_sec": 10.0,
+      "video_time_end_sec": 10.5,
+      "near_bad_event": true,
+      "feedback": {
+        "lateral": "adjust right",
+        "longitudinal": "decelerate",
+        "detail": "Avoid steering left into the obstacle; stop accelerating."
+      }
+    },
+    {
+      "chunk_index": 21,
+      "episode_step_start": 211,
+      "episode_step_end": 220,
+      "video_time_start_sec": 10.5,
+      "video_time_end_sec": 11.0,
+      "near_bad_event": true,
+      "feedback": {
+        "lateral": "adjust right",
+        "longitudinal": "decelerate",
+        "detail": "Maintain deceleration and adjust steering right to clear the car."
+      }
+    },
+    {
+      "chunk_index": 22,
+      "episode_step_start": 221,
+      "episode_step_end": 230,
+      "video_time_start_sec": 11.0,
+      "video_time_end_sec": 11.5,
+      "near_bad_event": true,
+      "feedback": {
+        "lateral": "adjust right",
+        "longitudinal": "decelerate",
+        "detail": "Keep steering right and stop accelerating to safely disengage."
+      }
+    },
+    {
+      "chunk_index": 23,
+      "episode_step_start": 231,
+      "episode_step_end": 240,
+      "video_time_start_sec": 11.5,
+      "video_time_end_sec": 12.0,
+      "near_bad_event": false,
+      "feedback": null
+    },
+    {
+      "chunk_index": 24,
+      "episode_step_start": 241,
+      "episode_step_end": 250,
+      "video_time_start_sec": 12.0,
+      "video_time_end_sec": 12.5,
+      "near_bad_event": false,
+      "feedback": null
+    },
+    {
+      "chunk_index": 25,
+      "episode_step_start": 251,
+      "episode_step_end": 256,
+      "video_time_start_sec": 12.5,
+      "video_time_end_sec": 13.0,
+      "near_bad_event": false,
+      "feedback": null
+    }
+  ]
+}

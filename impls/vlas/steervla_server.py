@@ -57,9 +57,9 @@ import openpi.transforms as openpi_transforms
 from openpi.models.pi0_config import Pi0CoTConfig
 
 if __package__ in (None, ""):
-    from steervla import CARLA_STEERVLA_IMAGE_KEYS, restore_openpi_params_on_single_gpu
+    from steervla import CARLA_STEERVLA_IMAGE_KEYS, restore_openpi_params_on_single_gpu, steervla_physical_denormalize_actions
 else:
-    from .steervla import CARLA_STEERVLA_IMAGE_KEYS, restore_openpi_params_on_single_gpu
+    from .steervla import CARLA_STEERVLA_IMAGE_KEYS, restore_openpi_params_on_single_gpu, steervla_physical_denormalize_actions
 
 # Tuple (not list): ``policy.Policy`` passes ``image_keys`` as a ``jax.jit`` static argument (must be hashable).
 _POLICY_IMAGE_KEYS = CARLA_STEERVLA_IMAGE_KEYS
@@ -75,6 +75,8 @@ _INFO_ATTRS = (
     "cot_jit_decode",
     "cot_jit_transformer_forward",
     "cot_replay_reasoning",
+    "action_dim",
+    "output_action_format",
 )
 
 _STATE_REQUIRED_KEYS = ("image", "state")
@@ -148,6 +150,14 @@ def _steervla_server_kwargs(
             "Provide OpenPI TrainConfig name and checkpoint via STEERVLA_ACTOR_CONFIG "
             "and STEERVLA_CHECKPOINT (or CLI --actor-config / --checkpoint)."
         )
+    train_cfg = openpi_train_config.get_config(ac)
+    data_factory = train_cfg.data
+    action_dim = int(getattr(data_factory, "action_dim", 4))
+    fmt = getattr(data_factory, "output_action_format", None)
+    if fmt is not None and hasattr(fmt, "name"):
+        output_action_format = str(fmt.name)
+    else:
+        output_action_format = _env_str("STEERVLA_OUTPUT_ACTION_FORMAT", "DELTA_XY_T_DELTA_XY_SPACE")
     return {
         "actor_config": ac,
         "checkpoint_path": ck,
@@ -166,6 +176,8 @@ def _steervla_server_kwargs(
         "cot_replay_reasoning": _parse_optional_bool_cli(
             cot_replay_reasoning_cli, "STEERVLA_COT_REPLAY_REASONING", True
         ),
+        "action_dim": action_dim,
+        "output_action_format": output_action_format,
     }
 
 
@@ -347,6 +359,11 @@ def create_app(
                 cot_sample_kwargs=_request_cot_sample_kwargs(cfg, request_options),
             )
         act = np.asarray(out["actions"], dtype=np.float32)
+        act = steervla_physical_denormalize_actions(
+            act,
+            action_dim=int(cfg.get("action_dim", 4)),
+            output_action_format=cfg.get("output_action_format"),
+        )
         return act.reshape(-1).tolist()
 
     @app.post("/gen_cot")

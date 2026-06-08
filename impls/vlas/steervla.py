@@ -48,17 +48,22 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
+from openpi.models import gemma as _openpi_gemma
 from openpi.models import model as _openpi_model
+from openpi.models import pi0 as _openpi_pi0
 from openpi.models.pi0_config import Pi0CoTConfig
 from openpi.models.tokenizer import CoTPaligemmaTokenizer
 from openpi.policies import steervla_policy as sv_policy
 from openpi.shared import array_typing as at
 from openpi.shared import download
 from openpi.shared import nnx_utils as nnx_utils
+from openpi.training import checkpoints as openpi_checkpoints
 from openpi.training import config as openpi_train_config
 from openpi.training import optimizer as _optimizer
 from openpi.training import utils as training_utils
 from openpi.training import weight_loaders as _weight_loaders
+import openpi.transforms as openpi_transforms
+from openpi.transforms import pad_to_dim
 import openpi.training.sharding as sharding
 from jax.sharding import SingleDeviceSharding
 
@@ -67,6 +72,14 @@ from impls.vlas.utils import RemoteActor
 
 # Only the front camera for OpenPI preprocess + SigLIP (skip zero-padded wrist streams).
 CARLA_STEERVLA_IMAGE_KEYS: tuple[str, ...] = ("base_0_rgb",)
+
+
+def _pool_prefix_hidden(prefix_out: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
+    """Mean-pool valid prefix token hiddens to a single vector per batch row."""
+    mask_f = mask.astype(prefix_out.dtype)[..., None]
+    summed = jnp.sum(prefix_out * mask_f, axis=1)
+    denom = jnp.maximum(jnp.sum(mask_f, axis=1), 1.0)
+    return summed / denom
 
 
 def restore_openpi_params_on_single_gpu(
@@ -105,6 +118,64 @@ def restore_openpi_params_on_single_gpu(
     return params, device
 
 
+@dataclasses.dataclass(frozen=True)
+class _SliceActionDim(openpi_transforms.DataTransformFn):
+    """Slice env action dims on the last axis (safe for ``(H, D)`` and ``(B, H, D)``)."""
+
+    action_dim: int
+
+    def __call__(self, data: dict) -> dict:
+        if "actions" not in data:
+            return data
+        return {
+            **data,
+            "actions": np.asarray(data["actions"], dtype=np.float32)[..., : int(self.action_dim)],
+        }
+
+
+def build_openpi_policy_transforms(
+    train_cfg: openpi_train_config.TrainConfig,
+    checkpoint_dir: Path,
+):
+    """Input/output transforms matching :func:`impls.vlas.steervla_server._build_steervla_openpi_policy`."""
+    data_factory = train_cfg.data
+    data_config = data_factory.create(train_cfg.assets_dirs, train_cfg.model)
+    if data_config.asset_id is None:
+        raise ValueError("TrainConfig data requires asset_id to load norm stats.")
+    env_action_dim = int(getattr(data_factory, "action_dim", 4))
+    norm_stats = openpi_checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+    input_transform = openpi_transforms.compose(
+        [
+            openpi_transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+        ]
+    )
+    output_transform = openpi_transforms.compose(
+        [
+            *data_config.model_transforms.outputs,
+            openpi_transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            _SliceActionDim(action_dim=env_action_dim),
+        ]
+    )
+    return data_config, input_transform, output_transform
+
+
+def steervla_physical_denormalize_actions(
+    actions: np.ndarray,
+    *,
+    action_dim: int,
+    output_action_format: str | None,
+) -> np.ndarray:
+    """Apply fixed RLDS scaling (``* 7``, ``* 180``, etc.) after OpenPI ``Unnormalize``."""
+    from openpi.visualizing.steervla_visualization import denormalize_actions
+
+    arr = np.asarray(actions, dtype=np.float32)
+    ad = min(int(action_dim), int(arr.shape[-1]))
+    return np.asarray(
+        denormalize_actions(arr, ad, output_action_format),
+        dtype=np.float32,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pi0-CoT CARLA inference helpers
 # ---------------------------------------------------------------------------
@@ -114,6 +185,25 @@ def routing_instruction_prompt(*, routing_command: str, current_speed_mps: float
     rc = routing_command.strip()
     speed_prefix = round(float(current_speed_mps), 1)
     return f"The current speed is {speed_prefix} m/s. {rc}"
+
+
+def steervla_prompt_state_dim(*, include_ego_history: bool) -> int:
+    """Proprio dimensions embedded in the CoT prompt (matches ``TokenizeCoTPrompt.prompt_state_dim``)."""
+    return 8 if include_ego_history else 2
+
+
+def format_steervla_cot_prompt(
+    prompt: str,
+    state: np.ndarray,
+    *,
+    state_dim: int,
+) -> str:
+    """Human-readable prefix string before BOS (matches ``CoTPaligemmaTokenizer.tokenize_prompt``)."""
+    cleaned = prompt.strip().replace("_", " ").replace("\n", " ")
+    state_arr = np.asarray(state, dtype=np.float32).reshape(-1)[:state_dim]
+    discretized = np.digitize(state_arr, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+    state_str = " ".join(map(str, discretized))
+    return f"Prompt:{cleaned};State:{state_str};"
 
 
 def carla_state_vec_to_steervla_state(
@@ -347,6 +437,39 @@ def openpi_replay_fields_from_observation(
     return out
 
 
+def openpi_cot_replay_fields_from_raw(raw: dict[str, Any] | None) -> dict[str, np.ndarray]:
+    """CoT/FAST token fields from a raw CARLA obs dict after VLA ``_stash_cot_in_raw``.
+
+    Returns an empty dict when CoT has not been generated for this observation yet.
+    """
+    if raw is None or not isinstance(raw, dict) or "reasoning" not in raw:
+        return {}
+
+    reasoning = np.asarray(raw["reasoning"], dtype=np.int32)
+    reasoning_mask = np.asarray(raw.get("reasoning_mask", reasoning != 0), dtype=bool)
+    subtask = np.asarray(raw["subtask"], dtype=np.int32)
+    subtask_mask = np.asarray(raw.get("subtask_mask", subtask != 0), dtype=bool)
+    out: dict[str, np.ndarray] = {
+        "openpi_tokenized_reasoning": reasoning,
+        "openpi_tokenized_reasoning_mask": reasoning_mask,
+        "openpi_tokenized_subtask": subtask,
+        "openpi_tokenized_subtask_mask": subtask_mask,
+        "reasoning": reasoning,
+        "reasoning_mask": reasoning_mask,
+        "subtask": subtask,
+        "subtask_mask": subtask_mask,
+    }
+    fast = raw.get("openpi_tokenized_fast", raw.get("fast"))
+    fast_mask = raw.get("openpi_tokenized_fast_mask", raw.get("fast_mask"))
+    if fast is not None:
+        out["openpi_tokenized_fast"] = np.asarray(fast, dtype=np.int32)
+        out["fast"] = out["openpi_tokenized_fast"]
+    if fast_mask is not None:
+        out["openpi_tokenized_fast_mask"] = np.asarray(fast_mask, dtype=bool)
+        out["fast_mask"] = out["openpi_tokenized_fast_mask"]
+    return out
+
+
 def _batch_has_openpi_replay_fields(replay_batch: dict[str, Any], *, prefix: str = "") -> bool:
     return f"{prefix}openpi_state" in replay_batch and f"{prefix}openpi_tokenized_prompt" in replay_batch
 
@@ -372,6 +495,8 @@ def openpi_observation_from_replay_batch(
         return None
 
     state = jnp.asarray(_get("openpi_state"), dtype=jnp.float32)
+    if int(state.shape[-1]) < 32:
+        state = jnp.asarray(pad_to_dim(np.asarray(state), 32), dtype=jnp.float32)
     prompt = jnp.asarray(_get("openpi_tokenized_prompt"), dtype=jnp.int32)
     prompt_mask = jnp.asarray(_get("openpi_tokenized_prompt_mask"), dtype=bool)
     image = jnp.asarray(_get("openpi_image_base_0_rgb"), dtype=jnp.uint8)
@@ -496,11 +621,14 @@ class SteerVLAActor:
         self.actions_per_cot = max(1, int(actions_per_cot))
         self.sample_actions_num_steps = int(sample_actions_num_steps)
         self.return_normalized_action_chunk = bool(return_normalized_action_chunk)
+        self.prompt_state_dim = steervla_prompt_state_dim(include_ego_history=include_ego_history)
         self._call_counter = 0
         self._cached_action_chunk: np.ndarray | None = None
         self._cached_action_step = 0
         self._cached_cot: dict[str, Any] | None = None
         self._cached_cot_actions_used = 0
+        self._cached_policy_embed: np.ndarray | None = None
+        self._cached_policy_embed_obs_id: int | None = None
 
         self.train_cfg = None
         self.model = None
@@ -512,6 +640,9 @@ class SteerVLAActor:
         self._mesh: jax.sharding.Mesh | None = None
         self._train_rng: jax.Array | None = None
         self._train_state: training_utils.TrainState | None = None
+        self._data_config: Any = None
+        self._input_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+        self._output_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
         if actor_url is not None:
             self._remote = RemoteActor(
@@ -570,6 +701,10 @@ class SteerVLAActor:
             use_fast_tokens=bool(getattr(model_cfg, "use_fast_tokens", False)),
         )
         self.model_cfg = model_cfg
+        self._data_config, self._input_transform, self._output_transform = build_openpi_policy_transforms(
+            self.train_cfg,
+            ckpt_root,
+        )
         self._sample_actions = nnx_utils.module_jit(
             self.model.sample_actions,
             static_argnames=(
@@ -588,6 +723,109 @@ class SteerVLAActor:
         )
         
         self._local_ready = True
+
+    def _state_for_transform(self, state: np.ndarray | jax.Array) -> np.ndarray:
+        """Proprio slice passed to OpenPI ``Normalize`` / ``Unnormalize`` (2 or 8 dims, not padded)."""
+        state_np = np.asarray(jax.device_get(state), dtype=np.float32)
+        if state_np.ndim == 1:
+            state_np = state_np[None, ...]
+        return state_np[..., : int(self.prompt_state_dim)]
+
+    def _normalize_state_batch(self, state: np.ndarray) -> np.ndarray:
+        """Apply OpenPI ``Normalize(norm_stats)`` to unpadded proprio fed to the model."""
+        state_np = self._state_for_transform(state)
+        if self._input_transform is None:
+            return state_np
+        return np.asarray(self._input_transform({"state": state_np})["state"], dtype=np.float32)
+
+    def _reshape_model_trajectory(self, trajectory: np.ndarray) -> np.ndarray:
+        """Normalize raw model outputs to ``(B, model_ah, model_ad)``."""
+        traj_np = np.asarray(trajectory, dtype=np.float32)
+        model_ah = int(self.model.action_horizon)
+        model_ad = int(self.model.action_dim)
+        env_ah = int(self.action_horizon)
+        env_ad = int(self.action_dim)
+        model_flat = model_ah * model_ad
+        env_flat = env_ah * env_ad
+
+        if traj_np.ndim == 1:
+            if traj_np.shape[0] == model_flat:
+                traj_np = traj_np.reshape(1, model_ah, model_ad)
+            elif traj_np.shape[0] == env_flat:
+                traj_np = traj_np.reshape(1, env_ah, env_ad)
+            elif traj_np.shape[0] == env_ad:
+                traj_np = traj_np.reshape(1, 1, env_ad)
+            else:
+                raise ValueError(
+                    f"Cannot map 1D trajectory length {traj_np.shape[0]} to model ({model_ah}, {model_ad})."
+                )
+        elif traj_np.ndim == 2:
+            batch, last = traj_np.shape
+            if last == model_flat:
+                traj_np = traj_np.reshape(batch, model_ah, model_ad)
+            elif last == env_flat:
+                traj_np = traj_np.reshape(batch, env_ah, env_ad)
+            elif last == model_ad and batch == model_ah:
+                traj_np = traj_np[None, ...]
+            elif last == model_ad:
+                traj_np = traj_np[:, None, :]
+            elif last == env_ad:
+                traj_np = traj_np[:, None, :]
+            else:
+                raise ValueError(
+                    f"Cannot map trajectory shape {(batch, last)} to model ({model_ah}, {model_ad})."
+                )
+        elif traj_np.ndim != 3:
+            raise ValueError(f"Expected trajectory ndim 1/2/3, got {traj_np.ndim}.")
+
+        if traj_np.shape[-1] < model_ad:
+            pad = np.zeros((*traj_np.shape[:-1], model_ad - traj_np.shape[-1]), dtype=np.float32)
+            traj_np = np.concatenate([traj_np, pad], axis=-1)
+        if traj_np.shape[1] < model_ah:
+            pad = np.zeros((traj_np.shape[0], model_ah - traj_np.shape[1], traj_np.shape[2]), dtype=np.float32)
+            traj_np = np.concatenate([traj_np, pad], axis=1)
+        if traj_np.shape[1] != model_ah or traj_np.shape[2] != model_ad:
+            full = np.zeros((traj_np.shape[0], model_ah, model_ad), dtype=np.float32)
+            ah = min(traj_np.shape[1], model_ah)
+            ad = min(traj_np.shape[2], model_ad)
+            full[:, :ah, :ad] = traj_np[:, :ah, :ad]
+            traj_np = full
+        return traj_np
+
+    def _postprocess_action_trajectory(
+        self,
+        trajectory: np.ndarray | jax.Array,
+        *,
+        observation_state: np.ndarray | jax.Array,
+    ) -> np.ndarray:
+        """Undo OpenPI norm stats, then apply fixed SteerVLA action scaling (meters / degrees)."""
+        traj_np = self._reshape_model_trajectory(np.asarray(jax.device_get(trajectory), dtype=np.float32))
+        state_np = self._state_for_transform(observation_state)
+        if state_np.ndim == 1:
+            state_np = state_np[None, ...]
+        if state_np.shape[0] == 1 and traj_np.shape[0] > 1:
+            state_np = np.tile(state_np, (traj_np.shape[0], 1))
+
+        if self._output_transform is not None:
+            out = self._output_transform({"actions": traj_np, "state": state_np})
+            traj_np = np.asarray(out["actions"], dtype=np.float32)
+
+        traj_np = steervla_physical_denormalize_actions(
+            traj_np,
+            action_dim=int(self.action_dim),
+            output_action_format=self.output_action_format,
+        )
+        return traj_np[:, : int(self.action_horizon), : int(self.action_dim)]
+
+    def postprocess_sampled_trajectory(
+        self,
+        trajectory: np.ndarray | jax.Array,
+        *,
+        observation_state: np.ndarray | jax.Array,
+    ) -> jnp.ndarray:
+        """Public wrapper for DSRL / training-time VLA forwards."""
+        out = self._postprocess_action_trajectory(trajectory, observation_state=observation_state)
+        return jnp.asarray(out, dtype=jnp.float32)
     
     def flow_sample(self, rng, openpi_observation, input_noise):
         # Always run sample_cot so reasoning/subtask/FAST tokens match the current prompt.
@@ -623,11 +861,13 @@ class SteerVLAActor:
             image_keys=CARLA_STEERVLA_IMAGE_KEYS,
             num_steps=int(self.sample_actions_num_steps),
         )
+        traj_np = self._postprocess_action_trajectory(
+            traj,
+            observation_state=openpi_observation.state,
+        )
         target_dim = int(self.action_dim)
-        first_step = traj[:, 0, :].astype(jnp.float32)
-        out = jnp.zeros((batch_size, target_dim), dtype=jnp.float32)
-        copy_dim = min(target_dim, int(first_step.shape[-1]))
-        out = out.at[:, :copy_dim].set(first_step[:, :copy_dim])
+        first_step = traj_np[:, 0, :target_dim]
+        out = jnp.asarray(first_step, dtype=jnp.float32)
         return out
 
     def _routing_for_raw(self, raw: Dict[str, Any]) -> str:
@@ -672,10 +912,25 @@ class SteerVLAActor:
             include_ego_history=self.include_ego_history,
             proprio_norm=self.proprio_norm,
         )
+        model_action_dim = int(self.model_cfg.action_dim)
+        state_norm = self._normalize_state_batch(state_pad)[0]
+        state_for_model = pad_to_dim(state_norm, model_action_dim)
+        state_batch = np.tile(state_for_model[None], (batch_size, 1))
+        formatted_prompt = format_steervla_cot_prompt(
+            prompt_text,
+            state_pad,
+            state_dim=self.prompt_state_dim,
+        )
+        if isinstance(raw, dict):
+            raw["openpi_prompt_text"] = formatted_prompt
 
         assert self.tokenizer is not None
-        tok_ids, tok_mask = self.tokenizer.tokenize_prompt(prompt_text, state_pad)
-        
+        tok_ids, tok_mask = self.tokenizer.tokenize_prompt(
+            prompt_text,
+            state_pad,
+            state_dim=self.prompt_state_dim,
+        )
+
         valid = tok_ids[tok_mask.astype(bool)]
         prompt_detokenized = self.tokenizer._tokenizer.decode(valid.tolist())
         print(f"[DEBUG - steervla] Prompt text: {prompt_detokenized}")
@@ -695,7 +950,7 @@ class SteerVLAActor:
             "image_mask": {
                 "base_0_rgb": np.ones(batch_size, dtype=bool),
             },
-            "state": np.tile(state_pad[None], (batch_size, 1)),
+            "state": state_batch,
             "tokenized_prompt": np.tile(tok_ids[None], (batch_size, 1)),
             "tokenized_prompt_mask": np.tile(tok_mask[None], (batch_size, 1)),
             "tokenized_reasoning": reasoning,
@@ -704,6 +959,140 @@ class SteerVLAActor:
             "tokenized_subtask_mask": subtask_mask,
         }
         return _openpi_model.Observation.from_dict(data)
+
+    def policy_embedding_dim(self) -> int:
+        """Hidden size of the frozen prefix (PaliGemma) representation."""
+        if self.model_cfg is None:
+            return 2048
+        variant = getattr(self.model_cfg, "paligemma_variant", "gemma_2b")
+        return int(_openpi_gemma.get_config(variant).width)
+
+    def _build_frozen_prefix_cache(
+        self,
+        model,
+        observation: _openpi_model.Observation,
+    ) -> tuple[_openpi_model.Observation, Any, jax.Array, jax.Array, jax.Array]:
+        """Precompute frozen prefix KV/cache and a pooled prefix embedding for DSRL."""
+        observation = _openpi_model.preprocess_observation(
+            None,
+            observation,
+            train=False,
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+
+        img_tokens, img_masks, img_ar = model._embed_images(observation)
+        n_img = sum(t.shape[1] for t in img_tokens)
+
+        prompt_emb = model._embed_text_tokens(observation.tokenized_prompt)
+        prompt_mask = observation.tokenized_prompt_mask
+        n_prompt = prompt_emb.shape[1]
+
+        reasoning_emb = model._embed_text_tokens(observation.tokenized_reasoning)
+        reasoning_mask = observation.tokenized_reasoning_mask
+        n_reasoning = reasoning_emb.shape[1]
+
+        subtask_emb = model._embed_text_tokens(observation.tokenized_subtask)
+        subtask_mask = observation.tokenized_subtask_mask
+        n_subtask = subtask_emb.shape[1]
+
+        prefix_parts = img_tokens + [prompt_emb, reasoning_emb, subtask_emb]
+        prefix_mask_parts = img_masks + [prompt_mask, reasoning_mask, subtask_mask]
+        prefix_ar_list = img_ar + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask
+        n_fast = 0
+        if getattr(model, "_use_fast_tokens", False) and observation.tokenized_fast is not None:
+            fast_emb = model._embed_text_tokens(observation.tokenized_fast)
+            fast_mask = observation.tokenized_fast_mask
+            n_fast = int(fast_emb.shape[1])
+            prefix_parts.append(fast_emb)
+            prefix_mask_parts.append(fast_mask)
+            prefix_ar_list += [True] * n_fast
+
+        prefix_tokens = jnp.concatenate(prefix_parts, axis=1)
+        prefix_mask = jnp.concatenate(prefix_mask_parts, axis=1)
+        prefix_ar = jnp.array(prefix_ar_list)
+
+        prefix_attn_mask = _openpi_pi0.make_attn_mask(prefix_mask, prefix_ar)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = model.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=prefix_attn_mask,
+            positions=positions,
+        )
+
+        reasoning_start = n_img + n_prompt
+        reasoning_end = reasoning_start + n_reasoning
+        prefix_len = prefix_mask.shape[1]
+        col_is_reasoning = (jnp.arange(prefix_len) >= reasoning_start) & (jnp.arange(prefix_len) < reasoning_end)
+        prefix_mask_no_reasoning = prefix_mask & ~col_is_reasoning[None, :]
+        prefix_embed = jax.lax.stop_gradient(
+            _pool_prefix_hidden(prefix_out, prefix_mask_no_reasoning)
+        )
+
+        return (
+            observation,
+            jax.tree.map(jax.lax.stop_gradient, kv_cache),
+            jax.lax.stop_gradient(prefix_mask),
+            jax.lax.stop_gradient(prefix_mask_no_reasoning),
+            prefix_embed,
+        )
+
+    def _stash_policy_embedding(self, embed: np.ndarray | jax.Array, *, raw: Optional[Dict[str, Any]] = None) -> np.ndarray:
+        embed_np = np.asarray(jax.device_get(embed), dtype=np.float32)
+        if embed_np.ndim == 1:
+            embed_np = embed_np[None, ...]
+        self._cached_policy_embed = embed_np
+        vec = embed_np[0] if embed_np.shape[0] == 1 else embed_np
+        targets: list[Dict[str, Any]] = []
+        if isinstance(raw, dict):
+            targets.append(raw)
+        if self.raw_obs_holder is not None and isinstance(self.raw_obs_holder.get("obs"), dict):
+            holder_obs = self.raw_obs_holder["obs"]
+            if holder_obs is not raw:
+                targets.append(holder_obs)
+        for tgt in targets:
+            tgt["policy_embedding"] = np.asarray(vec, dtype=np.float32)
+        return embed_np
+
+    def ensure_policy_embedding(
+        self,
+        batch_size: int = 1,
+        *,
+        raw: Optional[Dict[str, Any]] = None,
+        force: bool = False,
+    ) -> np.ndarray:
+        """Run CoT (if needed) + frozen prefix forward; cache pooled embedding for DSRL."""
+        if self._remote is not None:
+            raise RuntimeError("Policy prefix embeddings require local SteerVLAActor inference.")
+        assert self.model is not None and self._jax_device is not None
+
+        obs_id = id(raw) if raw is not None else id(self.raw_obs_holder.get("obs") if self.raw_obs_holder else None)
+        if (
+            not force
+            and self._cached_policy_embed is not None
+            and int(self._cached_policy_embed.shape[0]) == int(batch_size)
+            and self._cached_policy_embed_obs_id == obs_id
+        ):
+            return self._cached_policy_embed
+
+        self._call_counter += 1
+        rng = jax.random.PRNGKey(self._call_counter)
+        obs_np_struct = self.build_observation_batch_numpy(batch_size, raw=raw)
+        obs_jax = jax.tree.map(
+            lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
+            obs_np_struct,
+        )
+        cot_out = self._sample_or_reuse_cot(rng, obs_jax, batch_size)
+        if batch_size == 1:
+            stash_raw = raw
+            if stash_raw is None and self.raw_obs_holder is not None:
+                stash_raw = self.raw_obs_holder.get("obs")
+            if isinstance(stash_raw, dict):
+                self._stash_cot_in_raw(stash_raw, cot_out)
+        obs_full = _merge_cot_output_into_observation(obs_jax, cot_out)
+        _, _, _, _, prefix_embed = self._build_frozen_prefix_cache(self.model, obs_full)
+        embed_np = self._stash_policy_embedding(prefix_embed, raw=raw)
+        self._cached_policy_embed_obs_id = obs_id
+        return embed_np
 
     def _stash_cot_in_raw(self, raw: Optional[Dict[str, Any]], cot_out: dict[str, Any]) -> None:
         """Persist latest CoT tokens/masks in raw obs dict for downstream training."""
@@ -836,6 +1225,8 @@ class SteerVLAActor:
         self._cached_action_step = 0
         self._cached_cot = None
         self._cached_cot_actions_used = 0
+        self._cached_policy_embed = None
+        self._cached_policy_embed_obs_id = None
 
     def _forward_pi0(
         self,
@@ -889,6 +1280,12 @@ class SteerVLAActor:
                 self._stash_cot_in_raw(self.raw_obs_holder["obs"], cot_out)
 
         obs_full = _merge_cot_output_into_observation(obs_jax, cot_out)
+
+        obs_id = id(raw) if raw is not None else id(self.raw_obs_holder.get("obs") if self.raw_obs_holder else None)
+        if self._cached_policy_embed is None or self._cached_policy_embed_obs_id != obs_id:
+            _, _, _, _, prefix_embed = self._build_frozen_prefix_cache(self.model, obs_full)
+            self._stash_policy_embedding(prefix_embed, raw=raw)
+            self._cached_policy_embed_obs_id = obs_id
         
         # Prepare noise for inference
         batch_size = obs_jax.state.shape[0]
@@ -909,6 +1306,7 @@ class SteerVLAActor:
         noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(noise_chunk)
         
         # Sample the actions
+        sample_actions_time = time.time()
         traj = self._sample_actions(
             rng_act,
             obs_full,
@@ -916,17 +1314,25 @@ class SteerVLAActor:
             num_steps=int(self.sample_actions_num_steps),
             image_keys=CARLA_STEERVLA_IMAGE_KEYS,
         )
-        if self.return_normalized_action_chunk and not force_accel_steer:
-            traj_clip = traj[:, : int(self.action_horizon), : int(self.action_dim)]
-            flat = traj_clip.reshape(batch_size, -1)
-            return jax.device_put(flat.astype(jnp.float32), self._jax_device)
+        jax.block_until_ready(traj)
+        sample_actions_time = time.time() - sample_actions_time
 
-        first_step = traj[:, 0, :].astype(jnp.float32)
-        target_dim = int(self.action_dim)
-        out = jnp.zeros((batch_size, target_dim), dtype=jnp.float32)
-        copy_dim = min(target_dim, int(first_step.shape[-1]))
-        out = out.at[:, :copy_dim].set(first_step[:, :copy_dim])
-        return out
+        print(f"[DEBUG - steervla] Sample actions time: {sample_actions_time} seconds")
+        traj_np = self._postprocess_action_trajectory(traj, observation_state=obs_jax.state)
+
+        if self.return_normalized_action_chunk and not force_accel_steer:
+            flat = traj_np.reshape(batch_size, -1)
+            expected = int(self.action_horizon) * int(self.action_dim)
+            if flat.shape[-1] != expected:
+                raise ValueError(
+                    f"SteerVLA action chunk has length {flat.shape[-1]}, expected "
+                    f"{expected} (= {self.action_horizon} x {self.action_dim}). "
+                    f"Postprocessed trajectory shape: {tuple(traj_np.shape)}."
+                )
+            return jax.device_put(jnp.asarray(flat, dtype=jnp.float32), self._jax_device)
+
+        first_step = traj_np[:, 0, : int(self.action_dim)]
+        return jax.device_put(jnp.asarray(first_step, dtype=jnp.float32), self._jax_device)
 
     def __call__(self, observations_jax: jax.Array, noise_jax: jax.Array) -> jax.Array:
         """DSRL ``vla_sample_fn``: map encoder observations + noise to CARLA actions.

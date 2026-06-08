@@ -839,12 +839,6 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._progress_reward_weight = float(
             self.carla_config.get("progress_reward_weight", DEFAULT_PROGRESS_REWARD_WEIGHT)
         )
-        # self._centering_reward_weight = float(
-        #     self.carla_config.get("centering_reward_weight", DEFAULT_CENTERING_REWARD_WEIGHT)
-        # )
-        # self._heading_reward_weight = float(
-        #     self.carla_config.get("heading_reward_weight", DEFAULT_HEADING_REWARD_WEIGHT)
-        # )
         self._steer_penalty_weight = float(
             self.carla_config.get("steer_penalty_weight", DEFAULT_STEER_PENALTY_WEIGHT)
         )
@@ -885,7 +879,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._speed_limit_values: Any | None = None
         self._speed_limit_map_name: str = ""
         try:
-            from coaches.expert_label import ExpertLabelComputer
+            from impls.coaches.expert_label import ExpertLabelComputer
             self._label_computer = ExpertLabelComputer()
         except Exception:
             self._label_computer = None
@@ -1089,6 +1083,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._drain_pseudo_sensors()
         self._evaluator._cleanup()
         self._scenario_active = False
+        # Let Traffic Manager finish dropping route actors before the next load.
+        time.sleep(0.3)
         # Do not set _needs_setup_on_reset here: we reuse the existing CARLA
         # client/world across episodes to avoid spawning a new server (subprocess)
         # while JAX threads are running, which triggers fork() and crashes.
@@ -1651,6 +1647,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
 
         terminal_bonus = 0.0
         info["collision_count"] = collision_count
+        info["route_progress_pct"] = self._route_completion_pct()
         info["crash_stuck_ticks"] = self._crash_stuck_ticks
         info["collision_penalty_active"] = bool(collision_penalty_active)
         info["collision_contact_active"] = bool(collision_contact_active)
@@ -1786,6 +1783,19 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 except Exception:
                     pass
         return count
+
+    def _route_completion_pct(self) -> float:
+        """Route completion percentage from leaderboard ``RouteCompletionTest`` (0–100)."""
+        scenario = getattr(self.evaluator, "route_scenario", None)
+        if scenario is None:
+            return 0.0
+        for criterion in scenario.get_criteria():
+            if getattr(criterion, "name", "") == "RouteCompletionTest":
+                try:
+                    return float(getattr(criterion, "actual_value", 0.0))
+                except Exception:
+                    return 0.0
+        return 0.0
 
     def _route_infraction_values(self) -> Tuple[float, float]:
         """Return cumulative infraction values for outside-route and minimum-speed criteria."""

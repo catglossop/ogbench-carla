@@ -137,9 +137,19 @@ class ReplayBuffer(Dataset):
         def set_idx(buffer, new_element):
             buffer[self.pointer] = new_element
 
+        written_idx = int(self.pointer)
         jax.tree_util.tree_map(set_idx, self._dict, transition)
         self.pointer = (self.pointer + 1) % self.max_size
         self.size = max(self.pointer, self.size)
+        return written_idx % self.max_size
+
+    def update_at(self, index: int, **fields: Any) -> None:
+        """Overwrite selected fields for a stored transition (e.g. backfill labels)."""
+        idx = int(index) % self.max_size
+        for key, value in fields.items():
+            if key not in self._dict:
+                raise KeyError(f"Replay buffer has no field {key!r}.")
+            self._dict[key][idx] = np.asarray(value)
 
     def clear(self):
         """Clear the replay buffer."""
