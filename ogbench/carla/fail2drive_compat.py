@@ -1,4 +1,4 @@
-"""Make the ``fail2drive`` Python package work with the bench2drive srunner fork.
+"""Make the Fail2Drive scenario_runner work with the bench2drive srunner fork.
 
 Fail2Drive ships a forked ``scenario_runner`` (with extra scenario classes
 like ``ImageOnObject`` / ``ObscuredStopSign``, plus modified versions of
@@ -8,8 +8,7 @@ bench2drive srunner — so to honor Fail2Drive routes faithfully we need to
 **add Fail2Drive's scenario files to the leaderboard's class discovery**
 without replacing the rest of the bench2drive srunner.
 
-We pursue three runtime adjustments, all of which leave Fail2Drive's own
-source byte-for-byte (the source lives in the ``fail2drive`` package):
+We pursue three runtime adjustments:
 
 1. ``DeactivateBrakeLights`` is injected into
    ``srunner.scenariomanager.scenarioatomics.atomic_behaviors`` so that
@@ -21,7 +20,7 @@ source byte-for-byte (the source lives in the ``fail2drive`` package):
    to their Expert; bench2drive's fork doesn't define it).
 
 3. ``leaderboard.scenarios.route_scenario.RouteScenario.get_all_scenario_classes``
-   is monkey-patched to also walk :data:`fail2drive.SCENARIOS_DIR`. Files
+   is monkey-patched to also walk Fail2Drive's scenarios directory. Files
    from Fail2Drive are processed **first** so that for shared filenames
    (e.g. ``route_obstacles.py``) Fail2Drive's version lands in
    ``sys.modules`` and wins.
@@ -29,6 +28,12 @@ source byte-for-byte (the source lives in the ``fail2drive`` package):
 The patch is applied with :func:`apply` which is idempotent and safe to
 call before any route is loaded. Call it once after CARLA's PythonAPI is
 on ``sys.path`` but before the first ``RouteScenario`` is built.
+
+Scenario directory resolution order (first one that exists wins):
+  1. ``FAIL2DRIVE_SCENARIOS_DIR`` env var
+     e.g. ``~/fail2drive/scenario_runner/srunner/scenarios``
+  2. ``fail2drive`` Python package's ``SCENARIOS_DIR`` attribute
+     (only if the package is pip-installed)
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ import inspect
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Optional
 
 
@@ -46,23 +52,76 @@ _LOG = logging.getLogger(__name__)
 _APPLIED = False
 
 
+def _resolve_scenarios_dir() -> Optional[str]:
+    """Return the path to Fail2Drive's scenarios directory, or None."""
+    # 1. Explicit env var — works with a cloned repo (no pip install needed).
+    env_dir = os.environ.get("FAIL2DRIVE_SCENARIOS_DIR", "")
+    if env_dir:
+        p = Path(env_dir).expanduser().resolve()
+        if p.is_dir():
+            return str(p)
+
+    # 2. Installed package fallback.
+    try:
+        import fail2drive  # type: ignore
+        d = Path(getattr(fail2drive, "SCENARIOS_DIR", ""))
+        if d.is_dir():
+            return str(d)
+    except ImportError:
+        pass
+
+    return None
+
+
 def _inject_atomic() -> Optional[str]:
-    """Add ``DeactivateBrakeLights`` to srunner's atomic_behaviors if absent."""
+    """Add ``DeactivateBrakeLights`` to srunner's atomic_behaviors if absent.
+
+    ``hard_break.py`` imports it from ``srunner.scenariomanager.scenarioatomics``.
+    bench2drive's fork doesn't ship it, so we load it from Fail2Drive's own
+    atomic_behaviors.py (derived from FAIL2DRIVE_SCENARIOS_DIR or the package).
+    """
     try:
         import srunner.scenariomanager.scenarioatomics.atomic_behaviors as ab
     except ImportError as e:
         return f'srunner.atomic_behaviors unavailable ({e})'
 
     if hasattr(ab, 'DeactivateBrakeLights'):
+        return None  # already present (bench2drive fork ships it, or already injected)
+
+    # Try the installed package first.
+    try:
+        from fail2drive.atomics import DeactivateBrakeLights  # type: ignore
+        ab.DeactivateBrakeLights = DeactivateBrakeLights
         return None
+    except (ImportError, AttributeError):
+        pass
+
+    # Fall back: load DeactivateBrakeLights from the cloned repo's atomic_behaviors.py.
+    # It lives two levels up from the scenarios dir:
+    #   <root>/scenario_runner/srunner/scenariomanager/scenarioatomics/atomic_behaviors.py
+    scenarios_dir = _resolve_scenarios_dir()
+    if not scenarios_dir:
+        return 'fail2drive scenarios dir not found (set FAIL2DRIVE_SCENARIOS_DIR)'
+
+    # Derive atomic_behaviors.py path relative to scenarios dir.
+    # scenarios_dir = .../srunner/scenarios  →  parent = .../srunner
+    # then .../srunner/scenariomanager/scenarioatomics/atomic_behaviors.py
+    srunner_root = Path(scenarios_dir).parent
+    ab_path = srunner_root / "scenariomanager" / "scenarioatomics" / "atomic_behaviors.py"
+    if not ab_path.exists():
+        return f'DeactivateBrakeLights source not found at {ab_path}'
 
     try:
-        from fail2drive.atomics import DeactivateBrakeLights
-    except ImportError as e:
-        return f'fail2drive.atomics unavailable ({e})'
-
-    ab.DeactivateBrakeLights = DeactivateBrakeLights
-    return None
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_f2d_atomic_behaviors", str(ab_path)
+        )
+        f2d_ab = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(f2d_ab)  # type: ignore[union-attr]
+        ab.DeactivateBrakeLights = f2d_ab.DeactivateBrakeLights
+        return None
+    except Exception as e:
+        return f'Failed to load DeactivateBrakeLights from {ab_path}: {e}'
 
 
 def _add_active_scenarios_attr() -> Optional[str]:
@@ -88,16 +147,12 @@ def _patch_scenario_discovery() -> Optional[str]:
     except ImportError as e:
         return f'RouteScenario unavailable ({e})'
 
-    try:
-        import fail2drive
-    except ImportError as e:
-        return f'fail2drive package unavailable ({e})'
+    f2d_dir = _resolve_scenarios_dir()
+    if not f2d_dir:
+        return 'fail2drive scenarios dir not found (set FAIL2DRIVE_SCENARIOS_DIR)'
 
-    f2d_dir = str(fail2drive.SCENARIOS_DIR)
     if getattr(RouteScenario.get_all_scenario_classes, '_fail2drive_patched', False):
         return None
-
-    original = RouteScenario.get_all_scenario_classes
 
     def get_all_scenario_classes(self):
         """Discover scenario classes from both the fail2drive package and the

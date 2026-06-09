@@ -85,9 +85,40 @@ def warn_if_carla_root_mismatched(route_source: str, cfg: Dict[str, Any]) -> Non
 
     Fail2Drive routes reference static props (``brickwall``, ``walkingkid``,
     ``ampel`` etc.) that vanilla CARLA 0.9.16 doesn't ship — those scenarios
-    silently fail to spawn the intended obstacle. ``run_carla.sh`` switches
-    ``CARLA_ROOT`` automatically; this catches the case where someone invoked
-    ``main_carla.py`` directly without doing that.
+    silently fail to spawn the intended obstacle. ``run_simlingo_fail2drive.sh``
+    switches ``CARLA_ROOT`` automatically; this catches the case where someone
+    invoked the script directly without doing that.
+    """
+    if route_source != "fail2drive":
+        return
+    f2d_root = cfg.get("fail2drive_carla_root")
+    if not f2d_root:
+        return
+    current_root = os.environ.get("CARLA_ROOT", "")
+    current_api = os.environ.get("CARLA_PYTHON_API_ROOT", "")
+    f2d_root_resolved = str(Path(str(f2d_root)).expanduser().resolve())
+    if (
+        current_root
+        and Path(current_root).resolve() != Path(f2d_root_resolved)
+        and not current_api.startswith(f2d_root_resolved)
+    ):
+        print(
+            f"\033[93m[fail2drive] WARNING: route is from Fail2Drive but CARLA_ROOT="
+            f"{current_root!r} is not the Fail2Drive install ({f2d_root_resolved!r}). "
+            f"Assets like static.prop.brickwall / walkingkid may be missing — set "
+            f"CARLA_ROOT={f2d_root_resolved} (and relaunch the CARLA server from there).\033[0m"
+        )
+
+
+
+def warn_if_carla_root_mismatched(route_source: str, cfg: Dict[str, Any]) -> None:
+    """Log a clear warning if the active CARLA install can't serve this route's assets.
+
+    Fail2Drive routes reference static props (``brickwall``, ``walkingkid``,
+    ``ampel`` etc.) that vanilla CARLA 0.9.16 doesn't ship — those scenarios
+    silently fail to spawn the intended obstacle. ``run_simlingo_fail2drive.sh``
+    switches ``CARLA_ROOT`` automatically; this catches the case where someone
+    invoked the script directly without doing that.
     """
     if route_source != "fail2drive":
         return
@@ -142,6 +173,10 @@ from ogbench.carla.leaderboard_agents.observation_only import (
     IMAGE_SHAPE_HWC,
     RGB_FRONT_CAMERA_TAG,
     VIZ_IMAGE_SHAPE_HWC,
+)
+from ogbench.carla.leaderboard_agents.simlingo_obs import (
+    SIMLINGO_CAMERA_TAG,
+    SIMLINGO_IMAGE_SHAPE_HWC,
 )
 
 
@@ -203,17 +238,21 @@ _SPEED_LIMITS_DIR = Path(__file__).resolve().parent.parent.parent / "impls" / "c
 
 DEFAULT_CRASH_STUCK_SPEED_THRESHOLD = 0.1
 DEFAULT_CRASH_STUCK_STEPS = 20
-DEFAULT_CRASH_STUCK_PENALTY = -5.0
-DEFAULT_COLLISION_EVENT_PENALTY = -1.0 # catastrophic - should update to make sure any contact is given negative reward
-DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -1.0 # should be pretty heavy
-DEFAULT_PROGRESS_REWARD_WEIGHT = 2.0
-
-DEFAULT_STEER_PENALTY_WEIGHT = 0.05
-DEFAULT_BRAKE_PENALTY_WEIGHT = 0.02
-DEFAULT_SPEED_LIMIT_PENALTY_WEIGHT = 0.1
+DEFAULT_CRASH_STUCK_PENALTY = -20.0
+DEFAULT_COLLISION_EVENT_PENALTY = -20.0  # legacy: applied while contact is active unless split below
+DEFAULT_COLLISION_CONTACT_PENALTY = None  # float | None; if None, uses legacy collision_event_penalty
+DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -20.0
+DEFAULT_TRAFFIC_VIOLATION_PENALTY = -20.0  # per new RunningStop or RunningRedLight event
+DEFAULT_PROGRESS_REWARD_WEIGHT = 5.0 # 5.0
+DEFAULT_TERMINATE_ON_INFRACTION = False
 DEFAULT_MAX_EPISODE_STEPS = 250
-SUCCESS_BONUS = 100.0
-FAILURE_BONUS = -5.0
+# DEFAULT_CENTERING_REWARD_WEIGHT = 0.2
+# DEFAULT_HEADING_REWARD_WEIGHT = 0.2
+DEFAULT_STEER_PENALTY_WEIGHT = 0.0 # 0.05
+DEFAULT_BRAKE_PENALTY_WEIGHT = 0.0 # 0.02
+DEFAULT_SPEED_LIMIT_PENALTY_WEIGHT = 0.1
+SUCCESS_BONUS = 50.0
+FAILURE_BONUS = -20.0
 
 
 def _find_free_port(starting_port: int) -> int:
@@ -275,23 +314,36 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
             display_num = _find_free_display_num()
 
         xvfb_cmd = [
-            "Xvfb",
-            f":{display_num}",
-            "-screen",
-            "0",
-            "1280x1024x24",
-            "-ac",
-            "+extension",
-            "GLX",
-            "+render",
-            "-noreset",
+            "Xvfb", f":{display_num}",
+            "-screen", "0", "1280x1024x24",
+            "-ac", "+extension", "GLX", "+render", "-noreset",
         ]
-        self.xvfb = subprocess.Popen(xvfb_cmd, preexec_fn=os.setsid)
+        # stdin=DEVNULL so Xvfb/CARLA don't inherit any pipe fds from our process.
+        self.xvfb = subprocess.Popen(
+            xvfb_cmd, preexec_fn=os.setsid,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
         atexit.register(os.killpg, self.xvfb.pid, signal.SIGKILL)
         time.sleep(2)
 
-        carla_env = os.environ.copy()
-        carla_env["DISPLAY"] = f":{display_num}"
+        # Build a minimal clean env for CARLA/UE4. When this process is launched
+        # via `conda run` + `uv run`, both inject LD_LIBRARY_PATH entries with
+        # incompatible libstdc++/libssl versions that crash the UE4 binary right
+        # after "Disabling core dumps.". Use only what UE4 actually needs.
+        _sys_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        carla_env = {
+            "HOME": os.environ.get("HOME", "/root"),
+            "USER": os.environ.get("USER", "root"),
+            "LOGNAME": os.environ.get("LOGNAME", os.environ.get("USER", "root")),
+            "PATH": _sys_path,
+            "DISPLAY": f":{display_num}",
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+        }
+        # Forward CUDA and GPU visibility vars.
+        for _k in ("CUDA_VISIBLE_DEVICES", "CUDA_HOME", "CUDA_ROOT",
+                   "XDG_RUNTIME_DIR", "TMPDIR", "TMP", "TEMP"):
+            if _k in os.environ:
+                carla_env[_k] = os.environ[_k]
 
         cmd = [
             os.path.join(self.carla_path, "CarlaUE4.sh"),
@@ -303,10 +355,14 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
         streaming_port = int(getattr(args, "streaming_port", 0) or 0)
         if streaming_port > 0:
             cmd.append(f"-carla-streaming-port={streaming_port}")
-        self.server = subprocess.Popen(cmd, preexec_fn=os.setsid, env=carla_env)
+        _carla_log = open(f"/tmp/carla_rpc{rpc_port}.log", "w")
+        self.server = subprocess.Popen(
+            cmd, preexec_fn=os.setsid, env=carla_env,
+            stdin=subprocess.DEVNULL, stdout=_carla_log, stderr=_carla_log,
+        )
         print(" ".join(cmd), self.server.returncode, flush=True)
         atexit.register(os.killpg, self.server.pid, signal.SIGKILL)
-        time.sleep(30)
+        time.sleep(60)
 
         attempts = 0
         num_max_restarts = 20
@@ -383,6 +439,59 @@ def _bgra_to_rgb_hwc(arr: np.ndarray) -> np.ndarray:
     """CARLA leaderboard packs ``sensor.camera.rgb`` as H×W×4 BGRA uint8."""
     bgr = np.asarray(arr)[..., :3]
     return np.ascontiguousarray(bgr[..., ::-1], dtype=np.uint8)
+
+
+def _decode_simlingo_image(sensor_dict: Dict[str, Any]) -> np.ndarray:
+    """Decode ``rgb_simlingo`` at native 1024×512 resolution for SimLingo inference."""
+    if not sensor_dict or SIMLINGO_CAMERA_TAG not in sensor_dict:
+        return np.zeros(SIMLINGO_IMAGE_SHAPE_HWC, dtype=np.uint8)
+    tup = sensor_dict[SIMLINGO_CAMERA_TAG]
+    if not isinstance(tup, (tuple, list)) or len(tup) < 2:
+        return np.zeros(SIMLINGO_IMAGE_SHAPE_HWC, dtype=np.uint8)
+    payload = tup[1]
+    if payload is None:
+        return np.zeros(SIMLINGO_IMAGE_SHAPE_HWC, dtype=np.uint8)
+    arr = np.asarray(payload)
+    if arr.ndim != 3:
+        return np.zeros(SIMLINGO_IMAGE_SHAPE_HWC, dtype=np.uint8)
+    rgb = _bgra_to_rgb_hwc(arr) if arr.shape[-1] == 4 else arr.astype(np.uint8, copy=False)
+    if rgb.shape != SIMLINGO_IMAGE_SHAPE_HWC:
+        try:
+            import cv2
+            rgb = cv2.resize(rgb, (SIMLINGO_IMAGE_SHAPE_HWC[1], SIMLINGO_IMAGE_SHAPE_HWC[0]), interpolation=cv2.INTER_AREA)
+        except Exception:
+            return np.zeros(SIMLINGO_IMAGE_SHAPE_HWC, dtype=np.uint8)
+    return rgb
+
+
+def _compute_target_point_ego(ego_actor, route_planner) -> np.ndarray:
+    """Return the next route waypoint in the ego vehicle's local 2-D frame.
+
+    Matches the SimLingo convention: x is forward, y is left (right-hand frame).
+    Returns zeros if no route info is available.
+    """
+    if route_planner is None or ego_actor is None:
+        return np.zeros(2, dtype=np.float32)
+    try:
+        import math as _math
+        tf = ego_actor.get_transform()
+        ego_pos = np.array([tf.location.x, tf.location.y, tf.location.z], dtype=np.float64)
+        waypoint_route = route_planner.run_step(ego_pos)
+        if len(waypoint_route) > 1:
+            far_wp, _ = waypoint_route[1]
+        elif len(waypoint_route) > 0:
+            far_wp, _ = waypoint_route[0]
+        else:
+            return np.zeros(2, dtype=np.float32)
+        yaw = _math.radians(tf.rotation.yaw)
+        rel_x = float(far_wp[0]) - tf.location.x
+        rel_y = float(far_wp[1]) - tf.location.y
+        # Rotate from CARLA world to ego frame: x=forward, y=left
+        x_e = rel_x * _math.cos(yaw) + rel_y * _math.sin(yaw)
+        y_e = -rel_x * _math.sin(yaw) + rel_y * _math.cos(yaw)
+        return np.array([x_e, y_e], dtype=np.float32)
+    except Exception:
+        return np.zeros(2, dtype=np.float32)
 
 
 def _decode_rgb_front_viz(sensor_dict: Dict[str, Any]) -> np.ndarray | None:
@@ -619,7 +728,7 @@ def carla_config_to_args(
         traffic_manager_seed=int(cfg.get("traffic_manager_seed", 0)),
         debug=int(cfg.get("debug", 0)),
         record=str(cfg.get("record", "")),
-        timeout=float(cfg.get("timeout", 600.0)),
+        timeout=float(cfg.get("timeout", 2000.0)),
         routes=str(route_entry.xml_path),
         routes_subset=route_entry.route_id,
         repetitions=int(cfg.get("repetitions", 1)),
@@ -728,6 +837,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._args: Optional[SimpleNamespace] = None
         self._base_agent_config: str = ""
         self._scenario_active = False
+        self._last_driving_score = 0.0
         self._last_control = carla.VehicleControl()
         self._crash_stuck_speed_threshold = float(
             self.carla_config.get("crash_stuck_speed_threshold", DEFAULT_CRASH_STUCK_SPEED_THRESHOLD)
@@ -742,8 +852,20 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._collision_event_penalty = float(
             self.carla_config.get("collision_event_penalty", DEFAULT_COLLISION_EVENT_PENALTY)
         )
+        collision_contact_penalty = self.carla_config.get(
+            "collision_contact_penalty", DEFAULT_COLLISION_CONTACT_PENALTY
+        )
+        self._collision_contact_penalty = (
+            None if collision_contact_penalty is None else float(collision_contact_penalty)
+        )
         self._outside_route_event_penalty = float(
             self.carla_config.get("outside_route_event_penalty", DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY)
+        )
+        self._traffic_violation_penalty = float(
+            self.carla_config.get("traffic_violation_penalty", DEFAULT_TRAFFIC_VIOLATION_PENALTY)
+        )
+        self._terminate_on_infraction = bool(
+            self.carla_config.get("terminate_on_infraction", DEFAULT_TERMINATE_ON_INFRACTION)
         )
         self._progress_reward_weight = float(
             self.carla_config.get("progress_reward_weight", DEFAULT_PROGRESS_REWARD_WEIGHT)
@@ -757,6 +879,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._speed_limit_penalty_weight = float(
             self.carla_config.get("speed_limit_penalty_weight", DEFAULT_SPEED_LIMIT_PENALTY_WEIGHT)
         )
+        self._success_bonus = float(self.carla_config.get("success_bonus", SUCCESS_BONUS))
+        self._failure_bonus = float(self.carla_config.get("failure_bonus", FAILURE_BONUS))
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
         self._prev_route_progress_pct = 0.0
@@ -764,6 +888,18 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             self.carla_config.get("max_episode_steps", DEFAULT_MAX_EPISODE_STEPS)
         )
         self._episode_step_count = 0
+        self._prev_traffic_violation_count = 0
+        self._raw_collision_sensor: Any | None = None
+        self._raw_collision_active: bool = False
+        self._collision_recently_active: bool = False
+        self._last_route_completion = 0.0
+        self._route_progress_xyz: Optional[np.ndarray] = None
+        self._route_progress_s: Optional[np.ndarray] = None
+        self._route_total_distance_m = 0.0
+        self._route_progress_index = 0
+        self._route_transforms: list[Any] = []
+        self._route_completion_accum_perc: list[float] = []
+        self._route_completion_index = 0
 
         self._expert_controller_kind = str(self.carla_config.get("expert_controller", "") or "").strip().lower()
         self._expert_agent: Any | None = None
@@ -772,6 +908,9 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._current_routing_command: int = 4  # LANEFOLLOW until route is loaded
         self._routing_last_command_tmp: int = -1  # simlingo carryover state
         self._routing_last_command: int = -1
+        self._routing_dist_to_waypoint: int = 0  # metres; only shown when far_cmd != LANEFOLLOW
+        self._routing_include_distance: bool = False
+        self._target_points_ego: np.ndarray = np.zeros((2, 2), dtype=np.float32)  # (2, 2) ego-frame
         self._speed_limit_tree: Any | None = None
         self._speed_limit_values: Any | None = None
         self._speed_limit_map_name: str = ""
@@ -967,6 +1106,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
     def _stop_active_scenario(self) -> None:
         if not self._scenario_active or self._evaluator is None:
             return
+        self._destroy_raw_collision_sensor()
         try:
             print("\033[1m> Stopping the route (wrapper)\033[0m", flush=True)
             self._evaluator.manager.stop_scenario()
@@ -993,7 +1133,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         args.agent_config = self._base_agent_config
 
         route_name = f"{config.name}_rep{config.repetition_index}"
-        scenario_name = config.scenario_configs[0].name
+        scenario_name = config.scenario_configs[0].name if config.scenario_configs else "NoScenario"
         town_name = str(config.town)
         weather_id = get_weather_id(config.weather[0][1])
         current_time = datetime.now().strftime("%m_%d_%H_%M_%S")
@@ -1058,12 +1198,12 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._current_routing_command = 4
         self._routing_last_command_tmp = -1
         self._routing_last_command = -1
+        self._routing_dist_to_waypoint = 0
+        self._routing_include_distance = False
+        self._target_points_ego = np.zeros((2, 2), dtype=np.float32)
         self._route_planner = None
         try:
-            from coaches.simlingo.nav_planner import RoutePlanner as _RoutePlanner
-            planner = _RoutePlanner(min_distance=7.5, max_distance=50.0)
-            planner.set_route(ev.route_scenario.route, gps=False)
-            self._route_planner = planner
+            self._route_planner = self._create_route_planner(ev.route_scenario.route)
         except Exception as _rp_exc:
             print(f"[routing_command] RoutePlanner init failed: {_rp_exc}", flush=True)
         self._scenario_active = True
@@ -1072,6 +1212,12 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
         self._prev_route_progress_pct = 0.0
+        self._prev_traffic_violation_count = 0
+        self._raw_collision_active = False
+        self._collision_recently_active = False
+        self._last_route_completion = 0.0
+        self._init_route_progress_cache()
+        self._spawn_raw_collision_sensor()
 
     def _ego_actor(self) -> Optional[carla.Actor]:
         ev = self._evaluator
@@ -1080,6 +1226,25 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         ego_list = getattr(ev.manager, "ego_vehicles", None) or []
         return ego_list[0] if ego_list else None
 
+    def _create_route_planner(self, route) -> Any | None:
+        """Build a SimLingo-style command planner for the active route."""
+        route_planner_cls = None
+        try:
+            from team_code.nav_planner import RoutePlanner as route_planner_cls  # type: ignore
+        except Exception:
+            try:
+                from impls.coaches.simlingo.nav_planner import RoutePlanner as route_planner_cls
+            except Exception as exc:
+                print(f"[routing_command] RoutePlanner import failed: {exc}", flush=True)
+                return None
+        try:
+            planner = route_planner_cls(min_distance=7.5, max_distance=50.0)
+            planner.set_route(route, gps=False)
+            return planner
+        except Exception as exc:
+            print(f"[routing_command] RoutePlanner set_route failed: {exc}", flush=True)
+            return None
+
     def _update_routing_command(self) -> None:
         """Advance the route planner by one step and cache the current routing command."""
         if self._route_planner is None:
@@ -1087,27 +1252,52 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         ego = self._ego_actor()
         if ego is None:
             return
-        loc = ego.get_transform().location
+        import math as _math
+        tf = ego.get_transform()
+        loc = tf.location
         ego_pos = np.array([loc.x, loc.y, loc.z], dtype=np.float64)
         waypoint_route = self._route_planner.run_step(ego_pos)
-        if len(waypoint_route) > 1:
-            _, cmd = waypoint_route[1]
-        elif len(waypoint_route) > 0:
-            _, cmd = waypoint_route[0]
-        else:
+        if not waypoint_route:
             return
+
+        if len(waypoint_route) > 2:
+            far_wp, cmd = waypoint_route[1]
+            next_far_wp, _ = waypoint_route[2]
+        elif len(waypoint_route) > 1:
+            far_wp, cmd = waypoint_route[1]
+            next_far_wp, _ = waypoint_route[1]
+        else:
+            far_wp, cmd = waypoint_route[0]
+            next_far_wp, _ = waypoint_route[0]
+
         far_cmd_int = int(getattr(cmd, "value", cmd))
         if not (1 <= far_cmd_int <= 6):
             return
-        # Simlingo carryover: when transitioning back to LANEFOLLOW after a turn,
-        # keep showing the turn command (last_command) until the next route event.
-        if self._routing_last_command_tmp != far_cmd_int:
-            self._routing_last_command = self._routing_last_command_tmp
+
+        yaw = _math.radians(tf.rotation.yaw)
+        cos_y, sin_y = _math.cos(yaw), _math.sin(yaw)
+
+        def _to_ego(wp_world):
+            dx = float(wp_world[0]) - loc.x
+            dy = float(wp_world[1]) - loc.y
+            return np.array([dx * cos_y + dy * sin_y, -dx * sin_y + dy * cos_y], dtype=np.float32)
+
+        ego_tp = _to_ego(far_wp)
+        ego_next_tp = _to_ego(next_far_wp)
+        self._target_points_ego = np.array([ego_tp, ego_next_tp], dtype=np.float32)
+        dist = int(np.linalg.norm(ego_tp))
+
+        prev_tmp = self._routing_last_command_tmp
+        if prev_tmp != far_cmd_int:
+            self._routing_last_command = prev_tmp
         self._routing_last_command_tmp = far_cmd_int
         if self._routing_last_command in (1, 2, 3) and far_cmd_int == 4:
             self._current_routing_command = self._routing_last_command
+            self._routing_include_distance = False
         else:
             self._current_routing_command = far_cmd_int
+            self._routing_include_distance = far_cmd_int != 4
+            self._routing_dist_to_waypoint = dist
 
     def _load_speed_limit_map(self, map_name: str) -> bool:
         """Load the precomputed speed-limit cKDTree for ``map_name``; return True on success."""
@@ -1471,6 +1661,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         route_progress_pct = self._route_completion_pct()
         route_progress_delta = max(0.0, route_progress_pct - self._prev_route_progress_pct)
         self._prev_route_progress_pct = route_progress_pct
+        
+        criteria = self._criteria_snapshot()
         progress_reward = self._progress_reward_weight * route_progress_delta / 100.0
         # centering_reward = self._centering_reward_weight * centering_factor
         # heading_reward = self._heading_reward_weight * heading_factor
@@ -1488,34 +1680,55 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         )
         crash_stuck, collision_count = self._update_crash_stuck_state(speed)
         outside_route_value, _min_speed_value = self._route_infraction_values()
+        traffic_violation_count = self._traffic_violation_count()
 
         collision_delta = max(0, collision_count - self._prev_collision_count)
         outside_route_delta = max(0.0, outside_route_value - self._prev_outside_route_value)
+        traffic_violation_delta = max(0, traffic_violation_count - self._prev_traffic_violation_count)
         self._prev_collision_count = collision_count
         self._prev_outside_route_value = outside_route_value
+        self._prev_traffic_violation_count = traffic_violation_count
 
-        collision_pen = self._collision_event_penalty * float(collision_delta)
+        collision_contact_active = self._raw_collision_active
+        collision_penalty_active = collision_contact_active or (collision_delta > 0)
+        if self._collision_contact_penalty is None:
+            # Legacy mode: one coefficient applies whenever a new collision fires
+            # or bounding boxes remain in contact.
+            collision_pen = self._collision_event_penalty if collision_penalty_active else 0.0
+        else:
+            collision_pen = (
+                self._collision_event_penalty * float(collision_delta > 0)
+                + self._collision_contact_penalty * float(collision_contact_active)
+            )
         outside_route_pen = self._outside_route_event_penalty * float(outside_route_delta)
-        reward += collision_pen + outside_route_pen
+        traffic_violation_pen = self._traffic_violation_penalty * float(traffic_violation_delta)
+        reward += collision_pen + outside_route_pen + traffic_violation_pen
 
         terminal_bonus = 0.0
         info["collision_count"] = collision_count
         info["route_progress_pct"] = route_progress_pct
         info["route_progress_delta"] = route_progress_delta
         info["crash_stuck_ticks"] = self._crash_stuck_ticks
+        info["collision_penalty_active"] = bool(collision_penalty_active)
+        info["collision_contact_active"] = bool(collision_contact_active)
         info["outside_route_value"] = outside_route_value
         info["collision_delta"] = float(collision_delta)
         info["outside_route_delta"] = float(outside_route_delta)
+        info["traffic_violation_count"] = traffic_violation_count
+        info["traffic_violation_delta"] = float(traffic_violation_delta)
         info["lane_offset_m"] = lane_offset_m
         info["heading_error_rad"] = heading_error_rad
         info["lane_width_m"] = lane_width_m
         info["speed_limit_mps"] = speed_limit_mps
+        info["route_progress_pct"] = float(route_progress_pct)
+        info["route_progress_delta"] = float(route_progress_delta)
         info["speed_norm"] = speed_norm
         info["overspeed_frac"] = overspeed_frac
         info["centering_factor"] = centering_factor
         info["heading_factor"] = heading_factor
         info["penalty_collision"] = collision_pen
         info["penalty_outside_route"] = outside_route_pen
+        info["penalty_traffic_violation"] = traffic_violation_pen
         info["penalty_steer"] = -steer_pen
         info["penalty_brake"] = -brake_pen
         info["penalty_speed_limit"] = -speed_limit_pen
@@ -1532,15 +1745,21 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         else:
             info["penalty_crash_stuck"] = 0.0
 
+        if not terminated and self._terminate_on_infraction:
+            if collision_delta > 0 or outside_route_delta > 0 or traffic_violation_delta > 0:
+                terminated = True
+                info["termination_reason"] = "infraction"
+
         if terminated:
             if crash_stuck:
                 self._finalize_route("Finished", "Agent crashed and got stuck")
             else:
                 success = info["scenario_tree_status"] == "SUCCESS"
-                terminal_bonus = SUCCESS_BONUS if success else FAILURE_BONUS
+                terminal_bonus = self._success_bonus if success else self._failure_bonus
                 reward += terminal_bonus
                 info["success"] = success
                 self._finalize_route("Finished", "")
+            info["driving_score"] = self._last_driving_score
 
         info["reward_terminal"] = terminal_bonus
         info["reward_total"] = float(reward)
@@ -1575,6 +1794,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         """Apply a pre-computed VehicleControl and run one leaderboard tick."""
         self._last_control = control
         self.evaluator.manager.pending_control = control
+        self._raw_collision_active = False
         try:
             running, tree_status = self.evaluator.manager.step_once()
         except Exception as e:
@@ -1599,10 +1819,17 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             "state": self._get_state_vector(),
             "image": downscale_rgb_for_policy(rgb_viz),
             "image_viz": rgb_viz,
+            "simlingo_image": _decode_simlingo_image(sensors),
             "language_label": language_label,
             "commentary_text": commentary_text,
             "expert_action": expert_action,
-            "routing_command": ROUTING_COMMAND_TEXT.get(self._current_routing_command, "follow the road"),
+            "routing_command": (
+                f"{ROUTING_COMMAND_TEXT.get(self._current_routing_command, 'follow the road')}"
+                f" in {self._routing_dist_to_waypoint} meter."
+                if self._routing_include_distance
+                else f"{ROUTING_COMMAND_TEXT.get(self._current_routing_command, 'follow the road')}."
+            ),
+            "target_points": self._target_points_ego,
         }
 
     def _info_with_sensors(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1640,6 +1867,21 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 except Exception:
                     return 0.0
         return 0.0
+    
+    def _traffic_violation_count(self) -> int:
+        """Return total count of RunningStopTest + RunningRedLightTest infractions so far."""
+        scenario = getattr(self.evaluator, "route_scenario", None)
+        if scenario is None:
+            return 0
+        count = 0
+        for criterion in scenario.get_criteria():
+            name = str(getattr(criterion, "name", ""))
+            if name in ("RunningStopTest", "RunningRedLightTest"):
+                try:
+                    count += int(getattr(criterion, "actual_value", 0))
+                except Exception:
+                    pass
+        return count
 
     def _route_infraction_values(self) -> Tuple[float, float]:
         """Return cumulative infraction values for outside-route and minimum-speed criteria."""
@@ -1662,6 +1904,110 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 min_speed_val = max(min_speed_val, value)
 
         return outside_route_val, min_speed_val
+
+    def _criteria_snapshot(self) -> list[dict[str, Any]]:
+        scenario = getattr(self.evaluator, "route_scenario", None)
+        if scenario is None:
+            return []
+        out: list[dict[str, Any]] = []
+        for criterion in scenario.get_criteria():
+            name = str(getattr(criterion, "name", "") or "")
+            try:
+                value = float(getattr(criterion, "actual_value", 0.0))
+            except Exception:
+                value = 0.0
+            status = str(
+                getattr(criterion, "test_status", getattr(criterion, "status", "")) or ""
+            )
+            out.append(
+                {
+                    "name": name,
+                    "name_lower": name.lower(),
+                    "value": value,
+                    "status": status.lower(),
+                }
+            )
+        return out
+
+    @staticmethod
+    def _criterion_matches(name_lower: str, token_groups: tuple[tuple[str, ...], ...]) -> bool:
+        return any(all(token in name_lower for token in group) for group in token_groups)
+
+    def _criterion_value(
+        self,
+        criteria: list[dict[str, Any]],
+        token_groups: tuple[tuple[str, ...], ...],
+    ) -> float:
+        value = 0.0
+        for criterion in criteria:
+            if self._criterion_matches(criterion["name_lower"], token_groups):
+                value = max(value, float(criterion["value"]))
+        return value
+
+    def _route_completion_percent(self, criteria: list[dict[str, Any]]) -> float:
+        criterion_value = self._criterion_value(
+            criteria,
+            (("route", "completion"), ("route", "completed")),
+        )
+        if criterion_value > 0.0:
+            return float(np.clip(criterion_value, 0.0, 100.0))
+
+        ego = self._ego_actor()
+        if ego is None or not self._route_transforms or not self._route_completion_accum_perc:
+            return self._last_route_completion
+
+        location = ego.get_transform().location
+        route_length = len(self._route_transforms)
+        for index in range(
+            self._route_completion_index,
+            min(self._route_completion_index + 3, route_length),
+        ):
+            route_transform = self._route_transforms[index]
+            route_location = route_transform.location
+            wp_dir = route_transform.get_forward_vector()
+            wp_veh = location - route_location
+            if wp_veh.dot(wp_dir) > 0:
+                self._route_completion_index = index
+        return float(round(self._route_completion_accum_perc[self._route_completion_index], 2))
+
+    def _init_route_progress_cache(self) -> None:
+        ev = self._evaluator
+        route = getattr(getattr(ev, "route_scenario", None), "route", None) or []
+        self._route_transforms = [
+            route_item[0] if isinstance(route_item, (tuple, list)) and route_item else route_item
+            for route_item in route
+        ]
+        xyz: list[list[float]] = []
+        for transform in self._route_transforms:
+            loc = getattr(transform, "location", None)
+            if loc is None:
+                continue
+            xyz.append([float(loc.x), float(loc.y), float(loc.z)])
+        if len(xyz) < 2:
+            self._route_progress_xyz = None
+            self._route_progress_s = None
+            self._route_total_distance_m = 0.0
+            self._route_progress_index = 0
+            self._route_completion_accum_perc = []
+            self._route_completion_index = 0
+            self._last_route_completion = 0.0
+            return
+
+        route_xyz = np.asarray(xyz, dtype=np.float32)
+        seg = np.linalg.norm(route_xyz[1:] - route_xyz[:-1], axis=1)
+        route_s = np.concatenate(
+            [np.zeros(1, dtype=np.float32), np.cumsum(seg, dtype=np.float32)],
+            axis=0,
+        )
+        self._route_progress_xyz = route_xyz
+        self._route_progress_s = route_s
+        self._route_total_distance_m = float(max(route_s[-1], 1e-6))
+        self._route_progress_index = 0
+        self._route_completion_accum_perc = (
+            (100.0 * route_s / self._route_total_distance_m).astype(np.float32).tolist()
+        )
+        self._route_completion_index = 0
+        self._last_route_completion = 0.0
 
     @staticmethod
     def _wrap_angle_rad(angle: float) -> float:
@@ -1721,7 +2067,18 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
 
     def _update_crash_stuck_state(self, speed: float) -> Tuple[bool, int]:
         collision_count = self._collision_count()
-        if collision_count > 0 and speed < self._crash_stuck_speed_threshold:
+        # Latch: set on any new collision event, cleared only when the car gets back up
+        # to speed (i.e. it has physically freed itself).  This avoids two failure modes:
+        # (a) using raw _raw_collision_active alone: CARLA collision sensor fires on new
+        #     contact events, not continuously, so a wedged car stops generating events
+        #     and stuck_ticks never accumulates.
+        # (b) using cumulative collision_count: a stop sign/traffic light after any prior
+        #     collision would spuriously trigger crash_stuck.
+        if self._raw_collision_active:
+            self._collision_recently_active = True
+        if speed >= self._crash_stuck_speed_threshold:
+            self._collision_recently_active = False
+        if self._collision_recently_active and speed < self._crash_stuck_speed_threshold:
             self._crash_stuck_ticks += 1
         else:
             self._crash_stuck_ticks = 0
@@ -1754,14 +2111,17 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 self.evaluator.manager.scenario_duration_game,
                 crash_message,
             )
+            self._destroy_raw_collision_sensor()
             self._drain_pseudo_sensors()
             self.evaluator._cleanup()
             raise RuntimeError(f"Invalid sensors: {e}") from e
         except Exception:
+            self._destroy_raw_collision_sensor()
             self._drain_pseudo_sensors()
             self.evaluator._cleanup()
             raise
 
+        self._update_routing_command()
         return self._obs_dict(), self._info_with_sensors()
 
     def step(
@@ -1769,7 +2129,6 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
     ) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
         flat = np.asarray(action, dtype=np.float32).reshape(-1)
         control = None
-        self._update_routing_command()
         if self._steervla_exec_cfg is not None and self._steervla_decoder is not None:
             ah = int(self._steervla_exec_cfg["action_horizon"])
             ad = int(self._steervla_exec_cfg["action_dim"])
@@ -1794,10 +2153,12 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             control = _action_to_control(action)
         self._last_control = control
         self.evaluator.manager.pending_control = control
+        self._raw_collision_active = False
 
         try:
             running, tree_status = self.evaluator.manager.step_once()
         except AgentError as e:
+            self._update_routing_command()
             self._finalize_route(*FAILURE_MESSAGES["Agent_runtime"])
             return (
                 self._obs_dict(),
@@ -1805,6 +2166,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 self._info_with_sensors({"error": "agent_runtime", "exception": str(e)}),
             )
         except TickRuntimeError as e:
+            self._update_routing_command()
             self._finalize_route("Started", "TickRuntime")
             return (
                 self._obs_dict(),
@@ -1812,6 +2174,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 self._info_with_sensors({"error": "tick_runtime", "exception": str(e)}),
             )
         except Exception as e:
+            self._update_routing_command()
             self._finalize_route(*FAILURE_MESSAGES["Simulation"])
             return (
                 self._obs_dict(),
@@ -1819,6 +2182,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 self._info_with_sensors({"error": "simulation", "exception": str(e)}),
             )
 
+        self._update_routing_command()
         terminated = not running
         reward, terminated, info = self._compute_reward_and_info(
             tree_status=tree_status,
@@ -1830,6 +2194,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
     def _finalize_route(self, entry_status: str, crash_message: str) -> None:
         if not self._scenario_active:
             return
+        self._destroy_raw_collision_sensor()
         config_index = self.evaluator.manager.route_index
         try:
             print("\033[1m> Stopping the route (wrapper)\033[0m", flush=True)
@@ -1842,6 +2207,11 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 self.evaluator.manager.scenario_duration_game,
                 crash_message,
             )
+            try:
+                records = self.evaluator.statistics_manager._results.checkpoint.records
+                self._last_driving_score = float(records[config_index].scores["score_composed"])
+            except Exception:
+                self._last_driving_score = 0.0
             self.evaluator.statistics_manager.write_statistics()
             if self._args.record:
                 self.evaluator.client.stop_recorder()
@@ -1856,6 +2226,36 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             # spawning a new server.  Calling setup() after JAX is initialized
             # triggers subprocess.Popen (Xvfb + CarlaUE4.sh), which forks while
             # JAX threads are live and can corrupt the msgpack RPC connection.
+
+    def _spawn_raw_collision_sensor(self) -> None:
+        """Attach a raw sensor.other.collision to the ego; sets _raw_collision_active each tick."""
+        ego = self._ego_actor()
+        if ego is None:
+            return
+        try:
+            world = self.evaluator.world
+            bp = world.get_blueprint_library().find("sensor.other.collision")
+            sensor = world.spawn_actor(bp, carla.Transform(), attach_to=ego)
+            sensor.listen(lambda _event: setattr(self, "_raw_collision_active", True))
+            self._raw_collision_sensor = sensor
+        except Exception as exc:
+            print(f"[raw_collision_sensor] spawn failed: {exc}", flush=True)
+            self._raw_collision_sensor = None
+
+    def _destroy_raw_collision_sensor(self) -> None:
+        """Stop and destroy the raw collision sensor before scenario teardown."""
+        sensor = self._raw_collision_sensor
+        self._raw_collision_sensor = None
+        if sensor is None:
+            return
+        try:
+            sensor.stop()
+        except Exception:
+            pass
+        try:
+            sensor.destroy()
+        except Exception:
+            pass
 
     def render(self):
         """Placeholder frame for evaluation video paths (avoid NotImplementedError)."""

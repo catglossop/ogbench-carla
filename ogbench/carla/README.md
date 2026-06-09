@@ -104,8 +104,8 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 \
 WANDB_MODE=online \
 uv run python impls/main_carla.py \
   --agent=impls/configs/steervla_dsrl_config.py \
-  --route=parking-cut-in-001 \
-  --online_steps=10000 \
+  --route=signalized-junction-left-turn-001 \
+  --online_steps=50000 \
   --save_buffer=true \
   --seed=0
 ```
