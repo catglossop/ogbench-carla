@@ -262,9 +262,10 @@ def _vla_forward_prepare_actor_noise(
 
 
 class CarlaObservationEncoder(nn.Module):
-    """Encode CARLA observations: vector state, RGB via IMPALA, or precomputed policy embed."""
+    """Encode CARLA observations: vector state, precomputed SigLIP/policy embeds, or RGB via IMPALA."""
 
     observation_mode: str
+    image_encoder: str = "impala"
     impala_width: int = 1
     impala_stack_sizes: tuple = (16, 32, 32)
     impala_num_blocks: int = 2
@@ -274,6 +275,9 @@ class CarlaObservationEncoder(nn.Module):
     @nn.compact
     def __call__(self, observations):
         if self.observation_mode in ("state", "policy_embed"):
+            return observations.astype(jnp.float32)
+        if self.image_encoder == "siglip":
+            # Precomputed float32 SigLIP embeddings — pass through unchanged.
             return observations.astype(jnp.float32)
         return ImpalaEncoder(
             width=self.impala_width,
@@ -1289,6 +1293,7 @@ class DSRLAgent(flax.struct.PyTreeNode):
             raise ValueError(
                 f"observation_mode must be 'state', 'image', or 'policy_embed', got {obs_mode!r}"
             )
+        image_encoder = str(config.get("image_encoder", "impala")).lower()
 
         if vla_sample_fn is not None:
             env_action_dim = int(config.get("vla_action_dim", 4)) * int(
@@ -1307,16 +1312,17 @@ class DSRLAgent(flax.struct.PyTreeNode):
             env_action_dim = 2
         obs_encoder_def = CarlaObservationEncoder(
             observation_mode=obs_mode,
+            image_encoder=image_encoder,
             impala_width=int(config.get("image_impala_width", 1)),
             impala_stack_sizes=tuple(config.get("image_impala_stack_sizes", (16, 32, 32))),
             impala_num_blocks=int(config.get("image_impala_num_blocks", 2)),
             image_mlp_hidden_dims=tuple(config.get("image_mlp_hidden_dims", (512,))),
             layer_norm=config["layer_norm"],
         )
-        if obs_mode == "state":
+        if obs_mode in ("state", "policy_embed"):
             embed_dim = int(ex_observations.shape[-1])
-        elif obs_mode == "policy_embed":
-            embed_dim = int(config.get("policy_embed_dim", ex_observations.shape[-1]))
+        elif image_encoder == "siglip":
+            embed_dim = int(ex_observations.shape[-1])  # precomputed SigLIP embedding
         else:
             embed_dim = int(tuple(config.get("image_mlp_hidden_dims", (512,)))[-1])
         critic_feedback_mode = str(config.get("critic_feedback_mode", "commentary_bow"))

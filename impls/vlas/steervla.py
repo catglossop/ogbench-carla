@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 import re
 import time
 from pathlib import Path
@@ -202,16 +203,32 @@ def build_openpi_policy_transforms(
     if data_config.asset_id is None:
         raise ValueError("TrainConfig data requires asset_id to load norm stats.")
     env_action_dim = int(getattr(data_factory, "action_dim", 4))
-    norm_stats = openpi_checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+    # Checkpoint norm-stats Normalize/Unnormalize are skipped by default (matches
+    # master): with them enabled, Unnormalize + steervla_physical_denormalize_actions
+    # double-scales the waypoint deltas, inflating PID desired_speed (the policy then
+    # completes routes ~10x too fast and runs every red light — verified A/B on route
+    # 3936). Set STEERVLA_ENABLE_OPENPI_NORM=1 to re-enable for A/B testing.
+    disable_norm = os.environ.get("STEERVLA_ENABLE_OPENPI_NORM", "0") != "1"
+    if not disable_norm:
+        print("[steervla] STEERVLA_ENABLE_OPENPI_NORM=1: applying Normalize/Unnormalize", flush=True)
+    norm_stats = None if disable_norm else openpi_checkpoints.load_norm_stats(
+        checkpoint_dir / "assets", data_config.asset_id
+    )
     input_transform = openpi_transforms.compose(
-        [
+        []
+        if disable_norm
+        else [
             openpi_transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
         ]
     )
     output_transform = openpi_transforms.compose(
         [
             *data_config.model_transforms.outputs,
-            openpi_transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *(
+                []
+                if disable_norm
+                else [openpi_transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm)]
+            ),
             _SliceActionDim(action_dim=env_action_dim),
         ]
     )

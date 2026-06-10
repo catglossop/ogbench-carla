@@ -34,26 +34,12 @@ def get_config():
     config.online_training_mode = "sac_residual"
 
     # ── Observation for DSRL critic / obs_encoder ──────────────────────────
-    # "policy_embed": pooled frozen Pi0-CoT prefix hidden (fastest, no IMPALA CNN).
-    # "image": IMPALA CNN trained from raw CARLA RGB (more expressive, slower).
-    config.observation_mode = "policy_embed"
-    config.policy_embed_dim = 2048
-
-    # ── Residual actor observation ─────────────────────────────────────────
-    # When True, the raw CARLA ego-kinematics + routing-command one-hot (25-dim)
-    # is appended to the DSRL obs_encoder output so the residual MLP conditions
-    # on both the frozen Pi0 semantic features AND explicit proprioceptive state.
-    # The state suffix is normalized with a running mean/std computed during
-    # residual_warmup_steps; obs_dim of ResidualActor = policy_embed_dim + residual_obs_dim.
-    config.residual_append_state = True
-    config.residual_obs_dim = 19  # obs["state"][6:] — drops world-frame x/y/z pos and rpy orientation
-    config.residual_append_base_action = True  # prepend base Pi0 action to actor obs, matching torch
-
-    # ── Residual actor Pi-feature options ─────────────────────────────────
-    # When True, the residual MLP takes frozen Pi prefix features as its
-    # observation instead of DSRL's obs_encoder output.
-    config.residual_use_pi_image_features = False
-    config.residual_pi_feature_source = "prefix"
+    # Frozen SigLIP embeddings: [image_embed, prompt_embed, subtask_embed] (3×1152-d).
+    config.observation_mode = "image"
+    config.image_encoder = "siglip"
+    config.siglip_model_id = "google/siglip2-so400m-patch14-384"
+    config.siglip_include_prompt_subtask = True
+    # siglip_device is left unset so main_carla.py picks the training GPU automatically.
 
     config.residual_actor_hidden_dims = (256, 256)
 
@@ -70,7 +56,7 @@ def get_config():
     # del first: the base config types this field as float and ml_collections
     # refuses a tuple override on a typed field.
     del config.residual_action_scale
-    config.residual_action_scale = (2.0, 0.6)
+    config.residual_action_scale = (0.6, 0.6)
     config.residual_action_clip = 1.0
     # Entropy coefficient for the residual actor SAC loss.
     config.residual_alpha = 0.1
