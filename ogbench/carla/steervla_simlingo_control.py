@@ -159,7 +159,7 @@ class SimlingoStyleWaypointDecoder:
 
         return steer, throttle, brake
 
-    def flat_action_to_vehicle_control(
+    def _flat_action_to_pid(
         self,
         action_flat: np.ndarray,
         *,
@@ -168,7 +168,8 @@ class SimlingoStyleWaypointDecoder:
         action_horizon: int,
         action_dim: int,
         action_input_space: ActionInputSpace,
-    ) -> carla.VehicleControl:
+    ) -> tuple[float, float, bool]:
+        """Decode a flat chunk and run the stateful PIDs; returns ``(steer, throttle, brake)``."""
         flat = np.asarray(action_flat, dtype=np.float32).reshape(-1)
         expected = action_horizon * action_dim
         if flat.size != expected:
@@ -183,20 +184,60 @@ class SimlingoStyleWaypointDecoder:
             action_dim=action_dim,
             space=action_input_space,
         )
-        print("Denormalized action chunks:")
-        print(denorm)
-        #TODO: Check this produces correct waypoints
         pred_speed_wps, pred_route = _chunks_to_speed_and_route_waypoints(np.asarray(denorm, dtype=np.float64))
-        
-        print("Predicted speed waypoints:")
-        print(pred_speed_wps)
-        # breakpoint()
 
         s = np.asarray(state_vec, dtype=np.float32).reshape(-1)
         gt_velocity = float(s[EGO_STATE_IDX_SPEED]) if s.size > EGO_STATE_IDX_SPEED else 0.0
 
-        steer, throttle, brake = self.control_pid(pred_route, gt_velocity, pred_speed_wps)
+        return self.control_pid(pred_route, gt_velocity, pred_speed_wps)
+
+    def flat_action_to_vehicle_control(
+        self,
+        action_flat: np.ndarray,
+        *,
+        state_vec: np.ndarray,
+        output_action_format: str,
+        action_horizon: int,
+        action_dim: int,
+        action_input_space: ActionInputSpace,
+    ) -> carla.VehicleControl:
+        steer, throttle, brake = self._flat_action_to_pid(
+            action_flat,
+            state_vec=state_vec,
+            output_action_format=output_action_format,
+            action_horizon=action_horizon,
+            action_dim=action_dim,
+            action_input_space=action_input_space,
+        )
         return carla.VehicleControl(steer=steer, throttle=throttle, brake=float(brake))
+
+    def flat_action_to_accel_steer(
+        self,
+        action_flat: np.ndarray,
+        *,
+        state_vec: np.ndarray,
+        output_action_format: str,
+        action_horizon: int,
+        action_dim: int,
+        action_input_space: ActionInputSpace,
+    ) -> np.ndarray:
+        """Decode a flat chunk to a 2-D ``[accel, steer]`` action in ``[-1, 1]``.
+
+        Exact inverse of :func:`ogbench.carla.carla_utils._action_to_control`:
+        ``accel = throttle`` when not braking (throttle is 0 when braking), else
+        ``accel = -1``. Lets a residual policy act in the same bounded 2-D space
+        as the torch SimLingo residual SAC (``main_carla_simlingo.py``).
+        """
+        steer, throttle, brake = self._flat_action_to_pid(
+            action_flat,
+            state_vec=state_vec,
+            output_action_format=output_action_format,
+            action_horizon=action_horizon,
+            action_dim=action_dim,
+            action_input_space=action_input_space,
+        )
+        accel = -1.0 if brake else float(throttle)
+        return np.array([accel, steer], dtype=np.float32)
 
 
 def maybe_steervla_vehicle_control(

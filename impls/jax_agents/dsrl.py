@@ -98,6 +98,20 @@ def _critic_obs_e(obs_e: jnp.ndarray, batch: dict, key: str) -> jnp.ndarray:
         return obs_e
     return jnp.concatenate([obs_e, jnp.asarray(lang, dtype=jnp.float32)], axis=-1)
 
+
+def _batch_obs_embed_or_encoder(
+    network: TrainState,
+    batch: dict,
+    *,
+    obs_key: str,
+    embed_key: str,
+    params,
+) -> jnp.ndarray:
+    """Use precomputed critic embeddings from ``batch`` when present, else ``obs_encoder``."""
+    if embed_key in batch:
+        return jnp.asarray(batch[embed_key], dtype=jnp.float32)
+    return network.select("obs_encoder")(batch[obs_key], params=params)
+
 @jax.jit
 def _critic_loss_vla_pure_math(
     network: TrainState,
@@ -106,19 +120,40 @@ def _critic_loss_vla_pure_math(
     critic_actions: jnp.ndarray,
     grad_params,
     discount: jnp.ndarray,
+    next_log_pi=None,
+    alpha=None,
 ):
     """Pure DSRL critic math: target-Q bootstrap + critic MSE, no VLA model access.
 
     ``next_actions_critic`` and ``critic_actions`` must already be clipped to the env
     action layout (e.g. via :meth:`DSRLAgent._clip_actions_to_env`).
+
+    When ``next_log_pi`` and ``alpha`` are provided (residual SAC path), the soft
+    Bellman target subtracts the entropy bonus: ``min_Q(s',a') - alpha * log_pi(a'|s')``.
     """
-    next_obs_e = network.select("obs_encoder")(batch["next_observations"], params=network.params)
-    next_qs = network.select("target_critic")(_critic_obs_e(next_obs_e, batch, "next_language_label"), next_actions_critic)
+    next_obs_e = _batch_obs_embed_or_encoder(
+        network, batch, obs_key="next_observations", embed_key="critic_next_obs_e", params=network.params,
+    )
+    _next_critic_obs_e = _critic_obs_e(next_obs_e, batch, "next_language_label")
+    if "base_next_actions" in batch:
+        _next_critic_obs_e = jnp.concatenate(
+            [_next_critic_obs_e, jnp.asarray(batch["base_next_actions"], dtype=jnp.float32)], axis=-1
+        )
+    next_qs = network.select("target_critic")(_next_critic_obs_e, next_actions_critic)
     next_q = jnp.min(next_qs, axis=0)
+    if next_log_pi is not None and alpha is not None:
+        next_q = next_q - alpha * next_log_pi
     target_q = batch["rewards"] + discount * batch["masks"] * next_q
 
-    obs_e = network.select("obs_encoder")(batch["observations"], params=grad_params)
-    qs = network.select("critic")(_critic_obs_e(obs_e, batch, "language_label"), critic_actions, params=grad_params)
+    obs_e = _batch_obs_embed_or_encoder(
+        network, batch, obs_key="observations", embed_key="critic_obs_e", params=grad_params,
+    )
+    _curr_critic_obs_e = _critic_obs_e(obs_e, batch, "language_label")
+    if "base_actions" in batch:
+        _curr_critic_obs_e = jnp.concatenate(
+            [_curr_critic_obs_e, jnp.asarray(batch["base_actions"], dtype=jnp.float32)], axis=-1
+        )
+    qs = network.select("critic")(_curr_critic_obs_e, critic_actions, params=grad_params)
     critic_loss = jnp.square(qs - target_q[None]).mean()
     return critic_loss, {
         "critic_loss": critic_loss,
@@ -323,6 +358,7 @@ class DSRLAgent(flax.struct.PyTreeNode):
     # vla_train_state: Any = nonpytree_field()  # OpenPI ``training_utils.TrainState`` for :meth:`update_with_vla`
     openpi_train_config: Any = nonpytree_field()  # ``openpi.training.config.TrainConfig`` for VLA flow step
     steervla_actor: Any = nonpytree_field()  # Optional attached local ``SteerVLAActor`` instance
+    sac_residual_agent: Any = None  # Optional ``jax_agents.sac_residual.SACResidualAgent`` (pytree)
 
     @staticmethod
     def _as_jax_pytree(x):
@@ -808,6 +844,417 @@ class DSRLAgent(flax.struct.PyTreeNode):
             "vla_actions_nc": vla_actions_nc,
         }
 
+    # ----- residual SAC helpers ------------------------------------------- #
+
+    def _critic_uses_pi_prefix_features(self) -> bool:
+        return bool(self.config.get("critic_use_pi_prefix_features", False))
+
+    def _residual_uses_pi_image_features(self) -> bool:
+        return bool(self.config.get("residual_use_pi_image_features", False))
+
+    def _residual_append_state(self) -> bool:
+        """When True, the raw CARLA state vector is appended to the residual actor obs_e."""
+        return bool(self.config.get("residual_append_state", False))
+
+    def _residual_append_base_action(self) -> bool:
+        """When True, the base Pi0 action is appended to the residual actor obs_e (before state)."""
+        return bool(self.config.get("residual_append_base_action", False))
+
+    def _residual_uses_accel_steer(self) -> bool:
+        """True when the residual acts on the 2-D PID-decoded [accel, steer] action
+        (torch ``residual_sac.py`` parity) instead of the raw waypoint chunk."""
+        return str(self.config.get("residual_action_space", "waypoint_chunk")).strip().lower() == "accel_steer"
+
+    def _residual_env_actions(self, actions: jnp.ndarray) -> jnp.ndarray:
+        """Map stored residual-mode actions to the critic layout.
+
+        In ``accel_steer`` mode actions are already 2-D and must NOT go through
+        :meth:`_clip_actions_to_env` (which expects the waypoint-chunk layout).
+        """
+        if self._residual_uses_accel_steer():
+            return jnp.asarray(actions, dtype=jnp.float32)
+        return self._clip_actions_to_env(actions)
+
+    def _get_live_state(self, batch_size: int) -> jnp.ndarray:
+        """Read the current CARLA state vector from ``raw_obs_holder`` (rollout path only)."""
+        import numpy as _np
+        raw = None
+        if self.steervla_actor is not None and getattr(self.steervla_actor, "raw_obs_holder", None) is not None:
+            raw = self.steervla_actor.raw_obs_holder.get("obs")
+        if raw is not None and isinstance(raw, dict) and "state" in raw:
+            st = _np.asarray(raw["state"], dtype=_np.float32)[6:]
+            return jnp.asarray(_np.broadcast_to(st, (batch_size, st.shape[0])))
+        state_dim = int(self.config.get("residual_obs_dim", 25))
+        return jnp.zeros((batch_size, state_dim), dtype=jnp.float32)
+
+    def _residual_pi_feature_source(self) -> str:
+        return str(self.config.get("residual_pi_feature_source", "prefix")).strip().lower()
+
+    def _residual_uses_pi_prefix_features(self) -> bool:
+        return self._residual_uses_pi_image_features() and self._residual_pi_feature_source() == "prefix"
+
+    def _prepare_pi_prefix_feature_batch(self, batch):
+        """Attach frozen Pi prefix embeddings once so critic/residual can share them."""
+        if not (self._critic_uses_pi_prefix_features() or self._residual_uses_pi_prefix_features()):
+            return batch
+        if self.steervla_actor is None:
+            raise RuntimeError("Pi prefix features require an attached steervla_actor.")
+        if "openpi_observation" not in batch or "next_openpi_observation" not in batch:
+            batch = self._prepare_vla_batch(batch)
+        if "pi_prefix_obs_e" in batch and "pi_prefix_next_obs_e" in batch:
+            return batch
+        batch = dict(batch)
+        batch["pi_prefix_obs_e"] = jax.lax.stop_gradient(
+            self.steervla_actor.encode_prefix_features(batch["openpi_observation"])
+        )
+        batch["pi_prefix_next_obs_e"] = jax.lax.stop_gradient(
+            self.steervla_actor.encode_prefix_features(batch["next_openpi_observation"])
+        )
+        return batch
+
+    def _prepare_critic_feature_batch(self, batch):
+        """Attach frozen Pi prefix embeddings for critic/noise_critic when enabled."""
+        if not self._critic_uses_pi_prefix_features():
+            return batch
+        batch = self._prepare_pi_prefix_feature_batch(batch)
+        batch = dict(batch)
+        batch["critic_obs_e"] = batch["pi_prefix_obs_e"]
+        batch["critic_next_obs_e"] = batch["pi_prefix_next_obs_e"]
+        return batch
+
+    def _update_critic_only(self, batch, next_actions, next_log_pi=None, alpha=None):
+        """Critic-only update for residual SAC / shared VLA-backed actor paths.
+
+        ``next_actions`` is the bootstrap action a' at s' (env-layout flat); it must
+        be computed eagerly outside this jitted core because it may come from a
+        heavy VLA-backed policy path that is not jit-friendly.
+
+        ``next_log_pi`` and ``alpha`` are optional; when provided (residual SAC path)
+        the soft Bellman target includes the entropy bonus.
+        """
+        new_rng, rng = jax.random.split(self.rng)
+        critic_actions = self._residual_env_actions(batch["actions"])
+        discount = jnp.asarray(self.config["discount"], dtype=jnp.float32)
+
+        def loss_fn(grad_params):
+            loss, info = _critic_loss_vla_pure_math(
+                self.network, batch, next_actions, critic_actions, grad_params, discount,
+                next_log_pi=next_log_pi, alpha=alpha,
+            )
+            return loss, {f"critic/{k}": v for k, v in info.items()}
+
+        new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
+        self.target_update(new_network)
+        return self.replace(network=new_network, rng=new_rng), info
+
+    # ----- sac_residual --------------------------------------------------- #
+
+    def attach_sac_residual(self, sac_residual_agent):
+        """Attach a :class:`jax_agents.sac_residual.SACResidualAgent` sub-agent."""
+        return self.replace(sac_residual_agent=sac_residual_agent)
+
+    def _critic_obs_e_with_lang(self, obs_e, lang):
+        """Append ``lang`` to ``obs_e`` if present (matches ``_critic_obs_e``)."""
+        if lang is None:
+            return obs_e
+        return jnp.concatenate([obs_e, jnp.asarray(lang, dtype=jnp.float32)], axis=-1)
+
+    def _residual_obs_features(
+        self,
+        observations,
+        openpi_observation=None,
+        base_action=None,
+        precomputed_prefix_features=None,
+        residual_obs=None,
+    ):
+        """Feature source for the residual actor.
+
+        Returns DSRL's ``obs_encoder`` output (or a frozen Pi feature when
+        ``residual_use_pi_image_features=True``).  When ``residual_append_state=True``
+        the raw CARLA state vector (25-dim) is concatenated to the end, giving the
+        residual MLP explicit access to ego kinematics alongside the semantic VLM
+        features.  ``residual_obs`` carries the pre-fetched state at training time
+        (from ``batch["residual_obs"]``); at rollout it is read live from
+        ``steervla_actor.raw_obs_holder["obs"]["state"]``.
+        """
+        if not self._residual_uses_pi_image_features():
+            obs_e = self.network.select("obs_encoder")(observations)
+        else:
+            if self.steervla_actor is None:
+                raise RuntimeError("Pi residual features require an attached steervla_actor.")
+            if openpi_observation is None:
+                raw_obs = None
+                if getattr(self.steervla_actor, "raw_obs_holder", None) is not None:
+                    raw_obs = self.steervla_actor.raw_obs_holder.get("obs")
+                openpi_observation = self.steervla_actor.build_observation_batch_numpy(
+                    batch_size=observations.shape[0],
+                    raw=raw_obs,
+                )
+            source = self._residual_pi_feature_source()
+            if source == "prefix":
+                if precomputed_prefix_features is not None:
+                    obs_e = jnp.asarray(precomputed_prefix_features, dtype=jnp.float32)
+                else:
+                    obs_e = self.steervla_actor.encode_prefix_features(openpi_observation)
+            elif source == "suffix":
+                if base_action is None:
+                    raise RuntimeError("Pi suffix residual features require base_action.")
+                obs_e = self.steervla_actor.encode_suffix_features(openpi_observation, base_action)
+            else:
+                raise ValueError(
+                    f"Unsupported residual_pi_feature_source={source!r}; expected 'prefix' or 'suffix'."
+                )
+
+        if self._residual_append_base_action() and base_action is not None:
+            obs_e = jnp.concatenate([obs_e, jnp.asarray(base_action, dtype=jnp.float32)], axis=-1)
+
+        if self._residual_append_state():
+            if residual_obs is not None:
+                state = jnp.asarray(residual_obs, dtype=jnp.float32)
+            else:
+                state = self._get_live_state(int(observations.shape[0]))
+            obs_e = jnp.concatenate([obs_e, state], axis=-1)
+
+        return obs_e
+
+    def sample_actions_sac_residual(self, observations, seed=None, temperature=1.0, base_action=None):
+        """Rollout for SAC-residual / DAgger-residual: ``base + residual * scale``.
+
+        Returns ``(action, base_action)`` so the caller can store the base in
+        the replay buffer alongside the executed action.
+
+        ``base_action``: optional precomputed base (e.g. the 2-D PID-decoded
+        [accel, steer] in ``accel_steer`` mode, where the caller runs
+        ``vla_sample_fn`` + waypoint decode itself). When omitted, the raw
+        Pi0 waypoint chunk is sampled here.
+        """
+        if self.sac_residual_agent is None:
+            raise RuntimeError(
+                "sample_actions_sac_residual requires an attached sac_residual_agent."
+            )
+        seed = seed if seed is not None else self.rng
+        seed_b, seed_r = jax.random.split(seed)
+        if base_action is not None:
+            base_action = jnp.asarray(base_action, dtype=jnp.float32)
+        else:
+            if self.vla_sample_fn is None:
+                raise RuntimeError(
+                    "sample_actions_sac_residual requires a SteerVLA vla_sample_fn."
+                )
+            noise = jax.random.normal(seed_b, (observations.shape[0], self._flat_noise_dim()))
+            base_action = jnp.asarray(self.vla_sample_fn(observations, noise))
+            base_action = self._clip_actions_to_env(base_action)
+        # Get obs_e for the residual actor.  For policy_embed mode, use the fresh embedding
+        # stashed by vla_sample_fn so it matches what main_carla.py stores in the buffer.
+        # The state append (when residual_append_state=True) reads from raw_obs_holder, which
+        # is already pointing at the current step's obs (set by main_carla.py before this call).
+        if (
+            not self._residual_uses_pi_image_features()
+            and str(self.config.get("observation_mode", "state")) == "policy_embed"
+            and self.steervla_actor is not None
+        ):
+            embed = self.steervla_actor.ensure_policy_embedding(int(observations.shape[0]))
+            obs_e = jnp.asarray(embed, dtype=jnp.float32)
+            if self._residual_append_base_action():
+                obs_e = jnp.concatenate([obs_e, base_action], axis=-1)
+            if self._residual_append_state():
+                obs_e = jnp.concatenate([obs_e, self._get_live_state(int(observations.shape[0]))], axis=-1)
+        else:
+            obs_e = self._residual_obs_features(observations, base_action=base_action)
+        action, _residual = self.sac_residual_agent.sample_actions_residual(
+            obs_e,
+            base_action,
+            seed=seed_r,
+            temperature=temperature,
+        )
+        return action, base_action
+
+    def update_sac_residual(self, batch):
+        """SAC update with a residual actor on top of the frozen Pi0 base.
+
+        Steps:
+
+        1. Compute ``base_next = Pi0(s')`` eagerly (or use cached ``base_next_actions``).
+        2. Compute ``next_action = clip(base_next + residual(obs_e', base_next) * scale, -1, 1)``.
+        3. Update the DSRL critic with TD target bootstrapped from ``next_action``.
+        4. Update the residual MLP by maximizing ``Q(s, base_stored + residual(obs_e, base_stored) * scale)``.
+
+        Requires ``batch`` to contain ``base_actions`` — the base Pi0 action that
+        was used during rollout (stored separately by ``main_carla.py``).
+        """
+        new_rng, rng = jax.random.split(self.rng)
+        if self.sac_residual_agent is None:
+            return self.replace(rng=new_rng), {"sac_residual/skipped_no_subagent": 1.0}
+        if "base_actions" not in batch:
+            return self.replace(rng=new_rng), {"sac_residual/skipped_no_base_actions": 1.0}
+
+        # Only prepare VLA batch when Pi prefix features are needed or a live VLA
+        # forward is required for the bootstrap target.
+        _needs_vla_batch = (
+            self._critic_uses_pi_prefix_features()
+            or self._residual_uses_pi_prefix_features()
+            or "base_next_actions" not in batch
+        )
+        if _needs_vla_batch and self.steervla_actor is not None:
+            batch = self._prepare_vla_batch(batch)
+        batch = self._prepare_pi_prefix_feature_batch(batch)
+        if self._critic_uses_pi_prefix_features():
+            batch = self._prepare_critic_feature_batch(batch)
+
+        rng_base, rng_res = jax.random.split(rng)
+
+        # 1-2. Bootstrap action + log_prob for the critic TD target.
+        # Use pre-stored base_next_actions from the replay buffer when available (zero
+        # Pi0 overhead at training time); fall back to a live _vla_forward if not cached.
+        if "base_next_actions" in batch:
+            base_next = jax.lax.stop_gradient(
+                self._residual_env_actions(jnp.asarray(batch["base_next_actions"], dtype=jnp.float32))
+            )
+        else:
+            if self._residual_uses_accel_steer():
+                raise RuntimeError(
+                    "accel_steer residual mode requires base_next_actions in the replay "
+                    "buffer (the PID decode is rollout-side only)."
+                )
+            base_next = self._vla_forward(
+                batch["next_observations"], batch["next_openpi_observation"], rng_base,
+            )
+        next_obs_e_sg = jax.lax.stop_gradient(
+            self._residual_obs_features(
+                batch["next_observations"],
+                batch.get("next_openpi_observation"),
+                base_next,
+                precomputed_prefix_features=batch.get("pi_prefix_next_obs_e"),
+                residual_obs=batch.get("next_residual_obs"),
+            )
+        )
+        next_action, _, next_log_pi = self.sac_residual_agent.sample_actions_and_log_prob_residual(
+            next_obs_e_sg, base_next, seed=rng_res,
+        )
+        next_action = jax.lax.stop_gradient(self._residual_env_actions(next_action))
+        next_log_pi = jax.lax.stop_gradient(next_log_pi)
+        alpha = jnp.asarray(self.sac_residual_agent._alpha(), dtype=jnp.float32)
+
+        # 3. Critic update with soft Bellman target (subtracts entropy bonus).
+        new_self, critic_info = self._update_critic_only(batch, next_action, next_log_pi=next_log_pi, alpha=alpha)
+
+        # 4. Residual actor update: maximize Q(s, base + residual * scale).
+        base_action = new_self._residual_env_actions(
+            jnp.asarray(batch["base_actions"], dtype=jnp.float32)
+        )
+        obs_e_sg = jax.lax.stop_gradient(
+            new_self._residual_obs_features(
+                batch["observations"],
+                batch.get("openpi_observation"),
+                base_action,
+                precomputed_prefix_features=batch.get("pi_prefix_obs_e"),
+                residual_obs=batch.get("residual_obs"),
+            )
+        )
+        if "critic_obs_e" in batch:
+            critic_encoder_obs_e_sg = jax.lax.stop_gradient(
+                jnp.asarray(batch["critic_obs_e"], dtype=jnp.float32)
+            )
+        else:
+            critic_encoder_obs_e_sg = jax.lax.stop_gradient(
+                new_self.network.select("obs_encoder")(batch["observations"])
+            )
+        critic_obs_e_sg = new_self._critic_obs_e_with_lang(
+            critic_encoder_obs_e_sg, batch.get("language_label")
+        )
+        if "base_actions" in batch:
+            critic_obs_e_sg = jnp.concatenate(
+                [critic_obs_e_sg, jax.lax.stop_gradient(jnp.asarray(batch["base_actions"], dtype=jnp.float32))],
+                axis=-1,
+            )
+        new_residual, residual_info = new_self.sac_residual_agent.update_actor(
+            obs_e_sg=obs_e_sg,
+            base_action=base_action,
+            critic_obs_e_sg=critic_obs_e_sg,
+            dsrl_network=new_self.network,
+        )
+        new_self = new_self.replace(sac_residual_agent=new_residual, rng=new_rng)
+        return new_self, {
+            **critic_info,
+            **{f"sac_residual/{k}": v for k, v in residual_info.items()},
+        }
+
+    def update_dagger_residual(self, batch):
+        """DAgger update for the residual actor: MSE toward the expert.
+
+        No critic update — only MSE between ``base + residual * scale`` and the
+        expert action stored as ``batch["actions"]``. The base Pi0 action lives in
+        ``batch["base_actions"]``.
+
+        Config flag ``dagger_residual_train_obs_encoder`` (default False): when True,
+        the MSE loss also drives DSRL's ``obs_encoder`` so the image CNN learns
+        features useful for predicting the residual.
+        """
+        new_rng, _ = jax.random.split(self.rng)
+        if self.sac_residual_agent is None:
+            return self.replace(rng=new_rng), {"dagger_residual/skipped_no_subagent": 1.0}
+        if "base_actions" not in batch:
+            return self.replace(rng=new_rng), {"dagger_residual/skipped_no_base_actions": 1.0}
+
+        if self._residual_uses_pi_image_features():
+            if bool(self.config.get("dagger_residual_train_obs_encoder", False)):
+                raise ValueError(
+                    "dagger_residual_train_obs_encoder=True is incompatible with "
+                    "residual_use_pi_image_features=True."
+                )
+            if self.steervla_actor is not None:
+                batch = self._prepare_vla_batch(batch)
+
+        base_action = self._residual_env_actions(
+            jnp.asarray(batch["base_actions"], dtype=jnp.float32)
+        )
+        expert_action = self._residual_env_actions(
+            jnp.asarray(batch["actions"], dtype=jnp.float32)
+        )
+
+        if bool(self.config.get("dagger_residual_train_obs_encoder", False)):
+            from jax_agents.sac_residual import _joint_dagger_apply_step
+
+            scale = jnp.asarray(
+                self.sac_residual_agent._scale(), dtype=jnp.float32,
+            )
+            clip_bound = jnp.asarray(
+                float(self.sac_residual_agent._clip_bound()), dtype=jnp.float32,
+            )
+            new_dsrl_network, new_residual_network, info = _joint_dagger_apply_step(
+                self.network,
+                self.sac_residual_agent.network,
+                batch["observations"],
+                base_action,
+                expert_action,
+                scale,
+                clip_bound,
+            )
+            new_residual = self.sac_residual_agent.replace(network=new_residual_network)
+            new_self = self.replace(
+                network=new_dsrl_network,
+                sac_residual_agent=new_residual,
+                rng=new_rng,
+            )
+            return new_self, {f"dagger_residual/{k}": v for k, v in info.items()}
+
+        obs_e_sg = jax.lax.stop_gradient(
+            self._residual_obs_features(
+                batch["observations"],
+                batch.get("openpi_observation"),
+                base_action,
+                precomputed_prefix_features=batch.get("pi_prefix_obs_e"),
+                residual_obs=batch.get("residual_obs"),
+            )
+        )
+        new_residual, residual_info = self.sac_residual_agent.update_actor_dagger(
+            obs_e_sg=obs_e_sg,
+            base_action=base_action,
+            expert_action=expert_action,
+        )
+        new_self = self.replace(sac_residual_agent=new_residual, rng=new_rng)
+        return new_self, {f"dagger_residual/{k}": v for k, v in residual_info.items()}
+
     def update_with_vla(self, batch):
         """Flax update via :meth:`total_loss_vla` with eager VLA forwards and a jitted gradient core."""
         new_rng, rng = jax.random.split(self.rng)
@@ -851,6 +1298,13 @@ class DSRLAgent(flax.struct.PyTreeNode):
         else:
             env_action_dim = ex_actions.shape[-1]
             noise_action_dim = env_action_dim
+        if (
+            str(config.get("online_training_mode", "")) in ("sac_residual", "dagger_residual")
+            and str(config.get("residual_action_space", "waypoint_chunk")) == "accel_steer"
+        ):
+            # Residual acts on the 2-D PID-decoded [accel, steer]; the replay buffer
+            # and critic see 2-D actions, not the waypoint chunk.
+            env_action_dim = 2
         obs_encoder_def = CarlaObservationEncoder(
             observation_mode=obs_mode,
             impala_width=int(config.get("image_impala_width", 1)),
@@ -871,8 +1325,11 @@ class DSRLAgent(flax.struct.PyTreeNode):
         else:
             lang_dim = int(config.get("language_label_dim", 119))
         batch_shape = ex_observations.shape[:1]
+        base_action_critic_dim = (
+            env_action_dim if str(config.get("online_training_mode", "")) == "sac_residual" else 0
+        )
         ex_embedded = jnp.zeros(batch_shape + (embed_dim,), dtype=jnp.float32)
-        ex_critic_embedded = jnp.zeros(batch_shape + (embed_dim + lang_dim,), dtype=jnp.float32)
+        ex_critic_embedded = jnp.zeros(batch_shape + (embed_dim + lang_dim + base_action_critic_dim,), dtype=jnp.float32)
         ex_env_actions = jnp.zeros(batch_shape + (env_action_dim,), dtype=jnp.float32)
         ex_noise_actions = jnp.zeros(batch_shape + (noise_action_dim,), dtype=jnp.float32)
         ex_t = jnp.zeros(batch_shape + (1,), dtype=jnp.float32)
@@ -1001,7 +1458,40 @@ def get_config():
             # Online training regime.
             # "rl": standard DSRL online RL updates.
             # "dagger": collect on-policy states, store expert actions, and train with flow imitation only.
+            # "sac_residual": Pi0 frozen; small residual MLP trained via Q-gradient from DSRL critic.
+            # "dagger_residual": Pi0 frozen; small residual MLP supervised via MSE toward expert action.
             online_training_mode="rl",
+            # When True, critic and noise_critic consume frozen Pi prefix features
+            # instead of DSRL.obs_encoder features.
+            critic_use_pi_prefix_features=False,
+            # When True, the residual actor consumes a frozen Pi feature instead of
+            # DSRL's obs_encoder output.
+            residual_use_pi_image_features=False,
+            # "prefix": pooled frozen Pi prefix hidden states
+            # "suffix": pooled frozen Pi action-suffix hidden states
+            residual_pi_feature_source="prefix",
+            # When ``online_training_mode="dagger_residual"`` and True, the DAgger MSE
+            # gradient also updates DSRL's ``obs_encoder`` (image CNN).
+            dagger_residual_train_obs_encoder=False,
+            # Action space the residual acts on:
+            # "waypoint_chunk": flat Pi0 chunk (physical units; env PID-decodes it).
+            # "accel_steer":    2-D [accel, steer] in [-1, 1]; the waypoint chunk is
+            #                   PID-decoded in the rollout process BEFORE the residual
+            #                   (torch ``residual_sac.py`` / run_simlingo parity).
+            residual_action_space="waypoint_chunk",
+            # Env steps to run pure Pi0 (residual zeroed) before applying the residual MLP.
+            residual_warmup_steps=500,
+            # Residual actor hyperparameters.
+            residual_actor_hidden_dims=(256, 256),
+            residual_action_scale=0.3,
+            # Composed-action clip bound (None = no clip; required for physical
+            # DELTA_XY actions — see jax_agents/sac_residual.py docstring).
+            residual_action_clip=None,
+            residual_alpha=0.1,
+            residual_lr=3e-4,
+            residual_log_std_min=-5.0,
+            residual_log_std_max=2.0,
+            residual_layer_norm=False,
         )
     )
     return config

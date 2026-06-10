@@ -295,24 +295,28 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
         atexit.register(os.killpg, self.xvfb.pid, signal.SIGKILL)
         time.sleep(2)
 
-        # Build a minimal clean env for CARLA/UE4. When this process is launched
-        # via `conda run` + `uv run`, both inject LD_LIBRARY_PATH entries with
-        # incompatible libstdc++/libssl versions that crash the UE4 binary right
-        # after "Disabling core dumps.". Use only what UE4 actually needs.
+        # Minimal clean env for CARLA/UE4 binary. Full os.environ causes an early crash
+        # (before crash handler runs) when PYTHONPATH/VIRTUAL_ENV from the uv venv are
+        # present — CARLA's built-in Python interpreter picks them up and crashes.
         _sys_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         carla_env = {
             "HOME": os.environ.get("HOME", "/root"),
             "USER": os.environ.get("USER", "root"),
-            "LOGNAME": os.environ.get("LOGNAME", os.environ.get("USER", "root")),
-            "PATH": _sys_path,
+            "PATH": os.environ.get("PATH", _sys_path),
             "DISPLAY": f":{display_num}",
-            "LANG": os.environ.get("LANG", "C.UTF-8"),
+            "LANG": "en_US.UTF-8",
+            "TERM": "xterm",
         }
-        # Forward CUDA and GPU visibility vars.
-        for _k in ("CUDA_VISIBLE_DEVICES", "CUDA_HOME", "CUDA_ROOT",
-                   "XDG_RUNTIME_DIR", "TMPDIR", "TMP", "TEMP"):
+        for _k in ("CUDA_VISIBLE_DEVICES", "XDG_DATA_DIRS",
+                   "DBUS_SESSION_BUS_ADDRESS", "XAUTHORITY", "WAYLAND_DISPLAY"):
             if _k in os.environ:
                 carla_env[_k] = os.environ[_k]
+        # Force NVIDIA-only Vulkan ICD so -graphicsadapter=N maps to the correct GPU.
+        _nvidia_icd = "/etc/vulkan/icd.d/nvidia_icd.json"
+        carla_env["VK_ICD_FILENAMES"] = os.environ.get("VK_ICD_FILENAMES", _nvidia_icd)
+        # CARLA 0.9.16+ requires XDG_RUNTIME_DIR.
+        _xdg = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        carla_env["XDG_RUNTIME_DIR"] = _xdg if os.path.isdir(_xdg) else "/tmp"
 
         cmd = [
             os.path.join(self.carla_path, "CarlaUE4.sh"),
@@ -991,7 +995,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         # Force NVIDIA-only Vulkan ICD so -graphicsadapter=N maps to physical GPU N.
         # Without this, llvmpipe and other ICDs shift the Vulkan device indices, causing
         # UE4's render thread to select the wrong GPU or fail to initialize.
-        _NVIDIA_VK_ICD = "/usr/share/vulkan/icd.d/nvidia_icd.json"
+        _NVIDIA_VK_ICD = "/etc/vulkan/icd.d/nvidia_icd.json"
         prev_vk_icd = os.environ.get("VK_ICD_FILENAMES")
         os.environ["VK_ICD_FILENAMES"] = _NVIDIA_VK_ICD
         self._evaluator = IsolatedLeaderboardEvaluator(self._args, statistics_manager)

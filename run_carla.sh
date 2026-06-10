@@ -4,7 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-ROUTE="parking-cut-in-001"
+export CARLA_ROOT="${CARLA_ROOT:-/home/celinet/carla-0-9-16}"
+CARLA_ROOT="${CARLA_ROOT%/}"  # strip trailing slash
+if [[ ! -d "$CARLA_ROOT" ]]; then
+  CARLA_ROOT="/home/celinet/carla-0-9-16"
+fi
+
+ROUTE="3936"
 ONLINE_STEPS="50000"
 SEED="0"
 RUN_GROUP="Debug"
@@ -13,19 +19,19 @@ EXPERT_DEBUG="false"
 EXPERT_RECOVER_DEBUG="false"
 WANDB_MODE="${WANDB_MODE:-online}"
 
-TRAIN_GPU_RANK="2"
-SIM_GPU_RANK="3"
+TRAIN_GPU_RANK="1"
+SIM_GPU_RANK="1"
 RENDER_ADAPTER=""
 CARLA_HOST="localhost"
-CARLA_PORT="2020"
-CARLA_STREAMING_2PORT="0"
-TM_PORT="8020"
+CARLA_PORT=""
+CARLA_STREAMING_PORT=""
+TM_PORT=""
 X_DISPLAY_NUM=""
 
-CRITIC_MODE="delta"
-TRAIN_MODE="dagger"
+CRITIC_MODE="none"
+TRAIN_MODE="sac_residual"
 
-BASE_AGENT_CFG="impls/configs/steervla_dsrl_config.py"
+BASE_AGENT_CFG="impls/configs/pi0_residual_sac_config.py"
 BASE_CARLA_CFG="impls/configs/carla_config.yaml"
 
 EXTRA_ARGS=()
@@ -50,9 +56,9 @@ Options:
   --render-adapter N        CARLA -graphicsadapter value. Default: 3
 
   --carla-host HOST         CARLA host. Default: localhost
-  --carla-port PORT         CARLA RPC port. Default: 2020
-  --carla-streaming-port P  CARLA streaming port. Default: auto (0)
-  --tm-port PORT            Traffic manager port. Default: 8020
+  --carla-port PORT         CARLA RPC port. Default: 2000 + sim-gpu*20
+  --carla-streaming-port P  CARLA streaming port. Default: 0 (auto)
+  --tm-port PORT            Traffic manager port. Default: 8000 + sim-gpu*20
   --x-display-num N         Xvfb display number. Default: derived from carla port
 
   --critic-mode MODE        one of:
@@ -62,17 +68,23 @@ Options:
                               expert-lang  -> language on expert action
                             Default: delta
 
-  --train-mode MODE         rl|dagger. Default: rl
+  --train-mode MODE         rl|dagger|sac_residual|dagger_residual. Default: sac_residual
 
-  --agent-config PATH       Base agent config. Default: impls/configs/steervla_dsrl_config.py
+  --agent-config PATH       Base agent config. Default: impls/configs/pi0_residual_sac_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
   -h, --help                Show this help
 
 Examples:
-  bash run_carla.sh --critic-mode delta-lang --train-gpu 0 --sim-gpu 4
-  bash run_carla.sh --route parking-cut-in-001 --carla-port 2002 --carla-streaming-port 2003 --tm-port 8002 --x-display-num 12
-  bash run_carla.sh --critic-mode none --expert-debug true --save-buffer false
-  bash run_carla.sh --train-mode dagger --critic-mode delta-lang
+  # Pi0 residual SAC (default) on GPU 0/1:
+  bash run_carla.sh --route parking-cut-in-001 --train-gpu 0 --sim-gpu 1
+  # DAgger residual (supervised):
+  bash run_carla.sh --train-mode dagger_residual --critic-mode delta
+  # Standard DSRL RL:
+  bash run_carla.sh --train-mode rl --agent-config impls/configs/steervla_dsrl_config.py
+  # Expert debug (no RL):
+  bash run_carla.sh --expert-debug true --save-buffer false
+  # Second instance on different ports:
+  bash run_carla.sh --carla-port 2002 --carla-streaming-port 2003 --tm-port 8002 --x-display-num 12
 EOF
 }
 
@@ -121,13 +133,33 @@ case "$CRITIC_MODE" in
 esac
 
 case "$TRAIN_MODE" in
-  rl|dagger) ;;
+  rl|dagger|sac_residual|dagger_residual) ;;
   *)
     echo "Invalid --train-mode: $TRAIN_MODE" >&2
-    echo "Expected one of: rl, dagger" >&2
+    echo "Expected one of: rl, dagger, sac_residual, dagger_residual" >&2
     exit 2
     ;;
 esac
+
+# Always use CARLA 0.9.15 server + .venv-carla-0915 subprocess for the env.
+# This avoids CARLA 0.9.16 segfaults on Town12/Town13 and wire-protocol mismatch.
+# The main JAX training process stays on Python 3.11 (.venv); only the CARLA env
+# subprocess uses Python 3.10 (.venv-carla-0915) with carla 0.9.15.
+_CARLA_0915="/home/celinet/VLA_driving/software"
+_CARLA_0915_PYTHON="${ROOT_DIR}/.venv-carla-0915/bin/python"
+
+if [[ -d "$_CARLA_0915" ]]; then
+  export CARLA_ROOT="$_CARLA_0915"
+  if [[ -x "$_CARLA_0915_PYTHON" ]]; then
+    export CARLA_ENV_SUBPROCESS_PYTHON="$_CARLA_0915_PYTHON"
+  else
+    echo "[run_carla.sh] ERROR: .venv-carla-0915 not found at $_CARLA_0915_PYTHON; run setup first." >&2
+    exit 1
+  fi
+else
+  echo "[run_carla.sh] ERROR: CARLA 0.9.15 not found at $_CARLA_0915." >&2
+  exit 1
+fi
 
 TMP_ROOT="$ROOT_DIR/.run_carla"
 mkdir -p "$TMP_ROOT"
@@ -140,12 +172,19 @@ CARLA_CFG_TMP="$TMP_DIR/carla_config.yaml"
 BASE_AGENT_CFG_ABS="$(cd "$(dirname "$BASE_AGENT_CFG")" && pwd)/$(basename "$BASE_AGENT_CFG")"
 BASE_CARLA_CFG_ABS="$(cd "$(dirname "$BASE_CARLA_CFG")" && pwd)/$(basename "$BASE_CARLA_CFG")"
 
-if [[ -z "$X_DISPLAY_NUM" ]]; then
-  X_DISPLAY_NUM="$((10 + (CARLA_PORT % 90)))"
-fi
-
 if [[ -n "$RENDER_ADAPTER" ]]; then
   SIM_GPU_RANK="$RENDER_ADAPTER"
+fi
+
+# Derive ports from SIM_GPU_RANK when not explicitly set (offset = gpu * 20)
+_GPU_OFFSET=$((SIM_GPU_RANK * 20))
+CARLA_PORT="${CARLA_PORT:-$((2000 + _GPU_OFFSET))}"
+TM_PORT="${TM_PORT:-$((8000 + _GPU_OFFSET))}"
+CARLA_STREAMING_PORT="${CARLA_STREAMING_PORT:-0}"
+
+# Derive X display from CARLA_PORT (must be after port derivation)
+if [[ -z "$X_DISPLAY_NUM" ]]; then
+  X_DISPLAY_NUM="$((10 + (CARLA_PORT % 90)))"
 fi
 
 cat > "$AGENT_CFG_TMP" <<EOF
@@ -191,6 +230,7 @@ echo "[run_carla.sh] expert_debug=${EXPERT_DEBUG} expert_recover_debug=${EXPERT_
 echo "[run_carla.sh] temp agent config: ${AGENT_CFG_TMP}"
 echo "[run_carla.sh] temp carla config: ${CARLA_CFG_TMP}"
 
+PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla:${ROOT_DIR}/simlingo-rebuttal${PYTHONPATH:+:$PYTHONPATH}" \
 WANDB_MODE="${WANDB_MODE}" uv run python impls/main_carla.py \
   --agent="${AGENT_CFG_TMP}" \
   --carla_config="${CARLA_CFG_TMP}" \

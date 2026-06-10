@@ -82,6 +82,65 @@ def _pool_prefix_hidden(prefix_out: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarr
     return summed / denom
 
 
+def _frozen_prefix_embed_forward(model, observation):
+    """Pooled frozen-prefix embedding (jit target; bound to ``model`` via ``module_jit``).
+
+    Same prefix construction as ``SteerVLAActor._build_frozen_prefix_cache`` but
+    returns only the pooled embedding — the per-step policy_embed path doesn't
+    need the KV cache, and running this eagerly costs ~5 s/step on an A100
+    versus ~tens of ms jitted.
+    """
+    observation = _openpi_model.preprocess_observation(
+        None,
+        observation,
+        train=False,
+        image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+    )
+
+    img_tokens, img_masks, img_ar = model._embed_images(observation)
+    n_img = sum(t.shape[1] for t in img_tokens)
+
+    prompt_emb = model._embed_text_tokens(observation.tokenized_prompt)
+    prompt_mask = observation.tokenized_prompt_mask
+    n_prompt = prompt_emb.shape[1]
+
+    reasoning_emb = model._embed_text_tokens(observation.tokenized_reasoning)
+    reasoning_mask = observation.tokenized_reasoning_mask
+    n_reasoning = reasoning_emb.shape[1]
+
+    subtask_emb = model._embed_text_tokens(observation.tokenized_subtask)
+    subtask_mask = observation.tokenized_subtask_mask
+    n_subtask = subtask_emb.shape[1]
+
+    prefix_parts = img_tokens + [prompt_emb, reasoning_emb, subtask_emb]
+    prefix_mask_parts = img_masks + [prompt_mask, reasoning_mask, subtask_mask]
+    prefix_ar_list = img_ar + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask
+    if getattr(model, "_use_fast_tokens", False) and observation.tokenized_fast is not None:
+        fast_emb = model._embed_text_tokens(observation.tokenized_fast)
+        prefix_parts.append(fast_emb)
+        prefix_mask_parts.append(observation.tokenized_fast_mask)
+        prefix_ar_list += [True] * int(fast_emb.shape[1])
+
+    prefix_tokens = jnp.concatenate(prefix_parts, axis=1)
+    prefix_mask = jnp.concatenate(prefix_mask_parts, axis=1)
+    prefix_ar = jnp.array(prefix_ar_list)
+
+    prefix_attn_mask = _openpi_pi0.make_attn_mask(prefix_mask, prefix_ar)
+    positions = jnp.cumsum(prefix_mask, axis=1) - 1
+    (prefix_out, _), _kv_cache = model.PaliGemma.llm(
+        [prefix_tokens, None],
+        mask=prefix_attn_mask,
+        positions=positions,
+    )
+
+    reasoning_start = n_img + n_prompt
+    reasoning_end = reasoning_start + n_reasoning
+    prefix_len = prefix_mask.shape[1]
+    col_is_reasoning = (jnp.arange(prefix_len) >= reasoning_start) & (jnp.arange(prefix_len) < reasoning_end)
+    prefix_mask_no_reasoning = prefix_mask & ~col_is_reasoning[None, :]
+    return jax.lax.stop_gradient(_pool_prefix_hidden(prefix_out, prefix_mask_no_reasoning))
+
+
 def restore_openpi_params_on_single_gpu(
     params_dir: Path | str,
     *,
@@ -721,7 +780,14 @@ class SteerVLAActor:
                 "image_keys",
             ),
         )
-        
+        import types as _types
+
+        # Jitted pooled-prefix embedding for the per-step policy_embed path; the
+        # eager _build_frozen_prefix_cache costs ~5 s/step (see _frozen_prefix_embed_forward).
+        self._prefix_embed_fn = nnx_utils.module_jit(
+            _types.MethodType(_frozen_prefix_embed_forward, self.model)
+        )
+
         self._local_ready = True
 
     def _state_for_transform(self, state: np.ndarray | jax.Array) -> np.ndarray:
@@ -1089,7 +1155,7 @@ class SteerVLAActor:
             if isinstance(stash_raw, dict):
                 self._stash_cot_in_raw(stash_raw, cot_out)
         obs_full = _merge_cot_output_into_observation(obs_jax, cot_out)
-        _, _, _, _, prefix_embed = self._build_frozen_prefix_cache(self.model, obs_full)
+        prefix_embed = self._prefix_embed_fn(obs_full)
         embed_np = self._stash_policy_embedding(prefix_embed, raw=raw)
         self._cached_policy_embed_obs_id = obs_id
         return embed_np
@@ -1250,10 +1316,13 @@ class SteerVLAActor:
         )
         noise_jax = jax.device_put(noise_jax, self._jax_device)
         rng_cot, rng_act = jax.random.split(rng)
-        
+
         # Either sample or reuse the CoT
+        _cot_t0 = time.time()
         cot_out = self._sample_or_reuse_cot(rng_cot, obs_jax, batch_size)
-        
+        jax.block_until_ready(cot_out["tokenized_reasoning"])
+        print(f"[DEBUG - steervla] CoT time: {time.time() - _cot_t0:.3f} seconds")
+
         reason_tokens = cot_out["tokenized_reasoning"]
         reason_mask = cot_out["tokenized_reasoning_mask"]
         reason_valid = reason_tokens[reason_mask.astype(bool)]
@@ -1283,10 +1352,13 @@ class SteerVLAActor:
 
         obs_id = id(raw) if raw is not None else id(self.raw_obs_holder.get("obs") if self.raw_obs_holder else None)
         if self._cached_policy_embed is None or self._cached_policy_embed_obs_id != obs_id:
-            _, _, _, _, prefix_embed = self._build_frozen_prefix_cache(self.model, obs_full)
+            _prefix_t0 = time.time()
+            prefix_embed = self._prefix_embed_fn(obs_full)
+            jax.block_until_ready(prefix_embed)
             self._stash_policy_embedding(prefix_embed, raw=raw)
             self._cached_policy_embed_obs_id = obs_id
-        
+            print(f"[DEBUG - steervla] Prefix embed time: {time.time() - _prefix_t0:.3f} seconds")
+
         # Prepare noise for inference
         batch_size = obs_jax.state.shape[0]
         model_ah = int(self.model.action_horizon)

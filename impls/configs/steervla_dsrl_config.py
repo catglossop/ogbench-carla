@@ -112,7 +112,7 @@ def get_config():
             # Local OpenPI inference (ignored when actor_url is set):
             actor_config="pi05_steervla_cot_simplified_reasoning",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
-            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260521_021239/18000",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning_20260512_144250/50000",
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,

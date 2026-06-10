@@ -26,6 +26,11 @@ def critic_language_dim(agent_config: Any) -> int:
 
 def resolve_critic_feedback_mode(agent_config: Any) -> str:
     """Map ``language_feedback`` config (or legacy ``critic_feedback_mode``) to a mode string."""
+    # Explicit "none" via critic_feedback_mode always wins over language_feedback settings,
+    # so that run_carla.sh --critic-mode none can fully disable language labels.
+    cfm = agent_config.get("critic_feedback_mode")
+    if cfm is not None and str(cfm).strip().lower() == "none":
+        return "none"
     lang_fb = agent_config.get("language_feedback")
     if lang_fb is not None:
         src = str(lang_fb.get("source", "expert")).strip().lower()

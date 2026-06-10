@@ -36,9 +36,11 @@ remains free for CARLA's ``PythonAPI/carla/agents`` (navigation, etc.).
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import random
+import subprocess
 import sys
 import time
 import traceback
@@ -49,6 +51,7 @@ import numpy as np
 import jax
 
 from jax_agents import agents
+from jax_agents.sac_residual import SACResidualAgent
 from utils.flax_utils import restore_agent
 from coaches.expert_label import NUM_COMMENTARY_WORDS, NUM_DELTA_COMMENTARY_WORDS
 from coaches.critic_feedback import (
@@ -104,7 +107,7 @@ flags.DEFINE_bool(
 )
 
 # flags.DEFINE_string("save_dir", "/raid/users/celine/carla_exps", "Save directory.")
-flags.DEFINE_string("save_dir", "/home/carla/exps", "Save directory.")
+flags.DEFINE_string("save_dir", "/home/celinet/carla_exps", "Save directory.")
 flags.DEFINE_string("restore_path", None, "Restore path for JAX agents.")
 flags.DEFINE_integer("restore_epoch", None, "Restore epoch.")
 
@@ -175,17 +178,29 @@ def _configure_jax_training_device(training_gpu_rank: int) -> None:
     )
 
 
-def _extract_agent_obs(env, env_obs: dict, mode: str) -> np.ndarray:
+def _extract_agent_obs(env, env_obs: dict, mode: str, *, policy_embed_dim: int = 0) -> np.ndarray:
     """Pick the tensor the RL agent trains on (env always exposes both keys).
 
     The language label (BOW or delta) is stored separately in the replay buffer
     and concatenated to the encoded observation ONLY inside the critic (dsrl.py).
+
+    For ``policy_embed`` mode the obs dict carries a ``policy_embedding`` key that
+    is stashed by SteerVLAActor after each VLA inference call.  On the first call
+    (before the VLA has run once) there is no embedding yet, so we return a zero
+    placeholder of the declared ``policy_embed_dim``.  The training loop backfills
+    ``next_observations`` in the replay buffer once the embedding is available
+    (same scheme as ``base_next_actions``).
     """
     if mode == "state":
         return np.asarray(env_obs["state"], dtype=np.float32)
     if mode == "image":
         return np.asarray(env_obs["image"], dtype=np.uint8)
-    raise ValueError(f"Unknown observation_mode {mode!r}; expected 'state' or 'image'.")
+    if mode == "policy_embed":
+        embed = env_obs.get("policy_embedding") if isinstance(env_obs, dict) else None
+        if embed is not None:
+            return np.asarray(embed, dtype=np.float32)
+        return np.zeros(max(policy_embed_dim, 1), dtype=np.float32)
+    raise ValueError(f"Unknown observation_mode {mode!r}; expected 'state', 'image', or 'policy_embed'.")
 
 
 # Check if valid task environment
@@ -227,9 +242,155 @@ def _steervla_action_execution_cfg(steervla_cfg) -> dict[str, Any] | None:
         "output_action_format": fmt,
         "action_horizon": ah,
         "action_dim": ad,
-        # Remote HTTP policy applies ``Unnormalize`` (dataset units); local JAX returns raw flow outputs.
-        "action_input_space": "policy_output" if remote else "normalized",
+        # SteerVLA actor applies OpenPI Unnormalize + fixed denormalize_actions before returning actions.
+        "action_input_space": "policy_output",
     }
+
+
+class CarlaEnvSubprocess:
+    """Runs carla_env_server.py in a subprocess (Python 3.10 + carla 0.9.15).
+
+    Communicates over JSON stdin/stdout so main_carla.py (Python 3.11 + JAX)
+    never loads the carla 0.9.15 shared library directly.  Set the env var
+    ``CARLA_ENV_SUBPROCESS_PYTHON`` to the Python executable to use, e.g.
+    ``/home/celinet/ogbench-carla/.venv-carla-0915/bin/python``.
+    """
+
+    _REPO_ROOT = Path(__file__).resolve().parent.parent
+    _SERVER_SCRIPT = str(_REPO_ROOT / "impls" / "carla_env_server.py")
+
+    def __init__(
+        self,
+        carla_config_path: Optional[str],
+        route: str,
+        python_exe: str,
+        extra_carla_config: Optional[dict] = None,
+    ):
+        self._python_exe = python_exe
+        self._carla_config_path = carla_config_path
+        self._route = route
+        self._extra_carla_config = extra_carla_config or {}
+        self._proc = None
+        self.action_space: Any = None
+
+    def setup(self):
+        rebuttal = str(self._REPO_ROOT / "simlingo-rebuttal")
+        carla_root = os.environ.get("CARLA_ROOT", "/home/celinet/VLA_driving/software")
+        # Bench2Drive leaderboard must come BEFORE simlingo-rebuttal/leaderboard.
+        # PYTHONPATH is prepended to sys.path; carla_env_server.py uses sys.path.insert(0)
+        # but skips paths already in sys.path, so PYTHONPATH order is authoritative.
+        pythonpath_parts = [
+            f"{rebuttal}/Bench2Drive/leaderboard/leaderboard",
+            f"{rebuttal}/Bench2Drive/leaderboard",
+            f"{rebuttal}/Bench2Drive/scenario_runner",
+            str(self._REPO_ROOT),
+            str(self._REPO_ROOT / "impls"),
+            rebuttal,
+            f"{rebuttal}/leaderboard/leaderboard",
+            f"{rebuttal}/leaderboard",
+            f"{rebuttal}/scenario_runner",
+            f"{carla_root}/PythonAPI/carla",
+        ]
+        env = os.environ.copy()
+        existing = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = ":".join(pythonpath_parts) + (":" + existing if existing else "")
+        env["CARLA_ROOT"] = carla_root
+        env.setdefault("WORK_DIR", rebuttal)
+        env["SCENARIO_RUNNER_ROOT"] = f"{rebuttal}/Bench2Drive/scenario_runner"
+
+        cmd = [self._python_exe, self._SERVER_SCRIPT, f"--route={self._route}"]
+        # Keep the agent from carla_config.yaml (observation_only) — it registers the
+        # rgb_front camera that SteerVLA policy images are decoded from.  The server's
+        # default ("simlingo") registers only rgb_simlingo, leaving obs["image"] all zeros.
+        cmd.append("--leaderboard_agent=config")
+        if self._carla_config_path:
+            cmd.append(f"--carla_config={self._carla_config_path}")
+        if self._extra_carla_config:
+            cmd.append(f"--extra_config_json={json.dumps(self._extra_carla_config)}")
+
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            env=env,
+            text=True,
+            bufsize=1,
+        )
+        startup_line = self._proc.stdout.readline()
+        startup = json.loads(startup_line)
+        assert startup.get("ready"), f"Unexpected startup: {startup}"
+        shape = tuple(startup["action_space_shape"])
+        lo = float(startup.get("action_space_low", -1.0))
+        hi = float(startup.get("action_space_high", 1.0))
+        import gymnasium as _gym
+        self.action_space = _gym.spaces.Box(
+            low=lo, high=hi, shape=shape, dtype=np.float32
+        )
+
+    @staticmethod
+    def _decode_obs(wire: dict) -> dict:
+        def _img(key: str) -> np.ndarray | None:
+            b64 = wire.get(f"{key}_b64")
+            if b64 is None:
+                return None
+            return np.frombuffer(base64.b64decode(b64), dtype=np.uint8).reshape(wire[f"{key}_shape"])
+
+        image = _img("image")
+        viz = _img("viz_image")
+        simlingo = _img("simlingo_image")
+        if viz is None:
+            viz = simlingo if simlingo is not None else image
+        ea = wire.get("expert_action")
+        return {
+            "state": np.array(wire["state"], dtype=np.float32),
+            "image": image,
+            "image_viz": viz,  # native rgb_front (or simlingo camera) for rollout video logging
+            "simlingo_image": simlingo,
+            "routing_command": wire["routing_command"],
+            "target_points": np.array(wire["target_points"], dtype=np.float32),
+            "expert_action": np.array(ea, dtype=np.float32) if ea is not None else None,
+        }
+
+    def _read_obs_msg(self):
+        line = self._proc.stdout.readline()
+        return json.loads(line)
+
+    def reset(self, seed=None):
+        if self._proc is None:
+            raise RuntimeError("Call setup() before reset().")
+        self._proc.stdin.write(json.dumps({"reset": True}) + "\n")
+        self._proc.stdin.flush()
+        msg = self._read_obs_msg()
+        return self._decode_obs(msg["obs"]), msg.get("info", {})
+
+    def step(self, action):
+        self._proc.stdin.write(json.dumps({"action": action.tolist()}) + "\n")
+        self._proc.stdin.flush()
+        msg = self._read_obs_msg()
+        return self._decode_obs(msg["obs"]), msg["reward"], msg["terminated"], msg["truncated"], msg["info"]
+
+    def step_expert(self, obs_raw=None):
+        self._proc.stdin.write(json.dumps({"expert_step": True}) + "\n")
+        self._proc.stdin.flush()
+        msg = self._read_obs_msg()
+        return self._decode_obs(msg["obs"]), msg["reward"], msg["terminated"], msg["truncated"], msg["info"]
+
+    def reinit_expert(self):
+        if self._proc is None:
+            return
+        self._proc.stdin.write(json.dumps({"reinit_expert": True}) + "\n")
+        self._proc.stdin.flush()
+        self._proc.stdout.readline()  # consume ack
+
+    def close(self):
+        if self._proc is not None:
+            try:
+                self._proc.stdin.write(json.dumps({"shutdown": True}) + "\n")
+                self._proc.stdin.flush()
+                self._proc.wait(timeout=10)
+            except Exception:
+                self._proc.kill()
+            self._proc = None
 
 
 def _make_carla_env(
@@ -238,6 +399,25 @@ def _make_carla_env(
     *,
     extra_carla_config: Optional[dict[str, Any]] = None,
 ):
+    subprocess_python = os.environ.get("CARLA_ENV_SUBPROCESS_PYTHON", "").strip()
+    if subprocess_python:
+        if not Path(subprocess_python).exists():
+            raise FileNotFoundError(
+                f"CARLA_ENV_SUBPROCESS_PYTHON={subprocess_python!r} not found."
+            )
+        if route is None:
+            raise ValueError("--route is required when using CARLA_ENV_SUBPROCESS_PYTHON.")
+        print(
+            f"[main_carla] Using carla_env_server subprocess: {subprocess_python}",
+            flush=True,
+        )
+        env = CarlaEnvSubprocess(
+            carla_config_path, route, subprocess_python,
+            extra_carla_config=extra_carla_config,
+        )
+        env.setup()
+        return env
+
     from ogbench.carla.carla_utils import CarlaBench2DriveWrapper, load_carla_config
 
     cfg = load_carla_config(carla_config_path)
@@ -304,11 +484,20 @@ def run_online_carla(
 ) -> None:
 
     obs_mode = str(agent_config.get("observation_mode", "state"))
+    _policy_embed_dim = int(agent_config.get("policy_embed_dim", 0)) if obs_mode == "policy_embed" else 0
 
     capacity = int(agent_config.get("buffer_capacity", 5_000))
     warmup = int(agent_config.get("warmup_steps", 1000))
     updates_per_step = int(agent_config.get("updates_per_step", 1))
     batch_size = int(agent_config.get("batch_size", 256))
+    _online_training_mode = str(agent_config.get("online_training_mode", "rl")).strip().lower()
+    _residual_warmup = int(agent_config.get("residual_warmup_steps", 0))
+    _residual_append_state = bool(agent_config.get("residual_append_state", False))
+    _residual_obs_dim = int(agent_config.get("residual_obs_dim", 25))
+    # Welford online stats for residual obs normalization (updated during residual warmup).
+    _res_norm_count = 0
+    _res_norm_mean = np.zeros(_residual_obs_dim, dtype=np.float64)
+    _res_norm_M2 = np.zeros(_residual_obs_dim, dtype=np.float64)
 
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, "train.csv"))
     if warmup > 0 and agent is not None and not FLAGS.expert_debug:
@@ -368,17 +557,56 @@ def run_online_carla(
     if raw_obs_holder is not None:
         raw_obs_holder["obs"] = obs_raw
         raw_obs_holder["next_obs"] = obs_raw
-    obs = _extract_agent_obs(env, obs_raw, obs_mode)
-    log_images = obs_mode == "image"
+    obs = _extract_agent_obs(env, obs_raw, obs_mode, policy_embed_dim=_policy_embed_dim)
+    log_images = True
 
     _critic_feedback_mode = str(agent_config.get("critic_feedback_mode", "commentary_bow"))
-    _online_training_mode = str(agent_config.get("online_training_mode", "rl")).strip().lower()
     _lang_dim = critic_language_dim(agent_config)
 
     steervla_cfg = agent_config.get("steervla") or {}
+    _steervla_exec_cfg = _steervla_action_execution_cfg(steervla_cfg)
     env_ah = int(steervla_cfg.get("action_horizon", agent_config.get("vla_action_horizon", 10)))
     env_ad = int(steervla_cfg.get("action_dim", agent_config.get("vla_action_dim", 4)))
     action_dim = env_ah * env_ad
+
+    # accel_steer residual mode: PID-decode the Pi0 waypoint chunk to a 2-D
+    # [accel, steer] in [-1, 1] BEFORE the residual (torch residual_sac parity).
+    # The replay buffer / critic see 2-D actions; the env executes them via the
+    # legacy _action_to_control path.
+    _residual_2d = (
+        _online_training_mode in {"sac_residual", "dagger_residual"}
+        and str(agent_config.get("residual_action_space", "waypoint_chunk")).strip().lower() == "accel_steer"
+    )
+    if _residual_2d:
+        if _steervla_exec_cfg is None:
+            raise ValueError(
+                "residual_action_space='accel_steer' requires the SteerVLA action "
+                "execution config (waypoint chunk layout) to PID-decode base actions."
+            )
+        action_dim = 2
+
+    def _make_accel_steer_decoder():
+        from ogbench.carla.steervla_simlingo_control import SimlingoStyleWaypointDecoder
+
+        return SimlingoStyleWaypointDecoder()
+
+    _accel_steer_decoder = _make_accel_steer_decoder() if _residual_2d else None
+    _expert_accel_steer_decoder = (
+        _make_accel_steer_decoder()
+        if (_residual_2d and _online_training_mode == "dagger_residual")
+        else None
+    )
+
+    def _decode_chunk_to_accel_steer(decoder, chunk_flat: np.ndarray, state_vec) -> np.ndarray:
+        return decoder.flat_action_to_accel_steer(
+            np.asarray(chunk_flat, dtype=np.float32).reshape(-1),
+            state_vec=np.asarray(state_vec, dtype=np.float32),
+            output_action_format=str(_steervla_exec_cfg["output_action_format"]),
+            action_horizon=int(_steervla_exec_cfg["action_horizon"]),
+            action_dim=int(_steervla_exec_cfg["action_dim"]),
+            action_input_space=str(_steervla_exec_cfg.get("action_input_space", "policy_output")),
+        )
+
     example_transition = dict(
         observations=np.array(obs),
         actions=np.zeros((action_dim,), dtype=np.float32),
@@ -389,13 +617,41 @@ def run_online_carla(
         language_label=np.zeros(_lang_dim, dtype=np.float32),
         next_language_label=np.zeros(_lang_dim, dtype=np.float32),
     )
+    if _online_training_mode in {"sac_residual", "dagger_residual"}:
+        example_transition["base_actions"] = np.zeros((action_dim,), dtype=np.float32)
+    if _online_training_mode == "sac_residual":
+        example_transition["base_next_actions"] = np.zeros((action_dim,), dtype=np.float32)
+    if _residual_append_state and _online_training_mode in {"sac_residual", "dagger_residual"}:
+        example_transition["residual_obs"] = np.zeros((_residual_obs_dim,), dtype=np.float32)
+        example_transition["next_residual_obs"] = np.zeros((_residual_obs_dim,), dtype=np.float32)
     if steervla_actor is not None:
         openpi0 = _openpi_fields_from_raw(obs_raw)
         example_transition.update(openpi0)
         example_transition.update({f"next_{k}": np.array(v) for k, v in openpi0.items()})
-        
+    _uses_pi_prefix: bool = (
+        steervla_actor is not None
+        and (
+            (
+                bool(agent_config.get("residual_use_pi_image_features", False))
+                and str(agent_config.get("residual_pi_feature_source", "prefix")).strip().lower() == "prefix"
+            )
+            or bool(agent_config.get("critic_use_pi_prefix_features", False))
+        )
+    )
+    if _uses_pi_prefix:
+        _ex_openpi_obs = steervla_actor.build_observation_batch_numpy(batch_size=1, raw=obs_raw)
+        _pi_prefix_dim = int(steervla_actor.encode_prefix_features(_ex_openpi_obs).shape[-1])
+        example_transition["pi_prefix_obs_e"] = np.zeros((_pi_prefix_dim,), dtype=np.float32)
+        example_transition["pi_prefix_next_obs_e"] = np.zeros((_pi_prefix_dim,), dtype=np.float32)
+
     # Create replay buffer
     buffer = ReplayBuffer.create(example_transition, size=capacity)
+
+    def _compute_pi_prefix_e(raw_obs: dict) -> np.ndarray:
+        openpi_obs = steervla_actor.build_observation_batch_numpy(batch_size=1, raw=raw_obs)
+        return np.asarray(steervla_actor.encode_prefix_features(openpi_obs)[0], dtype=np.float32)
+
+    _pi_prefix_e: np.ndarray | None = _compute_pi_prefix_e(obs_raw) if _uses_pi_prefix else None
     
     rng = jax.random.PRNGKey(FLAGS.seed + 1)
     episode_return, episode_steps, episode_count = 0.0, 0, 0
@@ -407,6 +663,7 @@ def run_online_carla(
     episode_video_frames: list[np.ndarray] = []
     last_video_reward: float = 0.0
     last_video_critic_text: str = ""
+    last_policy_action: np.ndarray | None = None
 
     def _as_video_frame(image: np.ndarray) -> np.ndarray:
         frame = np.asarray(image)
@@ -419,9 +676,28 @@ def run_online_carla(
         if isinstance(raw, dict):
             if raw.get("image_viz") is not None:
                 return np.asarray(raw["image_viz"], dtype=np.uint8)
+            if raw.get("simlingo_image") is not None:
+                return np.asarray(raw["simlingo_image"], dtype=np.uint8)
             if raw.get("image") is not None:
                 return np.asarray(raw["image"], dtype=np.uint8)
         return np.asarray(raw, dtype=np.uint8)
+
+    def _annotate_waypoints(
+        frame: np.ndarray,
+        action_flat: np.ndarray | None,
+    ) -> np.ndarray:
+        if _steervla_exec_cfg is None or action_flat is None:
+            return frame
+        try:
+            from ogbench.carla.waypoint_viz import annotate_waypoints_on_frame
+
+            return annotate_waypoints_on_frame(
+                frame,
+                action_flat=action_flat,
+                exec_cfg=_steervla_exec_cfg,
+            )
+        except Exception:
+            return frame
 
     def _annotate_collision_frame(
         frame: np.ndarray,
@@ -599,9 +875,12 @@ def run_online_carla(
             return
         frames = list(episode_video_frames)
         if final_frame is not None:
+            final_viz = _as_video_frame(final_frame)
+            if not FLAGS.expert_debug:
+                final_viz = _annotate_waypoints(final_viz, last_policy_action)
             frames.append(
                 _annotate_text_panel(
-                    _as_video_frame(final_frame),
+                    final_viz,
                     final_raw,
                     reward_value=final_reward,
                     critic_text=final_critic_text,
@@ -624,12 +903,35 @@ def run_online_carla(
     last_update_info = None
 
     def _sample_agent_action(subkey):
-        """Rollout policy (SteerVLA VLA path, DAgger, or DSRL flow); used in warmup and RL phases."""
+        """Rollout policy; returns ``(action, base_action_or_None)``."""
+        if _online_training_mode in {"sac_residual", "dagger_residual"} and hasattr(agent, "sample_actions_sac_residual"):
+            noise = jax.random.normal(subkey, (1, agent._flat_noise_dim()))
+            if _residual_2d:
+                chunk = agent._clip_actions_to_env(
+                    jax.numpy.asarray(agent.vla_sample_fn(obs[None], noise))
+                )
+                base2d = _decode_chunk_to_accel_steer(
+                    _accel_steer_decoder, np.asarray(chunk)[0], obs_raw["state"]
+                )[None]
+                if step <= _residual_warmup:
+                    base = jax.numpy.asarray(base2d)
+                    return base, base
+                temperature = 0.0 if _online_training_mode == "dagger_residual" else 1.0
+                return agent.sample_actions_sac_residual(
+                    obs[None], seed=subkey, temperature=temperature, base_action=base2d
+                )
+            if step <= _residual_warmup:
+                # During warmup execute pure Pi0 with zero residual.
+                base = jax.numpy.asarray(agent.vla_sample_fn(obs[None], noise))
+                base = agent._clip_actions_to_env(base)
+                return base, base
+            temperature = 0.0 if _online_training_mode == "dagger_residual" else 1.0
+            return agent.sample_actions_sac_residual(obs[None], seed=subkey, temperature=temperature)
         if getattr(agent, "vla_sample_fn", None) is not None:
-            return agent.sample_actions_with_vla(obs[None], seed=subkey)
+            return agent.sample_actions_with_vla(obs[None], seed=subkey), None
         if _online_training_mode == "dagger" and hasattr(agent, "sample_actions_dagger"):
-            return agent.sample_actions_dagger(obs[None])
-        return agent.sample_actions(obs[None], seed=subkey)
+            return agent.sample_actions_dagger(obs[None]), None
+        return agent.sample_actions(obs[None], seed=subkey), None
 
     _vla_steps_budget = int(np.random.randint(70, 201)) if FLAGS.expert_recover_debug else 0
     if FLAGS.expert_recover_debug:
@@ -644,12 +946,20 @@ def run_online_carla(
         if FLAGS.expert_recover_debug and (episode_steps == _vla_steps_budget):
             env.reinit_expert()
         in_warmup = warmup > 0 and step <= warmup
+        base_action_np: np.ndarray | None = None
         if FLAGS.expert_debug or _in_expert_recovery or agent is None:
             action = np.zeros(env.action_space.shape, dtype=np.float32)
         else:
-            action_jax = _sample_agent_action(sub)
-            _block_until_ready_tree(action_jax)
+            action_jax, base_action_jax = _sample_agent_action(sub)
+            _block_until_ready_tree((action_jax, base_action_jax))
             action = np.asarray(action_jax[0])
+            last_policy_action = action
+            if base_action_jax is not None:
+                base_action_np = np.asarray(base_action_jax[0], dtype=np.float32)
+            # After VLA inference the embedding is stashed in obs_raw["policy_embedding"].
+            # Update obs so the buffer stores the actual embedding, not the stale placeholder.
+            if obs_mode == "policy_embed" and isinstance(obs_raw, dict) and "policy_embedding" in obs_raw:
+                obs = np.asarray(obs_raw["policy_embedding"], dtype=np.float32)
         t_sample_end = time.time()
 
         t_step_start = time.time()
@@ -660,7 +970,7 @@ def run_online_carla(
         if raw_obs_holder is not None:
             raw_obs_holder["next_obs"] = next_obs_raw
         drive_metrics = ego_drive_metrics_from_state_vec(next_obs_raw["state"])
-        next_obs = _extract_agent_obs(env, next_obs_raw, obs_mode)
+        next_obs = _extract_agent_obs(env, next_obs_raw, obs_mode, policy_embed_dim=_policy_embed_dim)
         done = bool(terminated or truncated)
         end_img = np.copy(_viz_image_from_raw(next_obs_raw)) if done and log_images else None
 
@@ -686,8 +996,63 @@ def run_online_carla(
         _critic_text_for_video = _critic_input_text(_critic_feedback_mode, _lang, _lang_text, obs_raw)
 
         replay_action = action.astype(np.float32)
-        if _online_training_mode == "dagger" and not FLAGS.expert_debug:
+        if _online_training_mode in {"dagger", "dagger_residual"} and not FLAGS.expert_debug:
             replay_action = np.asarray(obs_raw.get("expert_action", replay_action), dtype=np.float32)
+            if _residual_2d and replay_action.size == env_ah * env_ad:
+                # Expert provides a waypoint chunk; decode to 2-D [accel, steer] with a
+                # dedicated PID so its state tracks the episode like the policy's PID.
+                replay_action = _decode_chunk_to_accel_steer(
+                    _expert_accel_steer_decoder, replay_action, obs_raw["state"]
+                )
+
+        residual_fields: dict[str, np.ndarray] = {}
+        if _online_training_mode in {"sac_residual", "dagger_residual"}:
+            residual_fields["base_actions"] = (
+                base_action_np if base_action_np is not None else replay_action
+            )
+        if _online_training_mode == "sac_residual":
+            residual_fields["base_next_actions"] = np.zeros_like(
+                residual_fields["base_actions"]
+            )
+        if _online_training_mode == "sac_residual" and buffer.size > 0 and base_action_np is not None:
+            # Backfill: base_action_np = Pi0(obs) = Pi0(s') for the *previous* transition.
+            buffer._dict["base_next_actions"][(buffer.pointer - 1) % buffer.max_size] = base_action_np
+        if obs_mode == "policy_embed" and buffer.size > 0 and isinstance(obs_raw, dict) and "policy_embedding" in obs_raw:
+            # Backfill: obs_raw is s' for the previous transition; now we have its embedding.
+            buffer._dict["next_observations"][(buffer.pointer - 1) % buffer.max_size] = np.asarray(obs_raw["policy_embedding"], dtype=np.float32)
+        if _uses_pi_prefix and _pi_prefix_e is not None:
+            _pi_prefix_next_e = _compute_pi_prefix_e(next_obs_raw)
+            residual_fields["pi_prefix_obs_e"] = _pi_prefix_e
+            residual_fields["pi_prefix_next_obs_e"] = _pi_prefix_next_e
+        if _residual_append_state and _online_training_mode in {"sac_residual", "dagger_residual"}:
+            _res_state = np.asarray(obs_raw.get("state", np.zeros(25)), dtype=np.float32)[6:]
+            _res_next_state = np.asarray(next_obs_raw.get("state", np.zeros(25)), dtype=np.float32)[6:]
+            residual_fields["residual_obs"] = _res_state
+            residual_fields["next_residual_obs"] = _res_next_state
+            # Welford update during residual warmup to build normalizer stats.
+            if step <= _residual_warmup:
+                _res_norm_count += 1
+                _delta = _res_state.astype(np.float64) - _res_norm_mean
+                _res_norm_mean += _delta / _res_norm_count
+                _res_norm_M2 += _delta * (_res_state.astype(np.float64) - _res_norm_mean)
+            # Freeze normalizer at the end of warmup.
+            if (
+                step == _residual_warmup
+                and _res_norm_count > 0
+                and agent is not None
+                and getattr(agent, "sac_residual_agent", None) is not None
+            ):
+                _res_std = np.sqrt(_res_norm_M2 / max(_res_norm_count - 1, 1) + 1e-8).astype(np.float32)
+                agent = agent.replace(
+                    sac_residual_agent=agent.sac_residual_agent.set_obs_norm(
+                        _res_norm_mean.astype(np.float32), _res_std
+                    )
+                )
+                print(
+                    f"[main_carla] residual obs normalizer frozen from {_res_norm_count} warmup samples "
+                    f"(mean={_res_norm_mean[:3].round(3)}, std={_res_std[:3].round(3)})",
+                    flush=True,
+                )
 
         buffer.add_transition(
             {
@@ -699,6 +1064,7 @@ def run_online_carla(
                 "terminals": np.float32(1.0 if done else 0.0),
                 "language_label": _lang,
                 "next_language_label": _next_lang,
+                **residual_fields,
                 **(_openpi_fields_from_raw(obs_raw) if steervla_actor is not None else {}),
                 **(
                     {f"next_{k}": np.array(v) for k, v in _openpi_fields_from_raw(next_obs_raw).items()}
@@ -707,6 +1073,8 @@ def run_online_carla(
                 ),
             }
         )
+        if _uses_pi_prefix and _pi_prefix_e is not None:
+            _pi_prefix_e = _pi_prefix_next_e
         t_step_end = time.time()
         
         t_log_start = time.time()
@@ -725,6 +1093,8 @@ def run_online_carla(
             had_collision_this_step = collision_delta > 0
             if should_sample_periodic or had_collision_this_step:
                 frame = _as_video_frame(_viz_image_from_raw(obs_raw))
+                if not FLAGS.expert_debug:
+                    frame = _annotate_waypoints(frame, last_policy_action)
                 frame = _annotate_text_panel(
                     frame,
                     cot_obs_raw,
@@ -778,6 +1148,30 @@ def run_online_carla(
         step_wb["time/step_time"] = t_step_end - t_step_start
         step_wb["time/log_time"] = t_log_end - t_log_start
         step_wb["training/in_warmup"] = float(in_warmup)
+        if (
+            _online_training_mode in {"sac_residual", "dagger_residual"}
+            and base_action_np is not None
+            and not in_warmup
+        ):
+            residual_np = action - base_action_np
+            step_wb["rollout/base_action_abs_mean"] = float(np.abs(base_action_np).mean())
+            step_wb["rollout/base_action_abs_max"] = float(np.abs(base_action_np).max())
+            step_wb["rollout/residual_abs_mean"] = float(np.abs(residual_np).mean())
+            step_wb["rollout/residual_abs_max"] = float(np.abs(residual_np).max())
+            step_wb["rollout/composed_action_abs_mean"] = float(np.abs(action).mean())
+            if _residual_2d and base_action_np.shape[-1] == 2:
+                step_wb["rollout/base_accel"] = float(base_action_np[0])
+                step_wb["rollout/base_steer"] = float(base_action_np[1])
+                step_wb["rollout/residual_accel"] = float(residual_np[0])
+                step_wb["rollout/residual_steer"] = float(residual_np[1])
+                step_wb["rollout/composed_accel"] = float(action[0])
+                step_wb["rollout/composed_steer"] = float(action[1])
+        if step % 10 == 0:
+            print(
+                f"[main_carla] step {step}: sample={t_sample_end - t_sample_start:.3f}s "
+                f"env_step={t_step_end - t_step_start:.3f}s log={t_log_end - t_log_start:.3f}s",
+                flush=True,
+            )
 
         wandb.log(step_wb, step=step)
 
@@ -823,7 +1217,14 @@ def run_online_carla(
                 reset_vla_cache = getattr(getattr(agent, "vla_sample_fn", None), "reset_action_cache", None)
                 if reset_vla_cache is not None:
                     reset_vla_cache()
-            obs = _extract_agent_obs(env, obs_raw, obs_mode)
+            if _residual_2d:
+                # Fresh PID state for the new episode (the controllers integrate error).
+                _accel_steer_decoder = _make_accel_steer_decoder()
+                if _expert_accel_steer_decoder is not None:
+                    _expert_accel_steer_decoder = _make_accel_steer_decoder()
+            obs = _extract_agent_obs(env, obs_raw, obs_mode, policy_embed_dim=_policy_embed_dim)
+            if _uses_pi_prefix:
+                _pi_prefix_e = _compute_pi_prefix_e(obs_raw)
             episode_video_frames = []
             episode_return, episode_steps = 0.0, 0
             episode_collision_count = 0
@@ -847,7 +1248,11 @@ def run_online_carla(
             for _ in range(updates_per_step):
                 t_update_start = time.time()
                 batch = buffer.sample(batch_size)
-                if _online_training_mode == "dagger":
+                if _online_training_mode == "sac_residual":
+                    agent, update_info = agent.update_sac_residual(batch)
+                elif _online_training_mode == "dagger_residual":
+                    agent, update_info = agent.update_dagger_residual(batch)
+                elif _online_training_mode == "dagger":
                     agent, update_info = agent.update_dagger(batch)
                 elif getattr(agent, "vla_sample_fn", None) is not None:
                     agent, update_info = agent.update_with_vla(batch)
@@ -917,9 +1322,11 @@ def main(_):
 
     steervla_cfg = config.get("steervla", None)
     online_training_mode = str(config.get("online_training_mode", "rl")).strip().lower()
-    if online_training_mode not in {"rl", "dagger"}:
+    _VALID_TRAIN_MODES = {"rl", "dagger", "sac_residual", "dagger_residual"}
+    if online_training_mode not in _VALID_TRAIN_MODES:
         raise ValueError(
-            f"Unsupported online_training_mode={online_training_mode!r}; expected 'rl' or 'dagger'."
+            f"Unsupported online_training_mode={online_training_mode!r}; "
+            f"expected one of {sorted(_VALID_TRAIN_MODES)}."
         )
     use_steervla_rollout = bool(
         steervla_cfg is not None and steervla_cfg.get("enabled") and not FLAGS.expert_debug
@@ -935,7 +1342,29 @@ def main(_):
                 "[main_carla] DAgger mode requested but SteerVLA rollout is disabled; falling back to learner rollout for data collection.",
                 flush=True,
             )
+    if online_training_mode == "sac_residual":
+        print(
+            "[main_carla] SAC residual mode: Pi0 frozen; small residual MLP trained via "
+            "Q-gradient from DSRL critic.",
+            flush=True,
+        )
+    if online_training_mode == "dagger_residual":
+        print(
+            "[main_carla] DAgger residual mode: Pi0 frozen; small residual MLP supervised "
+            "via MSE toward expert action.",
+            flush=True,
+        )
+    _residual_2d_mode = (
+        online_training_mode in {"sac_residual", "dagger_residual"}
+        and str(config.get("residual_action_space", "waypoint_chunk")).strip().lower() == "accel_steer"
+    )
     critic_feedback_mode = str(config.get("critic_feedback_mode", "commentary_bow"))
+    if _residual_2d_mode and critic_feedback_mode == "action_delta":
+        raise ValueError(
+            "critic_feedback_mode='action_delta' compares waypoint chunks and is "
+            "incompatible with residual_action_space='accel_steer' (2-D actions); "
+            "use --critic-mode none."
+        )
     if critic_feedback_mode == "none":
         config.language_label_dim = 0
     elif critic_feedback_mode == "delta_commentary_bow":
@@ -972,7 +1401,8 @@ def main(_):
         steervla_actor = None
         agent = None
         if not FLAGS.expert_debug:
-            agent_obs = _extract_agent_obs(env, obs_dict, obs_mode)
+            _main_embed_dim = int(config.get("policy_embed_dim", 0)) if obs_mode == "policy_embed" else 0
+            agent_obs = _extract_agent_obs(env, obs_dict, obs_mode, policy_embed_dim=_main_embed_dim)
             ex_obs = np.expand_dims(agent_obs, 0)
             ex_actions = np.zeros((1,) + tuple(env.action_space.shape), dtype=np.float32)
 
@@ -997,6 +1427,61 @@ def main(_):
                         create_kwargs["steervla_actor"] = steervla_actor
 
             agent = agent_class.create(FLAGS.seed, ex_obs, ex_actions, config, **create_kwargs)
+
+            if online_training_mode in {"sac_residual", "dagger_residual"}:
+                if config["agent_name"] != "dsrl":
+                    raise ValueError(
+                        f"{online_training_mode} mode requires agent_name='dsrl'."
+                    )
+                if steervla_actor is None:
+                    raise ValueError(
+                        f"{online_training_mode} mode requires SteerVLA rollout (frozen Pi0 base policy)."
+                    )
+                if bool(config.get("residual_use_pi_image_features", False)):
+                    openpi_obs = steervla_actor.build_observation_batch_numpy(
+                        batch_size=1, raw=obs_dict,
+                    )
+                    residual_pi_feature_source = str(
+                        config.get("residual_pi_feature_source", "prefix")
+                    ).strip().lower()
+                    base_action_probe = np.zeros(
+                        (1, int(config.get("vla_action_horizon", 10)) * int(config.get("vla_action_dim", 4))),
+                        dtype=np.float32,
+                    )
+                    if residual_pi_feature_source == "prefix":
+                        embed_dim = int(steervla_actor.encode_prefix_features(openpi_obs).shape[-1])
+                    elif residual_pi_feature_source == "suffix":
+                        embed_dim = int(
+                            steervla_actor.encode_suffix_features(openpi_obs, base_action_probe).shape[-1]
+                        )
+                    else:
+                        raise ValueError(
+                            f"Unsupported residual_pi_feature_source={residual_pi_feature_source!r}."
+                        )
+                else:
+                    obs_mode_cfg = str(config.get("observation_mode", "state"))
+                    if obs_mode_cfg == "state":
+                        embed_dim = int(ex_obs.shape[-1])
+                    elif obs_mode_cfg == "policy_embed":
+                        embed_dim = int(config.get("policy_embed_dim", ex_obs.shape[-1]))
+                    else:
+                        embed_dim = int(tuple(config.get("image_mlp_hidden_dims", (512,)))[-1])
+                    if bool(config.get("residual_append_base_action", False)):
+                        # In accel_steer mode the appended base action is the 2-D
+                        # PID-decoded [accel, steer], not the waypoint chunk.
+                        embed_dim += 2 if _residual_2d_mode else int(ex_actions.shape[-1])
+                    if bool(config.get("residual_append_state", False)):
+                        embed_dim += int(config.get("residual_obs_dim", 19))
+                sac_residual_agent = SACResidualAgent.create(
+                    FLAGS.seed, ex_obs, ex_actions, config, embed_dim=embed_dim,
+                )
+                agent = agent.attach_sac_residual(sac_residual_agent)
+                print(
+                    f"[main_carla] SACResidualAgent created (embed_dim={embed_dim}, "
+                    f"action_dim={2 if _residual_2d_mode else ex_actions.shape[-1]}, "
+                    f"action_space={config.get('residual_action_space', 'waypoint_chunk')}).",
+                    flush=True,
+                )
 
             if FLAGS.restore_path is not None:
                 agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
