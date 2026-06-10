@@ -260,10 +260,18 @@ class ReplayBuffer:
     environment. base_action and next_base_action are also stored so that fresh actor
     samples can be composed during both the Bellman target and actor-loss computations.
 
-    When ``coach_label_dim > 0``, each transition additionally stores a language label
-    vector from the Gemini VLM coach (coaches/online_vlm_coach.py). Labels start as
-    zeros and are retroactively filled by ``update_at()`` at episode end once Gemini
-    has reviewed the rollout video.
+    When ``coach_label_dim > 0``, each transition additionally stores language label
+    vectors (current and next state) from the Gemini VLM coach
+    (coaches/online_vlm_coach.py). Labels start as zeros and are retroactively
+    filled by ``update_at()`` once Gemini has reviewed the rollout video. The LAST
+    column of each label is reserved as a validity flag (1.0 = backfilled), so the
+    critic can distinguish "no label yet" from a genuine all-zero label.
+
+    When ``expert_action_dim > 0``, each transition stores the expert planner action
+    for s_t (written by ``add()``) and for s_{t+1} (backfilled one step later via
+    ``update_next_expert_at()``), so the TD target conditions the target critic on
+    the expert action *at the next state* rather than reusing the current one.
+    The caller appends its own validity flag as the last expert-action dim.
     """
 
     def __init__(
@@ -292,12 +300,16 @@ class ReplayBuffer:
         self._dones = np.zeros((capacity, 1), dtype=np.float32)
         if coach_label_dim > 0:
             self._coach_labels = np.zeros((capacity, coach_label_dim), dtype=np.float32)
+            self._next_coach_labels = np.zeros((capacity, coach_label_dim), dtype=np.float32)
         else:
             self._coach_labels = None
+            self._next_coach_labels = None
         if expert_action_dim > 0:
             self._expert_actions = np.zeros((capacity, expert_action_dim), dtype=np.float32)
+            self._next_expert_actions = np.zeros((capacity, expert_action_dim), dtype=np.float32)
         else:
             self._expert_actions = None
+            self._next_expert_actions = None
         self._ptr = 0
         self._size = 0
 
@@ -331,24 +343,53 @@ class ReplayBuffer:
         self._dones[self._ptr, 0] = float(done)
         if self._coach_labels is not None:
             self._coach_labels[self._ptr] = 0.0  # zeroed until coach backfill
+            self._next_coach_labels[self._ptr] = 0.0
         if self._expert_actions is not None:
             self._expert_actions[self._ptr] = expert_action if expert_action is not None else 0.0
+            self._next_expert_actions[self._ptr] = 0.0  # backfilled via update_next_expert_at
         self._ptr = (self._ptr + 1) % self.capacity
         self._size = min(self._size + 1, self.capacity)
 
-    def update_at(self, idx: int, *, coach_label: np.ndarray) -> None:
-        """Retroactively write a coach language label into an existing buffer slot.
+    def update_at(
+        self,
+        idx: int,
+        *,
+        coach_label: np.ndarray,
+        next_coach_label: Optional[np.ndarray] = None,
+    ) -> None:
+        """Retroactively write coach language labels into an existing buffer slot.
 
-        Called by ``OnlineVLMSession.backfill_buffer()`` at episode end once
-        Gemini has returned per-chunk feedback for the just-completed episode.
+        Called by ``OnlineVLMSession.backfill_buffer()`` once Gemini has returned
+        per-chunk feedback. ``coach_label`` is the label for s_t; ``next_coach_label``
+        (when given) is the label for s_{t+1}, used by the TD bootstrap. The last
+        column of each stored label is set to 1.0 as a "backfilled" validity flag.
         """
         if self._coach_labels is None:
             return
         if not (0 <= idx < self.capacity):
             return
         label = np.asarray(coach_label, dtype=np.float32)
-        n = min(len(label), self.coach_label_dim)
+        n = min(len(label), self.coach_label_dim - 1)
         self._coach_labels[idx, :n] = label[:n]
+        self._coach_labels[idx, -1] = 1.0
+        if next_coach_label is not None:
+            next_label = np.asarray(next_coach_label, dtype=np.float32)
+            n = min(len(next_label), self.coach_label_dim - 1)
+            self._next_coach_labels[idx, :n] = next_label[:n]
+            self._next_coach_labels[idx, -1] = 1.0
+
+    def update_next_expert_at(self, idx: int, next_expert_action: np.ndarray) -> None:
+        """Backfill the next-state expert action for an existing slot.
+
+        The expert action computed at s_{t+1} (the next loop iteration's current
+        step) is written into transition t so the TD target conditions the target
+        critic on the matched next-state expert action.
+        """
+        if self._next_expert_actions is None:
+            return
+        if not (0 <= idx < self.capacity):
+            return
+        self._next_expert_actions[idx] = np.asarray(next_expert_action, dtype=np.float32)
 
     def sample(self, batch_size: int, device: torch.device) -> Dict[str, torch.Tensor]:
         idx = np.random.randint(0, self._size, size=batch_size)
@@ -366,8 +407,10 @@ class ReplayBuffer:
             batch["next_states"] = torch.from_numpy(self._next_states[idx]).to(device)
         if self._coach_labels is not None:
             batch["coach_labels"] = torch.from_numpy(self._coach_labels[idx]).to(device)
+            batch["next_coach_labels"] = torch.from_numpy(self._next_coach_labels[idx]).to(device)
         if self._expert_actions is not None:
             batch["expert_actions"] = torch.from_numpy(self._expert_actions[idx]).to(device)
+            batch["next_expert_actions"] = torch.from_numpy(self._next_expert_actions[idx]).to(device)
         return batch
 
     def __len__(self) -> int:
@@ -537,13 +580,18 @@ class ResidualSACAgent:
         dones = batch["dones"]
         states = batch.get("states")
         next_states = batch.get("next_states")
-        # Coach language label: (B, coach_label_dim) or None when coach is disabled.
-        # The same label is used for both current and next state since labels are
-        # assigned per episode chunk and are consistent within a rollout window.
+        # Coach language labels for s_t and s_{t+1}: (B, coach_label_dim) or None
+        # when the coach is disabled. The last dim is a "backfilled" validity flag.
+        # The TD target must condition the target critic on the NEXT state's label,
+        # not reuse the current one — a mispaired label biases the bootstrap exactly
+        # at the transitions where the label changes (the ones that matter).
         coach_labels = batch.get("coach_labels")
-        # Expert planner action: (B, expert_action_dim) or None when critic mode is disabled.
-        # Same action used for both s_t and s_{t+1} (smooth between consecutive steps).
+        next_coach_labels = batch.get("next_coach_labels", coach_labels)
+        # Expert planner actions for s_t and s_{t+1}: (B, expert_action_dim) or None
+        # when critic mode is disabled. The last dim is a validity flag (1.0 = the
+        # expert action was available; an all-zero action is a valid "coast" input).
         expert_actions = batch.get("expert_actions")
+        next_expert_actions = batch.get("next_expert_actions", expert_actions)
 
         # Normalise raw ego-state tensors from the replay buffer.
         if self.state_normalizer is not None:
@@ -556,7 +604,7 @@ class ResidualSACAgent:
         with torch.no_grad():
             next_residuals, next_log_probs = self.actor.sample(next_obs, next_base_actions, next_states)
             next_final = torch.clamp(next_base_actions + self.res_scale * next_residuals, -1.0, 1.0)
-            q1_t, q2_t = self.critic_target(next_obs, next_base_actions, next_final, next_states, coach_labels, expert_actions)
+            q1_t, q2_t = self.critic_target(next_obs, next_base_actions, next_final, next_states, next_coach_labels, next_expert_actions)
             min_q_t = torch.min(q1_t, q2_t)
             y = rewards + self.effective_gamma * (1.0 - dones) * (min_q_t - self.alpha.detach() * next_log_probs)
 

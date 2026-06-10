@@ -369,15 +369,26 @@ class OnlineVLMSession:
         if self.chunk_feedback_json is None:
             print("[online_vlm_coach] skip backfill: no chunk feedback yet", flush=True)
             return
+        # Memoize per-step labels: consecutive transitions share chunk labels, and
+        # each step is looked up twice (as its own label and as the previous
+        # transition's next-state label).
+        _label_memo: dict[int, np.ndarray] = {}
+
+        def _label(step: int) -> np.ndarray:
+            if step not in _label_memo:
+                _label_memo[step] = self.language_label_for_episode_step(step)[1]
+            return _label_memo[step]
+
         for buf_idx, ep_step in zip(new_indices, new_steps):
-            _text, bow = self.language_label_for_episode_step(ep_step)
-            buffer.update_at(int(buf_idx), coach_label=bow)
+            # The next-state label (ep_step + 1) keeps the TD bootstrap conditioned
+            # on the label the critic sees at s_{t+1}, not a stale/zero one.
+            buffer.update_at(
+                int(buf_idx),
+                coach_label=_label(ep_step),
+                next_coach_label=_label(ep_step + 1),
+            )
         self._backfill_cursor += len(new_indices)
-        n_labeled = sum(
-            1
-            for ep_step in new_steps
-            if self.language_label_for_episode_step(ep_step)[1].any()
-        )
+        n_labeled = sum(1 for ep_step in new_steps if _label(ep_step).any())
         n_total = len(new_indices)
         print(
             f"[online_vlm_coach] backfilled {n_total} transitions ({n_labeled} non-zero labels)",

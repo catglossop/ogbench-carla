@@ -1169,11 +1169,14 @@ def main(_argv):
         import os as _os
         from coaches.online_vlm_coach import OnlineVLMSession  # type: ignore
         from coaches.expert_label import NUM_DELTA_COMMENTARY_WORDS  # type: ignore
+        # +1: the last label dim is a validity flag set by the replay buffer when
+        # the coach backfills, so the critic can tell "no label yet" apart from a
+        # genuine all-zero label (empty text / no feedback for this step).
         if FLAGS.coach_label_mode in ("vlm_embed", "vlm_embed_raw"):
-            _coach_label_dim = vlm_dim  # 896-dim frozen Qwen2 token embedding
+            _coach_label_dim = vlm_dim + 1  # 896-dim frozen Qwen2 token embedding + validity
             _text_encoder = simlingo_base.encode_text
         else:
-            _coach_label_dim = NUM_DELTA_COMMENTARY_WORDS  # 17-dim delta-commentary BoW
+            _coach_label_dim = NUM_DELTA_COMMENTARY_WORDS + 1  # 17-dim delta-commentary BoW + validity
             _text_encoder = None
         if FLAGS.gemini_api_key:
             _os.environ["GEMINI_API_KEY"] = FLAGS.gemini_api_key
@@ -1206,7 +1209,9 @@ def main(_argv):
             flush=True,
         )
 
-    _expert_action_dim = 2 if FLAGS.use_expert_in_critic else 0
+    # [accel, steer, valid] — the trailing validity flag distinguishes "expert
+    # unavailable this step" from a genuine zero (coast, straight) action.
+    _expert_action_dim = 3 if FLAGS.use_expert_in_critic else 0
 
     agent = ResidualSACAgent(
         vlm_feature_dim=vlm_dim,
@@ -1276,8 +1281,10 @@ def main(_argv):
     last_collision_delta = 0
     last_update_time = 0.0
     video = _open_video(num_episodes)
-    current_expert_action_40d: Optional[np.ndarray] = obs.get("expert_action")
     last_expert_action_2d = np.zeros(2, dtype=np.float32)
+    # True when the previous buffer slot belongs to a finished episode — guards the
+    # next-expert backfill below from writing the new episode's expert action into it.
+    _prev_transition_done = True
 
     for global_step in range(FLAGS.total_steps):
         t_sample_start = time.time()
@@ -1286,6 +1293,10 @@ def main(_argv):
         sac_clip_limit = _residual_clip_limit(global_step, FLAGS.warmup_steps, FLAGS.residual_clip_schedule_steps)
         current_speed = float(obs["state"][15])
         current_obs_state = obs["state"][6:].copy()
+        # Refresh the expert chunk every step (and implicitly after env.reset) —
+        # reading it once before the loop left the critic conditioned on the
+        # expert plan from the very first frame of training.
+        current_expert_action_40d: Optional[np.ndarray] = obs.get("expert_action")
         # Only update normalizer stats before learning starts (i.e. during the
         # random/zero-residual phase).  Freezing after that keeps the state
         # representation consistent for every (s, a, r, s') tuple in the buffer.
@@ -1391,6 +1402,7 @@ def main(_argv):
             current_base_action + _res_scale_vec * residual_action, -1.0, 1.0
         ).astype(np.float32)
         _sac_expert_2d: Optional[np.ndarray] = None
+        _sac_expert_3d: Optional[np.ndarray] = None
         if FLAGS.use_expert_in_critic and current_expert_action_40d is not None:
             if not np.allclose(current_expert_action_40d, 0.0):
                 try:
@@ -1400,14 +1412,29 @@ def main(_argv):
                     last_expert_action_2d = _sac_expert_2d
                 except Exception as _ex:
                     print(f"[critic_mode] expert action conversion failed: {_ex}", flush=True)
+        if FLAGS.use_expert_in_critic:
+            # [accel, steer, valid] — valid=0 marks "expert unavailable" so the
+            # critic can tell it apart from a genuine zero (coast, straight) action.
+            _sac_expert_3d = (
+                np.concatenate([_sac_expert_2d, [1.0]]).astype(np.float32)
+                if _sac_expert_2d is not None
+                else np.zeros(3, dtype=np.float32)
+            )
+            # Backfill: the expert action at s_t is the next-state expert action of
+            # the *previous* transition, so its TD target conditions the target
+            # critic on the matched pair. Skipped across episode resets (the
+            # bootstrap is masked at terminals anyway).
+            if len(buffer) > 0 and not _prev_transition_done:
+                buffer.update_next_expert_at(buffer.last_ptr, _sac_expert_3d)
         buffer.add(
             vlm_features, next_vlm_features,
             current_base_action, next_base_action,
             actor_chosen_final_action,
             current_obs_state, obs["state"][6:],
             chunk_reward_discounted, done,  # discounted: r0 + γ·r1 + … + γ^(n-1)·r_{n-1}
-            expert_action=_sac_expert_2d,
+            expert_action=_sac_expert_3d,
         )
+        _prev_transition_done = done
 
         episode_reward += chunk_reward
         episode_env_reward += chunk_env_reward

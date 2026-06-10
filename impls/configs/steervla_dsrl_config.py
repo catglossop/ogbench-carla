@@ -61,13 +61,19 @@ def get_config():
     config.image_keys = ("base_0_rgb",)
     # JAX RL device: ``-1`` = unset. CARLA uses ``gpu_rank`` in carla_config.yaml.
     config.training_gpu_rank = 0
-    # Critic feedback mode — three options:
+    # Critic feedback mode — four options:
     #   "commentary_bow"      (default): expert commentary BOW from the SimLingo-style labeler.
-    #   "action_delta"                 : (critic_action_dim)-dim = expert first step minus agent first step.
+    #   "expert_action"                : (critic_action_dim + 1)-dim = expert first step + validity
+    #                                    flag. State-only (independent of the agent's action), so it
+    #                                    is consistent across the TD bootstrap and the actor's
+    #                                    Q-query. PID-decoded [accel, steer] in accel_steer mode.
+    #   "action_delta"                 : (critic_action_dim)-dim = expert first step minus agent
+    #                                    first step. Depends on the logged action; the next-state
+    #                                    label is backfilled one step later in main_carla.py.
     #   "delta_commentary_bow"        : corrective language BOW from expert-vs-agent action delta
     #                                   (e.g. "Adjust right. Decelerate more heavily.").
-    # To switch to action_delta, uncomment:
-    # config.critic_feedback_mode = "action_delta"
+    # To switch, uncomment:
+    # config.critic_feedback_mode = "expert_action"
     # Online training regime:
     #   "rl"     : standard DSRL online RL
     #   "dagger" : on-policy data aggregation with expert actions as supervision
@@ -80,8 +86,8 @@ def get_config():
             #   "expert" — SimLingo-style expert commentary / action-delta coaches
             #   "vlm"    — Gemini/Perceptron VLM chunk feedback (see ``vlm_coach``)
             source="expert",
-            # Used when source="expert". One of commentary_bow | action_delta |
-            # delta_commentary_bow | none
+            # Used when source="expert". One of commentary_bow | expert_action |
+            # action_delta | delta_commentary_bow | none
             expert_mode="commentary_bow",
         )
     )

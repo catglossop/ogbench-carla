@@ -57,7 +57,9 @@ from coaches.expert_label import NUM_COMMENTARY_WORDS, NUM_DELTA_COMMENTARY_WORD
 from coaches.critic_feedback import (
     compute_action_delta,
     compute_action_delta_commentary,
+    compute_expert_target,
     critic_language_dim,
+    resolve_critic_feedback_mode,
 )
 
 _IMPLS_ROOT = Path(__file__).resolve().parent
@@ -627,7 +629,7 @@ def run_online_carla(
         )
     log_images = True
 
-    _critic_feedback_mode = str(agent_config.get("critic_feedback_mode", "commentary_bow"))
+    _critic_feedback_mode = resolve_critic_feedback_mode(agent_config)
     _lang_dim = critic_language_dim(agent_config)
 
     steervla_cfg = agent_config.get("steervla") or {}
@@ -663,6 +665,29 @@ def run_online_carla(
         if (_residual_2d and _online_training_mode == "dagger_residual")
         else None
     )
+    # Dedicated decoder for the critic's privileged expert label in accel_steer
+    # mode: the expert waypoint chunk is PID-decoded to [accel, steer] controls so
+    # the label lives in the same 2-D space as the critic's action inputs. A
+    # separate instance keeps its PID state tracking the episode at exactly one
+    # decode per step, independent of the DAgger replay decoder.
+    _critic_expert_decoder = (
+        _make_accel_steer_decoder()
+        if (_residual_2d and _critic_feedback_mode in ("expert_action", "action_delta"))
+        else None
+    )
+
+    def _critic_expert_first(raw: dict) -> np.ndarray | None:
+        """PID-decoded 2-D expert controls for the critic label (None outside accel_steer mode)."""
+        if _critic_expert_decoder is None:
+            return None
+        expert_raw = raw.get("expert_action")
+        if expert_raw is None or raw.get("state") is None:
+            return None
+        try:
+            return _decode_chunk_to_accel_steer(_critic_expert_decoder, expert_raw, raw["state"])
+        except Exception as e:
+            print(f"[critic_expert_first] decode failed: {e}", flush=True)
+            return None
 
     def _decode_chunk_to_accel_steer(decoder, chunk_flat: np.ndarray, state_vec) -> np.ndarray:
         return decoder.flat_action_to_accel_steer(
@@ -907,7 +932,7 @@ def run_online_carla(
     ) -> str:
         if critic_mode == "none":
             return "none"
-        if critic_mode == "action_delta":
+        if critic_mode in ("expert_action", "action_delta"):
             arr = np.asarray(critic_label, dtype=np.float32).reshape(-1)
             if arr.size == 0:
                 return "[]"
@@ -1039,7 +1064,6 @@ def run_online_carla(
         )
 
     last_update_info = None
-
     def _sample_agent_action(subkey):
         """Rollout policy; returns ``(action, base_action_or_None)``."""
         if _online_training_mode in {"sac_residual", "dagger_residual"} and hasattr(agent, "sample_actions_sac_residual"):
@@ -1075,6 +1099,10 @@ def run_online_carla(
     _vla_steps_budget = int(np.random.randint(70, 201)) if FLAGS.expert_recover_debug else 0
     if FLAGS.expert_recover_debug:
         print(f"[expert_recover_debug] episode 0: VLA for {_vla_steps_budget} steps then expert", flush=True)
+
+    # True when the previous buffer slot belongs to a finished episode — guards the
+    # next-step backfills below from writing the new episode's data into it.
+    _prev_transition_done = True
 
     for step in tqdm.tqdm(range(1, FLAGS.online_steps + 1), smoothing=0.1, dynamic_ncols=True):
         t_sample_start = time.time()
@@ -1122,12 +1150,39 @@ def run_online_carla(
         elif _critic_feedback_mode == "none":
             _lang = _zero_label
             _next_lang = _zero_label
+        elif _critic_feedback_mode == "expert_action":
+            # State-only privileged label: expert first-step target (+validity).
+            # In accel_steer mode the expert chunk is PID-decoded to 2-D controls;
+            # the decoder is stateful, so the next label is backfilled one step
+            # later instead of decoding next_obs_raw's chunk a second time.
+            _expert_first = _critic_expert_first(obs_raw)
+            if _residual_2d and _expert_first is None:
+                _lang = _zero_label  # expert unavailable this step (validity flag stays 0)
+            else:
+                _lang = compute_expert_target(obs_raw, agent, agent_config, expert_first=_expert_first)
+            if _residual_2d:
+                _next_lang = _zero_label  # backfilled next step (see below)
+            else:
+                _next_lang = compute_expert_target(next_obs_raw, agent, agent_config)
         elif _critic_feedback_mode == "action_delta":
-            _lang = compute_action_delta(obs_raw, action, agent, agent_config)
-            _next_lang = _zero_label  # bootstrap target sees zero delta (next action unknown)
+            _expert_first = _critic_expert_first(obs_raw)
+            if _residual_2d and _expert_first is None:
+                _lang = _zero_label
+            else:
+                _lang = compute_action_delta(
+                    obs_raw, action, agent, agent_config,
+                    expert_first=_expert_first,
+                    agent_first=action if _residual_2d else None,
+                )
+            # Placeholder: the true next label depends on the *next* logged action,
+            # which doesn't exist yet. Backfilled one step later (below) — a zero
+            # delta means "agent matched the expert", so leaving it zero would
+            # bias the bootstrap optimistically.
+            _next_lang = _zero_label
         elif _critic_feedback_mode == "delta_commentary_bow":
             _lang_text, _lang = compute_action_delta_commentary(obs_raw, action, agent)
-            _next_lang = _zero_label  # depends on current action-vs-expert comparison only
+            # Placeholder: backfilled one step later (below), same reason as above.
+            _next_lang = _zero_label
         else:
             _lang = np.asarray(obs_raw.get("language_label", _zero_label), dtype=np.float32)
             _next_lang = np.asarray(next_obs_raw.get("language_label", _zero_label), dtype=np.float32)
@@ -1152,9 +1207,24 @@ def run_online_carla(
             residual_fields["base_next_actions"] = np.zeros_like(
                 residual_fields["base_actions"]
             )
-        if _online_training_mode == "sac_residual" and buffer.size > 0 and base_action_np is not None:
+        if (
+            _online_training_mode == "sac_residual"
+            and buffer.size > 0
+            and base_action_np is not None
+            and not _prev_transition_done
+        ):
             # Backfill: base_action_np = Pi0(obs) = Pi0(s') for the *previous* transition.
             buffer._dict["base_next_actions"][(buffer.pointer - 1) % buffer.max_size] = base_action_np
+        _needs_next_label_backfill = _critic_feedback_mode in ("action_delta", "delta_commentary_bow") or (
+            _critic_feedback_mode == "expert_action" and _residual_2d
+        )
+        if _needs_next_label_backfill and buffer.size > 0 and not _prev_transition_done:
+            # Backfill: _lang = label at s_t (under the logged a_t for the delta
+            # modes), which is the next-state label for the previous transition.
+            # This keeps the bootstrap conditioned on the label the critic will see
+            # when that next transition is trained as a "current" state (instead of
+            # a zero label, which means "agent matched the expert" in delta space).
+            buffer._dict["next_language_label"][(buffer.pointer - 1) % buffer.max_size] = _lang
         if _uses_pi_prefix and _pi_prefix_e is not None:
             _pi_prefix_next_e = _compute_pi_prefix_e(next_obs_raw)
             residual_fields["pi_prefix_obs_e"] = _pi_prefix_e
@@ -1208,6 +1278,7 @@ def run_online_carla(
                 ),
             }
         )
+        _prev_transition_done = done
         if _uses_pi_prefix and _pi_prefix_e is not None:
             _pi_prefix_e = _pi_prefix_next_e
         t_step_end = time.time()
@@ -1297,7 +1368,10 @@ def run_online_carla(
             step_wb["rollout/heading_factor"] = float(info.get("heading_factor", 0.0))
 
         # Log critic feedback signal (obs_raw is already next_obs_raw here)
-        if _critic_feedback_mode == "action_delta":
+        if _critic_feedback_mode == "expert_action":
+            step_wb["label/expert_target_norm"] = float(np.linalg.norm(_lang[:-1]))
+            step_wb["label/expert_target_valid"] = float(_lang[-1])
+        elif _critic_feedback_mode == "action_delta":
             step_wb["label/action_delta_norm"] = float(np.linalg.norm(_lang))
         elif _critic_feedback_mode == "delta_commentary_bow":
             if _lang_text:
@@ -1526,19 +1600,32 @@ def main(_):
         online_training_mode in {"sac_residual", "dagger_residual"}
         and str(config.get("residual_action_space", "waypoint_chunk")).strip().lower() == "accel_steer"
     )
-    critic_feedback_mode = str(config.get("critic_feedback_mode", "commentary_bow"))
-    if _residual_2d_mode and critic_feedback_mode == "action_delta":
-        raise ValueError(
-            "critic_feedback_mode='action_delta' compares waypoint chunks and is "
-            "incompatible with residual_action_space='accel_steer' (2-D actions); "
-            "use --critic-mode none."
-        )
+    critic_feedback_mode = resolve_critic_feedback_mode(config)
+    if _residual_2d_mode and critic_feedback_mode in ("expert_action", "action_delta"):
+        # accel_steer residual: the critic action space is the 2-D PID controls,
+        # so the expert label is PID-decoded [accel, steer] (see
+        # _critic_expert_first), not the 4-D waypoint first step.
+        config.critic_action_dim = 2
     if critic_feedback_mode == "none":
         config.language_label_dim = 0
-    elif critic_feedback_mode == "delta_commentary_bow":
+    elif critic_feedback_mode == "expert_action":
+        # first_step(expert) + trailing validity flag.
+        config.language_label_dim = int(config.get("critic_action_dim", 4)) + 1
+    elif critic_feedback_mode == "action_delta":
+        config.language_label_dim = int(config.get("critic_action_dim", 4))
+    elif critic_feedback_mode in ("delta_commentary_bow", "vlm_chunk_bow"):
         config.language_label_dim = NUM_DELTA_COMMENTARY_WORDS
     elif critic_feedback_mode == "commentary_bow":
         config.language_label_dim = NUM_COMMENTARY_WORDS
+    if critic_feedback_mode in ("action_delta", "delta_commentary_bow") and online_training_mode == "sac_residual":
+        print(
+            "[main_carla] NOTE: critic_feedback_mode="
+            f"'{critic_feedback_mode}' labels depend on the logged action; the "
+            "residual actor's Q-query pairs freshly sampled actions with that "
+            "logged-action label. critic_feedback_mode='expert_action' is the "
+            "state-only (fully Bellman-consistent) alternative.",
+            flush=True,
+        )
     extra_carla: dict[str, Any] = {}
     exec_cfg = _steervla_action_execution_cfg(steervla_cfg)
     if exec_cfg is not None:

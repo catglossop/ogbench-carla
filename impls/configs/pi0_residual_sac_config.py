@@ -79,7 +79,10 @@ def get_config():
     config.alpha = 0.1
     config.noise_scale = 1.0
 
-    # Critic language feedback — action_delta is compact and stable.
+    # Critic language feedback. "action_delta" (expert − agent first step) is
+    # compact but depends on the logged action; "expert_action" (expert first
+    # step + validity flag) is the state-only, Bellman-consistent alternative.
+    # In accel_steer mode both labels are PID-decoded [accel, steer] controls.
     config.critic_feedback_mode = "action_delta"
 
     # ── GPU placement ─────────────────────────────────────────────────────
