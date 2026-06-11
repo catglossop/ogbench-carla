@@ -740,20 +740,19 @@ class SteerVLAActor:
         pooled = jnp.sum(tokens * masks[..., None], axis=1) / denom
         return jax.lax.stop_gradient(pooled)
 
-    def encode_prefix_tokens(
+    def encode_prefix_features(
         self,
         observation: _openpi_model.Observation,
-    ) -> tuple[jax.Array, jax.Array]:
-        """Return the un-pooled frozen Pi prefix hidden states and their mask.
+    ) -> jax.Array:
+        """Return a frozen Pi prefix feature aligned with direct-action conditioning.
 
-        Runs the full frozen prefix path (image tokens plus prompt/reasoning/
-        subtask through the Pi transformer) and returns the per-token final-layer
-        embeddings ``prefix_out (B, P, H)`` plus a boolean validity ``mask
-        (B, P)``. These feed an external RL-token encoder; :meth:`encode_prefix_features`
-        is the mean-pooled view of the same tensor.
+        Unlike :meth:`encode_image_features`, this runs the full frozen prefix
+        path used by direct DAgger: image tokens plus prompt/reasoning/subtask
+        through the Pi transformer, then mean-pools the valid prefix hidden
+        states into one feature vector per batch row.
         """
         if self._remote is not None:
-            raise RuntimeError("Pi prefix tokens are not available in remote SteerVLAActor mode.")
+            raise RuntimeError("Pi prefix features are not available in remote SteerVLAActor mode.")
         if self.model is None or self._jax_device is None:
             raise RuntimeError("Local SteerVLA model is not initialized.")
 
@@ -798,14 +797,7 @@ class SteerVLAActor:
             mask=prefix_attn_mask,
             positions=positions,
         )
-        return jax.lax.stop_gradient(prefix_out), prefix_mask
 
-    def encode_prefix_features(
-        self,
-        observation: _openpi_model.Observation,
-    ) -> jax.Array:
-        """Mean-pooled view of :meth:`encode_prefix_tokens` (one vector per row)."""
-        prefix_out, prefix_mask = self.encode_prefix_tokens(observation)
         prefix_mask_f = prefix_mask.astype(prefix_out.dtype)
         denom = jnp.maximum(prefix_mask_f.sum(axis=1, keepdims=True), 1.0)
         pooled = jnp.sum(prefix_out * prefix_mask_f[..., None], axis=1) / denom

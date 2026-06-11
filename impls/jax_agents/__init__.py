@@ -6,6 +6,7 @@ from .gcivl import GCIVLAgent
 from .hiql import HIQLAgent
 from .qrl import QRLAgent
 from .sac import SACAgent
+from .sac_residual import SACResidualAgent
 
 agents = dict(
     crl=CRLAgent,
@@ -16,4 +17,5 @@ agents = dict(
     hiql=HIQLAgent,
     qrl=QRLAgent,
     sac=SACAgent,
+    sac_residual=SACResidualAgent,
 )
