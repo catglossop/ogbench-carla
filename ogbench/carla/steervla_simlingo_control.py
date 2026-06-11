@@ -96,7 +96,7 @@ class SimlingoStyleWaypointDecoder:
         carla_fps: float = 20.0,
         wp_dilation: int = 1,
         data_save_freq: int = 5,
-        brake_speed: float = 0.4,
+        brake_speed: float = 0.1,
         brake_ratio: float = 1.1,
         clip_delta: float = 1.0,
         clip_throttle: float = 1.0,
@@ -143,6 +143,7 @@ class SimlingoStyleWaypointDecoder:
         desired_speed = (
             np.linalg.norm(speed_waypoints[idx_hi] - speed_waypoints[idx_lo]) * 2.0
         )
+        print(f"[RC-PID] Desired speed: {desired_speed:.4f}  Current speed: {speed:.4f}", flush=True)
 
         brake = (desired_speed < self.brake_speed) or (
             (speed / max(desired_speed, 1e-6)) > self.brake_ratio
@@ -156,6 +157,7 @@ class SimlingoStyleWaypointDecoder:
         route_interp = interpolate_waypoints(route_waypoints.squeeze())
         steer = float(self.turn_controller.step(route_interp, speed))
         steer = float(np.clip(round(steer, 3), -1.0, 1.0))
+        print(f"[RC-PID] Steer: {steer:.4f}  Throttle: {throttle:.4f}  Brake: {brake}", flush=True)
 
         return steer, throttle, brake
 

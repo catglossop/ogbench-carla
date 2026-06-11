@@ -1132,6 +1132,7 @@ def run_online_carla(
         if FLAGS.expert_debug or _in_expert_recovery:
             next_obs_raw, reward, terminated, truncated, info = env.step_expert(obs_raw)
         else:
+            print(f"[RC-STEP] step={step} action={np.round(action, 4).tolist()}", flush=True)
             next_obs_raw, reward, terminated, truncated, info = env.step(action)
         if raw_obs_holder is not None:
             raw_obs_holder["next_obs"] = next_obs_raw
