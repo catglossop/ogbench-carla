@@ -50,8 +50,8 @@ flags.DEFINE_integer("seed", 0, "Random seed.")
 flags.DEFINE_string(
     "route",
     None,
-    "Bench2Drive/Fail2Drive route: scenario-name (parking-cut-in-001), file basename "
-    "(bench2drive_007), or route id (1711 / f2d:85). See --list_routes=true.",
+    "Bench2Drive route: scenario-name (parking-cut-in-001), file basename "
+    "(bench2drive_007), or route id (1711). See --list_routes=true.",
 )
 flags.DEFINE_bool("list_routes", False, "Print all known routes and exit.")
 
@@ -98,15 +98,10 @@ def _list_routes_and_exit() -> None:
     from ogbench.carla.route_registry import list_routes
 
     entries = list_routes()
-    b2d = sum(1 for e in entries if e.source == "bench2drive")
-    f2d = sum(1 for e in entries if e.source == "fail2drive")
-    print(f"# {len(entries)} routes ({b2d} bench2drive, {f2d} fail2drive)")
-    print(f"{'source':<12} {'scenario_name':<48} {'file_name':<32} {'route_id':<10} {'town':<10} {'scenario_type'}")
+    print(f"# {len(entries)} bench2drive routes")
+    print(f"{'scenario_name':<48} {'file_name':<20} {'route_id':<10} {'town':<10} {'scenario_type'}")
     for e in entries:
-        print(
-            f"{e.source:<12} {e.scenario_name:<48} {e.file_name:<32} "
-            f"{e.route_id:<10} {e.town:<10} {e.scenario_type}"
-        )
+        print(f"{e.scenario_name:<48} {e.file_name:<20} {e.route_id:<10} {e.town:<10} {e.scenario_type}")
 
 
 def _steervla_action_execution_cfg(steervla_cfg) -> Optional[dict[str, Any]]:

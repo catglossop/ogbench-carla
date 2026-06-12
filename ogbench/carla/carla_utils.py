@@ -870,12 +870,15 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         )
         prev_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
         os.environ["CUDA_VISIBLE_DEVICES"] = str(self._args.gpu_rank)
-        # Force NVIDIA-only Vulkan ICD so -graphicsadapter=N maps to physical GPU N.
-        # Without this, llvmpipe and other ICDs shift the Vulkan device indices, causing
-        # UE4's render thread to select the wrong GPU or fail to initialize.
-        _NVIDIA_VK_ICD = "/usr/share/vulkan/icd.d/nvidia_icd.json"
         prev_vk_icd = os.environ.get("VK_ICD_FILENAMES")
-        os.environ["VK_ICD_FILENAMES"] = _NVIDIA_VK_ICD
+        if not prev_vk_icd:
+            icds = sorted(
+                str(p)
+                for d in ("/etc/vulkan/icd.d", "/usr/share/vulkan/icd.d")
+                for p in Path(d).glob("*nvidia*icd*.json")
+            )
+            if icds:
+                os.environ["VK_ICD_FILENAMES"] = icds[0]
         self._evaluator = IsolatedLeaderboardEvaluator(self._args, statistics_manager)
         if prev_cuda_visible_devices is not None:
             os.environ["CUDA_VISIBLE_DEVICES"] = prev_cuda_visible_devices

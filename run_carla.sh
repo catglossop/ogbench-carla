@@ -30,11 +30,6 @@ ENABLE_UPDATES="true"
 BASE_AGENT_CFG="impls/configs/steervla_residual_config.py"
 BASE_CARLA_CFG="impls/configs/carla_config.yaml"
 
-# Fail2Drive's custom static props ship inside vanilla CARLA 0.9.16 here (see the
-# asset-pack note in carla_config.yaml). Only set FAIL2DRIVE_CARLA_ROOT to point
-# Fail2Drive routes at a separate install; empty = leave CARLA_ROOT alone.
-FAIL2DRIVE_CARLA_ROOT="${FAIL2DRIVE_CARLA_ROOT:-}"
-
 EXTRA_ARGS=()
 
 usage() {
@@ -43,7 +38,7 @@ Usage:
   bash run_carla.sh [options] [-- extra args passed to impls/main_carla_residual.py]
 
 Options:
-  --route NAME              Bench2Drive/Fail2Drive route name/id. Default: parking-cut-in-001
+  --route NAME              Bench2Drive route name/id. Default: parking-cut-in-001
   --online-steps N          Number of env steps. Default: 50000
   --seed N                  Random seed. Default: 0
   --run-group NAME          W&B / experiment group. Default: Debug
@@ -64,8 +59,6 @@ Options:
 
   --agent-config PATH       Base agent config. Default: impls/configs/steervla_residual_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
-  --fail2drive-carla-root PATH
-                            Override CARLA install used for Fail2Drive routes.
   -h, --help                Show this help
 
 Examples:
@@ -94,7 +87,6 @@ while [[ $# -gt 0 ]]; do
     --enable-updates) ENABLE_UPDATES="$2"; shift 2 ;;
     --agent-config) BASE_AGENT_CFG="$2"; shift 2 ;;
     --carla-config) BASE_CARLA_CFG="$2"; shift 2 ;;
-    --fail2drive-carla-root) FAIL2DRIVE_CARLA_ROOT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; EXTRA_ARGS+=("$@"); break ;;
     *)
@@ -163,21 +155,7 @@ cfg["use_cuda_visible_devices"] = False
 Path(r"${CARLA_CFG_TMP}").write_text(yaml.safe_dump(cfg, sort_keys=False))
 EOF
 
-# Resolve route source (bench2drive | fail2drive); only override CARLA_ROOT if
-# FAIL2DRIVE_CARLA_ROOT is explicitly set (separate Fail2Drive install).
-ROUTE_SOURCE="$(uv run python -c "from ogbench.carla.route_registry import find_route; print(find_route('${ROUTE}').source)" 2>/dev/null || true)"
-if [[ "$ROUTE_SOURCE" == "fail2drive" && -n "$FAIL2DRIVE_CARLA_ROOT" ]]; then
-  if [[ ! -d "$FAIL2DRIVE_CARLA_ROOT" ]]; then
-    echo "[run_carla.sh] WARNING: FAIL2DRIVE_CARLA_ROOT=${FAIL2DRIVE_CARLA_ROOT} doesn't exist; not switching CARLA_ROOT." >&2
-  else
-    export CARLA_ROOT="$FAIL2DRIVE_CARLA_ROOT"
-    export CARLA_PYTHON_API_ROOT="$FAIL2DRIVE_CARLA_ROOT/PythonAPI/carla"
-    echo "[run_carla.sh] Fail2Drive route detected: CARLA_ROOT=${CARLA_ROOT}"
-    echo "[run_carla.sh]   (relaunch the CARLA server from ${CARLA_ROOT}/CarlaUE4.sh to match)"
-  fi
-fi
-
-echo "[run_carla.sh] route=${ROUTE} (source=${ROUTE_SOURCE:-?})"
+echo "[run_carla.sh] route=${ROUTE}"
 echo "[run_carla.sh] enable_updates=${ENABLE_UPDATES}"
 echo "[run_carla.sh] train_gpu_rank=${TRAIN_GPU_RANK} render_adapter=${SIM_GPU_RANK}"
 echo "[run_carla.sh] carla_host=${CARLA_HOST} carla_port=${CARLA_PORT} streaming_port=${CARLA_STREAMING_PORT} tm_port=${TM_PORT} x_display=:${X_DISPLAY_NUM}"
