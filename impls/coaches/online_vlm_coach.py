@@ -371,7 +371,8 @@ class OnlineVLMSession:
             return
         for buf_idx, ep_step in zip(new_indices, new_steps):
             _text, bow = self.language_label_for_episode_step(ep_step)
-            buffer.update_at(int(buf_idx), coach_label=bow)
+            # DSRL ReplayBuffer (main_carla.py) stores critic language as ``language_label``.
+            buffer.update_at(int(buf_idx), language_label=bow)
         self._backfill_cursor += len(new_indices)
         n_labeled = sum(
             1

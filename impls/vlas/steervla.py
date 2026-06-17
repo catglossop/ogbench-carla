@@ -636,6 +636,7 @@ class SteerVLAActor:
         actions_per_model_query: int = 1,
         actions_per_cot: int = 1,
         sample_actions_num_steps: int = 10,
+        action_decode_batch_size: int = 2,
         training_gpu_rank: int = -1,
         return_normalized_action_chunk: bool = False,
         fixed_subtask_text: Optional[str] = None,
@@ -667,6 +668,7 @@ class SteerVLAActor:
         self.actions_per_model_query = max(1, int(actions_per_model_query))
         self.actions_per_cot = max(1, int(actions_per_cot))
         self.sample_actions_num_steps = int(sample_actions_num_steps)
+        self.action_decode_batch_size = max(1, int(action_decode_batch_size))
         self.return_normalized_action_chunk = bool(return_normalized_action_chunk)
         self.fixed_subtask_text = (
             str(fixed_subtask_text).strip() if fixed_subtask_text else None
@@ -1671,6 +1673,138 @@ class SteerVLAActor:
 
         return jax.tree.map(_to_numpy, dict(cot_out))
 
+    def sample_candidates(
+        self,
+        n: int,
+        *,
+        temperature: float,
+        noise: jax.Array | None = None,
+        raw: Optional[Dict[str, Any]] = None,
+        rng: jax.Array | None = None,
+    ) -> dict[str, Any]:
+        """Best-of-N support: sample ``n`` CoTs at ``temperature`` and decode each subtask.
+
+        One batched forward samples ``n`` diverse chains-of-thought (``temperature`` drives
+        per-row diversity), then ``sample_actions`` produces one normalized action chunk per
+        candidate. Each candidate's reasoning + subtask is printed for debugging.
+
+        Returns a dict with:
+          - ``actions``: ``(n, action_horizon * action_dim)`` float32 normalized chunks.
+          - ``subtask_texts`` / ``reasoning_texts``: decoded strings, one per candidate.
+          - ``cot_out``: the batched CoT dict; slice row ``i`` (via :meth:`stash_candidate_cot`)
+            to persist the executed candidate's tokens for replay/training.
+        """
+        assert (
+            self.model is not None
+            and self._jax_device is not None
+            and self.tokenizer is not None
+        ), "sample_candidates requires a local SteerVLAActor (checkpoint loaded)."
+        n = max(1, int(n))
+        if rng is None:
+            self._call_counter += 1
+            rng = jax.random.PRNGKey(self._call_counter)
+        else:
+            rng = jax.random.fold_in(jnp.asarray(rng), self._call_counter)
+        rng_cot, rng_act, rng_noise = jax.random.split(rng, 3)
+
+        obs_np_struct = self.build_observation_batch_numpy(n, raw=raw)
+        obs_jax = jax.tree.map(
+            lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
+            obs_np_struct,
+        )
+
+        # n diverse CoTs in one batched call (temperature gives independent per-row samples).
+        cot_out = self._sample_cot(
+            rng_cot,
+            obs_jax,
+            temperature=float(temperature),
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+
+        reason_tokens = np.asarray(jax.device_get(cot_out["tokenized_reasoning"]), dtype=np.int32)
+        reason_mask = np.asarray(jax.device_get(cot_out["tokenized_reasoning_mask"]), dtype=bool)
+        subtask_tokens = np.asarray(jax.device_get(cot_out["tokenized_subtask"]), dtype=np.int32)
+        subtask_mask = np.asarray(jax.device_get(cot_out["tokenized_subtask_mask"]), dtype=bool)
+        reasoning_texts: list[str] = []
+        subtask_texts: list[str] = []
+        for i in range(n):
+            r_txt = self.tokenizer._tokenizer.decode(reason_tokens[i][reason_mask[i]].tolist())
+            s_txt = self.tokenizer._tokenizer.decode(subtask_tokens[i][subtask_mask[i]].tolist())
+            reasoning_texts.append(r_txt)
+            subtask_texts.append(s_txt)
+            print(
+                f"[best_of_n][cand {i}] temp={float(temperature):.2f} "
+                f"subtask={s_txt!r} reasoning={r_txt!r}",
+                flush=True,
+            )
+
+        obs_full = _merge_cot_output_into_observation(obs_jax, cot_out)
+
+        # Build per-candidate noise in model space.
+        model_ah = int(self.model.action_horizon)
+        model_ad = int(self.model.action_dim)
+        cfg_ah = min(int(self.action_horizon), model_ah)
+        cfg_ad = min(int(self.action_dim), model_ad)
+        noise_scale = jnp.asarray(self.noise_scale, dtype=jnp.float32)
+        if noise is None:
+            noise_chunk = (
+                jax.random.normal(rng_noise, (n, cfg_ah, cfg_ad), dtype=jnp.float32) * noise_scale
+            )
+        else:
+            noise_arr = jnp.asarray(noise, dtype=jnp.float32)
+            if noise_arr.ndim == 2:
+                noise_arr = noise_arr.reshape(
+                    noise_arr.shape[0], int(self.action_horizon), int(self.action_dim)
+                )
+            noise_chunk = noise_arr[:, :cfg_ah, :cfg_ad]
+            if noise_chunk.shape[0] == 1 and n > 1:
+                noise_chunk = jnp.broadcast_to(noise_chunk, (n, cfg_ah, cfg_ad))
+        noise_full = jnp.zeros((n, model_ah, model_ad), dtype=jnp.float32)
+        noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(
+            jax.device_put(noise_chunk, self._jax_device)
+        )
+
+        decode_bs = min(n, int(self.action_decode_batch_size))
+        traj_parts: list[np.ndarray] = []
+        for start in range(0, n, decode_bs):
+            end = min(start + decode_bs, n)
+            chunk_rng = jax.random.fold_in(rng_act, start)
+            chunk_obs = jax.tree.map(lambda x: x[start:end], obs_full)
+            chunk_noise = noise_full[start:end]
+            traj = self._sample_actions(
+                chunk_rng,
+                chunk_obs,
+                noise=chunk_noise,
+                num_steps=int(self.sample_actions_num_steps),
+                image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+            )
+            jax.block_until_ready(traj)
+            traj_np = self._postprocess_action_trajectory(
+                traj, observation_state=jax.tree.map(lambda x: x[start:end], obs_jax.state)
+            )
+            traj_parts.append(np.asarray(traj_np, dtype=np.float32))
+        actions_flat = np.concatenate(traj_parts, axis=0).reshape(n, -1)
+
+        return {
+            "actions": actions_flat,
+            "subtask_texts": subtask_texts,
+            "reasoning_texts": reasoning_texts,
+            "cot_out": cot_out,
+        }
+
+    def stash_candidate_cot(
+        self,
+        cot_out: dict[str, Any],
+        index: int,
+        raw: Optional[Dict[str, Any]],
+    ) -> None:
+        """Persist candidate ``index`` from a batched :meth:`sample_candidates` CoT into ``raw``."""
+        if raw is None:
+            return
+        i = int(index)
+        sliced = {k: v[i : i + 1] for k, v in cot_out.items()}
+        self._stash_cot_in_raw(raw, sliced)
+
 
 def create_steervla_pi0_cot_sample_fn(
     steervla_cfg: MutableMapping[str, Any],
@@ -1698,6 +1832,7 @@ def create_steervla_pi0_cot_sample_fn(
         actions_per_model_query=int(steervla_cfg.get("actions_per_model_query", 1)),
         actions_per_cot=int(steervla_cfg.get("actions_per_cot", 1)),
         sample_actions_num_steps=int(steervla_cfg.get("sample_actions_num_steps", 10)),
+        action_decode_batch_size=int(steervla_cfg.get("action_decode_batch_size", 2)),
         training_gpu_rank=int(srank),
         return_normalized_action_chunk=bool(steervla_cfg.get("use_pi_action_chunk_for_env", True)),
         fixed_subtask_text=steervla_cfg.get("fixed_subtask_text"),
