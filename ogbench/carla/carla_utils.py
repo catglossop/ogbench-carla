@@ -56,6 +56,7 @@ import sys
 import threading
 import time
 import traceback
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple, Union
@@ -152,6 +153,7 @@ import py_trees
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 from srunner.scenariomanager.timer import GameTime
 from srunner.scenariomanager.watchdog import Watchdog
+from leaderboard.envs.sensor_interface import GenericMeasurement
 
 from leaderboard.leaderboard_evaluator import (
     LeaderboardEvaluator,
@@ -412,6 +414,74 @@ def _carla_subprocess_env(display_num: int, sim_gpu_rank: int) -> Dict[str, str]
     return carla_env
 
 
+def _child_process_setup() -> None:
+    """Session leader + kill child sim processes if the training parent dies abruptly."""
+    os.setsid()
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        PR_SET_PDEATHSIG = 1
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    except Exception:
+        pass
+
+
+_child_reaper_installed = False
+_emergency_cleanup_installed = False
+_ACTIVE_CARLA_ENV: Optional[weakref.ReferenceType["CarlaBench2DriveWrapper"]] = None
+
+
+def _install_child_process_reaper() -> None:
+    """No-op: do not set ``SIGCHLD`` to ``SIG_IGN``.
+
+    Ignoring ``SIGCHLD`` makes CARLA exit immediately during boot (``poll()==0``,
+    empty log). Zombie prevention is handled via ``PR_SET_PDEATHSIG`` on sim
+    children and explicit ``wait()`` in :meth:`kill_subprocesses`.
+    """
+    global _child_reaper_installed
+    _child_reaper_installed = True
+
+
+def _register_carla_env_for_emergency_cleanup(env: "CarlaBench2DriveWrapper") -> None:
+    global _ACTIVE_CARLA_ENV
+    _ACTIVE_CARLA_ENV = weakref.ref(env)
+
+
+def _emergency_carla_shutdown(signum: int, _frame: Any) -> None:
+    """Best-effort CARLA teardown when Python dies via native abort (SIGABRT/SIGSEGV).
+
+    ``atexit`` handlers do not run on C++ ``abort()``. Without this, Xvfb/CARLA
+    children are orphaned and the parent can remain a zombie holding GPU memory.
+    """
+    ref = _ACTIVE_CARLA_ENV
+    env = ref() if ref is not None else None
+    try:
+        if env is not None:
+            env._kill_carla_subprocesses()
+            CarlaBench2DriveWrapper._kill_stale_carla_processes(
+                rpc_port=int(env.carla_config.get("port", 0) or 0),
+                x_display_num=int(env.carla_config.get("x_display_num", 0) or 0),
+            )
+    except Exception:
+        pass
+    # Hard exit: do not wait for JAX/CUDA threads during normal interpreter shutdown.
+    os._exit(128 + (signum if 0 < signum < 128 else 0))
+
+
+def _install_emergency_carla_cleanup() -> None:
+    global _emergency_cleanup_installed
+    if _emergency_cleanup_installed:
+        return
+    _install_child_process_reaper()
+    for sig in (signal.SIGABRT, signal.SIGSEGV):
+        try:
+            signal.signal(sig, _emergency_carla_shutdown)
+        except Exception:
+            pass
+    _emergency_cleanup_installed = True
+
+
 class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
     """Leaderboard evaluator variant that honors explicit per-instance launch args."""
 
@@ -438,11 +508,18 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
             "-ac", "+extension", "GLX", "+render", "-noreset",
         ]
         # stdin=DEVNULL so Xvfb/CARLA don't inherit any pipe fds from our process.
+        self._launch_rpc_port = rpc_port
+        self._launch_display_num = display_num
+        self._carla_log_file = None
+
         self.xvfb = subprocess.Popen(
-            xvfb_cmd, preexec_fn=os.setsid,
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            xvfb_cmd,
+            preexec_fn=_child_process_setup,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        atexit.register(os.killpg, self.xvfb.pid, signal.SIGKILL)
+        atexit.register(self.kill_subprocesses)
         time.sleep(2)
 
         carla_env = _carla_subprocess_env(display_num, sim_gpu_rank)
@@ -458,13 +535,16 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
         if streaming_port > 0:
             cmd.append(f"-carla-streaming-port={streaming_port}")
         _carla_log_path = f"/tmp/carla_rpc{rpc_port}.log"
-        _carla_log = open(_carla_log_path, "w", buffering=1)
+        self._carla_log_file = open(_carla_log_path, "w", buffering=1)
         self.server = subprocess.Popen(
-            cmd, preexec_fn=os.setsid, env=carla_env,
-            stdin=subprocess.DEVNULL, stdout=_carla_log, stderr=_carla_log,
+            cmd,
+            preexec_fn=_child_process_setup,
+            env=carla_env,
+            stdin=subprocess.DEVNULL,
+            stdout=self._carla_log_file,
+            stderr=self._carla_log_file,
         )
         print(" ".join(cmd), self.server.returncode, flush=True)
-        atexit.register(os.killpg, self.server.pid, signal.SIGKILL)
 
         max_boot_s = max(60, int(os.environ.get("CARLA_BOOT_TIMEOUT", "180")))
         print(f"[carla] waiting up to {max_boot_s}s for UE4 RPC on port {rpc_port}...", flush=True)
@@ -552,6 +632,32 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
             raise RuntimeError(f"Traffic manager failed to come up on port {tm_port}")
 
         return client, client_timeout, traffic_manager
+
+    def kill_subprocesses(self) -> None:
+        """Terminate Xvfb + CARLA server process groups started by this evaluator."""
+        for attr in ("server", "xvfb"):
+            proc = getattr(self, attr, None)
+            if proc is None:
+                continue
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                pass
+            setattr(self, attr, None)
+        log_f = getattr(self, "_carla_log_file", None)
+        if log_f is not None:
+            try:
+                log_f.close()
+            except Exception:
+                pass
+            self._carla_log_file = None
 
 
 def ego_drive_metrics_from_state_vec(state: Any) -> Dict[str, float]:
@@ -698,6 +804,35 @@ def rgb_front_from_leaderboard_dict(sensor_dict: Dict[str, Any]) -> np.ndarray:
     return downscale_rgb_for_policy(rgb)
 
 
+def _sync_pseudo_sensors_for_tick(agent_wrapper: Any) -> None:
+    """Push pseudo-sensor readings for the current tick frame on the main thread.
+
+    ``SpeedometerReader`` runs in a background thread and is paused during long
+    VLA / best-of-N inference (``_run_ps=False``). Physical sensors enqueue on
+    ``world.tick()``, but a paused speedometer may never publish before
+    ``AutonomousAgent.__call__`` → ``sensor_interface.get_data()``, which blocks
+    for up to 300s waiting for all sensors.
+    """
+    if agent_wrapper is None:
+        return
+    frame = GameTime.get_frame()
+    for sensor in list(getattr(agent_wrapper, "_sensors_list", []) or []):
+        if sensor is None or not hasattr(sensor, "__call__"):
+            continue
+        cb = getattr(sensor, "_callback", None)
+        if cb is None:
+            continue
+        # Only pseudo-sensors (SpeedometerReader / OpenDriveMapReader) have _run_ps.
+        if not hasattr(sensor, "_run_ps"):
+            continue
+        try:
+            if not getattr(sensor, "_run_ps", True):
+                sensor._run_ps = True
+            cb(GenericMeasurement(sensor(), frame))
+        except Exception:
+            pass
+
+
 class SteppableScenarioManager(ScenarioManager):
     """ScenarioManager that runs one CARLA tick per call and applies an external control.
 
@@ -782,6 +917,7 @@ class SteppableScenarioManager(ScenarioManager):
             try:
                 self._agent_watchdog.resume()
                 self._agent_watchdog.update()
+                _sync_pseudo_sensors_for_tick(self._agent_wrapper)
                 agent_action = self._agent_wrapper()
                 self._agent_watchdog.pause()
             except Exception as e:  # noqa: BLE001
@@ -1256,6 +1392,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
 
     def setup(self) -> None:
         """Instantiate ``LeaderboardEvaluator`` and swap in :class:`SteppableScenarioManager`."""
+        _install_emergency_carla_cleanup()
+        _register_carla_env_for_emergency_cleanup(self)
         self._kill_stale_carla_processes(
             rpc_port=int(self.carla_config.get("port", 0) or 0),
             x_display_num=int(self.carla_config.get("x_display_num", 0) or 0),
@@ -1292,6 +1430,11 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         _orig_sigterm = _signal.getsignal(_signal.SIGTERM)
 
         def _sigterm_handler(signum, frame):
+            try:
+                if self._evaluator is not None:
+                    self._evaluator.kill_subprocesses()
+            except Exception:
+                pass
             import atexit as _atexit
             _atexit._run_exitfuncs()  # type: ignore[attr-defined]
             if callable(_orig_sigterm):
@@ -1300,6 +1443,19 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 raise SystemExit(0)
 
         _signal.signal(_signal.SIGTERM, _sigterm_handler)
+
+    def _kill_carla_subprocesses(self) -> None:
+        """Stop CARLA/Xvfb launched for this env instance."""
+        ev = self._evaluator
+        if ev is not None:
+            try:
+                ev.kill_subprocesses()
+            except Exception:
+                pass
+        self._kill_stale_carla_processes(
+            rpc_port=int(self.carla_config.get("port", 0) or 0),
+            x_display_num=int(self.carla_config.get("x_display_num", 0) or 0),
+        )
 
     def run_leaderboard(self) -> bool:
         """Full benchmark across all routes in the configured XML file (escape hatch)."""
@@ -2557,16 +2713,19 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         return np.zeros((64, 64, 3), dtype=np.uint8)
 
     def close(self) -> None:
-        if self._evaluator is not None:
-            try:
-                self._stop_active_scenario()
-            finally:
+        try:
+            if self._evaluator is not None:
                 try:
-                    self._evaluator._reset_world_settings()
-                except Exception:
-                    pass
-                self._evaluator = None
-                self._args = None
+                    self._stop_active_scenario()
+                finally:
+                    try:
+                        self._evaluator._reset_world_settings()
+                    except Exception:
+                        pass
+        finally:
+            self._kill_carla_subprocesses()
+            self._evaluator = None
+            self._args = None
         super().close()
 
 
