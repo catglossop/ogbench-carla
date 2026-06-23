@@ -13,6 +13,7 @@ temperature ``alpha``. One env step == one transition (per-tick MDP, discount ``
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Sequence
 
 import distrax
@@ -166,7 +167,7 @@ class SACResidualAgent(flax.struct.PyTreeNode):
 
         network_info = dict(
             critic=(critic_def, (ex_observations, None, ex_base_actions)),
-            target_critic=(critic_def, (ex_observations, None, ex_base_actions)),
+            target_critic=(copy.deepcopy(critic_def), (ex_observations, None, ex_base_actions)),
             actor=(actor_def, (ex_observations, ex_base_actions)),
             alpha=(alpha_def, ()),
         )
