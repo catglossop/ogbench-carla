@@ -61,7 +61,7 @@ flags.DEFINE_integer("restore_epoch", None, "Restore epoch.")
 
 flags.DEFINE_integer("online_steps", 1000, "Number of online environment steps to run.")
 flags.DEFINE_integer("log_interval", 10, "Logging interval (env steps).")
-flags.DEFINE_integer("save_interval", 100_000, "Agent-checkpoint interval (env steps).")
+flags.DEFINE_integer("save_interval", 5_000, "Agent-checkpoint interval (env steps).")
 flags.DEFINE_bool("save_buffer", False, "Dump the replay buffer to <save_dir>/buffer.npz at the end.")
 flags.DEFINE_string("buffer_path", None, "Optional explicit path for the saved buffer.")
 flags.DEFINE_string("carla_config", None, "Path to carla_config.yaml (default: impls/configs/carla_config.yaml).")
@@ -168,76 +168,86 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
     episode_count = 0
     start_time = time.time()
 
-    for step in tqdm.tqdm(range(1, FLAGS.online_steps + 1), dynamic_ncols=True):
-        residual_active = step > warmup and buffer is not None and buffer.size >= batch_size
-        if residual_active:
-            rng, sample_key = jax.random.split(rng)
-            final_b, _ = agent.sample_actions(x[None], base[None], seed=sample_key)
-            final = np.asarray(jax.device_get(final_b), dtype=np.float32).reshape(-1)
-        else:
-            final = base
+    def _flush_checkpoint(step_tag: int) -> None:
+        """Persist the latest agent (+ optional buffer). Runs on normal exit, a Python
+        exception, or Ctrl-C. Note: a C++ SIGABRT (CARLA teardown) bypasses ``finally`` --
+        only the periodic ``save_interval`` checkpoints survive that.
+        """
+        save_agent(agent, FLAGS.save_dir, step_tag)
+        if FLAGS.save_buffer and buffer is not None:
+            path = FLAGS.buffer_path or os.path.join(FLAGS.save_dir, "buffer.npz")
+            saved = buffer.save(path)
+            print(f"[main_carla_residual] Saved replay buffer ({buffer.size} transitions) -> {saved}", flush=True)
 
-        next_obs, reward, terminated, truncated, info = env.step(final)
-        done = bool(terminated or truncated)
+    last_step = 0
+    try:
+        for step in tqdm.tqdm(range(1, FLAGS.online_steps + 1), dynamic_ncols=True):
+            last_step = step
+            residual_active = step > warmup and buffer is not None and buffer.size >= batch_size
+            if residual_active:
+                rng, sample_key = jax.random.split(rng)
+                final_b, _ = agent.sample_actions(x[None], base[None], seed=sample_key)
+                final = np.asarray(jax.device_get(final_b), dtype=np.float32).reshape(-1)
+            else:
+                final = base
 
-        next_x = _proprio(next_obs, proprio_slice)
-        next_base = _base_chunk(vla_sample_fn, raw_holder, next_obs, action_dim)
+            next_obs, reward, terminated, truncated, info = env.step(final)
+            done = bool(terminated or truncated)
 
-        transition = dict(
-            observations=x,
-            actions=final,
-            base_actions=base,
-            rewards=np.float32(reward),
-            next_observations=next_x,
-            next_base_actions=next_base,
-            masks=np.float32(1.0 - float(terminated)),
-        )
-        if buffer is None:
-            buffer = ReplayBuffer.create(transition, size=capacity)
-        buffer.add_transition(transition)
+            next_x = _proprio(next_obs, proprio_slice)
+            next_base = _base_chunk(vla_sample_fn, raw_holder, next_obs, action_dim)
 
-        episode_return += float(reward)
-        episode_steps += 1
+            transition = dict(
+                observations=x,
+                actions=final,
+                base_actions=base,
+                rewards=np.float32(reward),
+                next_observations=next_x,
+                next_base_actions=next_base,
+                masks=np.float32(1.0 - float(terminated)),
+            )
+            if buffer is None:
+                buffer = ReplayBuffer.create(transition, size=capacity)
+            buffer.add_transition(transition)
 
-        train_info: dict[str, Any] = {}
-        if enable_updates and buffer.size >= batch_size:
-            for _ in range(updates_per_step):
-                agent, train_info = agent.update(buffer.sample(batch_size))
+            episode_return += float(reward)
+            episode_steps += 1
 
-        if step % FLAGS.log_interval == 0:
-            log = {
-                "env/reward": float(reward),
-                "env/episode_count": episode_count,
-                "env/buffer_size": int(buffer.size),
-                "env/residual_active": int(residual_active),
-                "env/sps": step / max(time.time() - start_time, 1e-6),
-            }
-            if "reward_total" in info:
-                log["reward/total"] = float(info["reward_total"])
-            if train_info:
-                log.update({k: float(jax.device_get(v)) for k, v in train_info.items()})
-            wandb.log(log, step=step)
+            train_info: dict[str, Any] = {}
+            if enable_updates and buffer.size >= batch_size:
+                for _ in range(updates_per_step):
+                    agent, train_info = agent.update(buffer.sample(batch_size))
 
-        if FLAGS.save_interval > 0 and step % FLAGS.save_interval == 0:
-            save_agent(agent, FLAGS.save_dir, step)
+            if step % FLAGS.log_interval == 0:
+                log = {
+                    "env/reward": float(reward),
+                    "env/episode_count": episode_count,
+                    "env/buffer_size": int(buffer.size),
+                    "env/residual_active": int(residual_active),
+                    "env/sps": step / max(time.time() - start_time, 1e-6),
+                }
+                if "reward_total" in info:
+                    log["reward/total"] = float(info["reward_total"])
+                if train_info:
+                    log.update({k: float(jax.device_get(v)) for k, v in train_info.items()})
+                wandb.log(log, step=step)
 
-        if done:
-            wandb.log({"rollout/episode_return": episode_return, "rollout/episode_length": episode_steps}, step=step)
-            episode_count += 1
-            episode_return = 0.0
-            episode_steps = 0
-            obs, _info = env.reset(seed=FLAGS.seed + episode_count)
-            steervla_actor.reset_action_cache()
-            x = _proprio(obs, proprio_slice)
-            base = _base_chunk(vla_sample_fn, raw_holder, obs, action_dim)
-        else:
-            obs, x, base = next_obs, next_x, next_base
+            if FLAGS.save_interval > 0 and step % FLAGS.save_interval == 0:
+                save_agent(agent, FLAGS.save_dir, step)
 
-    save_agent(agent, FLAGS.save_dir, FLAGS.online_steps)
-    if FLAGS.save_buffer and buffer is not None:
-        path = FLAGS.buffer_path or os.path.join(FLAGS.save_dir, "buffer.npz")
-        saved = buffer.save(path)
-        print(f"[main_carla_residual] Saved replay buffer ({buffer.size} transitions) -> {saved}", flush=True)
+            if done:
+                wandb.log({"rollout/episode_return": episode_return, "rollout/episode_length": episode_steps}, step=step)
+                episode_count += 1
+                episode_return = 0.0
+                episode_steps = 0
+                obs, _info = env.reset(seed=FLAGS.seed + episode_count)
+                steervla_actor.reset_action_cache()
+                x = _proprio(obs, proprio_slice)
+                base = _base_chunk(vla_sample_fn, raw_holder, obs, action_dim)
+            else:
+                obs, x, base = next_obs, next_x, next_base
+    finally:
+        _flush_checkpoint(last_step or FLAGS.online_steps)
 
 
 # --------------------------------------------------------------------------- #
