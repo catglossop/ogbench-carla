@@ -73,11 +73,7 @@ def get_config():
         dict(
             enabled=True,
             actor_config="pi05_steervla_cot_simplified_reasoning",
-            checkpoint=(
-                "gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_attention/"
-                "pi05_steervla_cot_simplified_reasoning_no_attention/"
-                "pi05_steervla_cot_simplified_reasoning_no_attention_20260526_175924/2000"
-            ),
+            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/20000/",
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,
             include_ego_history=False,
