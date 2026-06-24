@@ -93,7 +93,7 @@ def get_config():
             enabled=True,
             # Local OpenPI inference (ignored when actor_url is set):
             actor_config="pi05_steervla_cot_simplified_reasoning",
-            checkpoint="/home/carla/.cache/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",
             routing_command="Follow the route and stay in lane.",
             # Per-step CoT sampling temperature for the rollout actor. Best-of-N samples
             # ``best_of_n`` CoTs via ``sample_candidates`` at ``vla_cot_temperature`` (set above),

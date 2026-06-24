@@ -71,6 +71,22 @@ from impls.vlas.utils import RemoteActor
 # Only the front camera for OpenPI preprocess + SigLIP (skip zero-padded wrist streams).
 CARLA_STEERVLA_IMAGE_KEYS: tuple[str, ...] = ("base_0_rgb",)
 
+# Where OpenPI caches downloaded checkpoints. ``openpi.shared.download.maybe_download``
+# reads ``OPENPI_DATA_HOME`` (default ``~/.cache/openpi``) and lays out files as
+# ``<OPENPI_DATA_HOME>/<netloc>/<path>``. Point the cache at NFS so large GCS
+# checkpoints are shared across hosts/users instead of filling each box's home dir;
+# the on-disk layout under it is unchanged.
+STEERVLA_CACHE_DIR = "/nfs/kun2/users/cglossop/.cache/openpi"
+
+
+def _ensure_openpi_cache_dir() -> None:
+    """Redirect OpenPI's download cache to NFS unless the caller overrode it.
+
+    Uses ``setdefault`` so an explicit ``OPENPI_DATA_HOME`` in the environment still
+    wins. Must run before any ``download.maybe_download`` call.
+    """
+    os.environ.setdefault("OPENPI_DATA_HOME", STEERVLA_CACHE_DIR)
+
 
 def restore_openpi_params_on_single_gpu(
     params_dir: Path | str,
@@ -741,6 +757,7 @@ class SteerVLAActor:
         )
         self.train_cfg = dataclasses.replace(self.train_cfg, model=model_cfg)
 
+        _ensure_openpi_cache_dir()
         ckpt_root = Path(download.maybe_download(self.checkpoint_path)).resolve()
         self.checkpoint_dir = ckpt_root
         params_dir = ckpt_root / "params"

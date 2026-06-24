@@ -384,10 +384,71 @@ def _warn_unhealthy_gpus() -> None:
         pass
 
 
+# Candidate locations for the NVIDIA Vulkan ICD manifest. Distros disagree on
+# this path (Debian/Ubuntu driver packages install under /etc, the .run installer
+# and some images use /usr/share), so we probe instead of hardcoding one.
+_NVIDIA_VK_ICD_CANDIDATES = (
+    "/etc/vulkan/icd.d/nvidia_icd.json",
+    "/etc/vulkan/icd.d/nvidia_icd.x86_64.json",
+    "/usr/share/vulkan/icd.d/nvidia_icd.json",
+    "/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json",
+)
+
+
+def _resolve_nvidia_vk_icd() -> Optional[str]:
+    """Return a path to an existing NVIDIA Vulkan ICD, or ``None`` if none found.
+
+    Pointing ``VK_ICD_FILENAMES`` at a non-existent file makes the Vulkan loader
+    skip default discovery and find *no* driver, so CARLA's ``-RenderOffScreen``
+    (Vulkan RHI) exits immediately with an empty log. We therefore (1) honor a
+    caller-set ``VK_ICD_FILENAMES`` only if every listed file exists, else (2)
+    probe known NVIDIA ICD locations, else (3) return ``None`` so the caller can
+    leave the var unset and let the loader auto-discover from its default dirs.
+    """
+    explicit = os.environ.get("VK_ICD_FILENAMES")
+    if explicit:
+        paths = [p for p in explicit.split(os.pathsep) if p]
+        if paths and all(os.path.exists(p) for p in paths):
+            return explicit
+    for candidate in _NVIDIA_VK_ICD_CANDIDATES:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _describe_exit(returncode: Optional[int]) -> str:
+    """Human-readable description of a subprocess return code (decodes signals)."""
+    if returncode is None:
+        return "still running"
+    if returncode < 0:
+        sig = -returncode
+        try:
+            name = signal.Signals(sig).name
+        except (ValueError, AttributeError):
+            name = f"signal {sig}"
+        return f"killed by {name} ({sig})"
+    return f"exit code {returncode}"
+
+
+def _read_log_tail(path: str, n_bytes: int = 4000) -> str:
+    """Read the last ``n_bytes`` of a log, flagging empty/unreadable logs explicitly."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            data = f.read()
+    except Exception as exc:
+        return f"(log unreadable: {exc})"
+    if not data.strip():
+        return (
+            "(log is empty -- CARLA wrote nothing before exiting. This usually "
+            "means UE4 died before logging, e.g. Vulkan/GPU init failure, a missing "
+            "NVIDIA Vulkan ICD, or the process being killed by a signal.)"
+        )
+    return data[-n_bytes:]
+
+
 def _carla_subprocess_env(display_num: int, sim_gpu_rank: int) -> Dict[str, str]:
     """Minimal UE4 environment with GPU/Vulkan vars CARLA needs to boot off-screen."""
     _sys_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    _NVIDIA_VK_ICD = "/usr/share/vulkan/icd.d/nvidia_icd.json"
     carla_env: Dict[str, str] = {
         "HOME": os.environ.get("HOME", "/root"),
         "USER": os.environ.get("USER", "root"),
@@ -398,9 +459,21 @@ def _carla_subprocess_env(display_num: int, sim_gpu_rank: int) -> Dict[str, str]
         # Hide other GPUs from UE4/Vulkan so a wedged card cannot hang enumeration.
         "NVIDIA_VISIBLE_DEVICES": str(int(sim_gpu_rank)),
         "CUDA_VISIBLE_DEVICES": "0",
-        "VK_ICD_FILENAMES": os.environ.get("VK_ICD_FILENAMES", _NVIDIA_VK_ICD),
         "__GLX_VENDOR_LIBRARY_NAME": "nvidia",
     }
+    vk_icd = _resolve_nvidia_vk_icd()
+    if vk_icd is not None:
+        carla_env["VK_ICD_FILENAMES"] = vk_icd
+    else:
+        # No NVIDIA ICD found at any known path: leave VK_ICD_FILENAMES unset so
+        # the Vulkan loader scans its default dirs instead of a bogus file.
+        print(
+            "\033[33m[carla] WARNING: no NVIDIA Vulkan ICD found at any of "
+            f"{_NVIDIA_VK_ICD_CANDIDATES}; leaving VK_ICD_FILENAMES unset and "
+            "relying on Vulkan default discovery. If CARLA fails to boot, install "
+            "the NVIDIA Vulkan ICD or set VK_ICD_FILENAMES to its manifest.\033[0m",
+            flush=True,
+        )
     for _k in (
         "CUDA_HOME",
         "CUDA_ROOT",
@@ -544,7 +617,13 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
             stdout=self._carla_log_file,
             stderr=self._carla_log_file,
         )
-        print(" ".join(cmd), self.server.returncode, flush=True)
+        # NOTE: returncode is None immediately after Popen; log pid + paths instead.
+        print(
+            f"[carla] launched UE4 (pid={self.server.pid}) on display :{display_num} "
+            f"sim_gpu_rank={sim_gpu_rank}; VK_ICD_FILENAMES={carla_env.get('VK_ICD_FILENAMES', '<unset>')}; "
+            f"log={_carla_log_path}\n[carla] cmd: {' '.join(cmd)}",
+            flush=True,
+        )
 
         max_boot_s = max(60, int(os.environ.get("CARLA_BOOT_TIMEOUT", "180")))
         print(f"[carla] waiting up to {max_boot_s}s for UE4 RPC on port {rpc_port}...", flush=True)
@@ -554,14 +633,11 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
         while time.time() - boot_start < max_boot_s:
             elapsed = int(time.time() - boot_start)
             if self.server.poll() is not None:
-                try:
-                    with open(_carla_log_path, "r", encoding="utf-8", errors="replace") as f:
-                        tail = f.read()[-4000:]
-                except Exception:
-                    tail = "(log unreadable)"
+                tail = _read_log_tail(_carla_log_path)
                 raise RuntimeError(
-                    f"CARLA server exited during boot (code={self.server.returncode}) "
-                    f"after {elapsed}s; see {_carla_log_path}\n{tail}"
+                    f"CARLA server exited during boot ({_describe_exit(self.server.returncode)}) "
+                    f"after {elapsed}s on display :{display_num} sim_gpu_rank={sim_gpu_rank}; "
+                    f"see {_carla_log_path}\n{tail}"
                 )
             try:
                 probe = carla.Client(args.host, rpc_port)
@@ -575,15 +651,13 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
                     print(f"[carla] still booting... ({elapsed}s)", flush=True)
                 time.sleep(5)
         else:
-            try:
-                with open(_carla_log_path, "r", encoding="utf-8", errors="replace") as f:
-                    tail = f.read()[-4000:]
-            except Exception:
-                tail = "(log unreadable)"
+            tail = _read_log_tail(_carla_log_path)
+            still_alive = self.server.poll() is None
+            status = "still running but unresponsive" if still_alive else _describe_exit(self.server.returncode)
             raise RuntimeError(
-                f"CARLA server did not open RPC port {rpc_port} within {max_boot_s}s; "
-                f"see {_carla_log_path}. If nvidia-smi shows ERR! on a GPU, reset it "
-                f"or reboot.\n{tail}"
+                f"CARLA server did not open RPC port {rpc_port} within {max_boot_s}s "
+                f"(server {status}); see {_carla_log_path}. If nvidia-smi shows ERR! on a "
+                f"GPU, reset it or reboot.\n{tail}"
             )
 
         attempts = 0
