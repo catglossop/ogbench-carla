@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -41,7 +42,7 @@ from ml_collections import config_flags
 
 from utils.datasets import ReplayBuffer
 from utils.flax_utils import restore_agent, save_agent
-from utils.log_utils import get_exp_name, get_flag_dict, setup_wandb
+from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
 
 FLAGS = flags.FLAGS
 
@@ -151,6 +152,106 @@ def _base_chunk(vla_sample_fn, raw_holder: dict, obs: dict, action_dim: int) -> 
 
 
 # --------------------------------------------------------------------------- #
+# Logging helpers                                                             #
+# --------------------------------------------------------------------------- #
+
+# Reward components emitted by ogbench/carla/carla_utils.py::_compute_reward_and_info.
+# Logged under reward/* so the W&B "reward" section breaks total into its parts.
+_REWARD_KEYS = (
+    "reward_total",
+    "reward_progress",
+    "reward_terminal",
+    "penalty_collision",
+    "penalty_outside_route",
+    "penalty_traffic_violation",
+    "penalty_steer",
+    "penalty_brake",
+    "penalty_speed_limit",
+    "penalty_crash_stuck",
+)
+# Per-step driving diagnostics (logged under rollout/*).
+_DRIVE_KEYS = (
+    "route_progress_pct",
+    "route_progress_delta",
+    "lane_offset_m",
+    "heading_error_rad",
+    "speed_norm",
+    "overspeed_frac",
+    "collision_count",
+    "traffic_violation_count",
+)
+
+
+def _reward_breakdown_log(info: dict) -> dict[str, float]:
+    """Flatten the env reward components + drive diagnostics into a W&B log dict."""
+    out: dict[str, float] = {}
+    if "reward_total" in info:
+        for k in _REWARD_KEYS:
+            if k in info:
+                out[f"reward/{k}"] = float(info[k])
+    for k in _DRIVE_KEYS:
+        if k in info:
+            out[f"rollout/{k}"] = float(info[k])
+    return out
+
+
+def _episode_summary_log(info: dict) -> dict[str, Any]:
+    """Per-episode terminal summary (success / score / progress / collisions)."""
+    out: dict[str, Any] = {}
+    if "success" in info:
+        out["rollout/success"] = float(bool(info["success"]))
+    if "driving_score" in info:
+        out["rollout/driving_score"] = float(info["driving_score"])
+    if "route_progress_pct" in info:
+        out["rollout/final_route_progress_pct"] = float(info["route_progress_pct"])
+    if "collision_count" in info:
+        out["rollout/episode_collision_count"] = float(info["collision_count"])
+    if "termination_reason" in info:
+        out["rollout/termination_reason"] = str(info["termination_reason"])
+    return out
+
+
+def _viz_frame(obs: dict) -> Optional[np.ndarray]:
+    """uint8 camera frame for the rollout video (prefers high-res ``image_viz``)."""
+    if not isinstance(obs, dict):
+        return None
+    img = obs.get("image_viz")
+    if img is None:
+        img = obs.get("image")
+    if img is None:
+        return None
+    frame = np.asarray(img)
+    if frame.dtype != np.uint8:
+        frame = np.clip(frame, 0, 255).astype(np.uint8)
+    return frame
+
+
+def _annotate_reward(frame: np.ndarray, reward_value: float) -> np.ndarray:
+    """Draw ``r=<value>`` in the top-left corner; no-op if cv2 is unavailable."""
+    try:
+        import cv2  # type: ignore
+
+        out = np.ascontiguousarray(frame)
+        cv2.putText(
+            out, f"r={reward_value:+.3f}", (6, 18),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA,
+        )
+        return out
+    except Exception:
+        return frame
+
+
+def _episode_video(frames: list[np.ndarray], fps: float):
+    """Stack captured frames into a W&B video (T, C, H, W); None if empty."""
+    if not frames:
+        return None
+    video = np.stack(frames, axis=0)
+    if video.ndim == 4:  # (T, H, W, C) -> (T, C, H, W) as W&B expects.
+        video = np.transpose(video, (0, 3, 1, 2))
+    return wandb.Video(video, fps=fps, format="mp4")
+
+
+# --------------------------------------------------------------------------- #
 # Online loop                                                                  #
 # --------------------------------------------------------------------------- #
 
@@ -166,6 +267,14 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
     enable_updates = bool(FLAGS.enable_updates) if FLAGS.enable_updates is not None else bool(config["enable_updates"])
     if not enable_updates:
         print("[main_carla_residual] enable_updates=False: rollout-only (no RL gradient updates).", flush=True)
+
+    log_video = bool(config.get("log_episode_video", True))
+    video_fps = float(config.get("episode_video_fps", 10.0))
+    video_every = max(1, int(config.get("episode_video_every", 2)))
+    episode_frames: list[np.ndarray] = []
+
+    train_logger = CsvLogger(os.path.join(FLAGS.save_dir, "train.csv"))
+    last_residual: Optional[np.ndarray] = None
 
     rng = jax.random.PRNGKey(FLAGS.seed)
 
@@ -196,8 +305,9 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
             residual_active = step > warmup and buffer is not None and buffer.size >= batch_size
             if residual_active:
                 rng, sample_key = jax.random.split(rng)
-                final_b, _ = agent.sample_actions(x[None], base[None], seed=sample_key)
+                final_b, residual_b = agent.sample_actions(x[None], base[None], seed=sample_key)
                 final = np.asarray(jax.device_get(final_b), dtype=np.float32).reshape(-1)
+                last_residual = np.asarray(jax.device_get(residual_b), dtype=np.float32).reshape(-1)
             else:
                 final = base
 
@@ -223,6 +333,11 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
             episode_return += float(reward)
             episode_steps += 1
 
+            if log_video and (episode_steps % video_every == 0 or done):
+                frame = _viz_frame(next_obs)
+                if frame is not None:
+                    episode_frames.append(_annotate_reward(frame, float(reward)))
+
             train_info: dict[str, Any] = {}
             if enable_updates and buffer.size >= batch_size:
                 for _ in range(updates_per_step):
@@ -236,17 +351,35 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
                     "env/residual_active": int(residual_active),
                     "env/sps": step / max(time.time() - start_time, 1e-6),
                 }
-                if "reward_total" in info:
-                    log["reward/total"] = float(info["reward_total"])
+                log.update(_reward_breakdown_log(info))
                 if train_info:
                     log.update({k: float(jax.device_get(v)) for k, v in train_info.items()})
+                # Action / residual distributions (CSV logger drops Histograms automatically).
+                log["dist/base_action"] = wandb.Histogram(np.asarray(base, dtype=np.float32))
+                log["dist/final_action"] = wandb.Histogram(np.asarray(final, dtype=np.float32))
+                if last_residual is not None:
+                    log["dist/residual"] = wandb.Histogram(last_residual)
                 wandb.log(log, step=step)
+                train_logger.log(log, step=step)
 
             if FLAGS.save_interval > 0 and step % FLAGS.save_interval == 0:
                 save_agent(agent, FLAGS.save_dir, step)
 
             if done:
-                wandb.log({"rollout/episode_return": episode_return, "rollout/episode_length": episode_steps}, step=step)
+                rollout_log: dict[str, Any] = {
+                    "rollout/episode_return": episode_return,
+                    "rollout/episode_length": episode_steps,
+                    "rollout/episodes": episode_count + 1,
+                }
+                rollout_log.update(_episode_summary_log(info))
+                if log_video:
+                    video = _episode_video(episode_frames, video_fps)
+                    if video is not None:
+                        rollout_log["rollout/episode_video"] = video
+                wandb.log(rollout_log, step=step)
+                train_logger.log(rollout_log, step=step)
+                episode_frames.clear()
+
                 episode_count += 1
                 episode_return = 0.0
                 episode_steps = 0
@@ -257,6 +390,7 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
             else:
                 obs, x, base = next_obs, next_x, next_base
     finally:
+        train_logger.close()
         _flush_checkpoint(last_step or FLAGS.online_steps)
 
 
@@ -276,7 +410,10 @@ def main(_):
         raise ValueError("--route is required (see --list_routes=true).")
 
     wandb_mode = FLAGS.wandb_mode or os.environ.get("WANDB_MODE", "online")
-    exp_name = get_exp_name(FLAGS.seed)
+    # Descriptive run name so runs are distinguishable in W&B: <route>-<encoder>-sd###_<ts>.
+    route_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", str(FLAGS.route)).strip("-")
+    encoder_tag = str(config.get("state_encoder", "pi_prefix"))
+    exp_name = f"{route_tag}-{encoder_tag}-{get_exp_name(FLAGS.seed)}"
     setup_wandb(project="OGBench-CARLA-Residual", group=FLAGS.run_group, name=exp_name, mode=wandb_mode)
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)

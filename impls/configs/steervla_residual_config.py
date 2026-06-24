@@ -29,6 +29,13 @@ def get_config():
     config.enable_updates = True
     config.buffer_capacity = 100_000
 
+    # ----- logging ----------------------------------------------------------- #
+    # Log a W&B rollout video per episode (frames from obs["image_viz"]).
+    config.log_episode_video = True
+    config.episode_video_fps = 10.0
+    # Capture every Nth env step (plus the terminal frame) to keep videos light.
+    config.episode_video_every = 2
+
     # RL state encoder. The residual agent is encoder-agnostic: whatever this
     # produces (a single fixed-size vector) is concatenated with the base action
     # chunk and fed to the residual MLP. Options:
