@@ -1,8 +1,8 @@
 """Online residual RL on CARLA Bench2Drive with a frozen SteerVLA base policy.
 
-    SteerVLA proposes a base action chunk -> RL state x = proprio slice -> the
-    residual SAC agent adds a small correction -> the env executes one tick ->
-    transitions feed a replay buffer.
+    SteerVLA proposes a base action chunk -> RL state x = frozen mean-pooled
+    SteerVLA prefix feature -> the residual SAC agent adds a small correction ->
+    the env executes one tick -> transitions feed a replay buffer.
 
 Calling patterns::
 
@@ -127,10 +127,20 @@ def _make_carla_env(carla_config_path, route, *, extra_carla_config=None):
     return CarlaBench2DriveWrapper(cfg, route=route)
 
 
-def _proprio(obs: dict, slice_lo_hi) -> np.ndarray:
-    """RL state = proprio slice of obs['state'] -> float32 [proprio_dim]."""
-    state = np.asarray(obs["state"], dtype=np.float32).reshape(-1)
-    return state[int(slice_lo_hi[0]):int(slice_lo_hi[1])]
+def _encode_state(steervla_actor, obs: dict, encoder: str) -> np.ndarray:
+    """RL state = a single fixed-size vector encoded from the CARLA obs.
+
+    ``pi_prefix``: run the frozen SteerVLA prefix path (full PaliGemma forward
+    over image + prompt) and mean-pool to one vector per row (stop-gradient).
+    The pooled feature is deterministic given the obs; speed + routing command
+    enter via the prompt, so no separate proprio vector is concatenated. RLT
+    will later swap the mean-pool for a learned aggregation over the same tokens.
+    """
+    if encoder == "pi_prefix":
+        openpi_obs = steervla_actor.build_observation_batch_numpy(1, raw=obs)
+        feat = steervla_actor.encode_prefix_features(openpi_obs)
+        return np.asarray(jax.device_get(feat), dtype=np.float32).reshape(-1)
+    raise ValueError(f"Unknown state_encoder {encoder!r}; expected 'pi_prefix'.")
 
 
 def _base_chunk(vla_sample_fn, raw_holder: dict, obs: dict, action_dim: int) -> np.ndarray:
@@ -147,7 +157,7 @@ def _base_chunk(vla_sample_fn, raw_holder: dict, obs: dict, action_dim: int) -> 
 
 def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_holder):
     """Residual-SAC online loop. One env.step == one CARLA tick == one transition."""
-    proprio_slice = tuple(config["ego_state_slice"])
+    state_encoder = str(config["state_encoder"])
     action_dim = int(config["steervla"]["action_horizon"]) * int(config["steervla"]["action_dim"])
     warmup = int(config["residual_warmup_steps"])
     batch_size = int(config["batch_size"])
@@ -159,7 +169,7 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
 
     rng = jax.random.PRNGKey(FLAGS.seed)
 
-    x = _proprio(obs, proprio_slice)
+    x = _encode_state(steervla_actor, obs, state_encoder)
     base = _base_chunk(vla_sample_fn, raw_holder, obs, action_dim)
 
     buffer: Optional[ReplayBuffer] = None
@@ -194,7 +204,7 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
             next_obs, reward, terminated, truncated, info = env.step(final)
             done = bool(terminated or truncated)
 
-            next_x = _proprio(next_obs, proprio_slice)
+            next_x = _encode_state(steervla_actor, next_obs, state_encoder)
             next_base = _base_chunk(vla_sample_fn, raw_holder, next_obs, action_dim)
 
             transition = dict(
@@ -242,7 +252,7 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
                 episode_steps = 0
                 obs, _info = env.reset(seed=FLAGS.seed + episode_count)
                 steervla_actor.reset_action_cache()
-                x = _proprio(obs, proprio_slice)
+                x = _encode_state(steervla_actor, obs, state_encoder)
                 base = _base_chunk(vla_sample_fn, raw_holder, obs, action_dim)
             else:
                 obs, x, base = next_obs, next_x, next_base
@@ -306,12 +316,14 @@ def main(_):
 
         _configure_jax_training_device(training_gpu_rank)
 
-        proprio_slice = tuple(config["ego_state_slice"])
-        x_dim = int(proprio_slice[1]) - int(proprio_slice[0])
+        state_encoder = str(config["state_encoder"])
         action_dim = int(steervla_cfg["action_horizon"]) * int(steervla_cfg["action_dim"])
+        # Probe the encoded-state width once so the agent's MLPs are sized correctly.
+        # (pi_prefix dim = PaliGemma hidden width; not known until the model loads.)
+        x_dim = int(_encode_state(steervla_actor, obs, state_encoder).shape[-1])
         ex_obs = np.zeros((1, x_dim), dtype=np.float32)
         ex_base = np.zeros((1, action_dim), dtype=np.float32)
-        print(f"[main_carla_residual] proprio x_dim={x_dim}; action_dim={action_dim}", flush=True)
+        print(f"[main_carla_residual] state_encoder={state_encoder}; x_dim={x_dim}; action_dim={action_dim}", flush=True)
 
         from jax_agents.sac_residual import SACResidualAgent
 

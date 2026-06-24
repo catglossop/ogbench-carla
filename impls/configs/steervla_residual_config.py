@@ -2,10 +2,11 @@
 
 Use with ``--agent=impls/configs/steervla_residual_config.py`` (the default for
 ``impls/main_carla_residual.py``). This wraps :func:`jax_agents.sac_residual.get_config`
-(the residual SAC agent) and adds the run-level wiring: the proprio slice used as
-the RL state and the frozen SteerVLA base policy. (RLT, when added, plugs in as a
-state encoder feeding this same agent — it is not an agent itself, so it reuses
-this config/entrypoint via a ``config.encoder`` knob rather than new files.)
+(the residual SAC agent) and adds the run-level wiring: the state encoder used to
+build the RL state and the frozen SteerVLA base policy. (RLT, when added, plugs in
+as another ``state_encoder`` feeding this same agent — it is not an agent itself,
+so it reuses this config/entrypoint via the ``config.state_encoder`` knob rather
+than new run files.)
 
 ``config.training_gpu_rank`` pins JAX (RL agent + SteerVLA checkpoint restore) to
 one GPU; CARLA's render GPU is ``gpu_rank`` in ``impls/configs/carla_config.yaml``.
@@ -28,10 +29,17 @@ def get_config():
     config.enable_updates = True
     config.buffer_capacity = 100_000
 
-    # RL state = proprio slice of obs["state"] (carla_utils 25-dim layout):
-    # kinematics + last control = state[6:19] (13-dim). [0:6]=global pose,
-    # [19:25]=command (already in the VLA prompt).
-    config.ego_state_slice = (6, 19)
+    # RL state encoder. The residual agent is encoder-agnostic: whatever this
+    # produces (a single fixed-size vector) is concatenated with the base action
+    # chunk and fed to the residual MLP. Options:
+    #   "pi_prefix" : frozen, mean-pooled SteerVLA prefix feature
+    #                 (full PaliGemma forward over image + prompt, then mean-pool;
+    #                 deterministic, stop-gradient). Speed + routing command ride
+    #                 in via the prompt, so no separate proprio vector is needed.
+    #   "rl_token"  : (future) learned RLT encoder over the un-pooled prefix
+    #                 tokens — same input, learned aggregation instead of mean-pool.
+    # Both require local SteerVLA (remote HTTP mode does not expose Pi features).
+    config.state_encoder = "pi_prefix"
 
     # ----- frozen SteerVLA base policy --------------------------------------- #
     config.steervla = ml_collections.ConfigDict(
