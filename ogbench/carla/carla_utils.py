@@ -174,10 +174,6 @@ from ogbench.carla.leaderboard_agents.observation_only import (
     RGB_FRONT_CAMERA_TAG,
     VIZ_IMAGE_SHAPE_HWC,
 )
-from ogbench.carla.leaderboard_agents.simlingo_obs import (
-    SIMLINGO_CAMERA_TAG,
-    SIMLINGO_IMAGE_SHAPE_HWC,
-)
 
 
 def _patch_speedometer_no_rpc() -> None:
@@ -599,29 +595,6 @@ def _bgra_to_rgb_hwc(arr: np.ndarray) -> np.ndarray:
     """CARLA leaderboard packs ``sensor.camera.rgb`` as H×W×4 BGRA uint8."""
     bgr = np.asarray(arr)[..., :3]
     return np.ascontiguousarray(bgr[..., ::-1], dtype=np.uint8)
-
-
-def _decode_simlingo_image(sensor_dict: Dict[str, Any]) -> np.ndarray:
-    """Decode ``rgb_simlingo`` at native 1024×512 resolution for SimLingo inference."""
-    if not sensor_dict or SIMLINGO_CAMERA_TAG not in sensor_dict:
-        return np.zeros(SIMLINGO_IMAGE_SHAPE_HWC, dtype=np.uint8)
-    tup = sensor_dict[SIMLINGO_CAMERA_TAG]
-    if not isinstance(tup, (tuple, list)) or len(tup) < 2:
-        return np.zeros(SIMLINGO_IMAGE_SHAPE_HWC, dtype=np.uint8)
-    payload = tup[1]
-    if payload is None:
-        return np.zeros(SIMLINGO_IMAGE_SHAPE_HWC, dtype=np.uint8)
-    arr = np.asarray(payload)
-    if arr.ndim != 3:
-        return np.zeros(SIMLINGO_IMAGE_SHAPE_HWC, dtype=np.uint8)
-    rgb = _bgra_to_rgb_hwc(arr) if arr.shape[-1] == 4 else arr.astype(np.uint8, copy=False)
-    if rgb.shape != SIMLINGO_IMAGE_SHAPE_HWC:
-        try:
-            import cv2
-            rgb = cv2.resize(rgb, (SIMLINGO_IMAGE_SHAPE_HWC[1], SIMLINGO_IMAGE_SHAPE_HWC[0]), interpolation=cv2.INTER_AREA)
-        except Exception:
-            return np.zeros(SIMLINGO_IMAGE_SHAPE_HWC, dtype=np.uint8)
-    return rgb
 
 
 def _compute_target_point_ego(ego_actor, route_planner) -> np.ndarray:
@@ -2133,7 +2106,6 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             "state": self._get_state_vector(),
             "image": downscale_rgb_for_policy(rgb_viz),
             "image_viz": rgb_viz,
-            "simlingo_image": _decode_simlingo_image(sensors),
             "language_label": language_label,
             "commentary_text": commentary_text,
             "expert_action": expert_action,

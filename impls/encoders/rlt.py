@@ -22,7 +22,7 @@ from .base import StateEncoder
 from .rl_token_ae import RLTokenAEConfig, RLTokenAutoencoder
 
 
-def _load_autoencoder(checkpoint_path: str, device: str):
+def load_autoencoder(checkpoint_path: str, device: str):
     import torch
 
     try:
@@ -55,7 +55,7 @@ class RLTokenEncoder(StateEncoder):
             raise ValueError("rl_token encoder requires config.rl_token.checkpoint_path.")
         self._actor = steervla_actor
         self._device = device
-        self._model, self._cfg = _load_autoencoder(checkpoint_path, device)
+        self._model, self._cfg = load_autoencoder(checkpoint_path, device)
 
     def encode(self, obs: dict) -> np.ndarray:
         import torch
