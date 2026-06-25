@@ -547,6 +547,10 @@ class SteerVLAActor:
         self._cached_action_step = 0
         self._cached_cot: dict[str, Any] | None = None
         self._cached_cot_actions_used = 0
+        # Latest (batched) CoT output used to condition the current action chunk.
+        # Cached so encode_prefix_tokens (RLT state encoder) can rebuild the exact
+        # prefix the base policy acted on, even when CoT caching is disabled.
+        self._last_cot_out: dict[str, Any] | None = None
 
         self.train_cfg = None
         self.model = None
@@ -708,6 +712,77 @@ class SteerVLAActor:
             jax.lax.stop_gradient(prefix_mask_no_reasoning),
         )
 
+    def _preprocess_observation_on_device(
+        self,
+        observation: _openpi_model.Observation,
+    ) -> _openpi_model.Observation:
+        """Move an observation to the JAX device and run OpenPI eval preprocessing."""
+        obs_jax = jax.tree.map(
+            lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
+            observation,
+        )
+        return _openpi_model.preprocess_observation(
+            None, obs_jax, train=False, image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+
+    def _prefix_llm_forward(
+        self,
+        obs_proc: _openpi_model.Observation,
+        *,
+        include_fast: bool,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Run the frozen PaliGemma prefix LLM; return un-pooled ``(prefix_out, prefix_mask)``.
+
+        Embeds image + prompt + reasoning + subtask tokens (token order
+        ``[vision, prompt, reasoning, subtask, (fast)]``) and runs the full LLM.
+        When ``include_fast`` and the model uses FAST tokens, the FAST action
+        tokens are appended and the FAST->reasoning knowledge-insulation mask is
+        applied, matching the offline RL-Token dump. With ``include_fast=False``
+        this is the image+prompt+CoT prefix consumed by the mean-pooled feature.
+        Shared by :meth:`encode_prefix_features` and :meth:`encode_prefix_tokens`.
+        """
+        model = self.model
+        img_tokens, img_masks, img_ar = model._embed_images(obs_proc)
+        n_img = sum(t.shape[1] for t in img_tokens)
+
+        prompt = model._embed_text_tokens(obs_proc.tokenized_prompt)
+        reasoning = model._embed_text_tokens(obs_proc.tokenized_reasoning)
+        subtask = model._embed_text_tokens(obs_proc.tokenized_subtask)
+        n_prompt, n_reasoning, n_subtask = prompt.shape[1], reasoning.shape[1], subtask.shape[1]
+
+        parts = list(img_tokens) + [prompt, reasoning, subtask]
+        masks = list(img_masks) + [
+            obs_proc.tokenized_prompt_mask,
+            obs_proc.tokenized_reasoning_mask,
+            obs_proc.tokenized_subtask_mask,
+        ]
+        ar = list(img_ar) + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask
+
+        n_fast = 0
+        if include_fast and _model_uses_fast_tokens(self.model_cfg) and obs_proc.tokenized_fast is not None:
+            fast = model._embed_text_tokens(obs_proc.tokenized_fast)
+            n_fast = fast.shape[1]
+            parts.append(fast)
+            masks.append(obs_proc.tokenized_fast_mask)
+            ar += [True] * n_fast
+
+        tokens = jnp.concatenate(parts, axis=1)
+        prefix_mask = jnp.concatenate(masks, axis=1)
+        attn_mask = _openpi_pi0.make_attn_mask(prefix_mask, jnp.array(ar))
+        if n_fast > 0:
+            # FAST rows must not attend to reasoning cols (knowledge insulation), so
+            # z_rl is not graded on copying the action it conditions on.
+            total = prefix_mask.shape[1]
+            rstart, rend = n_img + n_prompt, n_img + n_prompt + n_reasoning
+            fstart = rend + n_subtask
+            idx = jnp.arange(total)
+            col_r = (idx >= rstart) & (idx < rend)
+            row_f = (idx >= fstart) & (idx < fstart + n_fast)
+            attn_mask = attn_mask & (~(row_f[:, None] & col_r[None, :]))[None]
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), _ = model.PaliGemma.llm([tokens, None], mask=attn_mask, positions=positions)
+        return prefix_out, prefix_mask
+
     def encode_image_features(
         self,
         observation: _openpi_model.Observation,
@@ -723,16 +798,7 @@ class SteerVLAActor:
         if self.model is None or self._jax_device is None:
             raise RuntimeError("Local SteerVLA model is not initialized.")
 
-        obs_jax = jax.tree.map(
-            lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
-            observation,
-        )
-        obs_proc = _openpi_model.preprocess_observation(
-            None,
-            obs_jax,
-            train=False,
-            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-        )
+        obs_proc = self._preprocess_observation_on_device(observation)
         img_tokens, img_masks, _img_ar = self.model._embed_images(obs_proc)
         tokens = jnp.concatenate(img_tokens, axis=1)
         masks = jnp.concatenate(img_masks, axis=1).astype(tokens.dtype)
@@ -756,52 +822,57 @@ class SteerVLAActor:
         if self.model is None or self._jax_device is None:
             raise RuntimeError("Local SteerVLA model is not initialized.")
 
-        obs_jax = jax.tree.map(
-            lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
-            observation,
-        )
-        obs_proc = _openpi_model.preprocess_observation(
-            None,
-            obs_jax,
-            train=False,
-            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-        )
-
-        img_tokens, img_masks, img_ar = self.model._embed_images(obs_proc)
-        prompt_emb = self.model._embed_text_tokens(obs_proc.tokenized_prompt)
-        prompt_mask = obs_proc.tokenized_prompt_mask
-        n_prompt = prompt_emb.shape[1]
-
-        reasoning_emb = self.model._embed_text_tokens(obs_proc.tokenized_reasoning)
-        reasoning_mask = obs_proc.tokenized_reasoning_mask
-        n_reasoning = reasoning_emb.shape[1]
-
-        subtask_emb = self.model._embed_text_tokens(obs_proc.tokenized_subtask)
-        subtask_mask = obs_proc.tokenized_subtask_mask
-        n_subtask = subtask_emb.shape[1]
-
-        prefix_tokens = jnp.concatenate(
-            img_tokens + [prompt_emb, reasoning_emb, subtask_emb], axis=1,
-        )
-        prefix_mask = jnp.concatenate(
-            img_masks + [prompt_mask, reasoning_mask, subtask_mask], axis=1,
-        )
-        prefix_ar = jnp.array(
-            img_ar + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask
-        )
-
-        prefix_attn_mask = _openpi_pi0.make_attn_mask(prefix_mask, prefix_ar)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        (prefix_out, _), _kv_cache = self.model.PaliGemma.llm(
-            [prefix_tokens, None],
-            mask=prefix_attn_mask,
-            positions=positions,
-        )
+        obs_proc = self._preprocess_observation_on_device(observation)
+        prefix_out, prefix_mask = self._prefix_llm_forward(obs_proc, include_fast=False)
 
         prefix_mask_f = prefix_mask.astype(prefix_out.dtype)
         denom = jnp.maximum(prefix_mask_f.sum(axis=1, keepdims=True), 1.0)
         pooled = jnp.sum(prefix_out * prefix_mask_f[..., None], axis=1) / denom
         return jax.lax.stop_gradient(pooled)
+
+    def encode_prefix_tokens(
+        self,
+        raw: Dict[str, Any],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return the *un-pooled* SteerVLA prefix tokens for the RLT state encoder.
+
+        Mirrors the offline RL-Token embedding dump (``dump_rl_token_embeddings.py``)
+        exactly so a separately trained autoencoder sees the same token layout it was
+        trained on: image + prompt + reasoning + subtask + FAST tokens run through the
+        full PaliGemma LLM (including the FAST->reasoning knowledge-insulation mask),
+        *without* the mean-pool that :meth:`encode_prefix_features` applies.
+
+        The reasoning/subtask/FAST tokens come from the CoT the base policy actually
+        sampled for this observation (``self._last_cot_out``), so call this only
+        *after* the base action chunk has been produced for ``raw``. Token order is
+        ``[base-cam vision, prompt, reasoning, subtask, fast]``; CARLA uses a single
+        camera so there are no wrist-cam tokens to drop (the offline dump drops them).
+
+        Returns ``(prefix_out f32[1, M, D], prefix_mask bool[1, M])``.
+        """
+        if self._remote is not None:
+            raise RuntimeError("Pi prefix tokens are not available in remote SteerVLAActor mode.")
+        if self.model is None or self._jax_device is None:
+            raise RuntimeError("Local SteerVLA model is not initialized.")
+
+        obs_np = self.build_observation_batch_numpy(1, raw=raw)
+        obs_jax = jax.tree.map(
+            lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
+            obs_np,
+        )
+        # Overlay the exact CoT/FAST the base policy sampled for this observation
+        # before preprocessing, so the prefix matches the offline RL-Token dump.
+        if self._last_cot_out is not None:
+            obs_jax = _merge_cot_output_into_observation(obs_jax, self._last_cot_out)
+        obs_proc = _openpi_model.preprocess_observation(
+            None, obs_jax, train=False, image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+
+        prefix_out, prefix_mask = self._prefix_llm_forward(obs_proc, include_fast=True)
+        prefix_out = jax.lax.stop_gradient(prefix_out)
+        out = np.asarray(jax.device_get(prefix_out), dtype=np.float32)
+        mask = np.asarray(jax.device_get(prefix_mask), dtype=bool)
+        return out, mask
 
     def encode_suffix_features(
         self,
@@ -1096,6 +1167,7 @@ class SteerVLAActor:
             and self._cached_cot is not None
             and self._cached_cot_actions_used < self.actions_per_cot
         ):
+            self._last_cot_out = self._cached_cot
             return self._cached_cot
         cot_out = self._sample_cot(
             rng,
@@ -1106,6 +1178,7 @@ class SteerVLAActor:
         if self._cot_cache_enabled(batch_size):
             self._cached_cot = dict(cot_out)
             self._cached_cot_actions_used = 0
+        self._last_cot_out = cot_out
         return cot_out
 
     def _mark_action_served(self, batch_size: int) -> None:
@@ -1117,6 +1190,7 @@ class SteerVLAActor:
         self._cached_action_step = 0
         self._cached_cot = None
         self._cached_cot_actions_used = 0
+        self._last_cot_out = None
 
     def sample_action_distribution(
         self,

@@ -26,6 +26,9 @@ TM_PORT="8020"
 X_DISPLAY_NUM=""
 
 ENABLE_UPDATES="true"
+BASE_ONLY=""
+STATE_ENCODER=""
+RLT_CHECKPOINT=""
 
 BASE_AGENT_CFG="impls/configs/steervla_residual_config.py"
 BASE_CARLA_CFG="impls/configs/carla_config.yaml"
@@ -56,6 +59,9 @@ Options:
   --x-display-num N         Xvfb display number. Default: derived from carla port
 
   --enable-updates BOOL     true|false. false = rollout/buffer only (no RL updates). Default: true
+  --base-only BOOL          true|false. true = no-RL baseline: roll out the frozen base policy only. Default: false
+  --state-encoder NAME      RL state encoder: pi_prefix|siglip_pool|rl_token. Default: config value (pi_prefix)
+  --rlt-checkpoint PATH     RLT autoencoder checkpoint (only for --state-encoder rl_token).
 
   --agent-config PATH       Base agent config. Default: impls/configs/steervla_residual_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
@@ -85,6 +91,9 @@ while [[ $# -gt 0 ]]; do
     --tm-port) TM_PORT="$2"; shift 2 ;;
     --x-display-num) X_DISPLAY_NUM="$2"; shift 2 ;;
     --enable-updates) ENABLE_UPDATES="$2"; shift 2 ;;
+    --base-only) BASE_ONLY="$2"; shift 2 ;;
+    --state-encoder) STATE_ENCODER="$2"; shift 2 ;;
+    --rlt-checkpoint) RLT_CHECKPOINT="$2"; shift 2 ;;
     --agent-config) BASE_AGENT_CFG="$2"; shift 2 ;;
     --carla-config) BASE_CARLA_CFG="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -101,6 +110,14 @@ case "$ENABLE_UPDATES" in
   true|false) ;;
   *)
     echo "Invalid --enable-updates: $ENABLE_UPDATES (expected true|false)" >&2
+    exit 2
+    ;;
+esac
+
+case "$BASE_ONLY" in
+  ""|true|false) ;;
+  *)
+    echo "Invalid --base-only: $BASE_ONLY (expected true|false)" >&2
     exit 2
     ;;
 esac
@@ -124,6 +141,19 @@ if [[ -n "$RENDER_ADAPTER" ]]; then
   SIM_GPU_RANK="$RENDER_ADAPTER"
 fi
 
+STATE_ENCODER_LINE=""
+if [[ -n "$STATE_ENCODER" ]]; then
+  STATE_ENCODER_LINE="config.state_encoder = \"${STATE_ENCODER}\""
+fi
+RLT_CHECKPOINT_LINE=""
+if [[ -n "$RLT_CHECKPOINT" ]]; then
+  RLT_CHECKPOINT_LINE="config.rl_token.checkpoint_path = r\"${RLT_CHECKPOINT}\""
+fi
+BASE_ONLY_LINE=""
+if [[ -n "$BASE_ONLY" ]]; then
+  BASE_ONLY_LINE="config.base_only = ${BASE_ONLY^}"
+fi
+
 cat > "$AGENT_CFG_TMP" <<EOF
 from pathlib import Path
 import runpy
@@ -136,6 +166,9 @@ def get_config():
     config = _BASE_GET_CONFIG()
     config.training_gpu_rank = ${TRAIN_GPU_RANK}
     config.enable_updates = ${ENABLE_UPDATES^}
+    ${STATE_ENCODER_LINE}
+    ${RLT_CHECKPOINT_LINE}
+    ${BASE_ONLY_LINE}
     return config
 EOF
 
@@ -156,7 +189,7 @@ Path(r"${CARLA_CFG_TMP}").write_text(yaml.safe_dump(cfg, sort_keys=False))
 EOF
 
 echo "[run_carla.sh] route=${ROUTE}"
-echo "[run_carla.sh] enable_updates=${ENABLE_UPDATES}"
+echo "[run_carla.sh] enable_updates=${ENABLE_UPDATES} base_only=${BASE_ONLY:-<config default>} state_encoder=${STATE_ENCODER:-<config default>}${RLT_CHECKPOINT:+ rlt_checkpoint=${RLT_CHECKPOINT}}"
 echo "[run_carla.sh] train_gpu_rank=${TRAIN_GPU_RANK} render_adapter=${SIM_GPU_RANK}"
 echo "[run_carla.sh] carla_host=${CARLA_HOST} carla_port=${CARLA_PORT} streaming_port=${CARLA_STREAMING_PORT} tm_port=${TM_PORT} x_display=:${X_DISPLAY_NUM}"
 echo "[run_carla.sh] save_buffer=${SAVE_BUFFER} online_steps=${ONLINE_STEPS}"

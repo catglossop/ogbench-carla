@@ -68,6 +68,12 @@ flags.DEFINE_string("buffer_path", None, "Optional explicit path for the saved b
 flags.DEFINE_string("carla_config", None, "Path to carla_config.yaml (default: impls/configs/carla_config.yaml).")
 flags.DEFINE_string("wandb_mode", None, "W&B mode (online/offline/disabled). Default: env WANDB_MODE or online.")
 flags.DEFINE_bool("enable_updates", None, "Override config.enable_updates. If false, rollout/buffer only.")
+flags.DEFINE_bool(
+    "base_only",
+    None,
+    "No-RL baseline: roll out the frozen base policy only (no residual agent, encoder, "
+    "buffer, or updates). Overrides config.base_only.",
+)
 
 config_flags.DEFINE_config_file("agent", "configs/steervla_residual_config.py", lock_config=False)
 
@@ -126,22 +132,6 @@ def _make_carla_env(carla_config_path, route, *, extra_carla_config=None):
     if extra_carla_config:
         cfg = {**cfg, **extra_carla_config}
     return CarlaBench2DriveWrapper(cfg, route=route)
-
-
-def _encode_state(steervla_actor, obs: dict, encoder: str) -> np.ndarray:
-    """RL state = a single fixed-size vector encoded from the CARLA obs.
-
-    ``pi_prefix``: run the frozen SteerVLA prefix path (full PaliGemma forward
-    over image + prompt) and mean-pool to one vector per row (stop-gradient).
-    The pooled feature is deterministic given the obs; speed + routing command
-    enter via the prompt, so no separate proprio vector is concatenated. RLT
-    will later swap the mean-pool for a learned aggregation over the same tokens.
-    """
-    if encoder == "pi_prefix":
-        openpi_obs = steervla_actor.build_observation_batch_numpy(1, raw=obs)
-        feat = steervla_actor.encode_prefix_features(openpi_obs)
-        return np.asarray(jax.device_get(feat), dtype=np.float32).reshape(-1)
-    raise ValueError(f"Unknown state_encoder {encoder!r}; expected 'pi_prefix'.")
 
 
 def _base_chunk(vla_sample_fn, raw_holder: dict, obs: dict, action_dim: int) -> np.ndarray:
@@ -251,14 +241,44 @@ def _episode_video(frames: list[np.ndarray], fps: float):
     return wandb.Video(video, fps=fps, format="mp4")
 
 
+def _maybe_capture_frame(
+    frames: list[np.ndarray], obs: dict, reward: float, *, episode_steps: int, done: bool,
+    log_video: bool, video_every: int,
+) -> None:
+    """Append an annotated frame on capture steps (every Nth step + the terminal one)."""
+    if log_video and (episode_steps % video_every == 0 or done):
+        frame = _viz_frame(obs)
+        if frame is not None:
+            frames.append(_annotate_reward(frame, float(reward)))
+
+
+def _log_episode_end(
+    info: dict, *, episode_return: float, episode_steps: int, episode_index: int,
+    frames: list[np.ndarray], log_video: bool, video_fps: float, step: int, train_logger: CsvLogger,
+) -> None:
+    """Log per-episode rollout metrics (+ video) to W&B and CSV, then clear ``frames``."""
+    rollout_log: dict[str, Any] = {
+        "rollout/episode_return": episode_return,
+        "rollout/episode_length": episode_steps,
+        "rollout/episodes": episode_index,
+    }
+    rollout_log.update(_episode_summary_log(info))
+    if log_video:
+        video = _episode_video(frames, video_fps)
+        if video is not None:
+            rollout_log["rollout/episode_video"] = video
+    wandb.log(rollout_log, step=step)
+    train_logger.log(rollout_log, step=step)
+    frames.clear()
+
+
 # --------------------------------------------------------------------------- #
 # Online loop                                                                  #
 # --------------------------------------------------------------------------- #
 
 
-def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_holder):
+def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_holder, state_encoder):
     """Residual-SAC online loop. One env.step == one CARLA tick == one transition."""
-    state_encoder = str(config["state_encoder"])
     action_dim = int(config["steervla"]["action_horizon"]) * int(config["steervla"]["action_dim"])
     warmup = int(config["residual_warmup_steps"])
     batch_size = int(config["batch_size"])
@@ -278,8 +298,10 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
 
     rng = jax.random.PRNGKey(FLAGS.seed)
 
-    x = _encode_state(steervla_actor, obs, state_encoder)
+    # Base chunk before encode: it samples + stashes the CoT that the rl_token
+    # encoder needs to reproduce the prefix the policy acted on (no-op for others).
     base = _base_chunk(vla_sample_fn, raw_holder, obs, action_dim)
+    x = state_encoder.encode(obs)
 
     buffer: Optional[ReplayBuffer] = None
     episode_return = 0.0
@@ -314,8 +336,8 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
             next_obs, reward, terminated, truncated, info = env.step(final)
             done = bool(terminated or truncated)
 
-            next_x = _encode_state(steervla_actor, next_obs, state_encoder)
             next_base = _base_chunk(vla_sample_fn, raw_holder, next_obs, action_dim)
+            next_x = state_encoder.encode(next_obs)
 
             transition = dict(
                 observations=x,
@@ -332,11 +354,10 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
 
             episode_return += float(reward)
             episode_steps += 1
-
-            if log_video and (episode_steps % video_every == 0 or done):
-                frame = _viz_frame(next_obs)
-                if frame is not None:
-                    episode_frames.append(_annotate_reward(frame, float(reward)))
+            _maybe_capture_frame(
+                episode_frames, next_obs, reward, episode_steps=episode_steps, done=done,
+                log_video=log_video, video_every=video_every,
+            )
 
             train_info: dict[str, Any] = {}
             if enable_updates and buffer.size >= batch_size:
@@ -366,32 +387,83 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
                 save_agent(agent, FLAGS.save_dir, step)
 
             if done:
-                rollout_log: dict[str, Any] = {
-                    "rollout/episode_return": episode_return,
-                    "rollout/episode_length": episode_steps,
-                    "rollout/episodes": episode_count + 1,
-                }
-                rollout_log.update(_episode_summary_log(info))
-                if log_video:
-                    video = _episode_video(episode_frames, video_fps)
-                    if video is not None:
-                        rollout_log["rollout/episode_video"] = video
-                wandb.log(rollout_log, step=step)
-                train_logger.log(rollout_log, step=step)
-                episode_frames.clear()
-
+                _log_episode_end(
+                    info, episode_return=episode_return, episode_steps=episode_steps,
+                    episode_index=episode_count + 1, frames=episode_frames, log_video=log_video,
+                    video_fps=video_fps, step=step, train_logger=train_logger,
+                )
                 episode_count += 1
                 episode_return = 0.0
                 episode_steps = 0
                 obs, _info = env.reset(seed=FLAGS.seed + episode_count)
                 steervla_actor.reset_action_cache()
-                x = _encode_state(steervla_actor, obs, state_encoder)
                 base = _base_chunk(vla_sample_fn, raw_holder, obs, action_dim)
+                x = state_encoder.encode(obs)
             else:
                 obs, x, base = next_obs, next_x, next_base
     finally:
         train_logger.close()
         _flush_checkpoint(last_step or FLAGS.online_steps)
+
+
+def run_base_only(env, config, obs, *, vla_sample_fn, steervla_actor, raw_holder):
+    """No-RL baseline: roll out the frozen SteerVLA base policy on the route.
+
+    Same per-step / per-episode logging as :func:`run_online` (reward breakdown,
+    rollout video, episode summary) but with no residual agent, state encoder,
+    replay buffer, or gradient updates -- just ``env.step(base_chunk)``.
+    """
+    action_dim = int(config["steervla"]["action_horizon"]) * int(config["steervla"]["action_dim"])
+    log_video = bool(config.get("log_episode_video", True))
+    video_fps = float(config.get("episode_video_fps", 10.0))
+    video_every = max(1, int(config.get("episode_video_every", 2)))
+    episode_frames: list[np.ndarray] = []
+
+    train_logger = CsvLogger(os.path.join(FLAGS.save_dir, "train.csv"))
+    episode_return = 0.0
+    episode_steps = 0
+    episode_count = 0
+    start_time = time.time()
+
+    try:
+        for step in tqdm.tqdm(range(1, FLAGS.online_steps + 1), dynamic_ncols=True):
+            base = _base_chunk(vla_sample_fn, raw_holder, obs, action_dim)
+            next_obs, reward, terminated, truncated, info = env.step(base)
+            done = bool(terminated or truncated)
+
+            episode_return += float(reward)
+            episode_steps += 1
+            _maybe_capture_frame(
+                episode_frames, next_obs, reward, episode_steps=episode_steps, done=done,
+                log_video=log_video, video_every=video_every,
+            )
+
+            if step % FLAGS.log_interval == 0:
+                log = {
+                    "env/reward": float(reward),
+                    "env/episode_count": episode_count,
+                    "env/sps": step / max(time.time() - start_time, 1e-6),
+                }
+                log.update(_reward_breakdown_log(info))
+                log["dist/base_action"] = wandb.Histogram(np.asarray(base, dtype=np.float32))
+                wandb.log(log, step=step)
+                train_logger.log(log, step=step)
+
+            if done:
+                _log_episode_end(
+                    info, episode_return=episode_return, episode_steps=episode_steps,
+                    episode_index=episode_count + 1, frames=episode_frames, log_video=log_video,
+                    video_fps=video_fps, step=step, train_logger=train_logger,
+                )
+                episode_count += 1
+                episode_return = 0.0
+                episode_steps = 0
+                obs, _info = env.reset(seed=FLAGS.seed + episode_count)
+                steervla_actor.reset_action_cache()
+            else:
+                obs = next_obs
+    finally:
+        train_logger.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -409,11 +481,14 @@ def main(_):
     if FLAGS.route is None:
         raise ValueError("--route is required (see --list_routes=true).")
 
+    base_only = bool(FLAGS.base_only) if FLAGS.base_only is not None else bool(config.get("base_only", False))
+
     wandb_mode = FLAGS.wandb_mode or os.environ.get("WANDB_MODE", "online")
-    # Descriptive run name so runs are distinguishable in W&B: <route>-<encoder>-sd###_<ts>.
+    # Descriptive run name so runs are distinguishable in W&B: <route>-<mode>-sd###_<ts>,
+    # where <mode> is the state encoder (rl runs) or "base" (no-RL baseline).
     route_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", str(FLAGS.route)).strip("-")
-    encoder_tag = str(config.get("state_encoder", "pi_prefix"))
-    exp_name = f"{route_tag}-{encoder_tag}-{get_exp_name(FLAGS.seed)}"
+    mode_tag = "base" if base_only else str(config.get("state_encoder", "pi_prefix"))
+    exp_name = f"{route_tag}-{mode_tag}-{get_exp_name(FLAGS.seed)}"
     setup_wandb(project="OGBench-CARLA-Residual", group=FLAGS.run_group, name=exp_name, mode=wandb_mode)
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
@@ -453,14 +528,26 @@ def main(_):
 
         _configure_jax_training_device(training_gpu_rank)
 
-        state_encoder = str(config["state_encoder"])
+        if base_only:
+            print("[main_carla_residual] base_only=True: rolling out the frozen base policy (no RL).", flush=True)
+            run_base_only(
+                env, config, obs,
+                vla_sample_fn=vla_sample_fn,
+                steervla_actor=steervla_actor,
+                raw_holder=raw_holder,
+            )
+            return
+
+        from encoders import build_state_encoder
+
+        state_encoder = build_state_encoder(config, steervla_actor)
         action_dim = int(steervla_cfg["action_horizon"]) * int(steervla_cfg["action_dim"])
-        # Probe the encoded-state width once so the agent's MLPs are sized correctly.
-        # (pi_prefix dim = PaliGemma hidden width; not known until the model loads.)
-        x_dim = int(_encode_state(steervla_actor, obs, state_encoder).shape[-1])
+        # Probe the encoded-state width once so the agent's MLPs are sized correctly
+        # (encoder output dim is not known until the SteerVLA model loads).
+        x_dim = int(state_encoder.encode(obs).shape[-1])
         ex_obs = np.zeros((1, x_dim), dtype=np.float32)
         ex_base = np.zeros((1, action_dim), dtype=np.float32)
-        print(f"[main_carla_residual] state_encoder={state_encoder}; x_dim={x_dim}; action_dim={action_dim}", flush=True)
+        print(f"[main_carla_residual] state_encoder={state_encoder.name}; x_dim={x_dim}; action_dim={action_dim}", flush=True)
 
         from jax_agents.sac_residual import SACResidualAgent
 
@@ -473,6 +560,7 @@ def main(_):
             vla_sample_fn=vla_sample_fn,
             steervla_actor=steervla_actor,
             raw_holder=raw_holder,
+            state_encoder=state_encoder,
         )
     finally:
         try:

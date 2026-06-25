@@ -27,6 +27,9 @@ def get_config():
     config.training_gpu_rank = 0
     # If False, collect transitions without RL gradient updates (rollout-only).
     config.enable_updates = True
+    # No-RL baseline: roll out the frozen base policy only (no residual agent,
+    # encoder, buffer, or updates). state_encoder is ignored when this is True.
+    config.base_only = False
     config.buffer_capacity = 100_000
 
     # ----- logging ----------------------------------------------------------- #
@@ -36,17 +39,34 @@ def get_config():
     # Capture every Nth env step (plus the terminal frame) to keep videos light.
     config.episode_video_every = 2
 
-    # RL state encoder. The residual agent is encoder-agnostic: whatever this
-    # produces (a single fixed-size vector) is concatenated with the base action
-    # chunk and fed to the residual MLP. Options:
-    #   "pi_prefix" : frozen, mean-pooled SteerVLA prefix feature
-    #                 (full PaliGemma forward over image + prompt, then mean-pool;
-    #                 deterministic, stop-gradient). Speed + routing command ride
-    #                 in via the prompt, so no separate proprio vector is needed.
-    #   "rl_token"  : (future) learned RLT encoder over the un-pooled prefix
-    #                 tokens — same input, learned aggregation instead of mean-pool.
-    # Both require local SteerVLA (remote HTTP mode does not expose Pi features).
+    # RL state encoder (see impls/encoders/). The residual agent is encoder-
+    # agnostic: whatever this produces (a single fixed-size vector) is
+    # concatenated with the base action chunk and fed to the residual MLP. Options:
+    #   "pi_prefix"   : frozen, mean-pooled SteerVLA prefix feature (full PaliGemma
+    #                   forward over image + prompt, then mean-pool; deterministic,
+    #                   stop-gradient). Speed + routing ride in via the prompt, so
+    #                   no separate proprio vector is needed.
+    #   "siglip_pool" : frozen, mean-pooled SigLIP image feature (vision tower only,
+    #                   no Gemma LLM) — a perception-only lower-bound ablation.
+    #   "rl_token"    : frozen RLT autoencoder (trained offline) over the un-pooled
+    #                   prefix tokens — same VLM-backbone input as pi_prefix, but a
+    #                   learned compression to z_rl instead of mean-pool. Requires a
+    #                   checkpoint (config.rl_token.checkpoint_path) and PyTorch.
+    # All require local SteerVLA (remote HTTP mode does not expose Pi features).
     config.state_encoder = "pi_prefix"
+
+    # ----- rl_token encoder (used only when state_encoder == "rl_token") ------ #
+    # The autoencoder is trained separately by train_rl_token_ae.py on prefix
+    # embeddings dumped (dump_rl_token_embeddings.py) from the *same* frozen
+    # SteerVLA checkpoint below; its config (d_model, layers, max_seq_len) is read
+    # from the checkpoint, so only the path is needed here. device="cpu" keeps the
+    # small Torch AE off the JAX GPU; set "cuda" to run it on-GPU.
+    config.rl_token = ml_collections.ConfigDict(
+        dict(
+            checkpoint_path="",
+            device="cpu",
+        )
+    )
 
     # ----- frozen SteerVLA base policy --------------------------------------- #
     config.steervla = ml_collections.ConfigDict(
