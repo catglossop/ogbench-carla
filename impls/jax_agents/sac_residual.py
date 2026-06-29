@@ -5,10 +5,11 @@ agent learns a residual on top of it::
 
     final = clip(base_action + residual_scale * tanh_gaussian(actor(x, base_action)), -1, 1)
 
-where ``x`` is the RL state. Unlike celine's ``SACResidualAgent`` (which borrowed
-DSRL's critic), this version owns its full SAC machinery: an ensemble critic
-``Q(x, final)``, a tanh-squashed Gaussian residual actor, and an auto-tuned
-temperature ``alpha``. One env step == one transition (per-tick MDP, discount ``gamma``).
+where ``x`` is the RL state.
+
+NOTE: the critic here is not language-conditioned. While the end goal is to attach the RLT
+state representation to a language-conditioned residual critic, this standalone label-free 
+critic exists only to test whether RLT is effective in isolation.
 """
 
 from __future__ import annotations
@@ -180,7 +181,6 @@ class SACResidualAgent(flax.struct.PyTreeNode):
         network = TrainState.create(network_def, network_params, tx=network_tx)
         network.params["modules_target_critic"] = network.params["modules_critic"]
 
-        # Keep only the hashable scalars the jitted methods read (valid static field for jax.jit).
         agent_config = dict(
             residual_scale=float(config["residual_scale"]),
             discount=float(config["discount"]),

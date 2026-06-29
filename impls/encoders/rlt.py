@@ -1,17 +1,8 @@
 """RLT state encoder: a separately trained autoencoder over the un-pooled prefix.
 
 Same VLM-backbone tokens as ``pi_prefix``, but instead of a parameter-free
-mean-pool we apply a frozen RL-Token autoencoder's encoder (Physical
-Intelligence's RLT) to compress the ``[B, M, D]`` prefix into a single
-learned ``z_rl`` vector of width ``d_model``.
-
-The autoencoder is trained offline (``train_rl_token_ae.py``) on prefix
-embeddings dumped from the *same* frozen SteerVLA checkpoint
-(``dump_rl_token_embeddings.py``); :meth:`SteerVLAActor.encode_prefix_tokens`
-reproduces that exact token layout at inference time so ``z_rl`` is meaningful.
-
-PyTorch is imported lazily (this stack is otherwise JAX-only); inference runs on
-CPU by default to avoid contending with JAX for GPU memory.
+mean-pool we apply a frozen RL-Token autoencoder's encoder to compress the 
+``[B, M, D]`` prefix into a single learned ``z_rl`` vector of width ``d_model``.
 """
 
 from __future__ import annotations

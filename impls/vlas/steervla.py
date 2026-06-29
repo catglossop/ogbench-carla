@@ -39,13 +39,13 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, MutableMapping, Optional
 
-import einops
-
 import flax.nnx as nnx
 import flax.traverse_util as traverse_util
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
+import os
 
 from openpi.models import model as _openpi_model
 from openpi.models import pi0 as _openpi_pi0
@@ -54,9 +54,14 @@ from openpi.models.tokenizer import CoTPaligemmaTokenizer
 from openpi.policies import steervla_policy as sv_policy
 from openpi.shared import array_typing as at
 from openpi.shared import download
+from openpi.shared import nnx_utils as nnx_utils
+from openpi.training import checkpoints as openpi_checkpoints
 from openpi.training import config as openpi_train_config
+from openpi.training import optimizer as _optimizer
 from openpi.training import utils as training_utils
 from openpi.training import weight_loaders as _weight_loaders
+import openpi.transforms as openpi_transforms
+from openpi.transforms import pad_to_dim
 import openpi.training.sharding as sharding
 from jax.sharding import SingleDeviceSharding
 
@@ -65,42 +70,6 @@ from impls.vlas.utils import RemoteActor
 
 # Only the front camera for OpenPI preprocess + SigLIP (skip zero-padded wrist streams).
 CARLA_STEERVLA_IMAGE_KEYS: tuple[str, ...] = ("base_0_rgb",)
-
-
-def _denormalize_action_chunk_numpy(
-    actions: np.ndarray,
-    *,
-    action_horizon: int,
-    action_dim: int,
-    output_action_format: str,
-) -> np.ndarray:
-    arr = np.asarray(actions, dtype=np.float32)
-    if arr.ndim != 2:
-        raise ValueError(f"Expected batched flat action chunks, got shape {arr.shape}.")
-    chunks = arr.reshape(arr.shape[0], action_horizon, action_dim)
-    from openpi.visualizing.steervla_visualization import denormalize_actions
-
-    denorm = denormalize_actions(chunks, action_dim, output_action_format)
-    return np.asarray(denorm, dtype=np.float32).reshape(arr.shape[0], action_horizon * action_dim)
-
-
-def _pad_action_chunk_to_model_numpy(
-    actions: np.ndarray,
-    *,
-    src_action_horizon: int,
-    src_action_dim: int,
-    dst_action_horizon: int,
-    dst_action_dim: int,
-) -> np.ndarray:
-    arr = np.asarray(actions, dtype=np.float32)
-    if arr.ndim != 2:
-        raise ValueError(f"Expected batched flat action chunks, got shape {arr.shape}.")
-    src = arr.reshape(arr.shape[0], src_action_horizon, src_action_dim)
-    dst = np.zeros((arr.shape[0], dst_action_horizon, dst_action_dim), dtype=np.float32)
-    copy_h = min(int(src_action_horizon), int(dst_action_horizon))
-    copy_d = min(int(src_action_dim), int(dst_action_dim))
-    dst[:, :copy_h, :copy_d] = src[:, :copy_h, :copy_d]
-    return dst
 
 
 def restore_openpi_params_on_single_gpu(
@@ -139,6 +108,64 @@ def restore_openpi_params_on_single_gpu(
     return params, device
 
 
+@dataclasses.dataclass(frozen=True)
+class _SliceActionDim(openpi_transforms.DataTransformFn):
+    """Slice env action dims on the last axis (safe for ``(H, D)`` and ``(B, H, D)``)."""
+
+    action_dim: int
+
+    def __call__(self, data: dict) -> dict:
+        if "actions" not in data:
+            return data
+        return {
+            **data,
+            "actions": np.asarray(data["actions"], dtype=np.float32)[..., : int(self.action_dim)],
+        }
+
+
+def build_openpi_policy_transforms(
+    train_cfg: openpi_train_config.TrainConfig,
+    checkpoint_dir: Path,
+):
+    """Input/output transforms matching :func:`impls.vlas.steervla_server._build_steervla_openpi_policy`."""
+    data_factory = train_cfg.data
+    data_config = data_factory.create(train_cfg.assets_dirs, train_cfg.model)
+    if data_config.asset_id is None:
+        raise ValueError("TrainConfig data requires asset_id to load norm stats.")
+    env_action_dim = int(getattr(data_factory, "action_dim", 4))
+    # norm_stats = openpi_checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+    input_transform = openpi_transforms.compose(
+        [
+            # openpi_transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+        ]
+    )
+    output_transform = openpi_transforms.compose(
+        [
+            *data_config.model_transforms.outputs,
+            # openpi_transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            _SliceActionDim(action_dim=env_action_dim),
+        ]
+    )
+    return data_config, input_transform, output_transform
+
+
+def steervla_physical_denormalize_actions(
+    actions: np.ndarray,
+    *,
+    action_dim: int,
+    output_action_format: str | None,
+) -> np.ndarray:
+    """Apply fixed RLDS scaling (``* 7``, ``* 180``, etc.) after OpenPI ``Unnormalize``."""
+    from openpi.visualizing.steervla_visualization import denormalize_actions
+
+    arr = np.asarray(actions, dtype=np.float32)
+    ad = min(int(action_dim), int(arr.shape[-1]))
+    return np.asarray(
+        denormalize_actions(arr, ad, output_action_format),
+        dtype=np.float32,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pi0-CoT CARLA inference helpers
 # ---------------------------------------------------------------------------
@@ -150,13 +177,32 @@ def routing_instruction_prompt(*, routing_command: str, current_speed_mps: float
     return f"The current speed is {speed_prefix} m/s. {rc}"
 
 
+def steervla_prompt_state_dim(*, include_ego_history: bool) -> int:
+    """Proprio dimensions embedded in the CoT prompt (matches ``TokenizeCoTPrompt.prompt_state_dim``)."""
+    return 8 if include_ego_history else 2
+
+
+def format_steervla_cot_prompt(
+    prompt: str,
+    state: np.ndarray,
+    *,
+    state_dim: int,
+) -> str:
+    """Human-readable prefix string before BOS (matches ``CoTPaligemmaTokenizer.tokenize_prompt``)."""
+    cleaned = prompt.strip().replace("_", " ").replace("\n", " ")
+    state_arr = np.asarray(state, dtype=np.float32).reshape(-1)[:state_dim]
+    discretized = np.digitize(state_arr, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+    state_str = " ".join(map(str, discretized))
+    return f"Prompt:{cleaned};State:{state_str};"
+
+
 def carla_state_vec_to_steervla_state(
     carla_vec: np.ndarray,
     *,
     include_ego_history: bool,
     proprio_norm: bool,
 ) -> np.ndarray:
-    """Map CARLA ego vector (``ogbench.carla.carla_utils._ego_state_vector`` layout) to padded proprio."""
+    """Map CARLA ego+command vector (``carla_utils.STATE_DIM``-dim) to padded proprio; uses indices 5 and 15."""
     flat_sv = np.asarray(carla_vec, dtype=np.float32).reshape(-1)
     speed = float(flat_sv[15])
     yaw_deg = float(flat_sv[5])
@@ -202,6 +248,38 @@ def _merge_cot_output_into_observation(
 
 def _model_uses_fast_tokens(model_cfg: Pi0CoTConfig | None) -> bool:
     return bool(model_cfg is not None and getattr(model_cfg, "use_fast_tokens", False))
+
+
+def empty_openpi_replay_fast_fields(max_fast_len: int) -> dict[str, np.ndarray]:
+    """Zero FAST token buffers for replay schema / transitions without FAST yet."""
+    fast = np.zeros((int(max_fast_len),), dtype=np.int32)
+    fast_mask = np.zeros((int(max_fast_len),), dtype=bool)
+    return {
+        "openpi_tokenized_fast": fast,
+        "openpi_tokenized_fast_mask": fast_mask,
+        "fast": fast.copy(),
+        "fast_mask": fast_mask.copy(),
+    }
+
+
+def with_openpi_replay_fast_fields(
+    fields: dict[str, np.ndarray],
+    *,
+    max_fast_len: int | None,
+    use_fast_tokens: bool,
+) -> dict[str, np.ndarray]:
+    """Ensure replay dicts always carry FAST keys when the model uses FAST tokens."""
+    if not use_fast_tokens or max_fast_len is None:
+        return fields
+    out = dict(fields)
+    if "openpi_tokenized_fast" not in out:
+        out.update(empty_openpi_replay_fast_fields(int(max_fast_len)))
+        return out
+    if "fast" not in out:
+        out["fast"] = out["openpi_tokenized_fast"]
+    if "fast_mask" not in out:
+        out["fast_mask"] = out["openpi_tokenized_fast_mask"]
+    return out
 
 
 def _pad_action_chunk_for_fast(actions: np.ndarray, *, model_action_dim: int) -> np.ndarray:
@@ -381,6 +459,52 @@ def openpi_replay_fields_from_observation(
     return out
 
 
+def openpi_replay_fields_with_fast_placeholders(
+    fields: dict[str, np.ndarray],
+    *,
+    model_cfg: Pi0CoTConfig | None,
+) -> dict[str, np.ndarray]:
+    """Add empty FAST replay keys when needed so buffer schema stays fixed."""
+    max_fast_len = int(getattr(model_cfg, "max_fast_len", 0)) if model_cfg is not None else 0
+    return with_openpi_replay_fast_fields(
+        fields,
+        max_fast_len=max_fast_len if max_fast_len > 0 else None,
+        use_fast_tokens=_model_uses_fast_tokens(model_cfg),
+    )
+
+
+def openpi_cot_replay_fields_from_raw(raw: dict[str, Any] | None) -> dict[str, np.ndarray]:
+    """CoT/FAST token fields from a raw CARLA obs dict after VLA ``_stash_cot_in_raw``.
+
+    Returns an empty dict when CoT has not been generated for this observation yet.
+    """
+    if raw is None or not isinstance(raw, dict) or "reasoning" not in raw:
+        return {}
+
+    reasoning = np.asarray(raw["reasoning"], dtype=np.int32)
+    reasoning_mask = np.asarray(raw.get("reasoning_mask", reasoning != 0), dtype=bool)
+    subtask = np.asarray(raw["subtask"], dtype=np.int32)
+    subtask_mask = np.asarray(raw.get("subtask_mask", subtask != 0), dtype=bool)
+    out: dict[str, np.ndarray] = {
+        "openpi_tokenized_reasoning": reasoning,
+        "openpi_tokenized_reasoning_mask": reasoning_mask,
+        "openpi_tokenized_subtask": subtask,
+        "openpi_tokenized_subtask_mask": subtask_mask,
+        "reasoning": reasoning,
+        "reasoning_mask": reasoning_mask,
+        "subtask": subtask,
+        "subtask_mask": subtask_mask,
+    }
+    fast = raw.get("openpi_tokenized_fast", raw.get("fast"))
+    fast_mask = raw.get("openpi_tokenized_fast_mask", raw.get("fast_mask"))
+    if fast is not None and fast_mask is not None:
+        out["openpi_tokenized_fast"] = np.asarray(fast, dtype=np.int32)
+        out["openpi_tokenized_fast_mask"] = np.asarray(fast_mask, dtype=bool)
+        out["fast"] = out["openpi_tokenized_fast"]
+        out["fast_mask"] = out["openpi_tokenized_fast_mask"]
+    return out
+
+
 def _batch_has_openpi_replay_fields(replay_batch: dict[str, Any], *, prefix: str = "") -> bool:
     return f"{prefix}openpi_state" in replay_batch and f"{prefix}openpi_tokenized_prompt" in replay_batch
 
@@ -406,27 +530,13 @@ def openpi_observation_from_replay_batch(
         return None
 
     state = jnp.asarray(_get("openpi_state"), dtype=jnp.float32)
+    if int(state.shape[-1]) < 32:
+        state = jnp.asarray(pad_to_dim(np.asarray(state), 32), dtype=jnp.float32)
     prompt = jnp.asarray(_get("openpi_tokenized_prompt"), dtype=jnp.int32)
     prompt_mask = jnp.asarray(_get("openpi_tokenized_prompt_mask"), dtype=bool)
-    base_image = jnp.asarray(_get("openpi_image_base_0_rgb"), dtype=jnp.uint8)
-    batch_size = int(state.shape[0])
-
-    images: dict[str, jax.Array] = {}
-    image_masks: dict[str, jax.Array] = {}
-    for image_key in _openpi_model.IMAGE_KEYS:
-        image_src = _get(f"openpi_image_{image_key}")
-        if image_src is None:
-            image = jnp.zeros_like(base_image)
-            image_mask = jnp.zeros((batch_size,), dtype=bool)
-        else:
-            image = jnp.asarray(image_src, dtype=jnp.uint8)
-            image_mask_src = _get(f"openpi_image_mask_{image_key}")
-            image_mask = jnp.asarray(
-                image_mask_src if image_mask_src is not None else jnp.ones((batch_size,), dtype=bool),
-                dtype=bool,
-            )
-        images[image_key] = image
-        image_masks[image_key] = image_mask
+    image = jnp.asarray(_get("openpi_image_base_0_rgb"), dtype=jnp.uint8)
+    image_mask_src = _get("openpi_image_mask_base_0_rgb")
+    image_mask = jnp.asarray(image_mask_src if image_mask_src is not None else jnp.ones((state.shape[0],), dtype=bool), dtype=bool)
 
     reasoning = jnp.asarray(
         _get("openpi_tokenized_reasoning", "reasoning"),
@@ -463,8 +573,12 @@ def openpi_observation_from_replay_batch(
         )
 
     data = {
-        "image": images,
-        "image_mask": image_masks,
+        "image": {
+            "base_0_rgb": image,
+        },
+        "image_mask": {
+            "base_0_rgb": image_mask,
+        },
         "state": state,
         "tokenized_prompt": prompt,
         "tokenized_prompt_mask": prompt_mask,
@@ -524,6 +638,17 @@ class SteerVLAActor:
         sample_actions_num_steps: int = 10,
         training_gpu_rank: int = -1,
         return_normalized_action_chunk: bool = False,
+        fixed_subtask_text: Optional[str] = None,
+        fixed_reasoning_text: Optional[str] = None,
+        debug_noise: bool = False,
+        debug_noise_samples: int = 15,
+        use_best_noise: bool = True,
+        debug_noise_log_every_n_steps: int = 5,
+        debug_noise_run_name: str | None = None,
+        debug_noise_save_root: str | Path | None = None,
+        debug_noise_route_name: str = "?",
+        debug_noise_episode: int = 0,
+        debug_noise_episode_step: int = 0,
     ) -> None:
         self.actor_url = actor_url
         self._remote: Optional[RemoteActor] = None
@@ -542,14 +667,31 @@ class SteerVLAActor:
         self.actions_per_cot = max(1, int(actions_per_cot))
         self.sample_actions_num_steps = int(sample_actions_num_steps)
         self.return_normalized_action_chunk = bool(return_normalized_action_chunk)
+        self.fixed_subtask_text = (
+            str(fixed_subtask_text).strip() if fixed_subtask_text else None
+        )
+        self.fixed_reasoning_text = (
+            str(fixed_reasoning_text).strip() if fixed_reasoning_text else None
+        )
+        self.debug_noise = bool(debug_noise)
+        self.debug_noise_samples = max(1, int(debug_noise_samples))
+        self.use_best_noise = bool(use_best_noise)
+        self.debug_noise_log_every_n_steps = max(1, int(debug_noise_log_every_n_steps))
+        self.debug_noise_run_name = debug_noise_run_name
+        self.debug_noise_save_root = (
+            Path(debug_noise_save_root) if debug_noise_save_root is not None else None
+        )
+        self.debug_noise_route_name = str(debug_noise_route_name)
+        self.debug_noise_episode = int(debug_noise_episode)
+        self.debug_noise_episode_step = int(debug_noise_episode_step)
+        self.prompt_state_dim = steervla_prompt_state_dim(include_ego_history=include_ego_history)
         self._call_counter = 0
         self._cached_action_chunk: np.ndarray | None = None
         self._cached_action_step = 0
         self._cached_cot: dict[str, Any] | None = None
         self._cached_cot_actions_used = 0
-        # Latest (batched) CoT output used to condition the current action chunk.
-        # Cached so encode_prefix_tokens (RLT state encoder) can rebuild the exact
-        # prefix the base policy acted on, even when CoT caching is disabled.
+        # Latest CoT output (reasoning/subtask/FAST tokens) the base policy sampled,
+        # needed by the RLT state encoder to reproduce the prefix the policy acted on.
         self._last_cot_out: dict[str, Any] | None = None
 
         self.train_cfg = None
@@ -562,12 +704,9 @@ class SteerVLAActor:
         self._mesh: jax.sharding.Mesh | None = None
         self._train_rng: jax.Array | None = None
         self._train_state: training_utils.TrainState | None = None
-        # Persistent state-parameterized JIT functions (created once, never recreated).
-        # _infer_state is updated in-place on each refresh so inference always uses
-        # current weights without triggering XLA recompilation.
-        self._infer_state = None
-        self._persistent_jit_sample_actions = None
-        self._persistent_jit_sample_cot = None
+        self._data_config: Any = None
+        self._input_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+        self._output_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
         if actor_url is not None:
             self._remote = RemoteActor(
@@ -626,91 +765,400 @@ class SteerVLAActor:
             use_fast_tokens=bool(getattr(model_cfg, "use_fast_tokens", False)),
         )
         self.model_cfg = model_cfg
-        self._refresh_compiled_inference_fns()
+        self._data_config, self._input_transform, self._output_transform = build_openpi_policy_transforms(
+            self.train_cfg,
+            ckpt_root,
+        )
+        self._sample_actions = nnx_utils.module_jit(
+            self.model.sample_actions,
+            static_argnames=(
+                "num_steps",
+                "image_keys",
+            ),
+        )
+        self._sample_cot = nnx_utils.module_jit(
+            self.model.sample_cot,
+            static_argnames=(
+                "temperature",
+                "max_subtask_len",
+                "max_reasoning_len",
+                "image_keys",
+            ),
+        )
+        
         self._local_ready = True
 
-    def _refresh_compiled_inference_fns(self) -> None:
-        """Initialize or refresh inference JIT functions.
+    def _state_for_transform(self, state: np.ndarray | jax.Array) -> np.ndarray:
+        """Proprio slice passed to OpenPI ``Normalize`` / ``Unnormalize`` (2 or 8 dims, not padded)."""
+        state_np = np.asarray(jax.device_get(state), dtype=np.float32)
+        if state_np.ndim == 1:
+            state_np = state_np[None, ...]
+        return state_np[..., : int(self.prompt_state_dim)]
 
-        On the first call, creates persistent state-parameterised JIT functions so that
-        later weight updates only swap ``self._infer_state`` without creating new
-        ``jax.jit`` objects, avoiding XLA recompilation.
-        """
-        assert self.model is not None
-        graphdef, state = nnx.split(self.model)
-        self._infer_state = state
+    def _normalize_state_batch(self, state: np.ndarray) -> np.ndarray:
+        """Apply OpenPI ``Normalize(norm_stats)`` to unpadded proprio fed to the model."""
+        state_np = self._state_for_transform(state)
+        if self._input_transform is None:
+            return state_np
+        return np.asarray(self._input_transform({"state": state_np})["state"], dtype=np.float32)
 
-        if self._persistent_jit_sample_actions is None:
-            # Created once. ``state`` is a dynamic arg, so different weight values never
-            # trigger recompilation.
-            def _sa_fn(state, rng, obs, *, noise=None, image_keys=CARLA_STEERVLA_IMAGE_KEYS, num_steps=10):
-                model = nnx.merge(graphdef, state)
-                return model.sample_actions(rng, obs, noise=noise, image_keys=image_keys, num_steps=num_steps)
+    def _reshape_model_trajectory(self, trajectory: np.ndarray) -> np.ndarray:
+        """Normalize raw model outputs to ``(B, model_ah, model_ad)``."""
+        traj_np = np.asarray(trajectory, dtype=np.float32)
+        model_ah = int(self.model.action_horizon)
+        model_ad = int(self.model.action_dim)
+        env_ah = int(self.action_horizon)
+        env_ad = int(self.action_dim)
+        model_flat = model_ah * model_ad
+        env_flat = env_ah * env_ad
 
-            def _sc_fn(state, rng, obs, *, temperature=0.0, max_subtask_len=None, max_reasoning_len=None, image_keys=CARLA_STEERVLA_IMAGE_KEYS):
-                model = nnx.merge(graphdef, state)
-                return model.sample_cot(rng, obs, temperature=temperature, max_subtask_len=max_subtask_len, max_reasoning_len=max_reasoning_len, image_keys=image_keys)
+        if traj_np.ndim == 1:
+            if traj_np.shape[0] == model_flat:
+                traj_np = traj_np.reshape(1, model_ah, model_ad)
+            elif traj_np.shape[0] == env_flat:
+                traj_np = traj_np.reshape(1, env_ah, env_ad)
+            elif traj_np.shape[0] == env_ad:
+                traj_np = traj_np.reshape(1, 1, env_ad)
+            else:
+                raise ValueError(
+                    f"Cannot map 1D trajectory length {traj_np.shape[0]} to model ({model_ah}, {model_ad})."
+                )
+        elif traj_np.ndim == 2:
+            batch, last = traj_np.shape
+            if last == model_flat:
+                traj_np = traj_np.reshape(batch, model_ah, model_ad)
+            elif last == env_flat:
+                traj_np = traj_np.reshape(batch, env_ah, env_ad)
+            elif last == model_ad and batch == model_ah:
+                traj_np = traj_np[None, ...]
+            elif last == model_ad:
+                traj_np = traj_np[:, None, :]
+            elif last == env_ad:
+                traj_np = traj_np[:, None, :]
+            else:
+                raise ValueError(
+                    f"Cannot map trajectory shape {(batch, last)} to model ({model_ah}, {model_ad})."
+                )
+        elif traj_np.ndim != 3:
+            raise ValueError(f"Expected trajectory ndim 1/2/3, got {traj_np.ndim}.")
 
-            self._persistent_jit_sample_actions = jax.jit(
-                _sa_fn, static_argnames=("num_steps", "image_keys")
-            )
-            self._persistent_jit_sample_cot = jax.jit(
-                _sc_fn, static_argnames=("temperature", "max_subtask_len", "max_reasoning_len", "image_keys")
-            )
+        if traj_np.shape[-1] < model_ad:
+            pad = np.zeros((*traj_np.shape[:-1], model_ad - traj_np.shape[-1]), dtype=np.float32)
+            traj_np = np.concatenate([traj_np, pad], axis=-1)
+        if traj_np.shape[1] < model_ah:
+            pad = np.zeros((traj_np.shape[0], model_ah - traj_np.shape[1], traj_np.shape[2]), dtype=np.float32)
+            traj_np = np.concatenate([traj_np, pad], axis=1)
+        if traj_np.shape[1] != model_ah or traj_np.shape[2] != model_ad:
+            full = np.zeros((traj_np.shape[0], model_ah, model_ad), dtype=np.float32)
+            ah = min(traj_np.shape[1], model_ah)
+            ad = min(traj_np.shape[2], model_ad)
+            full[:, :ah, :ad] = traj_np[:, :ah, :ad]
+            traj_np = full
+        return traj_np
 
-        # Wrappers read self._infer_state at call time, so refreshing the state
-        # propagates updated weights without touching the JIT objects.
-        self._sample_actions = lambda *a, **kw: self._persistent_jit_sample_actions(self._infer_state, *a, **kw)
-        self._sample_cot = lambda *a, **kw: self._persistent_jit_sample_cot(self._infer_state, *a, **kw)
-
-    def _build_frozen_prefix_cache(
+    def _postprocess_action_trajectory(
         self,
-        model,
-        observation: _openpi_model.Observation,
-    ) -> tuple[_openpi_model.Observation, Any, jax.Array, jax.Array]:
-        """Precompute frozen prefix KV/cache for suffix-only action-head training."""
-        observation = _openpi_model.preprocess_observation(
-            None,
-            observation,
-            train=False,
+        trajectory: np.ndarray | jax.Array,
+        *,
+        observation_state: np.ndarray | jax.Array,
+    ) -> np.ndarray:
+        """Undo OpenPI norm stats, then apply fixed SteerVLA action scaling (meters / degrees)."""
+        traj_np = self._reshape_model_trajectory(np.asarray(jax.device_get(trajectory), dtype=np.float32))
+        state_np = self._state_for_transform(observation_state)
+        if state_np.ndim == 1:
+            state_np = state_np[None, ...]
+        if state_np.shape[0] == 1 and traj_np.shape[0] > 1:
+            state_np = np.tile(state_np, (traj_np.shape[0], 1))
+
+        if self._output_transform is not None:
+            out = self._output_transform({"actions": traj_np, "state": state_np})
+            traj_np = np.asarray(out["actions"], dtype=np.float32)
+
+        traj_np = steervla_physical_denormalize_actions(
+            traj_np,
+            action_dim=int(self.action_dim),
+            output_action_format=self.output_action_format,
+        )
+        return traj_np[:, : int(self.action_horizon), : int(self.action_dim)]
+
+    def postprocess_sampled_trajectory(
+        self,
+        trajectory: np.ndarray | jax.Array,
+        *,
+        observation_state: np.ndarray | jax.Array,
+    ) -> jnp.ndarray:
+        """Public wrapper for DSRL / training-time VLA forwards."""
+        out = self._postprocess_action_trajectory(trajectory, observation_state=observation_state)
+        return jnp.asarray(out, dtype=jnp.float32)
+    
+    def flow_sample(self, rng, openpi_observation, input_noise):
+        batch_size = int(openpi_observation.state.shape[0])
+        cot_out = self._sample_or_reuse_cot(rng, openpi_observation, batch_size)
+        obs_full = _merge_cot_output_into_observation(openpi_observation, cot_out)
+        
+        # Construct the noise
+        model_ah = int(self.model.action_horizon)
+        model_ad = int(self.model.action_dim)
+        cfg_ah = min(int(self.action_horizon), model_ah)
+        cfg_ad = min(int(self.action_dim), model_ad)
+        noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
+        if input_noise.ndim == 3:
+            noise_chunk = input_noise[:, :cfg_ah, :cfg_ad]
+        elif int(input_noise.shape[-1]) == int(self.action_horizon) * int(self.action_dim):
+            noise_chunk = input_noise.reshape(batch_size, int(self.action_horizon), int(self.action_dim))[:, :cfg_ah, :cfg_ad]
+        else:
+            noise_chunk = input_noise[:, None, :cfg_ad]
+            write_ah = 1
+        noise_full = noise_full.at[:, :write_ah, :cfg_ad].set(noise_chunk)
+        
+        # Sample the actions
+        traj = self._sample_actions(
+            rng,
+            obs_full,
+            noise=noise_full,
             image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+            num_steps=int(self.sample_actions_num_steps),
+        )
+        traj_np = self._postprocess_action_trajectory(
+            traj,
+            observation_state=openpi_observation.state,
+        )
+        target_dim = int(self.action_dim)
+        first_step = traj_np[:, 0, :target_dim]
+        out = jnp.asarray(first_step, dtype=jnp.float32)
+        return out
+
+    def _routing_for_raw(self, raw: Dict[str, Any]) -> str:
+        rc = raw.get("routing_command")
+        if rc is not None and isinstance(rc, str) and rc.strip():
+            return rc.strip()
+        return self.routing_command
+
+    def build_observation_batch_numpy(
+        self,
+        batch_size: int,
+        *,
+        raw: Optional[Dict[str, Any]] = None,
+    ) -> _openpi_model.Observation:
+        if raw is None:
+            if self.raw_obs_holder is None:
+                raise RuntimeError(
+                    "Missing CARLA observation: pass ``raw=`` to build_observation_batch_numpy "
+                    "or set ``raw_obs_holder['obs']`` before calling SteerVLAActor.__call__."
+                )
+            raw_holder = self.raw_obs_holder.get("obs")
+            if raw_holder is None or not isinstance(raw_holder, dict):
+                raise RuntimeError('raw_obs_holder["obs"] must be set to the latest CARLA gym dict.')
+            raw = raw_holder
+
+        img = np.asarray(raw["image"], dtype=np.uint8)
+        if img.ndim == 3:
+            img = np.broadcast_to(img[None], (batch_size, *img.shape))
+        elif img.shape[0] != batch_size:
+            img = np.repeat(img[:1], batch_size, axis=0)
+
+        state_vec = np.asarray(raw["state"], dtype=np.float32).reshape(-1)
+        spd = float(state_vec[15])
+        prompt_text = routing_instruction_prompt(
+            routing_command=self._routing_for_raw(raw),
+            current_speed_mps=spd,
         )
 
-        img_tokens, img_masks, img_ar = model._embed_images(observation)
-        n_img = sum(t.shape[1] for t in img_tokens)
-
-        prompt_emb = model._embed_text_tokens(observation.tokenized_prompt)
-        prompt_mask = observation.tokenized_prompt_mask
-        n_prompt = prompt_emb.shape[1]
-
-        reasoning_emb = model._embed_text_tokens(observation.tokenized_reasoning)
-        reasoning_mask = observation.tokenized_reasoning_mask
-        n_reasoning = reasoning_emb.shape[1]
-
-        subtask_emb = model._embed_text_tokens(observation.tokenized_subtask)
-        subtask_mask = observation.tokenized_subtask_mask
-        n_subtask = subtask_emb.shape[1]
-
-        prefix_tokens = jnp.concatenate(img_tokens + [prompt_emb, reasoning_emb, subtask_emb], axis=1)
-        prefix_mask = jnp.concatenate(img_masks + [prompt_mask, reasoning_mask, subtask_mask], axis=1)
-        prefix_ar = jnp.array(img_ar + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask)
-
-        prefix_attn_mask = _openpi_pi0.make_attn_mask(prefix_mask, prefix_ar)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = model.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
-
-        reasoning_start = n_img + n_prompt
-        reasoning_end = reasoning_start + n_reasoning
-        prefix_len = prefix_mask.shape[1]
-        col_is_reasoning = (jnp.arange(prefix_len) >= reasoning_start) & (jnp.arange(prefix_len) < reasoning_end)
-        prefix_mask_no_reasoning = prefix_mask & ~col_is_reasoning[None, :]
-
-        return (
-            observation,
-            jax.tree.map(jax.lax.stop_gradient, kv_cache),
-            jax.lax.stop_gradient(prefix_mask),
-            jax.lax.stop_gradient(prefix_mask_no_reasoning),
+        assert self.model_cfg is not None
+        state_pad = carla_state_vec_to_steervla_state(
+            state_vec,
+            include_ego_history=self.include_ego_history,
+            proprio_norm=self.proprio_norm,
         )
+        model_action_dim = int(self.model_cfg.action_dim)
+        state_norm = self._normalize_state_batch(state_pad)[0]
+        state_for_model = pad_to_dim(state_norm, model_action_dim)
+        state_batch = np.tile(state_for_model[None], (batch_size, 1))
+        formatted_prompt = format_steervla_cot_prompt(
+            prompt_text,
+            state_pad,
+            state_dim=self.prompt_state_dim,
+        )
+        if isinstance(raw, dict):
+            raw["openpi_prompt_text"] = formatted_prompt
+
+        assert self.tokenizer is not None
+        tok_ids, tok_mask = self.tokenizer.tokenize_prompt(
+            prompt_text,
+            state_pad,
+            state_dim=self.prompt_state_dim,
+        )
+
+        valid = tok_ids[tok_mask.astype(bool)]
+        prompt_detokenized = self.tokenizer._tokenizer.decode(valid.tolist())
+        print(f"[DEBUG - steervla] Prompt text: {prompt_detokenized}")
+        
+        reasoning_len = int(self.model_cfg.max_reasoning_len)
+        subtask_len = int(self.model_cfg.max_subtask_len)
+        # Do not preload stale CoT/FAST from raw; sample_cot generates fresh tokens each query.
+        reasoning = np.zeros((batch_size, reasoning_len), dtype=np.int32)
+        reasoning_mask = np.zeros((batch_size, reasoning_len), dtype=bool)
+        subtask = np.zeros((batch_size, subtask_len), dtype=np.int32)
+        subtask_mask = np.zeros((batch_size, subtask_len), dtype=bool)
+
+        data = {
+            "image": {
+                "base_0_rgb": img,
+            },
+            "image_mask": {
+                "base_0_rgb": np.ones(batch_size, dtype=bool),
+            },
+            "state": state_batch,
+            "tokenized_prompt": np.tile(tok_ids[None], (batch_size, 1)),
+            "tokenized_prompt_mask": np.tile(tok_mask[None], (batch_size, 1)),
+            "tokenized_reasoning": reasoning,
+            "tokenized_reasoning_mask": reasoning_mask,
+            "tokenized_subtask": subtask,
+            "tokenized_subtask_mask": subtask_mask,
+        }
+        return _openpi_model.Observation.from_dict(data)
+
+    def _stash_cot_in_raw(self, raw: Optional[Dict[str, Any]], cot_out: dict[str, Any]) -> None:
+        """Persist latest CoT tokens/masks in raw obs dict for downstream training."""
+        if raw is None:
+            return
+        try:
+            reason_tokens = np.asarray(jax.device_get(cot_out["tokenized_reasoning"][0]), dtype=np.int32)
+            reason_mask = np.asarray(jax.device_get(cot_out["tokenized_reasoning_mask"][0]), dtype=bool)
+            subtask_tokens = np.asarray(jax.device_get(cot_out["tokenized_subtask"][0]), dtype=np.int32)
+            subtask_mask = np.asarray(jax.device_get(cot_out["tokenized_subtask_mask"][0]), dtype=bool)
+            raw["reasoning"] = reason_tokens
+            raw["reasoning_mask"] = reason_mask
+            raw["subtask"] = subtask_tokens
+            raw["subtask_mask"] = subtask_mask
+            raw["reasoning_text"] = self.tokenizer._tokenizer.decode(reason_tokens[reason_mask].tolist())
+            raw["subtask_text"] = self.tokenizer._tokenizer.decode(subtask_tokens[subtask_mask].tolist())
+            if "tokenized_fast" in cot_out and "tokenized_fast_mask" in cot_out:
+                fast_tokens = np.asarray(jax.device_get(cot_out["tokenized_fast"][0]), dtype=np.int32)
+                fast_mask = np.asarray(jax.device_get(cot_out["tokenized_fast_mask"][0]), dtype=bool)
+                if np.any(fast_mask):
+                    raw["openpi_tokenized_fast"] = fast_tokens
+                    raw["openpi_tokenized_fast_mask"] = fast_mask
+                    raw["fast"] = fast_tokens
+                    raw["fast_mask"] = fast_mask
+        except Exception:
+            # Keep rollout robust if CoT payload changes shape unexpectedly.
+            return
+
+    def attach_replay_tokens(
+        self,
+        openpi_observation: _openpi_model.Observation,
+        replay_batch: dict[str, Any],
+        *,
+        prefix: str = "",
+    ) -> _openpi_model.Observation:
+        """Overlay replay CoT/FAST tokens; tokenize FAST from actions when needed."""
+        obs = with_replay_cot_tokens(openpi_observation, replay_batch, prefix=prefix)
+        if not _model_uses_fast_tokens(self.model_cfg) or self.tokenizer is None:
+            return obs
+        if obs.tokenized_fast is not None:
+            try:
+                if bool(jnp.any(jnp.asarray(obs.tokenized_fast_mask))):
+                    return obs
+            except Exception:
+                pass
+        actions_key = f"{prefix}openpi_actions"
+        if actions_key not in replay_batch:
+            actions_key = f"{prefix}actions" if f"{prefix}actions" in replay_batch else "actions"
+        if actions_key not in replay_batch:
+            return obs
+        try:
+            fast, fast_mask = _tokenize_fast_actions_batch(
+                self.tokenizer,
+                np.asarray(replay_batch[actions_key]),
+                model_action_dim=int(self.model_cfg.action_dim),
+                action_horizon=int(self.action_horizon),
+                action_dim=int(self.action_dim),
+            )
+        except Exception:
+            return obs
+        return dataclasses.replace(
+            obs,
+            tokenized_fast=jnp.asarray(fast, dtype=jnp.int32),
+            tokenized_fast_mask=jnp.asarray(fast_mask, dtype=bool),
+        )
+
+    def _shift_cached_action_chunk(self, action: np.ndarray, step: int) -> np.ndarray:
+        flat = np.asarray(action, dtype=np.float32)
+        expected = int(self.action_horizon) * int(self.action_dim)
+        if flat.ndim != 2 or flat.shape[-1] != expected or step <= 0:
+            return flat
+        chunks = flat.reshape(flat.shape[0], int(self.action_horizon), int(self.action_dim))
+        shifted = np.zeros_like(chunks)
+        keep = max(0, int(self.action_horizon) - int(step))
+        if keep > 0:
+            shifted[:, :keep, :] = chunks[:, int(step): int(step) + keep, :]
+            shifted[:, keep:, :] = shifted[:, keep - 1: keep, :]
+        return shifted.reshape(flat.shape[0], expected)
+
+    def _next_cached_action(self, batch_size: int) -> jnp.ndarray | None:
+        if self.actions_per_model_query <= 1 or batch_size != 1 or self._cached_action_chunk is None:
+            return None
+        max_cached_steps = min(self.actions_per_model_query, int(self.action_horizon))
+        if self._cached_action_step >= max_cached_steps:
+            self._cached_action_chunk = None
+            self._cached_action_step = 0
+            return None
+        out = self._shift_cached_action_chunk(self._cached_action_chunk, self._cached_action_step)
+        self._cached_action_step += 1
+        return jnp.asarray(out)
+
+    def _remember_action_chunk(self, action: Any, batch_size: int) -> None:
+        if self.actions_per_model_query <= 1 or batch_size != 1:
+            return
+        self._cached_action_chunk = np.asarray(jax.device_get(action), dtype=np.float32)
+        # Step 0 was just returned from the fresh model query.
+        self._cached_action_step = 1
+
+    def _cot_cache_enabled(self, batch_size: int) -> bool:
+        return self.actions_per_cot > 1 and batch_size == 1
+
+    def _uses_fixed_cot(self) -> bool:
+        return self.fixed_subtask_text is not None
+
+    def _build_fixed_cot_out(
+        self,
+        batch_size: int,
+        *,
+        ref_array: jnp.ndarray,
+    ) -> dict[str, Any]:
+        """Teacher-forced CoT matching ``inspect_outputs.ipynb`` (no ``sample_cot``)."""
+        if self.tokenizer is None or self.model_cfg is None:
+            raise RuntimeError("Fixed CoT requires a loaded local SteerVLAActor tokenizer/model.")
+        reasoning_text = self.fixed_reasoning_text or "Follow the route."
+        rea_np, rea_mask_np = self.tokenizer.tokenize_reasoning(reasoning_text)
+        sub_np, sub_mask_np = self.tokenizer.tokenize_subtask(self.fixed_subtask_text)
+        device = self._jax_device if self._jax_device is not None else ref_array.devices().pop()
+
+        def _tile(tok: np.ndarray, mask: np.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+            tokens = jnp.asarray(np.tile(tok[None, :], (batch_size, 1)), dtype=ref_array.dtype)
+            masks = jnp.asarray(np.tile(mask[None, :], (batch_size, 1)), dtype=bool)
+            return jax.device_put(tokens, device), jax.device_put(masks, device)
+
+        reasoning, reasoning_mask = _tile(rea_np, rea_mask_np)
+        subtask, subtask_mask = _tile(sub_np, sub_mask_np)
+        out: dict[str, Any] = {
+            "tokenized_reasoning": reasoning,
+            "tokenized_reasoning_mask": reasoning_mask,
+            "tokenized_subtask": subtask,
+            "tokenized_subtask_mask": subtask_mask,
+        }
+        if self.tokenizer.use_fast_tokens:
+            mf = int(self.model_cfg.max_fast_len)
+            out["tokenized_fast"] = jax.device_put(
+                jnp.zeros((batch_size, mf), dtype=ref_array.dtype),
+                device,
+            )
+            out["tokenized_fast_mask"] = jax.device_put(
+                jnp.zeros((batch_size, mf), dtype=bool),
+                device,
+            )
+        return out
 
     def _preprocess_observation_on_device(
         self,
@@ -874,294 +1322,19 @@ class SteerVLAActor:
         mask = np.asarray(jax.device_get(prefix_mask), dtype=bool)
         return out, mask
 
-    def encode_suffix_features(
-        self,
-        observation: _openpi_model.Observation,
-        base_action: jax.Array | np.ndarray,
-    ) -> jax.Array:
-        """Return a frozen Pi suffix/action-head feature for each batch row.
-
-        This reuses the same frozen prefix context as direct DAgger, then runs
-        the Pi action suffix stack conditioned on the current base action chunk.
-        The returned feature is the pooled hidden state over the final action
-        suffix tokens immediately before ``action_out_proj``.
-        """
-        if self._remote is not None:
-            raise RuntimeError("Pi suffix features are not available in remote SteerVLAActor mode.")
-        if self.model is None or self._jax_device is None:
-            raise RuntimeError("Local SteerVLA model is not initialized.")
-
-        obs_jax = jax.tree.map(
-            lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
-            observation,
-        )
-        obs_proc, kv_cache, prefix_mask, prefix_mask_no_reasoning = self._build_frozen_prefix_cache(
-            self.model, obs_jax,
-        )
-
-        base_action_np = np.asarray(base_action, dtype=np.float32)
-        padded_action = _pad_action_chunk_to_model_numpy(
-            base_action_np,
-            src_action_horizon=int(self.action_horizon),
-            src_action_dim=int(self.action_dim),
-            dst_action_horizon=int(self.model.action_horizon),
-            dst_action_dim=int(self.model.action_dim),
-        )
-        x_t = jax.device_put(jnp.asarray(padded_action), self._jax_device)
-        # Use a tiny fixed diffusion time so the suffix stack sees a nearly-final
-        # action chunk while remaining in-distribution for the time embedding.
-        time = jnp.full((x_t.shape[0],), 1e-3, dtype=jnp.float32)
-
-        suffix_tokens, suffix_mask, suffix_ar_list, adarms_cond = self.model._embed_action_suffix(
-            obs_proc, x_t, time,
-        )
-        suffix_ar = jnp.array(suffix_ar_list)
-        suffix_attn_mask = _openpi_pi0.make_attn_mask(suffix_mask, suffix_ar)
-        action_to_prefix = einops.repeat(
-            prefix_mask_no_reasoning, "b p -> b s p", s=suffix_tokens.shape[1],
-        )
-        full_attn_mask = jnp.concatenate([action_to_prefix, suffix_attn_mask], axis=-1)
-        positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
-
-        (_, suffix_out), _ = self.model.PaliGemma.llm(
-            [None, suffix_tokens],
-            mask=full_attn_mask,
-            positions=positions,
-            kv_cache=kv_cache,
-            adarms_cond=[None, adarms_cond],
-        )
-        action_hidden = suffix_out[:, -int(self.model.action_horizon) :]
-        pooled = jnp.mean(action_hidden, axis=1)
-        return jax.lax.stop_gradient(pooled)
-
-    def flow_sample(self, rng, openpi_observation, input_noise):
-        # Always run sample_cot so reasoning/subtask/FAST tokens match the current prompt.
-        cot_out = self._sample_cot(
-            rng,
-            openpi_observation,
-            temperature=float(self.cot_temperature),
-            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-        )
-        obs_full = _merge_cot_output_into_observation(openpi_observation, cot_out)
-        
-        # Construct the noise
-        batch_size = int(openpi_observation.state.shape[0])
-        model_ah = int(self.model.action_horizon)
-        model_ad = int(self.model.action_dim)
-        cfg_ah = min(int(self.action_horizon), model_ah)
-        cfg_ad = min(int(self.action_dim), model_ad)
-        noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
-        full_chunk = None
-        if input_noise.ndim == 3:
-            noise_chunk = input_noise[:, :cfg_ah, :cfg_ad]
-        elif int(input_noise.shape[-1]) == model_ah * model_ad:
-            # Full Pi0 chunk from DSRL noise actor (actor_action_dim * action_horizon):
-            # reshape directly so every dim/timestep gets noise (training uses N(0,I) over (B,H,D)).
-            full_chunk = input_noise.reshape(batch_size, model_ah, model_ad).astype(jnp.float32)
-        elif int(input_noise.shape[-1]) == int(self.action_horizon) * int(self.action_dim):
-            noise_chunk = input_noise.reshape(batch_size, int(self.action_horizon), int(self.action_dim))[:, :cfg_ah, :cfg_ad]
-        elif int(input_noise.shape[-1]) == model_ad:
-            noise_chunk = jnp.broadcast_to(input_noise[:, None, :], (batch_size, cfg_ah, model_ad))
-            cfg_ad = model_ad
-        else:
-            noise_chunk = input_noise[:, None, :cfg_ad]
-            cfg_ah = 1
-        if full_chunk is not None:
-            noise_full = full_chunk
-        else:
-            noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(noise_chunk)
-        
-        # Sample the actions
-        traj = self._sample_actions(
-            rng,
-            obs_full,
-            noise=noise_full,
-            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-            num_steps=int(self.sample_actions_num_steps),
-        )
-        target_dim = int(self.action_dim)
-        first_step = traj[:, 0, :].astype(jnp.float32)
-        out = jnp.zeros((batch_size, target_dim), dtype=jnp.float32)
-        copy_dim = min(target_dim, int(first_step.shape[-1]))
-        out = out.at[:, :copy_dim].set(first_step[:, :copy_dim])
-        return out
-
-    def _routing_for_raw(self, raw: Dict[str, Any]) -> str:
-        rc = raw.get("routing_command")
-        if rc is not None and isinstance(rc, str) and rc.strip():
-            return rc.strip()
-        return self.routing_command
-
-    def build_observation_batch_numpy(
-        self,
-        batch_size: int,
-        *,
-        raw: Optional[Dict[str, Any]] = None,
-    ) -> _openpi_model.Observation:
-        if raw is None:
-            if self.raw_obs_holder is None:
-                raise RuntimeError(
-                    "Missing CARLA observation: pass ``raw=`` to build_observation_batch_numpy "
-                    "or set ``raw_obs_holder['obs']`` before calling SteerVLAActor.__call__."
-                )
-            raw_holder = self.raw_obs_holder.get("obs")
-            if raw_holder is None or not isinstance(raw_holder, dict):
-                raise RuntimeError('raw_obs_holder["obs"] must be set to the latest CARLA gym dict.')
-            raw = raw_holder
-
-        img = np.asarray(raw["image"], dtype=np.uint8)
-        if img.ndim == 3:
-            img = np.broadcast_to(img[None], (batch_size, *img.shape))
-        elif img.shape[0] != batch_size:
-            img = np.repeat(img[:1], batch_size, axis=0)
-
-        state_vec = np.asarray(raw["state"], dtype=np.float32).reshape(-1)
-        spd = float(state_vec[15])
-        prompt_text = routing_instruction_prompt(
-            routing_command=self._routing_for_raw(raw),
-            current_speed_mps=spd,
-        )
-
-        assert self.model_cfg is not None
-        state_pad = carla_state_vec_to_steervla_state(
-            state_vec,
-            include_ego_history=self.include_ego_history,
-            proprio_norm=self.proprio_norm,
-        )
-
-        assert self.tokenizer is not None
-        tok_ids, tok_mask = self.tokenizer.tokenize_prompt(prompt_text, state_pad)
-
-        reasoning_len = int(self.model_cfg.max_reasoning_len)
-        subtask_len = int(self.model_cfg.max_subtask_len)
-        # Do not preload stale CoT/FAST from raw; sample_cot generates fresh tokens each query.
-        reasoning = np.zeros((batch_size, reasoning_len), dtype=np.int32)
-        reasoning_mask = np.zeros((batch_size, reasoning_len), dtype=bool)
-        subtask = np.zeros((batch_size, subtask_len), dtype=np.int32)
-        subtask_mask = np.zeros((batch_size, subtask_len), dtype=bool)
-
-        data = {
-            "image": {
-                "base_0_rgb": img,
-            },
-            "image_mask": {
-                "base_0_rgb": np.ones(batch_size, dtype=bool),
-            },
-            "state": np.tile(state_pad[None], (batch_size, 1)),
-            "tokenized_prompt": np.tile(tok_ids[None], (batch_size, 1)),
-            "tokenized_prompt_mask": np.tile(tok_mask[None], (batch_size, 1)),
-            "tokenized_reasoning": reasoning,
-            "tokenized_reasoning_mask": reasoning_mask,
-            "tokenized_subtask": subtask,
-            "tokenized_subtask_mask": subtask_mask,
-        }
-        return _openpi_model.Observation.from_dict(data)
-
-    def _stash_cot_in_raw(self, raw: Optional[Dict[str, Any]], cot_out: dict[str, Any]) -> None:
-        """Persist latest CoT tokens/masks in raw obs dict for downstream training."""
-        if raw is None:
-            return
-        try:
-            reason_tokens = np.asarray(jax.device_get(cot_out["tokenized_reasoning"][0]), dtype=np.int32)
-            reason_mask = np.asarray(jax.device_get(cot_out["tokenized_reasoning_mask"][0]), dtype=bool)
-            subtask_tokens = np.asarray(jax.device_get(cot_out["tokenized_subtask"][0]), dtype=np.int32)
-            subtask_mask = np.asarray(jax.device_get(cot_out["tokenized_subtask_mask"][0]), dtype=bool)
-            raw["reasoning"] = reason_tokens
-            raw["reasoning_mask"] = reason_mask
-            raw["subtask"] = subtask_tokens
-            raw["subtask_mask"] = subtask_mask
-            raw["reasoning_text"] = self.tokenizer._tokenizer.decode(reason_tokens[reason_mask].tolist())
-            raw["subtask_text"] = self.tokenizer._tokenizer.decode(subtask_tokens[subtask_mask].tolist())
-            if "tokenized_fast" in cot_out and "tokenized_fast_mask" in cot_out:
-                fast_tokens = np.asarray(jax.device_get(cot_out["tokenized_fast"][0]), dtype=np.int32)
-                fast_mask = np.asarray(jax.device_get(cot_out["tokenized_fast_mask"][0]), dtype=bool)
-                raw["openpi_tokenized_fast"] = fast_tokens
-                raw["openpi_tokenized_fast_mask"] = fast_mask
-                raw["fast"] = fast_tokens
-                raw["fast_mask"] = fast_mask
-        except Exception:
-            # Keep rollout robust if CoT payload changes shape unexpectedly.
-            return
-
-    def attach_replay_tokens(
-        self,
-        openpi_observation: _openpi_model.Observation,
-        replay_batch: dict[str, Any],
-        *,
-        prefix: str = "",
-    ) -> _openpi_model.Observation:
-        """Overlay replay CoT/FAST tokens; tokenize FAST from actions when needed."""
-        obs = with_replay_cot_tokens(openpi_observation, replay_batch, prefix=prefix)
-        if not _model_uses_fast_tokens(self.model_cfg) or self.tokenizer is None:
-            return obs
-        if obs.tokenized_fast is not None:
-            try:
-                if bool(jnp.any(jnp.asarray(obs.tokenized_fast_mask))):
-                    return obs
-            except Exception:
-                pass
-        actions_key = f"{prefix}openpi_actions"
-        if actions_key not in replay_batch:
-            actions_key = f"{prefix}actions" if f"{prefix}actions" in replay_batch else "actions"
-        if actions_key not in replay_batch:
-            return obs
-        try:
-            fast, fast_mask = _tokenize_fast_actions_batch(
-                self.tokenizer,
-                np.asarray(replay_batch[actions_key]),
-                model_action_dim=int(self.model_cfg.action_dim),
-                action_horizon=int(self.action_horizon),
-                action_dim=int(self.action_dim),
-            )
-        except Exception:
-            return obs
-        return dataclasses.replace(
-            obs,
-            tokenized_fast=jnp.asarray(fast, dtype=jnp.int32),
-            tokenized_fast_mask=jnp.asarray(fast_mask, dtype=bool),
-        )
-
-    def _shift_cached_action_chunk(self, action: np.ndarray, step: int) -> np.ndarray:
-        flat = np.asarray(action, dtype=np.float32)
-        expected = int(self.action_horizon) * int(self.action_dim)
-        if flat.ndim != 2 or flat.shape[-1] != expected or step <= 0:
-            return flat
-        chunks = flat.reshape(flat.shape[0], int(self.action_horizon), int(self.action_dim))
-        shifted = np.zeros_like(chunks)
-        keep = max(0, int(self.action_horizon) - int(step))
-        if keep > 0:
-            shifted[:, :keep, :] = chunks[:, int(step): int(step) + keep, :]
-            shifted[:, keep:, :] = shifted[:, keep - 1: keep, :]
-        return shifted.reshape(flat.shape[0], expected)
-
-    def _next_cached_action(self, batch_size: int) -> jnp.ndarray | None:
-        if self.actions_per_model_query <= 1 or batch_size != 1 or self._cached_action_chunk is None:
-            return None
-        max_cached_steps = min(self.actions_per_model_query, int(self.action_horizon))
-        if self._cached_action_step >= max_cached_steps:
-            self._cached_action_chunk = None
-            self._cached_action_step = 0
-            return None
-        out = self._shift_cached_action_chunk(self._cached_action_chunk, self._cached_action_step)
-        self._cached_action_step += 1
-        return jnp.asarray(out)
-
-    def _remember_action_chunk(self, action: Any, batch_size: int) -> None:
-        if self.actions_per_model_query <= 1 or batch_size != 1:
-            return
-        self._cached_action_chunk = np.asarray(jax.device_get(action), dtype=np.float32)
-        # Step 0 was just returned from the fresh model query.
-        self._cached_action_step = 1
-
-    def _cot_cache_enabled(self, batch_size: int) -> bool:
-        return self.actions_per_cot > 1 and batch_size == 1
-
     def _sample_or_reuse_cot(
         self,
         rng: jax.Array,
         obs_jax: _openpi_model.Observation,
         batch_size: int,
     ) -> dict[str, Any]:
+        if self._uses_fixed_cot():
+            cot_out = self._build_fixed_cot_out(
+                batch_size,
+                ref_array=obs_jax.tokenized_prompt,
+            )
+            self._last_cot_out = cot_out
+            return cot_out
         if (
             self._cot_cache_enabled(batch_size)
             and self._cached_cot is not None
@@ -1192,70 +1365,6 @@ class SteerVLAActor:
         self._cached_cot_actions_used = 0
         self._last_cot_out = None
 
-    def sample_action_distribution(
-        self,
-        raw: Dict[str, Any],
-        *,
-        num_samples: int = 32,
-        seed: int | None = None,
-    ) -> dict[str, np.ndarray] | None:
-        """Sample the frozen Pi action expert on one observation for support diagnostics.
-
-        Returns both normalized OpenPI chunks and ``policy_output`` chunks so they can
-        be compared directly to CARLA ``expert_action`` labels.
-        """
-        if self._remote is not None:
-            return None
-        assert self.model is not None and self._jax_device is not None
-
-        saved_action_chunk = self._cached_action_chunk
-        saved_action_step = self._cached_action_step
-        saved_cot = self._cached_cot
-        saved_cot_actions_used = self._cached_cot_actions_used
-        saved_counter = self._call_counter
-        try:
-            if seed is None:
-                self._call_counter += 1
-                seed = self._call_counter
-            rng = jax.random.PRNGKey(int(seed))
-            rng_noise, rng_zero = jax.random.split(rng)
-            noise = jax.random.normal(
-                rng_noise,
-                (int(num_samples), int(self.action_horizon), int(self.action_dim)),
-                dtype=jnp.float32,
-            )
-            zero_noise = jnp.zeros((1, int(self.action_horizon), int(self.action_dim)), dtype=jnp.float32)
-
-            sampled_norm = self._forward_pi0(int(num_samples), noise, raw=raw, rng=rng_noise, force_accel_steer=False)
-            zero_norm = self._forward_pi0(1, zero_noise, raw=raw, rng=rng_zero, force_accel_steer=False)
-
-            sampled_norm_np = np.asarray(jax.device_get(sampled_norm), dtype=np.float32)
-            zero_norm_np = np.asarray(jax.device_get(zero_norm), dtype=np.float32)
-            sampled_policy = _denormalize_action_chunk_numpy(
-                sampled_norm_np,
-                action_horizon=int(self.action_horizon),
-                action_dim=int(self.action_dim),
-                output_action_format=str(self.output_action_format or "DELTA_XY_T_DELTA_XY_SPACE"),
-            )
-            zero_policy = _denormalize_action_chunk_numpy(
-                zero_norm_np,
-                action_horizon=int(self.action_horizon),
-                action_dim=int(self.action_dim),
-                output_action_format=str(self.output_action_format or "DELTA_XY_T_DELTA_XY_SPACE"),
-            )
-            return {
-                "normalized": sampled_norm_np,
-                "policy_output": sampled_policy,
-                "zero_normalized": zero_norm_np,
-                "zero_policy_output": zero_policy,
-            }
-        finally:
-            self._cached_action_chunk = saved_action_chunk
-            self._cached_action_step = saved_action_step
-            self._cached_cot = saved_cot
-            self._cached_cot_actions_used = saved_cot_actions_used
-            self._call_counter = saved_counter
-
     def _forward_pi0(
         self,
         batch_size: int,
@@ -1282,6 +1391,24 @@ class SteerVLAActor:
         # Either sample or reuse the CoT
         cot_out = self._sample_or_reuse_cot(rng_cot, obs_jax, batch_size)
         
+        reason_tokens = cot_out["tokenized_reasoning"]
+        reason_mask = cot_out["tokenized_reasoning_mask"]
+        reason_valid = reason_tokens[reason_mask.astype(bool)]
+        reason_text = self.tokenizer._tokenizer.decode(reason_valid.tolist())
+        print(f"[DEBUG - steervla] Reason text: {reason_text}")
+        
+        subtask_tokens = cot_out["tokenized_subtask"]
+        subtask_mask = cot_out["tokenized_subtask_mask"]
+        subtask_valid = subtask_tokens[subtask_mask.astype(bool)]
+        subtask_text = self.tokenizer._tokenizer.decode(subtask_valid.tolist())
+        print(f"[DEBUG - steervla] Subtask text: {subtask_text}")
+        if "tokenized_fast" in cot_out and self.tokenizer.use_fast_tokens:
+            fast_tokens = cot_out["tokenized_fast"]
+            fast_mask = cot_out["tokenized_fast_mask"]
+            fast_valid = fast_tokens[fast_mask.astype(bool)]
+            fast_text = self.tokenizer._tokenizer.decode(fast_valid.tolist())
+            print(f"[DEBUG - steervla] FAST segment ({int(jnp.sum(fast_mask))} tok): {fast_text[:120]}")
+        
         # Keep latest generated CoT in raw holder (batch-1 online CARLA path).
         if batch_size == 1:
             if raw is not None:
@@ -1290,7 +1417,7 @@ class SteerVLAActor:
                 self._stash_cot_in_raw(self.raw_obs_holder["obs"], cot_out)
 
         obs_full = _merge_cot_output_into_observation(obs_jax, cot_out)
-        
+
         # Prepare noise for inference
         batch_size = obs_jax.state.shape[0]
         model_ah = int(self.model.action_horizon)
@@ -1298,31 +1425,19 @@ class SteerVLAActor:
         cfg_ah = min(int(self.action_horizon), model_ah)
         cfg_ad = min(int(self.action_dim), model_ad)
         noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
-        full_chunk = None
         if noise_jax.ndim == 3:
             noise_chunk = noise_jax[:, :cfg_ah, :cfg_ad]
-        elif int(noise_jax.shape[-1]) == model_ah * model_ad:
-            # Full Pi0 chunk from DSRL noise actor (actor_action_dim * action_horizon):
-            # reshape directly so every dim/timestep gets noise (training uses N(0,I) over (B,H,D)).
-            full_chunk = noise_jax.reshape(batch_size, model_ah, model_ad).astype(jnp.float32)
         elif int(noise_jax.shape[-1]) == int(self.action_horizon) * int(self.action_dim):
             noise_chunk = noise_jax.reshape(batch_size, int(self.action_horizon), int(self.action_dim))[
                 :, :cfg_ah, :cfg_ad
             ]
-        elif int(noise_jax.shape[-1]) == model_ad:
-            # DSRL noise is in full model action_dim space (e.g. actor_action_dim=32 == model_ad=32).
-            # Broadcast it to all action steps so every step gets guidance, not just step 0.
-            noise_chunk = jnp.broadcast_to(noise_jax[:, None, :], (batch_size, cfg_ah, model_ad))
-            cfg_ad = model_ad
         else:
             noise_chunk = noise_jax[:, None, :cfg_ad]
             cfg_ah = 1
-        if full_chunk is not None:
-            noise_full = full_chunk
-        else:
-            noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(noise_chunk)
+        noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(noise_chunk)
         
         # Sample the actions
+        sample_actions_time = time.time()
         traj = self._sample_actions(
             rng_act,
             obs_full,
@@ -1330,17 +1445,319 @@ class SteerVLAActor:
             num_steps=int(self.sample_actions_num_steps),
             image_keys=CARLA_STEERVLA_IMAGE_KEYS,
         )
-        if self.return_normalized_action_chunk and not force_accel_steer:
-            traj_clip = traj[:, : int(self.action_horizon), : int(self.action_dim)]
-            flat = traj_clip.reshape(batch_size, -1)
-            return jax.device_put(flat.astype(jnp.float32), self._jax_device)
+        jax.block_until_ready(traj)
+        sample_actions_time = time.time() - sample_actions_time
 
-        first_step = traj[:, 0, :].astype(jnp.float32)
-        target_dim = int(self.action_dim)
-        out = jnp.zeros((batch_size, target_dim), dtype=jnp.float32)
-        copy_dim = min(target_dim, int(first_step.shape[-1]))
-        out = out.at[:, :copy_dim].set(first_step[:, :copy_dim])
-        return out
+        print(f"[DEBUG - steervla] Sample actions time: {sample_actions_time} seconds")
+        traj_np = self._postprocess_action_trajectory(traj, observation_state=obs_jax.state)
+
+        if self.return_normalized_action_chunk and not force_accel_steer:
+            # Residual RL operates in the model's normalized action space, so return the
+            # raw sampled chunk (env applies denormalize_actions via action_input_space),
+            # rather than the physically-postprocessed trajectory.
+            chunk = traj[:, : int(self.action_horizon), : int(self.action_dim)]
+            flat = chunk.reshape(batch_size, -1)
+            expected = int(self.action_horizon) * int(self.action_dim)
+            if flat.shape[-1] != expected:
+                raise ValueError(
+                    f"SteerVLA action chunk has length {flat.shape[-1]}, expected "
+                    f"{expected} (= {self.action_horizon} x {self.action_dim}). "
+                    f"Sampled trajectory shape: {tuple(traj.shape)}."
+                )
+            return jax.device_put(jnp.asarray(flat, dtype=jnp.float32), self._jax_device)
+
+        first_step = traj_np[:, 0, : int(self.action_dim)]
+        return jax.device_put(jnp.asarray(first_step, dtype=jnp.float32), self._jax_device)
+
+    @staticmethod
+    def _sanitize_debug_path_component(name: str) -> str:
+        s = str(name).strip() or "unknown"
+        s = re.sub(r"[^\w\-.]+", "_", s)
+        return s[:120]
+
+    def set_debug_noise_context(
+        self,
+        *,
+        run_name: str | None = None,
+        save_root: str | Path | None = None,
+        route_name: str | None = None,
+        episode: int | None = None,
+        episode_step: int | None = None,
+    ) -> None:
+        """Update where debug-noise plots and npz logs are written (per run / route / episode)."""
+        if run_name is not None:
+            self.debug_noise_run_name = str(run_name)
+        if save_root is not None:
+            self.debug_noise_save_root = Path(save_root)
+        if route_name is not None:
+            self.debug_noise_route_name = str(route_name)
+        if episode is not None:
+            self.debug_noise_episode = int(episode)
+        if episode_step is not None:
+            self.debug_noise_episode_step = int(episode_step)
+
+    def _should_log_debug_noise_plot(self) -> bool:
+        step = int(self.debug_noise_episode_step)
+        every = int(self.debug_noise_log_every_n_steps)
+        return step > 0 and step % every == 0
+
+    def _debug_noise_artifact_dir(self) -> Path:
+        run_name = self._sanitize_debug_path_component(
+            self.debug_noise_run_name or "run"
+        )
+        route = self._sanitize_debug_path_component(self.debug_noise_route_name)
+        ep = int(self.debug_noise_episode)
+        root = self.debug_noise_save_root or Path("debug_noises")
+        out_dir = root / "debug_noises" / f"{run_name}_{route}" / f"ep{ep:04d}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
+    def _debug_speed_score_from_flat(self, flat_action: Any) -> float:
+        """First-step speed delta magnitude (``delta_xy`` cols 0:2); lower means slower."""
+        ah = int(self.action_horizon)
+        ad = int(self.action_dim)
+        flat = np.asarray(jax.device_get(flat_action), dtype=np.float32).reshape(-1)
+        expected = ah * ad
+        if flat.size != expected:
+            return float("inf")
+        speed_xy = flat.reshape(ah, ad)[:, :2]
+        speed_xy_final = np.cumsum(speed_xy, axis=0)[-1, :2]
+        return float(np.linalg.norm(speed_xy_final))
+
+    def _debug_xy_cumsum_from_flat(self, flat_action: Any) -> np.ndarray:
+        """Cumulative ``delta_xy`` in meters, shape ``(action_horizon, 2)``."""
+        ah = int(self.action_horizon)
+        ad = int(self.action_dim)
+        flat = np.asarray(jax.device_get(flat_action), dtype=np.float32).reshape(-1)
+        expected = ah * ad
+        if flat.size != expected:
+            return np.full((ah, 2), np.nan, dtype=np.float64)
+        deltas = flat.reshape(ah, ad)[:, :2].astype(np.float64)
+        return np.cumsum(deltas, axis=0)
+
+    def _sample_best_of_random_noises(self, batch_size: int, noise_jax: jax.Array) -> jnp.ndarray:
+        """Debug rollout: sample random noises, log distributions, optionally pick the slowest chunk."""
+        if not self.use_best_noise and not self._should_log_debug_noise_plot():
+            return self._forward_pi0(batch_size, noise_jax, raw=None)
+
+        import matplotlib.pyplot as plt
+
+        n = int(self.debug_noise_samples)
+        self._call_counter += 1
+        rng = jax.random.PRNGKey(self._call_counter)
+        rng, samp_rng = jax.random.split(rng)
+
+        ref_noise = np.asarray(jax.device_get(noise_jax), dtype=np.float32)
+        if ref_noise.ndim == 1:
+            ref_noise = ref_noise.reshape(1, -1)
+        noise_dim = int(ref_noise.shape[-1])
+        candidate_noises = np.asarray(
+            jax.device_get(
+                jax.random.normal(samp_rng, (n, batch_size, noise_dim), dtype=jnp.float32)
+            ),
+            dtype=np.float32,
+        )
+
+        best_out: jnp.ndarray | None = None
+        best_score = float("inf")
+        best_idx = -1
+        scores: list[float] = []
+        xy_avgs: list[tuple[float, float]] = []
+        xy_cumsum_steps: list[np.ndarray] = []
+        for i in range(n):
+            noise_i = jnp.asarray(candidate_noises[i], dtype=jnp.float32)
+            out = self._forward_pi0(batch_size, noise_i, raw=None)
+            score = self._debug_speed_score_from_flat(out)
+            scores.append(score)
+            cumsum_xy = self._debug_xy_cumsum_from_flat(out)
+            xy_cumsum_steps.append(cumsum_xy)
+            final_xy = cumsum_xy[-1]
+            xy_avgs.append((float(final_xy[0]), float(final_xy[1])))
+            if self.use_best_noise and score < best_score:
+                best_score = score
+                best_out = out
+                best_idx = i
+
+        scores_arr = np.asarray(scores, dtype=np.float64)
+        xy_arr = np.asarray(xy_avgs, dtype=np.float64)
+        xy_cumsum_arr = np.stack(xy_cumsum_steps, axis=0)
+        score_mean = float(np.mean(scores_arr))
+        score_std = float(np.std(scores_arr))
+        score_max = float(np.max(scores_arr))
+        score_min = float(np.min(scores_arr))
+
+        should_log_plot = self._should_log_debug_noise_plot()
+        plot_path: Path | None = None
+        npz_path: Path | None = None
+        if should_log_plot:
+            fig, (ax_score, ax_xy) = plt.subplots(1, 2, figsize=(13, 5))
+
+            ax_score.scatter(range(n), scores_arr, alpha=0.75, label="candidates")
+            if self.use_best_noise and best_idx >= 0:
+                ax_score.scatter(
+                    [best_idx],
+                    [scores_arr[best_idx]],
+                    color="red",
+                    s=80,
+                    zorder=3,
+                    label=f"best ({best_idx})",
+                )
+            ax_score.axhline(score_mean, color="C1", linestyle="-", linewidth=1.5, label="mean")
+            ax_score.axhline(score_max, color="C2", linestyle="--", linewidth=1.2, label="max")
+            ax_score.axhline(score_min, color="C3", linestyle="--", linewidth=1.2, label="min")
+            ax_score.axhspan(
+                score_mean - score_std,
+                score_mean + score_std,
+                color="C1",
+                alpha=0.15,
+                label="±1 std",
+            )
+            stats_text = (
+                f"mean = {score_mean:.4f}\n"
+                f"std  = {score_std:.4f}\n"
+                f"max  = {score_max:.4f}\n"
+                f"min  = {score_min:.4f}"
+            )
+            ax_score.text(
+                0.02,
+                0.98,
+                stats_text,
+                transform=ax_score.transAxes,
+                va="top",
+                ha="left",
+                fontsize=9,
+                bbox={"boxstyle": "round", "facecolor": "wheat", "alpha": 0.85},
+            )
+            ax_score.set_title("Speed score (lower = slower)")
+            ax_score.set_xlabel("Candidate")
+            ax_score.set_ylabel("||cumsum delta_xy||")
+            ax_score.legend(loc="upper right", fontsize=8)
+
+            cmap = plt.get_cmap("tab20", max(n, 1))
+            valid_cumsum_mask = np.isfinite(xy_cumsum_arr).all(axis=(1, 2))
+            final_points: list[np.ndarray] = []
+            for i in range(n):
+                if not valid_cumsum_mask[i]:
+                    continue
+                cumsum_xy = xy_cumsum_arr[i]
+                color = cmap(i % cmap.N)
+                ax_xy.plot(
+                    cumsum_xy[:, 0],
+                    cumsum_xy[:, 1],
+                    color=color,
+                    alpha=0.55,
+                    linewidth=1.2,
+                    zorder=2,
+                )
+                ax_xy.scatter(
+                    cumsum_xy[:, 0],
+                    cumsum_xy[:, 1],
+                    color=[color],
+                    alpha=0.35,
+                    s=14,
+                    edgecolors="none",
+                    zorder=2,
+                )
+                final_xy = cumsum_xy[-1]
+                final_points.append(final_xy)
+                marker_edge = "red" if i == best_idx else "black"
+                marker_lw = 1.0 if i == best_idx else 0.35
+                ax_xy.scatter(
+                    final_xy[0],
+                    final_xy[1],
+                    color=color,
+                    marker="D",
+                    s=52,
+                    edgecolors=marker_edge,
+                    linewidths=marker_lw,
+                    zorder=4,
+                )
+                ax_xy.annotate(
+                    f"c{i}",
+                    (final_xy[0], final_xy[1]),
+                    xytext=(4, 4),
+                    textcoords="offset points",
+                    fontsize=7,
+                    color=color,
+                    fontweight="bold" if i == best_idx else "normal",
+                )
+
+            if final_points:
+                finals = np.stack(final_points, axis=0)
+                overall_mean = finals.mean(axis=0)
+                ax_xy.scatter(
+                    overall_mean[0],
+                    overall_mean[1],
+                    color="black",
+                    marker="X",
+                    s=90,
+                    linewidths=1.5,
+                    zorder=5,
+                )
+                ax_xy.annotate(
+                    "overall",
+                    (overall_mean[0], overall_mean[1]),
+                    xytext=(5, -10),
+                    textcoords="offset points",
+                    fontsize=8,
+                    color="black",
+                    fontweight="bold",
+                )
+
+            ax_xy.axhline(0.0, color="0.7", linewidth=0.8)
+            ax_xy.axvline(0.0, color="0.7", linewidth=0.8)
+            ax_xy.set_title("Cumulative delta_xy per candidate")
+            ax_xy.set_xlabel("x (m)")
+            ax_xy.set_ylabel("y (m)")
+            ax_xy.set_aspect("equal", adjustable="datalim")
+
+            mode_label = "best_of_n" if self.use_best_noise else "log_only"
+            fig.suptitle(
+                f"debug_noise call={self._call_counter} step={self.debug_noise_episode_step} "
+                f"mode={mode_label} route={self.debug_noise_route_name} "
+                f"ep={self.debug_noise_episode}",
+                fontsize=10,
+            )
+            fig.tight_layout()
+
+            artifact_dir = self._debug_noise_artifact_dir()
+            stem = f"debug_noise_step{self.debug_noise_episode_step:04d}_{self._call_counter:04d}"
+            plot_path = artifact_dir / f"{stem}.png"
+            npz_path = artifact_dir / f"{stem}.npz"
+            fig.savefig(plot_path)
+            plt.close(fig)
+
+            np.savez(
+                npz_path,
+                candidate_noises=candidate_noises,
+                scores=scores_arr,
+                xy_final=xy_arr,
+                xy_cumsum=xy_cumsum_arr,
+                ref_noise=ref_noise,
+                best_idx=np.int32(best_idx),
+                use_best_noise=np.bool_(self.use_best_noise),
+                call_counter=np.int32(self._call_counter),
+                episode=np.int32(self.debug_noise_episode),
+                episode_step=np.int32(self.debug_noise_episode_step),
+                route_name=np.array(self.debug_noise_route_name),
+            )
+
+        best_speed_str = f"{best_score:.4f}" if best_idx >= 0 else "n/a"
+        plot_msg = f" plot={plot_path} npz={npz_path}" if should_log_plot else " plot=skipped"
+        print(
+            f"[debug_noise] step={self.debug_noise_episode_step} candidates={n} "
+            f"use_best_noise={self.use_best_noise} "
+            f"best_idx={best_idx} best_speed_delta_xy={best_speed_str} "
+            f"mean={score_mean:.4f} std={score_std:.4f} "
+            f"min={score_min:.4f} max={score_max:.4f}{plot_msg}",
+            flush=True,
+        )
+
+        if self.use_best_noise:
+            if best_out is None:
+                raise RuntimeError("debug_noise search failed to produce any action.")
+            return jnp.asarray(best_out)
+        return self._forward_pi0(batch_size, noise_jax, raw=None)
 
     def __call__(self, observations_jax: jax.Array, noise_jax: jax.Array) -> jax.Array:
         """DSRL ``vla_sample_fn``: map encoder observations + noise to CARLA actions.
@@ -1359,6 +1776,7 @@ class SteerVLAActor:
                 and self.raw_obs_holder is not None
                 and isinstance(self.raw_obs_holder.get("obs"), dict)
             ):
+                print(f"[DEBUG - steervla] Stashing cached CoT in raw obs holder")
                 self._stash_cot_in_raw(self.raw_obs_holder["obs"], self._cached_cot)
             self._mark_action_served(batch_size)
             return cached
@@ -1380,7 +1798,11 @@ class SteerVLAActor:
             self._mark_action_served(batch_size)
             return out
 
-        out = self._forward_pi0(batch_size, noise_jax, raw=None)
+        out = (
+            self._sample_best_of_random_noises(batch_size, noise_jax)
+            if self.debug_noise
+            else self._forward_pi0(batch_size, noise_jax, raw=None)
+        )
         self._remember_action_chunk(out, batch_size)
         self._mark_action_served(batch_size)
         return out
@@ -1414,13 +1836,7 @@ class SteerVLAActor:
             lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
             obs_np_struct,
         )
-        cot_out = self._sample_cot(
-            rng,
-            obs_jax,
-            temperature=float(self.cot_temperature),
-            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-            # replay_reasoning=self.cot_replay_reasoning,
-        )
+        cot_out = self._sample_or_reuse_cot(rng, obs_jax, 1)
 
         def _to_numpy(x: Any) -> Any:
             return np.asarray(jax.device_get(x))
@@ -1455,6 +1871,14 @@ def create_steervla_pi0_cot_sample_fn(
         sample_actions_num_steps=int(steervla_cfg.get("sample_actions_num_steps", 10)),
         training_gpu_rank=int(srank),
         return_normalized_action_chunk=bool(steervla_cfg.get("use_pi_action_chunk_for_env", True)),
+        fixed_subtask_text=steervla_cfg.get("fixed_subtask_text"),
+        fixed_reasoning_text=steervla_cfg.get("fixed_reasoning_text"),
+        debug_noise=bool(steervla_cfg.get("debug_noise", False)),
+        debug_noise_samples=int(steervla_cfg.get("debug_noise_samples", 15)),
+        use_best_noise=bool(steervla_cfg.get("use_best_noise", True)),
+        debug_noise_log_every_n_steps=int(
+            steervla_cfg.get("debug_noise_log_every_n_steps", 5)
+        ),
     )
 
     if url_clean:

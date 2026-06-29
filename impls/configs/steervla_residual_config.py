@@ -3,13 +3,7 @@
 Use with ``--agent=impls/configs/steervla_residual_config.py`` (the default for
 ``impls/main_carla_residual.py``). This wraps :func:`jax_agents.sac_residual.get_config`
 (the residual SAC agent) and adds the run-level wiring: the state encoder used to
-build the RL state and the frozen SteerVLA base policy. (RLT, when added, plugs in
-as another ``state_encoder`` feeding this same agent — it is not an agent itself,
-so it reuses this config/entrypoint via the ``config.state_encoder`` knob rather
-than new run files.)
-
-``config.training_gpu_rank`` pins JAX (RL agent + SteerVLA checkpoint restore) to
-one GPU; CARLA's render GPU is ``gpu_rank`` in ``impls/configs/carla_config.yaml``.
+build the RL state and the frozen SteerVLA base policy.
 """
 
 from __future__ import annotations

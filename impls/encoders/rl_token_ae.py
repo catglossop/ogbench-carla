@@ -1,11 +1,5 @@
 """RL Token autoencoder (Physical Intelligence's RLT, https://www.pi.website/research/rlt).
 
-Vendored verbatim from the training repo's ``openpi/models/rl_token.py`` so the
-``state_dict`` saved by ``train_rl_token_ae.py`` loads into an identical module
-structure here, without coupling this JAX residual-RL stack to that repo. Only
-:meth:`RLTokenAutoencoder.encode` is exercised at inference (decoder/out_proj are
-kept so checkpoint loading is exact).
-
 Encoder: bidirectional transformer over [z_{1:M}, e_rl]; RL token z_rl is the
 encoder output at the appended e_rl position. Decoder: causal transformer with
 z_rl prepended; at position i, predicts z̄_{i+1} from [z_rl, z̄_{1:i}].

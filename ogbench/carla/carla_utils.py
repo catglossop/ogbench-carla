@@ -109,37 +109,6 @@ def warn_if_carla_root_mismatched(route_source: str, cfg: Dict[str, Any]) -> Non
             f"CARLA_ROOT={f2d_root_resolved} (and relaunch the CARLA server from there).\033[0m"
         )
 
-
-
-def warn_if_carla_root_mismatched(route_source: str, cfg: Dict[str, Any]) -> None:
-    """Log a clear warning if the active CARLA install can't serve this route's assets.
-
-    Fail2Drive routes reference static props (``brickwall``, ``walkingkid``,
-    ``ampel`` etc.) that vanilla CARLA 0.9.16 doesn't ship — those scenarios
-    silently fail to spawn the intended obstacle. ``run_simlingo_fail2drive.sh``
-    switches ``CARLA_ROOT`` automatically; this catches the case where someone
-    invoked the script directly without doing that.
-    """
-    if route_source != "fail2drive":
-        return
-    f2d_root = cfg.get("fail2drive_carla_root")
-    if not f2d_root:
-        return
-    current_root = os.environ.get("CARLA_ROOT", "")
-    current_api = os.environ.get("CARLA_PYTHON_API_ROOT", "")
-    f2d_root_resolved = str(Path(str(f2d_root)).expanduser().resolve())
-    if (
-        current_root
-        and Path(current_root).resolve() != Path(f2d_root_resolved)
-        and not current_api.startswith(f2d_root_resolved)
-    ):
-        print(
-            f"\033[93m[fail2drive] WARNING: route is from Fail2Drive but CARLA_ROOT="
-            f"{current_root!r} is not the Fail2Drive install ({f2d_root_resolved!r}). "
-            f"Assets like static.prop.brickwall / walkingkid may be missing — set "
-            f"CARLA_ROOT={f2d_root_resolved} (and relaunch the CARLA server from there).\033[0m"
-        )
-
 import carla
 from leaderboard.autoagents.agent_wrapper import AgentError, TickRuntimeError, validate_sensor_configuration
 from leaderboard.envs.sensor_interface import SensorConfigurationInvalid
@@ -235,20 +204,18 @@ _SPEED_LIMITS_DIR = Path(__file__).resolve().parent.parent.parent / "impls" / "c
 DEFAULT_CRASH_STUCK_SPEED_THRESHOLD = 0.1
 DEFAULT_CRASH_STUCK_STEPS = 20
 DEFAULT_CRASH_STUCK_PENALTY = -20.0
-DEFAULT_COLLISION_EVENT_PENALTY = -20.0  # legacy: applied while contact is active unless split below
-DEFAULT_COLLISION_CONTACT_PENALTY = None  # float | None; if None, uses legacy collision_event_penalty
+DEFAULT_COLLISION_EVENT_PENALTY = -20.0
 DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -20.0
-DEFAULT_TRAFFIC_VIOLATION_PENALTY = -20.0  # per new RunningStop or RunningRedLight event
-DEFAULT_PROGRESS_REWARD_WEIGHT = 5.0 # 5.0
-DEFAULT_TERMINATE_ON_INFRACTION = False
+DEFAULT_PROGRESS_REWARD_WEIGHT = 1.0
 DEFAULT_MAX_EPISODE_STEPS = 250
 # DEFAULT_CENTERING_REWARD_WEIGHT = 0.2
 # DEFAULT_HEADING_REWARD_WEIGHT = 0.2
-DEFAULT_STEER_PENALTY_WEIGHT = 0.0 # 0.05
-DEFAULT_BRAKE_PENALTY_WEIGHT = 0.0 # 0.02
+DEFAULT_STEER_PENALTY_WEIGHT = 0.05
+DEFAULT_BRAKE_PENALTY_WEIGHT = 0.02
 DEFAULT_SPEED_LIMIT_PENALTY_WEIGHT = 0.1
-SUCCESS_BONUS = 50.0
-FAILURE_BONUS = -20.0
+DEFAULT_SPEEDING_EVENT_PENALTY = -0.1
+SUCCESS_BONUS = 5.0
+FAILURE_BONUS = -5.0
 
 
 def _find_free_port(starting_port: int) -> int:
@@ -1088,20 +1055,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._collision_event_penalty = float(
             self.carla_config.get("collision_event_penalty", DEFAULT_COLLISION_EVENT_PENALTY)
         )
-        collision_contact_penalty = self.carla_config.get(
-            "collision_contact_penalty", DEFAULT_COLLISION_CONTACT_PENALTY
-        )
-        self._collision_contact_penalty = (
-            None if collision_contact_penalty is None else float(collision_contact_penalty)
-        )
         self._outside_route_event_penalty = float(
             self.carla_config.get("outside_route_event_penalty", DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY)
-        )
-        self._traffic_violation_penalty = float(
-            self.carla_config.get("traffic_violation_penalty", DEFAULT_TRAFFIC_VIOLATION_PENALTY)
-        )
-        self._terminate_on_infraction = bool(
-            self.carla_config.get("terminate_on_infraction", DEFAULT_TERMINATE_ON_INFRACTION)
         )
         self._progress_reward_weight = float(
             self.carla_config.get("progress_reward_weight", DEFAULT_PROGRESS_REWARD_WEIGHT)
@@ -1115,27 +1070,20 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._speed_limit_penalty_weight = float(
             self.carla_config.get("speed_limit_penalty_weight", DEFAULT_SPEED_LIMIT_PENALTY_WEIGHT)
         )
+        self._speeding_event_penalty = float(
+            self.carla_config.get("speeding_event_penalty", DEFAULT_SPEEDING_EVENT_PENALTY)
+        )
         self._success_bonus = float(self.carla_config.get("success_bonus", SUCCESS_BONUS))
         self._failure_bonus = float(self.carla_config.get("failure_bonus", FAILURE_BONUS))
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
-        self._prev_route_progress_pct = 0.0
         self._max_episode_steps = int(
             self.carla_config.get("max_episode_steps", DEFAULT_MAX_EPISODE_STEPS)
         )
         self._episode_step_count = 0
-        self._prev_traffic_violation_count = 0
         self._raw_collision_sensor: Any | None = None
         self._raw_collision_active: bool = False
         self._collision_recently_active: bool = False
-        self._last_route_completion = 0.0
-        self._route_progress_xyz: Optional[np.ndarray] = None
-        self._route_progress_s: Optional[np.ndarray] = None
-        self._route_total_distance_m = 0.0
-        self._route_progress_index = 0
-        self._route_transforms: list[Any] = []
-        self._route_completion_accum_perc: list[float] = []
-        self._route_completion_index = 0
 
         self._expert_controller_kind = str(self.carla_config.get("expert_controller", "") or "").strip().lower()
         self._expert_agent: Any | None = None
@@ -1498,12 +1446,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._crash_stuck_ticks = 0
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
-        self._prev_route_progress_pct = 0.0
-        self._prev_traffic_violation_count = 0
         self._raw_collision_active = False
         self._collision_recently_active = False
-        self._last_route_completion = 0.0
-        self._init_route_progress_cache()
         self._spawn_raw_collision_sensor()
 
     def _ego_actor(self) -> Optional[carla.Actor]:
@@ -1942,15 +1886,11 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         heading_factor = float(np.clip(math.cos(heading_error_rad), 0.0, 1.0))
         speed_norm = float(np.clip(speed / max(speed_limit_mps, 1e-3), 0.0, 1.0))
         overspeed_frac = max(0.0, speed / max(speed_limit_mps, 1e-3) - 1.0)
+        overspeed_kmh = max(0.0, (speed - speed_limit_mps) * 3.6)
         steer_pen = self._steer_penalty_weight * abs(float(getattr(self._last_control, "steer", 0.0)))
         brake_pen = self._brake_penalty_weight * float(getattr(self._last_control, "brake", 0.0))
         speed_limit_pen = self._speed_limit_penalty_weight * overspeed_frac
-        route_progress_pct = self._route_completion_pct()
-        route_progress_delta = max(0.0, route_progress_pct - self._prev_route_progress_pct)
-        self._prev_route_progress_pct = route_progress_pct
-        
-        criteria = self._criteria_snapshot()
-        progress_reward = self._progress_reward_weight * route_progress_delta / 100.0
+        progress_reward = self._progress_reward_weight * speed_norm * centering_factor * heading_factor
         # centering_reward = self._centering_reward_weight * centering_factor
         # heading_reward = self._heading_reward_weight * heading_factor
 
@@ -1967,55 +1907,41 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         )
         crash_stuck, collision_count = self._update_crash_stuck_state(speed)
         outside_route_value, _min_speed_value = self._route_infraction_values()
-        traffic_violation_count = self._traffic_violation_count()
+        route_progress_pct = self._route_completion_pct()
 
         collision_delta = max(0, collision_count - self._prev_collision_count)
         outside_route_delta = max(0.0, outside_route_value - self._prev_outside_route_value)
-        traffic_violation_delta = max(0, traffic_violation_count - self._prev_traffic_violation_count)
         self._prev_collision_count = collision_count
         self._prev_outside_route_value = outside_route_value
-        self._prev_traffic_violation_count = traffic_violation_count
 
         collision_contact_active = self._raw_collision_active
         collision_penalty_active = collision_contact_active or (collision_delta > 0)
-        if self._collision_contact_penalty is None:
-            # Legacy mode: one coefficient applies whenever a new collision fires
-            # or bounding boxes remain in contact.
-            collision_pen = self._collision_event_penalty if collision_penalty_active else 0.0
-        else:
-            collision_pen = (
-                self._collision_event_penalty * float(collision_delta > 0)
-                + self._collision_contact_penalty * float(collision_contact_active)
-            )
+        collision_pen = self._collision_event_penalty if collision_penalty_active else 0.0
         outside_route_pen = self._outside_route_event_penalty * float(outside_route_delta)
-        traffic_violation_pen = self._traffic_violation_penalty * float(traffic_violation_delta)
-        reward += collision_pen + outside_route_pen + traffic_violation_pen
+        speeding_pen = self._speeding_event_penalty * float(overspeed_kmh)
+        reward += collision_pen + outside_route_pen + speeding_pen
 
         terminal_bonus = 0.0
         info["collision_count"] = collision_count
-        info["route_progress_pct"] = route_progress_pct
-        info["route_progress_delta"] = route_progress_delta
+        info["route_progress_pct"] = float(route_progress_pct)
         info["crash_stuck_ticks"] = self._crash_stuck_ticks
         info["collision_penalty_active"] = bool(collision_penalty_active)
         info["collision_contact_active"] = bool(collision_contact_active)
         info["outside_route_value"] = outside_route_value
         info["collision_delta"] = float(collision_delta)
         info["outside_route_delta"] = float(outside_route_delta)
-        info["traffic_violation_count"] = traffic_violation_count
-        info["traffic_violation_delta"] = float(traffic_violation_delta)
         info["lane_offset_m"] = lane_offset_m
         info["heading_error_rad"] = heading_error_rad
         info["lane_width_m"] = lane_width_m
         info["speed_limit_mps"] = speed_limit_mps
-        info["route_progress_pct"] = float(route_progress_pct)
-        info["route_progress_delta"] = float(route_progress_delta)
         info["speed_norm"] = speed_norm
         info["overspeed_frac"] = overspeed_frac
+        info["overspeed_kmh"] = overspeed_kmh
         info["centering_factor"] = centering_factor
         info["heading_factor"] = heading_factor
         info["penalty_collision"] = collision_pen
         info["penalty_outside_route"] = outside_route_pen
-        info["penalty_traffic_violation"] = traffic_violation_pen
+        info["penalty_speeding"] = speeding_pen
         info["penalty_steer"] = -steer_pen
         info["penalty_brake"] = -brake_pen
         info["penalty_speed_limit"] = -speed_limit_pen
@@ -2031,11 +1957,6 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             info["penalty_crash_stuck"] = self._crash_stuck_penalty
         else:
             info["penalty_crash_stuck"] = 0.0
-
-        if not terminated and self._terminate_on_infraction:
-            if collision_delta > 0 or outside_route_delta > 0 or traffic_violation_delta > 0:
-                terminated = True
-                info["termination_reason"] = "infraction"
 
         if terminated:
             if crash_stuck:
@@ -2153,21 +2074,6 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 except Exception:
                     return 0.0
         return 0.0
-    
-    def _traffic_violation_count(self) -> int:
-        """Return total count of RunningStopTest + RunningRedLightTest infractions so far."""
-        scenario = getattr(self.evaluator, "route_scenario", None)
-        if scenario is None:
-            return 0
-        count = 0
-        for criterion in scenario.get_criteria():
-            name = str(getattr(criterion, "name", ""))
-            if name in ("RunningStopTest", "RunningRedLightTest"):
-                try:
-                    count += int(getattr(criterion, "actual_value", 0))
-                except Exception:
-                    pass
-        return count
 
     def _route_infraction_values(self) -> Tuple[float, float]:
         """Return cumulative infraction values for outside-route and minimum-speed criteria."""
@@ -2190,110 +2096,6 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 min_speed_val = max(min_speed_val, value)
 
         return outside_route_val, min_speed_val
-
-    def _criteria_snapshot(self) -> list[dict[str, Any]]:
-        scenario = getattr(self.evaluator, "route_scenario", None)
-        if scenario is None:
-            return []
-        out: list[dict[str, Any]] = []
-        for criterion in scenario.get_criteria():
-            name = str(getattr(criterion, "name", "") or "")
-            try:
-                value = float(getattr(criterion, "actual_value", 0.0))
-            except Exception:
-                value = 0.0
-            status = str(
-                getattr(criterion, "test_status", getattr(criterion, "status", "")) or ""
-            )
-            out.append(
-                {
-                    "name": name,
-                    "name_lower": name.lower(),
-                    "value": value,
-                    "status": status.lower(),
-                }
-            )
-        return out
-
-    @staticmethod
-    def _criterion_matches(name_lower: str, token_groups: tuple[tuple[str, ...], ...]) -> bool:
-        return any(all(token in name_lower for token in group) for group in token_groups)
-
-    def _criterion_value(
-        self,
-        criteria: list[dict[str, Any]],
-        token_groups: tuple[tuple[str, ...], ...],
-    ) -> float:
-        value = 0.0
-        for criterion in criteria:
-            if self._criterion_matches(criterion["name_lower"], token_groups):
-                value = max(value, float(criterion["value"]))
-        return value
-
-    def _route_completion_percent(self, criteria: list[dict[str, Any]]) -> float:
-        criterion_value = self._criterion_value(
-            criteria,
-            (("route", "completion"), ("route", "completed")),
-        )
-        if criterion_value > 0.0:
-            return float(np.clip(criterion_value, 0.0, 100.0))
-
-        ego = self._ego_actor()
-        if ego is None or not self._route_transforms or not self._route_completion_accum_perc:
-            return self._last_route_completion
-
-        location = ego.get_transform().location
-        route_length = len(self._route_transforms)
-        for index in range(
-            self._route_completion_index,
-            min(self._route_completion_index + 3, route_length),
-        ):
-            route_transform = self._route_transforms[index]
-            route_location = route_transform.location
-            wp_dir = route_transform.get_forward_vector()
-            wp_veh = location - route_location
-            if wp_veh.dot(wp_dir) > 0:
-                self._route_completion_index = index
-        return float(round(self._route_completion_accum_perc[self._route_completion_index], 2))
-
-    def _init_route_progress_cache(self) -> None:
-        ev = self._evaluator
-        route = getattr(getattr(ev, "route_scenario", None), "route", None) or []
-        self._route_transforms = [
-            route_item[0] if isinstance(route_item, (tuple, list)) and route_item else route_item
-            for route_item in route
-        ]
-        xyz: list[list[float]] = []
-        for transform in self._route_transforms:
-            loc = getattr(transform, "location", None)
-            if loc is None:
-                continue
-            xyz.append([float(loc.x), float(loc.y), float(loc.z)])
-        if len(xyz) < 2:
-            self._route_progress_xyz = None
-            self._route_progress_s = None
-            self._route_total_distance_m = 0.0
-            self._route_progress_index = 0
-            self._route_completion_accum_perc = []
-            self._route_completion_index = 0
-            self._last_route_completion = 0.0
-            return
-
-        route_xyz = np.asarray(xyz, dtype=np.float32)
-        seg = np.linalg.norm(route_xyz[1:] - route_xyz[:-1], axis=1)
-        route_s = np.concatenate(
-            [np.zeros(1, dtype=np.float32), np.cumsum(seg, dtype=np.float32)],
-            axis=0,
-        )
-        self._route_progress_xyz = route_xyz
-        self._route_progress_s = route_s
-        self._route_total_distance_m = float(max(route_s[-1], 1e-6))
-        self._route_progress_index = 0
-        self._route_completion_accum_perc = (
-            (100.0 * route_s / self._route_total_distance_m).astype(np.float32).tolist()
-        )
-        self._route_completion_index = 0
-        self._last_route_completion = 0.0
 
     @staticmethod
     def _wrap_angle_rad(angle: float) -> float:
