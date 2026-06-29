@@ -127,10 +127,17 @@ def _make_carla_env(carla_config_path, route, *, extra_carla_config=None):
     return CarlaBench2DriveWrapper(cfg, route=route)
 
 
-def _base_chunk(vla_sample_fn, raw_holder: dict, obs: dict, action_dim: int) -> np.ndarray:
-    """Frozen SteerVLA base action chunk (noise=0 -> deterministic) -> float32 [action_dim]."""
+def _base_chunk(vla_sample_fn, raw_holder: dict, obs: dict, base_noise: jnp.ndarray) -> np.ndarray:
+    """Frozen SteerVLA base action chunk for one flow-noise draw -> float32 [action_dim].
+
+    The base policy is a flow/diffusion model: the action chunk is produced by integrating
+    the flow ODE from an initial noise sample, so ``base_noise`` must be a Gaussian draw
+    (``x ~ N(0, I)``), matching the ``main_carla.py`` rollout. Seeding with zeros lands off
+    the training noise distribution and collapses the chunk toward a near-stationary action
+    (the car only inches forward).
+    """
     raw_holder["obs"] = obs
-    out = vla_sample_fn(jnp.zeros((1, 1), dtype=jnp.float32), jnp.zeros((1, action_dim), dtype=jnp.float32))
+    out = vla_sample_fn(jnp.zeros((1, 1), dtype=jnp.float32), base_noise)
     return np.asarray(jax.device_get(out), dtype=np.float32).reshape(-1)
 
 
@@ -270,13 +277,7 @@ def _log_episode_end(
 
 
 def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_holder, state_encoder):
-    """Residual-SAC online loop. One env.step == one CARLA tick == one transition.
-
-    Pass ``agent=None`` and ``state_encoder=None`` for the no-RL baseline
-    (``base_only``): the frozen base chunk is executed every step with identical
-    per-step / per-episode logging, but no residual, encoder, replay buffer, or
-    gradient updates.
-    """
+    """Residual-SAC online loop. One env.step == one CARLA tick == one transition."""
     base_only = agent is None
     action_dim = int(config["steervla"]["action_horizon"]) * int(config["steervla"]["action_dim"])
     warmup = int(config["residual_warmup_steps"])
@@ -299,9 +300,16 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
 
     rng = jax.random.PRNGKey(FLAGS.seed)
 
+    def _draw_base_noise(key: jax.Array) -> jnp.ndarray:
+        """Fresh Gaussian seed for the base flow ODE (``x ~ N(0, I)``), matching the
+        ``main_carla.py`` rollout. Seeding with zeros lands off the training noise
+        distribution and collapses the chunk so the car only inches forward."""
+        return jax.random.normal(key, (1, action_dim), dtype=jnp.float32)
+
     # Base chunk before encode: it samples + stashes the CoT that the rl_token
     # encoder needs to reproduce the prefix the policy acted on (no-op for others).
-    base = _base_chunk(vla_sample_fn, raw_holder, obs, action_dim)
+    rng, nk = jax.random.split(rng)
+    base = _base_chunk(vla_sample_fn, raw_holder, obs, _draw_base_noise(nk))
     x = None if state_encoder is None else state_encoder.encode(obs)
 
     buffer: Optional[ReplayBuffer] = None
@@ -341,7 +349,8 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
             next_obs, reward, terminated, truncated, info = env.step(final)
             done = bool(terminated or truncated)
 
-            next_base = _base_chunk(vla_sample_fn, raw_holder, next_obs, action_dim)
+            rng, nk = jax.random.split(rng)
+            next_base = _base_chunk(vla_sample_fn, raw_holder, next_obs, _draw_base_noise(nk))
             next_x = None if state_encoder is None else state_encoder.encode(next_obs)
 
             if agent is not None:
@@ -405,7 +414,8 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
                 episode_steps = 0
                 obs, _info = env.reset(seed=FLAGS.seed + episode_count)
                 steervla_actor.reset_action_cache()
-                base = _base_chunk(vla_sample_fn, raw_holder, obs, action_dim)
+                rng, nk = jax.random.split(rng)
+                base = _base_chunk(vla_sample_fn, raw_holder, obs, _draw_base_noise(nk))
                 x = None if state_encoder is None else state_encoder.encode(obs)
             else:
                 obs, x, base = next_obs, next_x, next_base
