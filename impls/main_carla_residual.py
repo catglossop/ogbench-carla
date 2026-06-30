@@ -128,14 +128,7 @@ def _make_carla_env(carla_config_path, route, *, extra_carla_config=None):
 
 
 def _base_chunk(vla_sample_fn, raw_holder: dict, obs: dict, base_noise: jnp.ndarray) -> np.ndarray:
-    """Frozen SteerVLA base action chunk for one flow-noise draw -> float32 [action_dim].
-
-    The base policy is a flow/diffusion model: the action chunk is produced by integrating
-    the flow ODE from an initial noise sample, so ``base_noise`` must be a Gaussian draw
-    (``x ~ N(0, I)``), matching the ``main_carla.py`` rollout. Seeding with zeros lands off
-    the training noise distribution and collapses the chunk toward a near-stationary action
-    (the car only inches forward).
-    """
+    """Frozen SteerVLA base action chunk for one flow-noise draw -> float32 [action_dim]."""
     raw_holder["obs"] = obs
     out = vla_sample_fn(jnp.zeros((1, 1), dtype=jnp.float32), base_noise)
     return np.asarray(jax.device_get(out), dtype=np.float32).reshape(-1)
@@ -169,6 +162,60 @@ _DRIVE_KEYS = (
     "overspeed_kmh",
     "collision_count",
 )
+
+
+# Gym state-vector indices (mirror ogbench.carla.carla_utils.EGO_STATE_IDX_*); defined
+# locally so logging doesn't import carla_utils (and pull in CARLA) at module load.
+_EGO_STATE_IDX_SPEED = 15
+_EGO_STATE_IDX_THROTTLE = 16
+_EGO_STATE_IDX_STEER = 17
+_EGO_STATE_IDX_BRAKE = 18
+
+
+def _ego_control_log(obs: dict) -> dict[str, float]:
+    """Last-applied CARLA control + speed from the gym state vector (drive/* line charts).
+
+    These are the signals that actually say whether the car is moving: a dead
+    ``drive/control_throttle`` with ~zero ``drive/ego_speed_mps`` is the "inching"
+    failure mode, independent of what the raw action chunk looks like.
+    """
+    if not isinstance(obs, dict):
+        return {}
+    s = np.asarray(obs.get("state"), dtype=np.float32).reshape(-1)
+    if s.size <= _EGO_STATE_IDX_BRAKE:
+        return {}
+    return {
+        "drive/ego_speed_mps": float(s[_EGO_STATE_IDX_SPEED]),
+        "drive/control_throttle": float(s[_EGO_STATE_IDX_THROTTLE]),
+        "drive/control_steer": float(s[_EGO_STATE_IDX_STEER]),
+        "drive/control_brake": float(s[_EGO_STATE_IDX_BRAKE]),
+    }
+
+
+def _chunk_stats_log(name: str, chunk_flat: np.ndarray, action_dim: int) -> dict[str, float]:
+    """Per-component scalar summaries of a flattened ``(H, action_dim)`` chunk.
+
+    Splits the SimLingo layout into speed deltas (cols 0:2) and route deltas
+    (cols 2:4) so W&B shows readable line charts instead of a per-step histogram
+    heatmap. ``*_speed_cumnorm`` is the magnitude of the cumulative speed waypoint
+    -- the quantity the PID converts into desired speed -- so it directly flags a
+    near-stationary (collapsed) base chunk vs. one that actually commands motion.
+    """
+    arr = np.asarray(chunk_flat, dtype=np.float32).reshape(-1)
+    if action_dim <= 0 or arr.size == 0 or arr.size % action_dim != 0:
+        return {f"action/{name}_absmean": float(np.abs(arr).mean()) if arr.size else 0.0}
+    chunk = arr.reshape(-1, action_dim)
+    speed = chunk[:, :2]
+    out = {
+        f"action/{name}_absmean": float(np.abs(arr).mean()),
+        f"action/{name}_speed_absmean": float(np.abs(speed).mean()),
+        f"action/{name}_speed_cumnorm": float(np.linalg.norm(np.cumsum(speed, axis=0)[-1])),
+    }
+    if action_dim >= 4:
+        route = chunk[:, 2:4]
+        out[f"action/{name}_route_absmean"] = float(np.abs(route).mean())
+        out[f"action/{name}_route_cumnorm"] = float(np.linalg.norm(np.cumsum(route, axis=0)[-1]))
+    return out
 
 
 def _reward_breakdown_log(info: dict) -> dict[str, float]:
@@ -279,7 +326,8 @@ def _log_episode_end(
 def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_holder, state_encoder):
     """Residual-SAC online loop. One env.step == one CARLA tick == one transition."""
     base_only = agent is None
-    action_dim = int(config["steervla"]["action_horizon"]) * int(config["steervla"]["action_dim"])
+    vla_action_dim = int(config["steervla"]["action_dim"])
+    action_dim = int(config["steervla"]["action_horizon"]) * vla_action_dim
     warmup = int(config["residual_warmup_steps"])
     batch_size = int(config["batch_size"])
     updates_per_step = int(config["updates_per_step"])
@@ -301,9 +349,7 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
     rng = jax.random.PRNGKey(FLAGS.seed)
 
     def _draw_base_noise(key: jax.Array) -> jnp.ndarray:
-        """Fresh Gaussian seed for the base flow ODE (``x ~ N(0, I)``), matching the
-        ``main_carla.py`` rollout. Seeding with zeros lands off the training noise
-        distribution and collapses the chunk so the car only inches forward."""
+        """Fresh Gaussian seed for the base flow ODE (``x ~ N(0, I)``)."""
         return jax.random.normal(key, (1, action_dim), dtype=jnp.float32)
 
     # Base chunk before encode: it samples + stashes the CoT that the rl_token
@@ -391,12 +437,16 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
                 log.update(_reward_breakdown_log(info))
                 if train_info:
                     log.update({k: float(jax.device_get(v)) for k, v in train_info.items()})
-                # Action / residual distributions (CSV logger drops Histograms automatically).
-                log["dist/base_action"] = wandb.Histogram(np.asarray(base, dtype=np.float32))
+                # Executed control + per-component chunk stats as scalar line charts.
+                # (A per-step histogram of the 40-value flattened chunk renders as an
+                # unreadable time-heatmap and mixes 10 horizon steps x 4 heterogeneous
+                # dims; the splits below are the readable, diagnostic signals.)
+                log.update(_ego_control_log(next_obs))
+                log.update(_chunk_stats_log("base", base, vla_action_dim))
                 if agent is not None:
-                    log["dist/final_action"] = wandb.Histogram(np.asarray(final, dtype=np.float32))
+                    log.update(_chunk_stats_log("final", final, vla_action_dim))
                     if last_residual is not None:
-                        log["dist/residual"] = wandb.Histogram(last_residual)
+                        log.update(_chunk_stats_log("residual", last_residual, vla_action_dim))
                 wandb.log(log, step=step)
                 train_logger.log(log, step=step)
 
