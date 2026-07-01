@@ -38,12 +38,13 @@ def get_config():
     # Number of CoT candidates sampled per env step; the critic picks the argmax-Q chunk.
     # Each step runs one batched CoT forward plus ``action_decode_batch_size`` micro-batches
     # for action decoding — keep this modest for interactive CARLA rollouts.
-    config.best_of_n = 4
+    config.best_of_n = 10
+    config.bon_viz_interval = 50
     # Temperature for the best-of-N CoT sampling (>0 so candidates differ).
     config.vla_cot_temperature = 1.0
-    # Denoise steps for the frozen VLA bootstrap forward during RL updates.
+    # Denoise steps for the frozen VLA bootstrap forward during RL up\dates.
     config.vla_update_flow_steps = 5
-    config.noise_scale = 5.0
+    config.noise_scale = 1.0
     config.alpha = 0.1
     # Collect transitions with the rollout policy but skip RL updates for this many env steps.
     config.warmup_steps = 200
@@ -75,7 +76,11 @@ def get_config():
     config.siglip_model_id = "google/siglip2-so400m-patch14-384"
     # Subtask is the critic label, so the observation can stay image-only (no prompt/subtask concat).
     config.siglip_include_prompt_subtask = False
-    config.siglip_device = "cpu"
+    # Run SigLIP on GPU. Within the run's CUDA_VISIBLE_DEVICES this maps to the same
+    # physical GPU as JAX (the sim renderer is on a different GPU via carla_config.gpu_rank).
+    # Keep this on GPU on many-core machines: SigLIP-on-CPU oversubscribes torch's intra-op
+    # thread pool (defaults to core count) and thrashes the box.
+    config.siglip_device = "cuda"
     config.image_keys = ("base_0_rgb",)
     # JAX RL device: ``-1`` = unset. CARLA uses ``gpu_rank`` in carla_config.yaml.
     config.training_gpu_rank = 0
@@ -87,6 +92,9 @@ def get_config():
     # Online training regime: "rl" (standard online RL) or "dagger".
     config.online_training_mode = "rl"
     # language_label_dim is auto-set from siglip_embed_dim in main_carla.py.
+    
+    # Critic weights
+    config.critic_pretrained_weights = "/scratch/current/celinet/critic_pretrain/run_20260617_212839/8000"
 
     config.steervla = ml_collections.ConfigDict(
         dict(
