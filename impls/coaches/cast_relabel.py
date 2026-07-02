@@ -25,6 +25,7 @@ replay buffer or fed to the DSRL critic yet.
 from __future__ import annotations
 
 import json
+import os
 import re
 import textwrap
 from dataclasses import dataclass
@@ -276,8 +277,7 @@ def build_credit_relabel_prompt(
         - rationale: one short sentence tying the chunk to the nearest event (may be empty).
         - suggested_subtasks: up to {num_suggestions} subtask phrases that would improve or
           reinforce this chunk. For BAD chunks, suggest corrective subtasks. For GOOD chunks,
-          suggest the subtask that best describes the good behavior (to reinforce it). For
-          null chunks, return an empty list.
+          keep the original subtask.
 
         Return ONLY valid JSON (no markdown fences):
         {{
@@ -296,7 +296,7 @@ def build_credit_relabel_prompt(
         Rules:
         - Include exactly one entry per chunk_index listed above.
         - Use null (not "none") for label when no event applies.
-        - Keep rationale under 25 words.
+        - Keep rationale under 50 words.
         - Never exceed {num_suggestions} suggested subtasks per chunk.
         """
     ).strip()
@@ -541,7 +541,7 @@ class OnlineCastRelabelSession:
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
 
         self.provider = str(self.cfg.get("provider", "gemini"))
-        self.gemini_model = str(self.cfg.get("gemini_model", "gemini-2.0-flash"))
+        self.gemini_model = str(self.cfg.get("gemini_model", "gemini-3.5-flash"))
         self.action_chunk_steps = int(self.cfg.get("action_chunk_steps", action_chunk_steps))
         self.video_fps = float(self.cfg.get("video_fps", 10.0))
         self.video_frame_stride = int(self.cfg.get("video_frame_stride", video_frame_stride))
@@ -569,6 +569,15 @@ class OnlineCastRelabelSession:
         self.window_env_steps = n_chunks * self.action_chunk_steps
 
         self._coach = create_coach(self.provider, model=self.gemini_model)
+        if self.provider == "gemini":
+            _key = os.environ.get("GEMINI_API_KEY", "")
+            if not _key or _key.startswith("YOUR_"):
+                print(
+                    "[cast_relabel] WARNING: GEMINI_API_KEY is unset (or placeholder). Every "
+                    "window review will fail (handled non-fatally) and produce no feedback. "
+                    "Export GEMINI_API_KEY before launching.",
+                    flush=True,
+                )
         self.window_count = 0
         self.reset_episode()
 
@@ -620,7 +629,22 @@ class OnlineCastRelabelSession:
     ) -> bool:
         if not self.should_query(episode_step, force=force):
             return False
-        self._run_window(episode_step=episode_step, done_info=done_info, final=force, global_step=global_step)
+        # A coach/VLM failure (bad model id, auth, network, quota, parse error) must never
+        # tear down the CARLA route or the training run. Catch everything, log it, and
+        # advance the cursors so the failed window is skipped rather than retried forever.
+        # NOTE: only Exception is caught here; a watchdog timeout raises KeyboardInterrupt,
+        # which is why main_carla pauses the leaderboard watchdogs around this call.
+        try:
+            self._run_window(
+                episode_step=episode_step, done_info=done_info, final=force, global_step=global_step
+            )
+        except Exception as exc:  # noqa: BLE001 - deliberately non-fatal
+            import traceback
+
+            print(f"[cast_relabel] window query failed (non-fatal): {exc}", flush=True)
+            traceback.print_exc()
+            self._frames_cursor = len(self.frames)
+            self._traj_cursor = len(self.trajectory_steps)
         self._last_query_episode_step = episode_step
         return True
 

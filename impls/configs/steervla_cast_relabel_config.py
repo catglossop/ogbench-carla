@@ -43,7 +43,7 @@ def get_config():
             query_every_n_episode_steps=128,
             query_on_episode_end=True,
             provider="gemini",
-            gemini_model="gemini-3.1-flash",
+            gemini_model="gemini-3.5-flash",
             # Must match the rollout's action chunk length (config.action_horizon).
             action_chunk_steps=10,
             # How many subtasks to suggest per chunk that needs improvement.
@@ -54,6 +54,38 @@ def get_config():
             save_artifacts=True,
             # Leave empty to use coaches.cast_relabel.SEED_SUBTASKS; set a list to override.
             seed_subtasks=[],
+        )
+    )
+    
+    config.steervla = ml_collections.ConfigDict(
+        dict(
+            enabled=True,
+            # Local OpenPI inference (ignored when actor_url is set):
+            actor_config="pi05_steervla_cot_simplified_reasoning",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",
+            routing_command="Follow the route and stay in lane.",
+            # Per-step CoT sampling temperature for the rollout actor. Best-of-N samples
+            # ``best_of_n`` CoTs via ``sample_candidates`` at ``vla_cot_temperature`` (set above),
+            # so this default only affects any non-candidate single-sample paths.
+            cot_temperature=1.0,
+            include_ego_history=False,
+            proprio_norm=True,
+            # Replay buffer + CARLA ``step`` use OpenPI chunk layout (``action_horizon`` × ``action_dim``),
+            # executed like ``simlingo/team_code/agent_steervla.py`` (cumsums + PID).
+            use_pi_action_chunk_for_env=True,
+            action_horizon=10,
+            action_dim=4,
+            # Query Pi0-CoT once, then execute this many rows before re-querying (1 = every step).
+            actions_per_model_query=1,
+            # Reuse sampled CoT reasoning/subtask for this many env actions before re-sampling CoT.
+            actions_per_cot=1,
+            output_action_format="DELTA_XY_T_DELTA_XY_SPACE",
+            sample_actions_num_steps=10,
+            # Decode action chunks in small micro-batches (CoT stays batched). Large
+            # batched _sample_actions forwards can trigger native aborts on some drivers.
+            action_decode_batch_size=2,
+            # Remote HTTP actor is NOT supported for best-of-N (needs local sample_candidates):
+            # actor_url="http://35.186.30.251:8000",
         )
     )
 

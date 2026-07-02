@@ -121,6 +121,19 @@ def build_coaching_prompt(
         good or clearly bad (lane keeping, speed, turns, collisions/near-misses,
         stopping, yielding, etc.). The collision log above shows ground-truth sensor
         data — use it to anchor your feedback to the correct timestamps.
+        
+        For example, you can ask these questions to guide your analysis: 
+        - Is the vehicle maintaining a safe distance from the front car? (if yes, GOOD; if no, BAD)
+        - Is the vehicle maintaining a safe speed? (if yes, GOOD; if no, BAD)
+        - Did the vehicle get dangerously close to any other vehicles and/or collide with any other vehicles? (if yes, BAD; if no, GOOD)
+        - Does the vehicle leave unnecessary gaps between itself and the front car? (if yes, BAD; if no, GOOD)
+        - Does the vehicle properly wait for a gap in the traffic before changing lanes? (if yes, GOOD; if no, BAD)
+        - Does the vehicle properly yield to other vehicles when necessary? (if yes, GOOD; if no, BAD)
+        - Does the vehicle properly stop at red lights and stop signs? (if yes, GOOD; if no, BAD)
+        - Does the vehicle properly follow the route and traffic laws? (if yes, GOOD; if no, BAD)
+        - Does the vehicle yield to pedestrians and cyclists when necessary? (if yes, GOOD; if no, BAD)
+        - Does the vehicle follow the rules of the road (turning from left or right most lane when making a turn, stopping at stop signs and red lights, etc.)? (if yes, GOOD; if no, BAD)
+        - and so on...
 
         Return ONLY valid JSON with this schema (no markdown fences):
         {{

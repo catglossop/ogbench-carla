@@ -1319,7 +1319,21 @@ def run_online_carla(
                 _vlm_coach.backfill_buffer(buffer)
         if _cast_relabel is not None and episode_trajectory:
             _cast_relabel.record_trajectory_step(episode_trajectory[-1])
-            _cast_relabel.maybe_query(episode_step=episode_steps, done_info=info, global_step=step)
+            # A mid-route window review makes blocking Gemini calls (video upload + two
+            # model queries) that can exceed the CARLA leaderboard watchdog timeout. Pause
+            # the watchdogs/pseudo-sensors across the query so the route isn't stopped for
+            # inactivity (same mechanism SteerVLA inference uses per step).
+            if _cast_relabel.should_query(episode_steps):
+                _pause_offtick = hasattr(env, "pause_for_vla_inference")
+                if _pause_offtick:
+                    env.pause_for_vla_inference()
+                try:
+                    _cast_relabel.maybe_query(
+                        episode_step=episode_steps, done_info=info, global_step=step
+                    )
+                finally:
+                    if _pause_offtick and hasattr(env, "resume_after_vla_inference"):
+                        env.resume_after_vla_inference()
         last_video_reward = float(reward)
         last_video_critic_text = _critic_text_for_video
         t_log_end = time.time()

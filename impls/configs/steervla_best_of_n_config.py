@@ -106,7 +106,7 @@ def get_config():
             # Per-step CoT sampling temperature for the rollout actor. Best-of-N samples
             # ``best_of_n`` CoTs via ``sample_candidates`` at ``vla_cot_temperature`` (set above),
             # so this default only affects any non-candidate single-sample paths.
-            cot_temperature=0.0,
+            cot_temperature=1.0,
             include_ego_history=False,
             proprio_norm=True,
             # Replay buffer + CARLA ``step`` use OpenPI chunk layout (``action_horizon`` × ``action_dim``),
