@@ -79,6 +79,7 @@ from coaches.critic_feedback import (
     resolve_critic_feedback_mode,
 )
 from impls.coaches.online_vlm_coach import OnlineVLMSession
+from impls.coaches.cast_relabel import OnlineCastRelabelSession
 
 _IMPLS_ROOT = Path(__file__).resolve().parent
 if str(_IMPLS_ROOT) not in sys.path:
@@ -587,6 +588,23 @@ def run_online_carla(
             flush=True,
         )
         capture_rollout_video = True
+
+    # CAST relabel observer: window rollout -> VLM good/bad review -> per-chunk credit
+    # assignment -> suggested subtasks. Artifacts + wandb only (no buffer backfill).
+    _cast_relabel: OnlineCastRelabelSession | None = None
+    cast_cfg = agent_config.get("cast_relabel")
+    if cast_cfg is not None and bool(cast_cfg.get("enabled", False)):
+        _cast_relabel = OnlineCastRelabelSession(
+            cast_cfg,
+            save_dir=FLAGS.save_dir,
+            action_chunk_steps=int(agent_config.get("action_horizon", 10)),
+        )
+        print(
+            f"[main_carla] CAST relabel enabled (provider={_cast_relabel.provider}, "
+            f"window={_cast_relabel.window_env_steps} env steps, debug={_cast_relabel.debug})",
+            flush=True,
+        )
+        capture_rollout_video = True
     _online_training_mode = str(agent_config.get("online_training_mode", "rl")).strip().lower()
     _lang_dim = critic_language_dim(agent_config)
     _steervla_exec_cfg = _steervla_action_execution_cfg(agent_config.get("steervla") or {})
@@ -668,6 +686,11 @@ def run_online_carla(
     )
     if _vlm_coach is not None:
         _vlm_coach.begin_episode(
+            episode_count=max(1, episode_count),
+            route_name=str(obs_raw.get("routing_command", "?") if isinstance(obs_raw, dict) else "?"),
+        )
+    if _cast_relabel is not None:
+        _cast_relabel.begin_episode(
             episode_count=max(1, episode_count),
             route_name=str(obs_raw.get("routing_command", "?") if isinstance(obs_raw, dict) else "?"),
         )
@@ -1177,6 +1200,15 @@ def run_online_carla(
                 episode_video_frames.append(frame)
                 if _vlm_coach is not None:
                     _vlm_coach.record_frame(frame)
+                if _cast_relabel is not None:
+                    _cast_relabel.record_frame(
+                        frame,
+                        subtask_text=(
+                            _format_text_field(cot_obs_raw, "subtask_text")
+                            or _format_text_field(cot_obs_raw, "subtask")
+                        ),
+                        episode_step=episode_steps,
+                    )
                 if step_in_video:
                     episode_video_frame_index += 1
             if live_viewer is not None and episode_video_frames:
@@ -1194,6 +1226,9 @@ def run_online_carla(
             _vlm_coach.record_trajectory_step(episode_trajectory[-1])
             if _vlm_coach.maybe_query(episode_step=episode_steps, done_info=info):
                 _vlm_coach.backfill_buffer(buffer)
+        if _cast_relabel is not None and episode_trajectory:
+            _cast_relabel.record_trajectory_step(episode_trajectory[-1])
+            _cast_relabel.maybe_query(episode_step=episode_steps, done_info=info, global_step=step)
         last_video_reward = float(reward)
         last_video_critic_text = _critic_text_for_video
         t_log_end = time.time()
@@ -1348,6 +1383,10 @@ def run_online_carla(
                     episode_step=done_episode_steps, done_info=done_info, force=True
                 )
                 _vlm_coach.backfill_buffer(buffer)
+            if _cast_relabel is not None:
+                _cast_relabel.maybe_query(
+                    episode_step=done_episode_steps, done_info=done_info, force=True, global_step=step
+                )
             episode_video_frames = []
             episode_trajectory = []
             episode_video_frame_index = 0
@@ -1355,6 +1394,12 @@ def run_online_carla(
             if _vlm_coach is not None:
                 _vlm_coach.reset_episode()
                 _vlm_coach.begin_episode(
+                    episode_count=episode_count,
+                    route_name=done_route,
+                )
+            if _cast_relabel is not None:
+                _cast_relabel.reset_episode()
+                _cast_relabel.begin_episode(
                     episode_count=episode_count,
                     route_name=done_route,
                 )
