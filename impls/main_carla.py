@@ -50,6 +50,7 @@ import faulthandler
 import json
 import os
 import random
+import re
 import sys
 import time
 import traceback
@@ -131,7 +132,7 @@ flags.DEFINE_bool(
 )
 
 # flags.DEFINE_string("save_dir", "/raid/users/celine/carla_exps", "Save directory.")
-flags.DEFINE_string("save_dir", "/home/carla/exps", "Save directory.")
+flags.DEFINE_string("save_dir", "/home/cglossop/exps", "Save directory.")
 flags.DEFINE_string("restore_path", None, "Restore path for JAX agents.")
 flags.DEFINE_integer("restore_epoch", None, "Restore epoch.")
 
@@ -607,6 +608,7 @@ def run_online_carla(
         capture_rollout_video = True
     _online_training_mode = str(agent_config.get("online_training_mode", "rl")).strip().lower()
     _lang_dim = critic_language_dim(agent_config)
+    _bon_viz_interval = int(agent_config.get("bon_viz_interval", 0))
     _steervla_exec_cfg = _steervla_action_execution_cfg(agent_config.get("steervla") or {})
 
     steervla_cfg = agent_config.get("steervla") or {}
@@ -709,6 +711,79 @@ def run_online_carla(
             if raw.get("image") is not None:
                 return np.asarray(raw["image"], dtype=np.uint8)
         return np.asarray(raw, dtype=np.uint8)
+
+    def _plot_bon_candidates(frame: np.ndarray, cand: dict, step: int):
+        """W&B image: the frame + all best-of-N candidate action trajectories.
+
+        Each candidate's first two action dims are speed-waypoint deltas; their cumsum gives a
+        planned (forward, lateral) path. The legend keys every candidate to its subtask and
+        critic Q value, with the executed (best) candidate highlighted.
+        """
+        import textwrap
+        from io import BytesIO
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        actions = np.asarray(cand["actions"], dtype=np.float32)  # (n, env_flat)
+        q = np.asarray(cand["q"], dtype=np.float32)  # (n,)
+        subtasks = list(cand.get("subtasks", []))
+        best = int(cand.get("best", int(np.argmax(q)) if q.size else 0))
+        ah, ad = int(cand["ah"]), int(cand["ad"])
+        n = actions.shape[0]
+        chunks = actions.reshape(n, ah, ad)
+
+        fig, (ax_img, ax_traj) = plt.subplots(1, 2, figsize=(16, 8))
+        ax_img.imshow(frame)
+        ax_img.set_title(f"frame @ step {step}")
+        ax_img.axis("off")
+
+        cmap = plt.get_cmap("tab10" if n <= 10 else "tab20")
+        handles = []
+        for i in range(n):
+            wps = np.cumsum(chunks[i, :, :2], axis=0)
+            wps = np.concatenate([np.zeros((1, 2), dtype=wps.dtype), wps], axis=0)
+            is_best = i == best
+            # Show the full subtask, wrapped so long strings stay readable in the legend.
+            sub = subtasks[i] if i < len(subtasks) else ""
+            sub_wrapped = "\n     ".join(textwrap.wrap(sub, width=60)) or "(none)"
+            (h,) = ax_traj.plot(
+                wps[:, 1],  # lateral on x-axis
+                wps[:, 0],  # forward on y-axis
+                marker="o",
+                markersize=3,
+                color=cmap(i % cmap.N),
+                linewidth=3.0 if is_best else 1.5,
+                alpha=1.0 if is_best else 0.6,
+                zorder=3 if is_best else 2,
+                label=f"{i}{'*' if is_best else ''}: Q={q[i]:.2f} | {sub_wrapped}",
+            )
+            handles.append(h)
+        ego = ax_traj.scatter([0], [0], c="k", marker="s", s=40, zorder=4, label="ego")
+        handles.append(ego)
+        ax_traj.set_title("best-of-N candidate action trajectories (cumsum dx, dy)")
+        ax_traj.set_xlabel("lateral (action dim 1, cumsum)")
+        ax_traj.set_ylabel("forward (action dim 0, cumsum)")
+        ax_traj.set_aspect("equal", adjustable="datalim")
+        ax_traj.grid(True, alpha=0.3)
+        # Legend below the plots so full (wrapped) subtasks have horizontal room.
+        legend = fig.legend(
+            handles=handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.0),
+            fontsize=8,
+            ncol=2,
+            title="candidate: Q | subtask  (* = executed)",
+        )
+        # Render with bbox_inches='tight' so the out-of-axes legend is never clipped.
+        buf = BytesIO()
+        fig.savefig(buf, format="png", dpi=100, bbox_inches="tight", bbox_extra_artists=(legend,))
+        plt.close(fig)
+        buf.seek(0)
+        img = wandb.Image(plt.imread(buf))
+        return img
 
     def _annotate_collision_frame(
         frame: np.ndarray,
@@ -1032,6 +1107,7 @@ def run_online_carla(
 
     for step in tqdm.tqdm(range(1, FLAGS.online_steps + 1), smoothing=0.1, dynamic_ncols=True):
         t_sample_start = time.time()
+        _bon_viz_img = None
         if raw_obs_holder is not None:
             raw_obs_holder["obs"] = obs_raw
         rng, sub = jax.random.split(rng)
@@ -1084,6 +1160,21 @@ def run_online_carla(
                             if f"next_{k}" in _buffer_keys
                         },
                     )
+            # Best-of-N candidate visualization (frame is still s_t here), every N env steps.
+            if (
+                _bon_viz_interval > 0
+                and step % _bon_viz_interval == 0
+                and steervla_actor is not None
+                and getattr(steervla_actor, "last_bon_candidates", None) is not None
+            ):
+                try:
+                    _bon_viz_img = _plot_bon_candidates(
+                        _viz_image_from_raw(obs_raw),
+                        steervla_actor.last_bon_candidates,
+                        step,
+                    )
+                except Exception as e:
+                    print(f"[main_carla] best-of-n viz failed: {e}", flush=True)
         t_sample_end = time.time()
 
         t_step_start = time.time()
@@ -1236,6 +1327,13 @@ def run_online_carla(
         step_wb = {f"rollout/{k}": v for k, v in drive_metrics.items()}
         step_wb["rollout/collision_count"] = float(collision_count)
         step_wb["rollout/collision_events"] = float(collision_delta)
+        # Best-of-N candidate action entropy (per-dim + mean), stashed by the agent at sample time.
+        _bon_actor = getattr(agent, "steervla_actor", None)
+        _bon_metrics = getattr(_bon_actor, "last_bon_metrics", None) if _bon_actor is not None else None
+        if _bon_metrics:
+            step_wb.update(_bon_metrics)
+        if _bon_viz_img is not None:
+            step_wb["rollout/bon_candidates"] = _bon_viz_img
         if "reward_total" in info:
             step_wb["reward/total"] = float(info["reward_total"])
             step_wb["reward/progress"] = float(info.get("reward_progress", 0.0))
@@ -1476,7 +1574,16 @@ def main(_):
 
     config = FLAGS.agent
 
-    exp_name = get_exp_name(FLAGS.seed)
+    def _slug(s: str) -> str:
+        return re.sub(r"[^0-9A-Za-z._-]+", "-", str(s)).strip("-") or "na"
+
+    _agent_name = str(config.get("agent_name", "agent"))
+    _route_name = str(FLAGS.route or "all-routes")
+    _exp_name_parts = [_slug(_agent_name)]
+    if _agent_name == "best_of_n":
+        _exp_name_parts.append(f"n{int(config.get('best_of_n', 10))}")
+    _exp_name_parts.extend([_slug(_route_name), get_exp_name(FLAGS.seed)])
+    exp_name = "_".join(_exp_name_parts)
     setup_wandb(project="OGBench-CARLA", group=FLAGS.run_group, name=exp_name, mode=wandb_mode)
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)

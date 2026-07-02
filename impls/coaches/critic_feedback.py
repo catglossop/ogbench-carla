@@ -29,6 +29,11 @@ def critic_language_dim(agent_config: Any) -> int:
 
 def resolve_critic_feedback_mode(agent_config: Any) -> str:
     """Map ``language_feedback`` config (or legacy ``critic_feedback_mode``) to a mode string."""
+    # A pretrained DSRL critic was trained without a language label; loading it forces the
+    # no-language critic setup everywhere (buffer width 0, no subtask conditioning). This must
+    # match BestOfNAgent.create, which also forces 'none' when critic_pretrained_weights is set.
+    if agent_config.get("critic_pretrained_weights"):
+        return "none"
     lang_fb = agent_config.get("language_feedback")
     if lang_fb is not None:
         src = str(lang_fb.get("source", "expert")).strip().lower()

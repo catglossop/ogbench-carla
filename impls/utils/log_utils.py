@@ -40,7 +40,7 @@ class CsvLogger:
 def get_exp_name(seed):
     """Return the experiment name."""
     exp_name = ''
-    exp_name += f'sd{seed:03d}_'
+    exp_name += f'seed_{seed}_'
     if 'SLURM_JOB_ID' in os.environ:
         exp_name += f's_{os.environ["SLURM_JOB_ID"]}.'
     if 'SLURM_PROCID' in os.environ:

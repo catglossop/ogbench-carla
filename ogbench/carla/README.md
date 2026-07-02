@@ -26,7 +26,7 @@ For ease of use, you can directly add the `CARLA_ROOT` to your `.bashrc`
 ```
 vim ~/.bashrc
 export CARLA_ROOT=<your carla path>
-source ~/.bashrc
+soumainrce ~/.bashrc
 ```
 
 ## Quickstart
