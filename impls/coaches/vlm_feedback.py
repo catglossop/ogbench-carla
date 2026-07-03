@@ -126,7 +126,7 @@ def build_coaching_prompt(
         - Is the vehicle maintaining a safe distance from the front car? (if yes, GOOD; if no, BAD)
         - Is the vehicle maintaining a safe speed? (if yes, GOOD; if no, BAD)
         - Did the vehicle get dangerously close to any other vehicles and/or collide with any other vehicles? (if yes, BAD; if no, GOOD)
-        - Does the vehicle leave unnecessary gaps between itself and the front car? (if yes, BAD; if no, GOOD)
+        - Does the vehicle leave unnecessary gaps between itself and the front car? For example, at a stop light, the car should move forward to be closer to the front car to not leave an unnecessary gap (if yes, BAD; if no, GOOD)
         - Does the vehicle properly wait for a gap in the traffic before changing lanes? (if yes, GOOD; if no, BAD)
         - Does the vehicle properly yield to other vehicles when necessary? (if yes, GOOD; if no, BAD)
         - Does the vehicle properly stop at red lights and stop signs? (if yes, GOOD; if no, BAD)
