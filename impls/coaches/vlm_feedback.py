@@ -81,6 +81,114 @@ def load_metadata(metadata_path: str | Path) -> dict[str, Any]:
     return load_trajectory_metadata(metadata_path)
 
 
+def _build_task_overview_block(metadata: dict[str, Any]) -> str:
+    """Render the episode's full routing-command plan as an overall 'task' for the VLM.
+
+    ``metadata["route_command_plan"]`` is the ordered list of maneuvers the ego will be told
+    to perform over the whole route (precomputed at episode start, e.g. ``follow the road``
+    → ``go right at the next intersection`` → ``follow the road``). Giving the VLM the whole
+    plan up front lets it judge whether the policy is progressing through the route correctly
+    rather than only reacting to the single command visible at each instant.
+    """
+    plan = metadata.get("route_command_plan") or []
+    if not isinstance(plan, list) or not plan:
+        return ""
+    lines: list[str] = []
+    for i, item in enumerate(plan):
+        if not isinstance(item, dict):
+            continue
+        command = str(item.get("command", "")).strip()
+        if not command:
+            continue
+        dist = item.get("start_distance_m")
+        if dist is not None:
+            lines.append(f"  {i + 1}. {command} (after ~{float(dist):.0f} m along the route)")
+        else:
+            lines.append(f"  {i + 1}. {command}")
+    if not lines:
+        return ""
+    body = "\n".join(lines)
+    return (
+        "\nOverall task — the full sequence of routing commands the ego is given over this "
+        "route, in order (the video may cover only part of it):\n"
+        f"{body}\n"
+    )
+
+
+def _build_route_progress_block(metadata: dict[str, Any]) -> str:
+    """Render route-completion context so the VLM rewards/penalizes making progress.
+
+    Completing the assigned route is a primary objective: an agent that stalls short of the
+    goal — most commonly by stopping prematurely when the path ahead is clear — should be
+    flagged BAD even if its moment-to-moment driving looks smooth.
+    """
+    start = metadata.get("route_progress_start_pct")
+    end = metadata.get("route_progress_end_pct")
+    delta = metadata.get("route_progress_delta_pct")
+    completed = metadata.get("route_completed")
+    mean_end_speed = metadata.get("mean_end_speed_mps")
+    if end is None and start is None:
+        return ""
+    lines = ["\nRoute progress over this window (route completion is a primary objective):"]
+    if start is not None:
+        lines.append(f"  - start: {float(start):.1f}% complete")
+    if end is not None:
+        lines.append(f"  - end:   {float(end):.1f}% complete")
+    if delta is not None:
+        lines.append(f"  - advanced {float(delta):.1f}% of the route during this window")
+    if mean_end_speed is not None:
+        lines.append(f"  - mean ego speed over the last few steps: {float(mean_end_speed):.2f} m/s")
+    if completed is False and end is not None and float(end) < 99.5:
+        lines.append(
+            "  - NOTE: the route is NOT complete. If the ego is stopped or barely moving with a "
+            "clear gap ahead (no leading vehicle within stopping distance, green/no light, no "
+            "pedestrian or yield obligation), treat that as BAD — it should accelerate and make "
+            "forward progress. Only reward stopping when there is a real reason (red light, stop "
+            "sign, leading vehicle close ahead, pedestrian/cyclist crossing, or a yield)."
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _build_per_timestamp_block(metadata: dict[str, Any]) -> str:
+    """Render a timestamp-keyed JSON block of per-step trajectory data for the prompt.
+
+    Top-level keys are video seconds (as strings); each value bundles the vehicle state and
+    controls already recorded per step with the executed subtask, chain-of-thought
+    reasoning, and the prompt the policy received at that moment. Steps that were not
+    captured in the video (``video_timestamp_sec is None``) are skipped, since the VLM can
+    only cross-reference moments it can actually see.
+    """
+    steps = metadata.get("steps", []) or []
+    per_timestamp: dict[str, Any] = {}
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        ts = s.get("video_timestamp_sec")
+        if ts is None:
+            continue
+        key = f"{float(ts):.2f}"
+        per_timestamp[key] = {
+            "episode_step": s.get("episode_step"),
+            "ego_speed_mps": s.get("ego_speed_mps"),
+            "control_throttle": s.get("control_throttle"),
+            "control_steer": s.get("control_steer"),
+            "control_brake": s.get("control_brake"),
+            "collision": s.get("collision"),
+            "route_progress_pct": s.get("route_progress_pct"),
+            "subtask": s.get("subtask", ""),
+            "reasoning": s.get("reasoning", ""),
+            "prompt": s.get("prompt", ""),
+        }
+    if not per_timestamp:
+        return ""
+    return (
+        "\nPer-timestamp trajectory data (keys are video seconds; each value is the vehicle "
+        "state/controls plus the executed subtask, chain-of-thought reasoning, and the prompt "
+        "the policy received at that moment):\n"
+        f"```json\n{json.dumps(per_timestamp, indent=2)}\n```\n"
+    )
+
+
 def build_coaching_prompt(
     metadata: dict[str, Any],
     *,
@@ -88,11 +196,26 @@ def build_coaching_prompt(
 ) -> str:
     """Prompt shared by Gemini and Perceptron coaches."""
     # Summarise metadata compactly: top-level fields + collision events only.
-    # The full steps array is omitted from the prompt to stay within token budgets.
     summary_keys = ("episode", "route", "episode_steps", "success",
-                    "termination_reason", "collision_events")
+                    "termination_reason", "route_progress_start_pct",
+                    "route_progress_end_pct", "route_progress_delta_pct",
+                    "route_completed", "collision_events")
     summary = {k: metadata[k] for k in summary_keys if k in metadata}
     metadata_block = json.dumps(summary, indent=2) if summary else "{}"
+
+    # Overall task: the full ordered routing-command plan for the episode (highest-level
+    # context — what the whole route asks of the ego, not just the current command).
+    task_overview_block = _build_task_overview_block(metadata)
+
+    # Route-completion context: emphasize that failing to advance the route (e.g. stopping
+    # prematurely with a clear gap ahead while progress is well under 100%) is a bad behavior.
+    progress_block = _build_route_progress_block(metadata)
+
+    # Per-timestamp trajectory data: key each in-video step by its video timestamp so the
+    # VLM can line up the executed subtask, chain-of-thought reasoning, and the prompt the
+    # policy received with the exact moment in the video (alongside the speed/controls/
+    # collision/route data already recorded per step).
+    per_timestamp_block = _build_per_timestamp_block(metadata)
 
     collision_events = metadata.get("collision_events", [])
     if collision_events:
@@ -111,17 +234,30 @@ def build_coaching_prompt(
     return textwrap.dedent(
         f"""
         You are reviewing a driving rollout video for an autonomous vehicle policy.
-
+        {task_overview_block}
         Episode summary:
         ```json
         {metadata_block}
         ```
-        {collision_section}
-        Watch the full video and identify moments where driving behavior was clearly
+        {collision_section}{progress_block}{per_timestamp_block}
+        Carefully watch the full video and identify moments where driving behavior was clearly
         good or clearly bad (lane keeping, speed, turns, collisions/near-misses,
-        stopping, yielding, etc.). The collision log above shows ground-truth sensor
-        data — use it to anchor your feedback to the correct timestamps.
+        stopping, yielding, route progress, etc.). The collision log above shows ground-truth
+        sensor data — use it to anchor your feedback to the correct timestamps.
         
+        ** Step 1 **
+        Determine the state of the vehicle and of the other agents (vehicles, pedestrians, cyclists, etc.) in the video. 
+        Ask these questions to guide your analysis:
+        - What lane in the vehicle in? 
+        - What other vehicles are there? What lanes are they in? 
+        - Is there a leading vehicle? If so, how far ahead is it? Is it stopped or moving? 
+        - Are there any pedestrians or cyclists in the video? If so, what are they doing? 
+        - Are there any stop signs or traffic lights in the video? What are their states?
+        - According to the overall task (the ordered routing-command plan above) and the current
+          routing command in the per-timestamp data, what maneuver should the vehicle be
+          performing right now (following the road, turning left/right at the intersection,
+          changing lanes, etc.), and is it in the correct lane and position to do so?
+
         For example, you can ask these questions to guide your analysis: 
         - Is the vehicle maintaining a safe distance from the front car? (if yes, GOOD; if no, BAD)
         - Is the vehicle maintaining a safe speed? (if yes, GOOD; if no, BAD)
@@ -133,6 +269,13 @@ def build_coaching_prompt(
         - Does the vehicle properly follow the route and traffic laws? (if yes, GOOD; if no, BAD)
         - Does the vehicle yield to pedestrians and cyclists when necessary? (if yes, GOOD; if no, BAD)
         - Does the vehicle follow the rules of the road (turning from left or right most lane when making a turn, stopping at stop signs and red lights, etc.)? (if yes, GOOD; if no, BAD)
+        - Is the vehicle making progress along the route toward completion? Completing the route
+          is a primary objective (see the route-progress section above). If route progress is
+          below 100% and the vehicle is stopped or crawling with a clear gap ahead and NO valid
+          reason to stop (no red light/stop sign, no close leading vehicle, no pedestrian/cyclist,
+          no yield), that is BAD — it should accelerate and move forward. Conversely, resuming
+          motion and advancing the route when the way is clear is GOOD. (Do NOT penalize stopping
+          that is justified by a red light, stop sign, close leading vehicle, or a pedestrian/yield.)
         - and so on...
 
         Return ONLY valid JSON with this schema (no markdown fences):

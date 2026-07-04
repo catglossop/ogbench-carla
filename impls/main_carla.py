@@ -695,6 +695,9 @@ def run_online_carla(
         _cast_relabel.begin_episode(
             episode_count=max(1, episode_count),
             route_name=str(obs_raw.get("routing_command", "?") if isinstance(obs_raw, dict) else "?"),
+            route_command_plan=(
+                obs_raw.get("route_command_plan") if isinstance(obs_raw, dict) else None
+            ),
         )
 
     def _as_video_frame(image: np.ndarray) -> np.ndarray:
@@ -1318,7 +1321,20 @@ def run_online_carla(
             if _vlm_coach.maybe_query(episode_step=episode_steps, done_info=info):
                 _vlm_coach.backfill_buffer(buffer)
         if _cast_relabel is not None and episode_trajectory:
-            _cast_relabel.record_trajectory_step(episode_trajectory[-1])
+            # Enrich the recorded step with the executed subtask / CoT reasoning / prompt
+            # (stashed on ``cot_obs_raw`` by the VLA) so the CAST relabel window review can
+            # key them by timestamp for the VLM coach prompt.
+            _cast_step_record = dict(episode_trajectory[-1])
+            _cast_step_record["subtask"] = (
+                _format_text_field(cot_obs_raw, "subtask_text")
+                or _format_text_field(cot_obs_raw, "subtask")
+            )
+            _cast_step_record["reasoning"] = (
+                _format_text_field(cot_obs_raw, "reasoning_text")
+                or _format_text_field(cot_obs_raw, "reasoning")
+            )
+            _cast_step_record["prompt"] = _format_text_field(cot_obs_raw, "openpi_prompt_text")
+            _cast_relabel.record_trajectory_step(_cast_step_record)
             # A mid-route window review makes blocking Gemini calls (video upload + two
             # model queries) that can exceed the CARLA leaderboard watchdog timeout. Pause
             # the watchdogs/pseudo-sensors across the query so the route isn't stopped for

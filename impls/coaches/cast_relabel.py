@@ -252,9 +252,10 @@ def build_credit_relabel_prompt(
         Each action chunk spans a fixed number of env steps; the chunk timing (in the same
         video seconds as the events) is given below.
 
-        Window summary:
+        Window summary (``route_progress_end_pct`` < 100 means the route is unfinished — making
+        forward progress toward completion is a primary objective):
         ```json
-        {json.dumps({k: metadata.get(k) for k in ("episode", "route", "episode_steps", "window_index", "success")}, indent=2)}
+        {json.dumps({k: metadata.get(k) for k in ("episode", "route", "episode_steps", "window_index", "success", "route_progress_start_pct", "route_progress_end_pct", "route_completed", "mean_end_speed_mps")}, indent=2)}
         ```
 
         GOOD/BAD events from the window review (timestamps are video seconds):
@@ -277,7 +278,10 @@ def build_credit_relabel_prompt(
         - rationale: one short sentence tying the chunk to the nearest event (may be empty).
         - suggested_subtasks: up to {num_suggestions} subtask phrases that would improve or
           reinforce this chunk. For BAD chunks, suggest corrective subtasks. For GOOD chunks,
-          keep the original subtask.
+          keep the original subtask. If a chunk is BAD because the vehicle stopped or crawled
+          prematurely while the route is unfinished and the way ahead is clear (no red light,
+          stop sign, close leading vehicle, or pedestrian/yield), suggest a subtask that has it
+          accelerate and make forward progress along the route.
 
         Return ONLY valid JSON (no markdown fences):
         {{
@@ -551,6 +555,9 @@ class OnlineCastRelabelSession:
         self.save_artifacts = bool(self.cfg.get("save_artifacts", True))
         self.debug = bool(self.cfg.get("debug", False))
         self.query_on_episode_end = bool(self.cfg.get("query_on_episode_end", True))
+        # When set, render the trajectory graphs (speed / throttle / steer / brake / route
+        # progress vs video time) per window and attach them to the VLM coach prompt.
+        self.include_plots_in_prompt = bool(self.cfg.get("include_plots_in_prompt", False))
 
         raw_seeds = self.cfg.get("seed_subtasks")
         self.seed_subtasks: tuple[str, ...] = (
@@ -592,10 +599,20 @@ class OnlineCastRelabelSession:
         self._frames_cursor = 0
         self._traj_cursor = 0
         self._last_query_episode_step = 0
+        self.route_command_plan: list[dict[str, Any]] = []
 
-    def begin_episode(self, *, episode_count: int, route_name: str) -> None:
+    def begin_episode(
+        self,
+        *,
+        episode_count: int,
+        route_name: str,
+        route_command_plan: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.episode_count = int(episode_count)
         self.route_name = str(route_name)
+        # Full ordered maneuver plan for the episode (constant), surfaced to the VLM coach as
+        # the overall "task" context. May be empty if the route planner was unavailable.
+        self.route_command_plan = list(route_command_plan) if route_command_plan else []
 
     def record_frame(self, frame: np.ndarray | None, *, subtask_text: str = "", episode_step: int = 0) -> None:
         if frame is None:
@@ -676,9 +693,34 @@ class OnlineCastRelabelSession:
             key = str(chunk_index)
             if subtask and key not in chunk_original_subtask:
                 chunk_original_subtask[key] = subtask
+        # Route-completion context: how far along the route the ego got over this window, so
+        # the VLM can penalize failing to make progress (e.g. stopping prematurely with a
+        # clear gap ahead while route progress is well short of 100%).
+        progresses = [
+            float(s["route_progress_pct"])
+            for s in traj_window
+            if s.get("route_progress_pct") is not None
+        ]
+        route_progress_start_pct = round(progresses[0], 2) if progresses else None
+        route_progress_end_pct = round(progresses[-1], 2) if progresses else None
+        route_progress_delta_pct = (
+            round(route_progress_end_pct - route_progress_start_pct, 2)
+            if route_progress_start_pct is not None and route_progress_end_pct is not None
+            else None
+        )
+        route_completed = route_progress_end_pct is not None and route_progress_end_pct >= 99.5
+        # Mean ego speed over the last few steps — a near-zero value with the route
+        # unfinished is a strong hint the ego stopped prematurely.
+        end_speeds = [
+            float(s["ego_speed_mps"])
+            for s in traj_window[-5:]
+            if s.get("ego_speed_mps") is not None
+        ]
+        mean_end_speed_mps = round(sum(end_speeds) / len(end_speeds), 3) if end_speeds else None
         return {
             "episode": self.episode_count,
             "route": self.route_name,
+            "route_command_plan": self.route_command_plan,
             "window_index": self.window_count,
             "episode_steps": len(traj_window),
             "action_chunk_steps": self.action_chunk_steps,
@@ -688,6 +730,11 @@ class OnlineCastRelabelSession:
             "step_offset": step_offset,
             "success": done_info.get("success"),
             "termination_reason": done_info.get("termination_reason"),
+            "route_progress_start_pct": route_progress_start_pct,
+            "route_progress_end_pct": route_progress_end_pct,
+            "route_progress_delta_pct": route_progress_delta_pct,
+            "route_completed": route_completed,
+            "mean_end_speed_mps": mean_end_speed_mps,
             "collision_events": collision_events,
             "chunk_original_subtask": chunk_original_subtask,
             "steps": traj_window,
@@ -724,6 +771,13 @@ class OnlineCastRelabelSession:
             flush=True,
         )
 
+        plot_paths: list[Path] | None = None
+        if self.include_plots_in_prompt:
+            from coaches.trajectory_plots import generate_trajectory_plots
+
+            plot_map = generate_trajectory_plots(metadata, work_dir / "plots")
+            plot_paths = [plot_map["combined"]]
+
         events, cast_json = generate_cast_relabel(
             self._coach,
             video_path,
@@ -732,6 +786,8 @@ class OnlineCastRelabelSession:
             chunk_duration_sec=self.chunk_duration_sec,
             seed_subtasks=self.seed_subtasks,
             num_suggestions=self.num_subtask_suggestions,
+            plot_paths=plot_paths,
+            include_plots_in_prompt=self.include_plots_in_prompt,
         )
         (work_dir / "cast_relabel.json").write_text(json.dumps(cast_json, indent=2), encoding="utf-8")
 

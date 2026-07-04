@@ -1135,6 +1135,45 @@ def _routing_command_to_onehot(command: int) -> np.ndarray:
     return out
 
 
+def _summarize_route_commands(route: Any) -> list[dict]:
+    """Collapse a full route's per-waypoint RoadOptions into an ordered maneuver list.
+
+    ``route`` is the leaderboard ``route_scenario.route`` — a list of
+    ``(carla.Transform, RoadOption)`` covering the whole episode. The interpolated route
+    carries one RoadOption per densely-sampled waypoint (mostly LANEFOLLOW with turns /
+    lane changes near intersections); we collapse each contiguous run of the same command
+    into a single maneuver so the result reads as the high-level "task" for the episode,
+    e.g. ``follow the road`` → ``go right at the next intersection`` → ``follow the road``.
+
+    Returns a list of ``{"command_id", "command", "start_distance_m"}`` dicts in route order
+    (``start_distance_m`` is the cumulative metres travelled along the route before the
+    maneuver begins).
+    """
+    plan: list[dict] = []
+    prev_cmd: Optional[int] = None
+    cum_dist = 0.0
+    prev_xy: Optional[tuple[float, float]] = None
+    for pos, cmd in route:
+        loc = getattr(pos, "location", pos)
+        x, y = float(loc.x), float(loc.y)
+        if prev_xy is not None:
+            cum_dist += ((x - prev_xy[0]) ** 2 + (y - prev_xy[1]) ** 2) ** 0.5
+        prev_xy = (x, y)
+        cmd_int = int(getattr(cmd, "value", cmd))
+        if not (1 <= cmd_int <= 6):
+            continue
+        if cmd_int != prev_cmd:
+            plan.append(
+                {
+                    "command_id": cmd_int,
+                    "command": ROUTING_COMMAND_TEXT.get(cmd_int, "follow the road"),
+                    "start_distance_m": round(cum_dist, 1),
+                }
+            )
+            prev_cmd = cmd_int
+    return plan
+
+
 def _ego_state_vector(
     ego: carla.Actor, last_control: carla.VehicleControl
 ) -> np.ndarray:
@@ -1358,6 +1397,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._expert_agent: Any | None = None
         self._cached_world_map: Any | None = None
         self._route_planner: Any | None = None
+        self._route_command_plan: list[dict] = []  # full ordered maneuver plan (set at reset)
         self._current_routing_command: int = 4  # LANEFOLLOW until route is loaded
         self._routing_last_command_tmp: int = -1  # simlingo carryover state
         self._routing_last_command: int = -1
@@ -1730,6 +1770,13 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             self._route_planner = self._create_route_planner(ev.route_scenario.route)
         except Exception as _rp_exc:
             print(f"[routing_command] RoutePlanner init failed: {_rp_exc}", flush=True)
+        # Precompute the full ordered maneuver plan for the episode so downstream consumers
+        # (e.g. the VLM coach) can present the overall task, not just the current command.
+        self._route_command_plan = []
+        try:
+            self._route_command_plan = _summarize_route_commands(ev.route_scenario.route)
+        except Exception as _rc_exc:
+            print(f"[routing_command] route summary failed: {_rc_exc}", flush=True)
         self._scenario_active = True
         self._last_control = carla.VehicleControl()
         self._crash_stuck_ticks = 0
@@ -2353,6 +2400,10 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 if self._routing_include_distance
                 else f"{ROUTING_COMMAND_TEXT.get(self._current_routing_command, 'follow the road')}."
             ),
+            # Constant per episode: the full ordered list of routing commands over the route
+            # (see :func:`_summarize_route_commands`). Lets downstream consumers show the
+            # overall task, not just the current command.
+            "route_command_plan": self._route_command_plan,
             "target_points": self._target_points_ego,
         }
 
