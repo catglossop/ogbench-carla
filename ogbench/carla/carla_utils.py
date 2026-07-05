@@ -213,12 +213,12 @@ DEFAULT_COLLISION_EVENT_PENALTY = -20.0  # legacy: applied while contact is acti
 DEFAULT_COLLISION_CONTACT_PENALTY = None  # float | None; if None, uses legacy collision_event_penalty
 DEFAULT_OUTSIDE_ROUTE_EVENT_PENALTY = -20.0
 DEFAULT_TRAFFIC_VIOLATION_PENALTY = -20.0  # per new RunningStop or RunningRedLight event
-DEFAULT_PROGRESS_REWARD_WEIGHT = 5.0 # 5.0
+DEFAULT_PROGRESS_REWARD_WEIGHT = 10.0 #5.0
 DEFAULT_TERMINATE_ON_INFRACTION = False
 # DEFAULT_CENTERING_REWARD_WEIGHT = 0.2
 # DEFAULT_HEADING_REWARD_WEIGHT = 0.2
-DEFAULT_STEER_PENALTY_WEIGHT = 0.0 # 0.05
-DEFAULT_BRAKE_PENALTY_WEIGHT = 0.0 # 0.02
+DEFAULT_STEER_PENALTY_WEIGHT = 0.0
+DEFAULT_BRAKE_PENALTY_WEIGHT = 0.0
 DEFAULT_SPEED_LIMIT_PENALTY_WEIGHT = 0.1
 SUCCESS_BONUS = 50.0
 FAILURE_BONUS = -20.0
@@ -339,11 +339,15 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
 
         attempts = 0
         num_max_restarts = 20
+        client_timeout = args.timeout if args.timeout else self.client_timeout
+        # Use a short per-attempt timeout during setup so the retry loop can
+        # cycle on a slow/unready CARLA server instead of blocking for
+        # client_timeout (7200s) on the first attempt.
+        _setup_attempt_timeout = 30.0
         while attempts < num_max_restarts:
             try:
                 client = carla.Client(args.host, rpc_port)
-                client_timeout = args.timeout if args.timeout else self.client_timeout
-                client.set_timeout(client_timeout)
+                client.set_timeout(_setup_attempt_timeout)
 
                 settings = carla.WorldSettings(
                     synchronous_mode=True,
@@ -352,6 +356,7 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
                     spectator_as_ego=False,
                 )
                 client.get_world().apply_settings(settings)
+                client.set_timeout(client_timeout)
                 print(f"load_world success , attempts={attempts}", flush=True)
                 break
             except Exception as e:
@@ -940,6 +945,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
     def _kill_stale_carla_processes(
         rpc_port: Optional[int] = None,
         x_display_num: Optional[int] = None,
+        tm_port: Optional[int] = None,
     ) -> None:
         """Kill only the CARLA/Xvfb processes for this instance's launch args.
 
@@ -952,6 +958,12 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         Also removes stale /tmp/.X{N}-lock files for dead Xvfb instances so the
         leaderboard's display-number picker (which scans :10–:99) doesn't exhaust
         all display numbers after repeated crashes.
+
+        ``tm_port``: if set, any process listening on this TCP port (typically
+        an orphaned carla_env_server holding the Traffic Manager port open) is
+        killed before a new CARLA server is started.  Without this cleanup, the
+        new CARLA's TM fails to bind the port and retries for minutes before
+        raising RuntimeError.
         """
         import subprocess as _sp
         import glob as _glob
@@ -960,6 +972,11 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 ["pkill", "-9", "-f", f"CarlaUE4.*-carla-rpc-port={int(rpc_port)}"],
                 capture_output=True,
             )
+            time.sleep(1)
+        if tm_port is not None:
+            # Kill any process (typically an old carla_env_server) that is still
+            # listening on the TM port — fuser sends SIGKILL and ignores errors.
+            _sp.run(["fuser", "-k", f"{int(tm_port)}/tcp"], capture_output=True)
             time.sleep(1)
         if x_display_num is not None:
             _sp.run(["pkill", "-9", "-f", f"Xvfb :{int(x_display_num)}"], capture_output=True)
@@ -984,6 +1001,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._kill_stale_carla_processes(
             rpc_port=int(self.carla_config.get("port", 0) or 0),
             x_display_num=int(self.carla_config.get("x_display_num", 0) or 0),
+            tm_port=int(self.carla_config.get("traffic_manager_port", 0) or 0) or None,
         )
         self._args = carla_config_to_args(self.carla_config, self.route_entry)
         self._base_agent_config = self._args.agent_config
@@ -1312,6 +1330,97 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             print(f"[expert] SimLingo autopilot init failed: {exc}", flush=True)
             return None
 
+    def _compute_scene_context(self) -> dict:
+        """Return a dict describing nearby actors visible in the ego vehicle's FoV.
+
+        FoV is approximated as ±55° of the forward direction (matching the 110°
+        SimLingo camera) within 30 m.  Used by the language-feedback critic mode
+        to ground corrective commentary in visible scene objects.
+        """
+        ctx: dict = {
+            "vehicle_ahead": False,
+            "vehicle_ahead_dist_m": -1.0,
+            "pedestrian_in_fov": False,
+            "pedestrian_dist_m": -1.0,
+            "traffic_light_state": "none",
+            "stop_sign_ahead": False,
+        }
+        try:
+            ego = self._ego_actor()
+            if ego is None:
+                return ctx
+            ev = self._evaluator
+            world = ev.world
+            ego_loc = ego.get_location()
+            ego_tf = ego.get_transform()
+            ego_fwd = ego_tf.get_forward_vector()
+
+            fov_cos = math.cos(math.radians(55.0))  # ±55° half-angle
+            look_ahead_m = 30.0
+
+            actors = world.get_actors()
+
+            # Vehicles in FoV
+            min_veh_dist = float("inf")
+            for v in actors.filter("*vehicle*"):
+                if v.id == ego.id:
+                    continue
+                rel = v.get_location() - ego_loc
+                dist = math.sqrt(rel.x ** 2 + rel.y ** 2)
+                if dist > look_ahead_m or dist < 0.5:
+                    continue
+                cos_a = (rel.x * ego_fwd.x + rel.y * ego_fwd.y) / dist
+                if cos_a < fov_cos:
+                    continue
+                ctx["vehicle_ahead"] = True
+                if dist < min_veh_dist:
+                    min_veh_dist = dist
+                    ctx["vehicle_ahead_dist_m"] = float(dist)
+
+            # Walkers / pedestrians in FoV
+            min_ped_dist = float("inf")
+            for w in actors.filter("*walker*"):
+                rel = w.get_location() - ego_loc
+                dist = math.sqrt(rel.x ** 2 + rel.y ** 2)
+                if dist > look_ahead_m or dist < 0.5:
+                    continue
+                cos_a = (rel.x * ego_fwd.x + rel.y * ego_fwd.y) / dist
+                if cos_a < fov_cos:
+                    continue
+                ctx["pedestrian_in_fov"] = True
+                if dist < min_ped_dist:
+                    min_ped_dist = dist
+                    ctx["pedestrian_dist_m"] = float(dist)
+
+            # Traffic light affecting ego
+            try:
+                tl = ego.get_traffic_light()
+                if tl is not None:
+                    state_str = str(tl.get_state())
+                    if "Red" in state_str:
+                        ctx["traffic_light_state"] = "red"
+                    elif "Yellow" in state_str:
+                        ctx["traffic_light_state"] = "yellow"
+                    elif "Green" in state_str:
+                        ctx["traffic_light_state"] = "green"
+            except Exception:
+                pass
+
+            # Stop signs in FoV (within 15 m)
+            for sign in actors.filter("*traffic.stop*"):
+                rel = sign.get_location() - ego_loc
+                dist = math.sqrt(rel.x ** 2 + rel.y ** 2)
+                if dist > 15.0 or dist < 0.5:
+                    continue
+                cos_a = (rel.x * ego_fwd.x + rel.y * ego_fwd.y) / dist
+                if cos_a < fov_cos:
+                    continue
+                ctx["stop_sign_ahead"] = True
+                break
+        except Exception:
+            pass
+        return ctx
+
     def _compute_language_label(self, expert_action=None):
         """Query expert commentary from live CARLA state."""
         try:
@@ -1366,7 +1475,16 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                     route_xy = np.asarray(route_local[:, :2], dtype=np.float32)
                     chunk = np.zeros((action_horizon, 4), dtype=np.float32)
                     dt = 5.0 / 20.0
-                    route_dist = np.linalg.norm(np.diff(route_xy, axis=0), axis=1)
+                    # Prepend ego-frame origin so cum_d[0]=0 maps to the current
+                    # position (0,0), not to the first route point (~2 m ahead).
+                    # Without this, _expert_action_to_accel_steer extracts a speed
+                    # of (dist_to_first_wp + v*dt)/dt instead of v, causing the
+                    # expert to appear to drive far too fast and crash into leading
+                    # vehicles even when the PDM-Lite planner has slowed down.
+                    route_xy_from_ego = np.vstack(
+                        [np.zeros((1, 2), dtype=np.float32), route_xy]
+                    )
+                    route_dist = np.linalg.norm(np.diff(route_xy_from_ego, axis=0), axis=1)
                     cum_d = np.concatenate(
                         [np.zeros(1, dtype=np.float32), np.cumsum(route_dist, dtype=np.float32)],
                         axis=0,
@@ -1375,8 +1493,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                         prev_xy = np.zeros(2, dtype=np.float32)
                         for i in range(action_horizon):
                             s = min(target_speed_live * dt * (i + 1), float(cum_d[-1]))
-                            x_wp = float(np.interp(s, cum_d, route_xy[:, 0]))
-                            y_wp = float(np.interp(s, cum_d, route_xy[:, 1]))
+                            x_wp = float(np.interp(s, cum_d, route_xy_from_ego[:, 0]))
+                            y_wp = float(np.interp(s, cum_d, route_xy_from_ego[:, 1]))
                             delta_xy = np.array([x_wp, y_wp], dtype=np.float32) - prev_xy
                             chunk[i, :2] = delta_xy
                             chunk[i, 2:] = delta_xy
@@ -1567,7 +1685,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 return self._step_with_control(control)
             except Exception as _ee:
                 print(f"[step_expert] SimLingo autopilot failed: {_ee}", flush=True)
-        expert_action = obs_raw.get("expert_action")
+        expert_action = (obs_raw or {}).get("expert_action")
         if expert_action is None:
             expert_action = np.zeros(self.action_space.shape, dtype=np.float32)
         if self._steervla_exec_cfg is not None:
@@ -1732,6 +1850,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         sensors = getattr(self.evaluator.manager, "last_agent_input", None) or {}
         expert_action = self._compute_expert_action()
         commentary_text, language_label = self._compute_language_label(expert_action=expert_action)
+        scene_context = self._compute_scene_context()
         rgb_viz = rgb_viz_from_leaderboard_dict(sensors)
         return {
             "state": self._get_state_vector(),
@@ -1741,6 +1860,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             "language_label": language_label,
             "commentary_text": commentary_text,
             "expert_action": expert_action,
+            "scene_context": scene_context,
             "routing_command": (
                 f"{ROUTING_COMMAND_TEXT.get(self._current_routing_command, 'follow the road')}"
                 f" in {self._routing_dist_to_waypoint} meter."
@@ -2102,6 +2222,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             tree_status=tree_status,
             terminated=terminated,
         )
+        if self._expert_agent is not None:
+            self.tick_expert()
         return self._obs_dict(), float(reward), terminated, False, info
 
     def _finalize_route(self, entry_status: str, crash_message: str) -> None:

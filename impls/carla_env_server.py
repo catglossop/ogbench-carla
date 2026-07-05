@@ -102,6 +102,7 @@ def _obs_to_wire(obs: Dict[str, Any], include_simlingo: bool) -> Dict[str, Any]:
     image_b64 = base64.b64encode(policy_img.tobytes()).decode("ascii")
     tp = obs.get("target_points")
     expert_action = obs.get("expert_action")
+    scene_ctx = obs.get("scene_context") or {}
     out = {
         "state": obs["state"].tolist(),
         "image_b64": image_b64,
@@ -109,6 +110,14 @@ def _obs_to_wire(obs: Dict[str, Any], include_simlingo: bool) -> Dict[str, Any]:
         "routing_command": obs["routing_command"],
         "target_points": tp.tolist() if tp is not None else [[0.0, 0.0], [0.0, 0.0]],
         "expert_action": expert_action.tolist() if expert_action is not None else None,
+        "scene_context": {
+            "vehicle_ahead": bool(scene_ctx.get("vehicle_ahead", False)),
+            "vehicle_ahead_dist_m": float(scene_ctx.get("vehicle_ahead_dist_m", -1.0)),
+            "pedestrian_in_fov": bool(scene_ctx.get("pedestrian_in_fov", False)),
+            "pedestrian_dist_m": float(scene_ctx.get("pedestrian_dist_m", -1.0)),
+            "traffic_light_state": str(scene_ctx.get("traffic_light_state", "none")),
+            "stop_sign_ahead": bool(scene_ctx.get("stop_sign_ahead", False)),
+        },
     }
     if include_simlingo:
         simlingo = np.ascontiguousarray(obs["simlingo_image"])
@@ -195,7 +204,8 @@ def main(_argv):
             _wire_out.flush()
 
         elif msg.get("expert_step"):
-            obs_raw_in = msg.get("obs_raw")
+            ea = msg.get("expert_action")
+            obs_raw_in = {"expert_action": np.array(ea, dtype=np.float32)} if ea is not None else None
             next_obs, reward, terminated, truncated, info = env.step_expert(obs_raw_in)
 
             safe_info = {

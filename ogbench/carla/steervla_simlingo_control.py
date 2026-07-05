@@ -187,6 +187,19 @@ class SimlingoStyleWaypointDecoder:
             space=action_input_space,
         )
         pred_speed_wps, pred_route = _chunks_to_speed_and_route_waypoints(np.asarray(denorm, dtype=np.float64))
+        print(
+            f"[RC-PID] Model chunk raw: {np.array2string(chunks, precision=4, suppress_small=False)}",
+            flush=True,
+        )
+        print(
+            f"[RC-PID] Denorm chunk: {np.array2string(np.asarray(denorm), precision=4, suppress_small=False)}",
+            flush=True,
+        )
+        print(
+            f"[RC-PID] Speed wps: {np.array2string(np.asarray(pred_speed_wps), precision=4)}  "
+            f"Route wps: {np.array2string(np.asarray(pred_route), precision=4)}",
+            flush=True,
+        )
 
         s = np.asarray(state_vec, dtype=np.float32).reshape(-1)
         gt_velocity = float(s[EGO_STATE_IDX_SPEED]) if s.size > EGO_STATE_IDX_SPEED else 0.0

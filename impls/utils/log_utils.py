@@ -1,6 +1,7 @@
 import os
 import tempfile
 from datetime import datetime
+from pathlib import Path
 
 import absl.flags as flags
 import ml_collections
@@ -98,12 +99,22 @@ def setup_wandb(
         settings=wandb.Settings(
             start_method='thread',
             _disable_stats=False,
+            code_dir=str(Path(__file__).resolve().parent.parent.parent),
         ),
         mode=mode,
         save_code=True,
     )
 
     run = wandb.init(**init_kwargs)
+
+    # Save full codebase as a W&B Artifact (shows up under Artifacts → code in the UI).
+    try:
+        run.log_code(
+            root=str(Path(__file__).resolve().parent.parent.parent),
+            include_fn=lambda p, root: p.endswith(".py") or p.endswith(".sh") or p.endswith(".json"),
+        )
+    except Exception:
+        pass
 
     return run
 

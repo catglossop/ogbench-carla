@@ -18,7 +18,9 @@ def critic_language_dim(agent_config: Any) -> int:
     if mode == "none":
         return 0
     if mode == "expert_action":
-        # first_step(expert) + trailing validity flag (1.0 = expert available).
+        explicit = agent_config.get("language_label_dim")
+        if explicit is not None:
+            return int(explicit)
         return int(agent_config.get("critic_action_dim", 4)) + 1
     if mode == "action_delta":
         return int(agent_config.get("critic_action_dim", 4))
@@ -27,13 +29,16 @@ def critic_language_dim(agent_config: Any) -> int:
     return NUM_COMMENTARY_WORDS
 
 
+_EXPLICIT_MODES = frozenset({"none", "expert_action", "action_delta", "delta_commentary_bow", "vlm_chunk_bow"})
+
+
 def resolve_critic_feedback_mode(agent_config: Any) -> str:
     """Map ``language_feedback`` config (or legacy ``critic_feedback_mode``) to a mode string."""
-    # Explicit "none" via critic_feedback_mode always wins over language_feedback settings,
-    # so that run_carla.sh --critic-mode none can fully disable language labels.
+    # An explicit critic_feedback_mode (any non-commentary-bow value) always wins over
+    # language_feedback settings, so that run_carla.sh --critic-mode flags take effect.
     cfm = agent_config.get("critic_feedback_mode")
-    if cfm is not None and str(cfm).strip().lower() == "none":
-        return "none"
+    if cfm is not None and str(cfm).strip().lower() in _EXPLICIT_MODES:
+        return str(cfm).strip().lower()
     lang_fb = agent_config.get("language_feedback")
     if lang_fb is not None:
         src = str(lang_fb.get("source", "expert")).strip().lower()

@@ -64,6 +64,61 @@ _EGO_STATE_IDX_STEER = 17
 _EGO_STATE_IDX_BRAKE = 18
 
 
+def _load_pretrained_critic_simlingo(agent, checkpoint_path: str) -> None:
+    """Inject pretrained critic weights from a pretrain_critic_simlingo.py checkpoint.
+
+    Only loads critic and critic_target; skips actor, optimizer, state_normalizer.
+
+    When the online agent uses state_dim > 0 (include_ego_state=True) but the
+    pretrained checkpoint used state_dim=0, exact load_state_dict would fail due
+    to first-layer shape mismatch.  In this case we do a partial injection:
+    the vlm-features + action columns of the first layer are copied from the
+    pretrained checkpoint; the state columns remain at random init.
+
+    For all layers beyond the first (hidden layers, output) shapes are always
+    identical (same hidden_dims), so they are loaded exactly.
+
+    The pretrained checkpoint must have been created with the same vlm_feature_dim,
+    action_dim, and hidden_dims as the online agent.
+    """
+    import copy
+    import torch
+
+    state = torch.load(checkpoint_path, map_location=agent.device)
+    if "critic" not in state:
+        raise KeyError(f"Checkpoint at {checkpoint_path} has no 'critic' key; got {list(state.keys())}")
+
+    def _inject_critic(online_critic, pretrained_sd):
+        online_sd = online_critic.state_dict()
+        if all(v.shape == online_sd[k].shape for k, v in pretrained_sd.items() if k in online_sd):
+            online_critic.load_state_dict(pretrained_sd, strict=True)
+            return "exact"
+        # Shapes differ (state_dim mismatch in first layer).  Inject shared columns.
+        new_sd = copy.deepcopy(online_sd)
+        for key in pretrained_sd:
+            if key not in online_sd:
+                continue
+            pt_w, on_w = pretrained_sd[key], online_sd[key]
+            if pt_w.shape == on_w.shape:
+                new_sd[key] = pt_w.clone()
+            elif pt_w.ndim == 2 and on_w.ndim == 2 and pt_w.shape[0] == on_w.shape[0]:
+                # First-layer weight: on_w is (out, in_online), pt_w is (out, in_pretrain).
+                # in_pretrain < in_online; copy first in_pretrain columns.
+                cols = pt_w.shape[1]
+                new_sd[key] = on_w.clone()
+                new_sd[key][:, :cols] = pt_w
+            # bias and other tensors: skip if shapes differ (shouldn't happen)
+        online_critic.load_state_dict(new_sd, strict=True)
+        return "partial (first-layer column injection)"
+
+    mode = _inject_critic(agent.critic, state["critic"])
+    print(f"[main_carla_simlingo] Pretrained critic loaded from {checkpoint_path} ({mode})")
+
+    pretrained_target_sd = state.get("critic_target", state["critic"])
+    mode_t = _inject_critic(agent.critic_target, pretrained_target_sd)
+    print(f"[main_carla_simlingo] Pretrained critic_target loaded ({mode_t})")
+
+
 def _ego_drive_metrics_from_state_vec(state: Any) -> Dict[str, float]:
     s = np.asarray(state, dtype=np.float32).reshape(-1)
     if s.size < _STATE_DIM:
@@ -166,6 +221,17 @@ flags.DEFINE_float("debug_target_speed_reward", 0.0,
                    "E.g. 5.0 → SAC should learn to drive at 5 m/s.")
 flags.DEFINE_bool("expert_debug", False,
                   "Debug: drive with the CARLA expert action instead of base+residual (dagger_residual only).")
+flags.DEFINE_string("expert_checkpoint", None,
+                    "Path to a saved ResidualSACAgent .pt checkpoint to use as the expert when --expert_debug is set. "
+                    "When provided, loads the full VLA model and uses the checkpoint's deterministic policy as the expert "
+                    "instead of the PDM-Lite autopilot waypoint decoder.")
+flags.DEFINE_string(
+    "pretrained_critic", None,
+    "Path to a pretrained ResidualSACAgent .pt checkpoint from pretrain_critic_simlingo.py. "
+    "Injects only the critic and critic_target params into the freshly created agent. "
+    "Actor, optimizer, and state_normalizer are NOT loaded, so a state_dim mismatch between "
+    "pretraining (state_dim=0) and online (state_dim=EGO_STATE_DIM) is safe.",
+)
 flags.DEFINE_bool("terminate_on_infraction", False,
                   "Terminate the episode immediately when a collision, traffic violation, or off-route event occurs.")
 flags.DEFINE_bool("expert_recover_debug", False,
@@ -173,6 +239,20 @@ flags.DEFINE_bool("expert_recover_debug", False,
 flags.DEFINE_bool("use_expert_in_critic", False,
                   "Feed the expert planner's (accel, steer) action as additional input to the SAC critic. "
                   "The expert action is read from obs['expert_action'] (provided by the CARLA env server).")
+flags.DEFINE_bool("use_language_bow_critic", False,
+                  "Feed a programmatic scene-grounded language BoW label as additional critic input. "
+                  "Computed each step from the delta between the executed action and the expert planner "
+                  "action, grounded in nearby scene actors visible in the ego vehicle's FoV. "
+                  "Uses SCENE_DELTA_VOCAB (26 words + 1 validity flag = 27 dims).")
+flags.DEFINE_bool("log_q_expert_diff", False,
+                  "Log Q(expert action) - Q(buffer action) at each SAC update. "
+                  "For use_expert_in_critic, uses the stored expert_actions. "
+                  "For use_language_bow_critic / use_gemini_coach (delta), stores the expert action "
+                  "in a separate log-only buffer field.")
+flags.DEFINE_bool("use_noise_critic", False,
+                  "Debug: feed i.i.d. Gaussian noise (same dim as language_bow: 27) as the critic's "
+                  "coach-label input each step. Use as a sanity-check ablation against language_bow — "
+                  "if the noise critic improves over none, the benefit is from extra capacity, not language.")
 flags.DEFINE_string("run_group", "Debug", "W&B run group.")
 flags.DEFINE_string("wandb_project", "OGBench-CARLA-SimLingo", "W&B project name.")
 flags.DEFINE_string("wandb_run_name", None, "W&B run name. If None, auto-generates from route + seed.")
@@ -215,10 +295,19 @@ flags.DEFINE_bool("coach_embed_plot", False,
                   "and log a 2-D scatter plot to wandb (coach/embedding_pca). "
                   "Only meaningful when coach_label_mode is vlm_embed or vlm_embed_raw.")
 
+# ── Observation histogram debug flags ─────────────────────────────────────────
+flags.DEFINE_bool("debug_obs_hist", False,
+                  "Collect obs samples for N steps then plot histograms of embedding "
+                  "elements vs everything else (ego state, actions, expert). Exits after "
+                  "the plot is saved.")
+flags.DEFINE_integer("debug_obs_hist_steps", 2000,
+                     "Number of steps to collect before plotting observation histograms. "
+                     "Only used when --debug_obs_hist is set.")
+
 
 # ── Video overlay ─────────────────────────────────────────────────────────────
 
-_VIDEO_PANEL_H = 113
+_VIDEO_PANEL_H = 130
 
 
 def _annotate_frame(
@@ -235,6 +324,7 @@ def _annotate_frame(
     collision_events: int = 0,
     expert_waypoints: Optional[np.ndarray] = None,
     expert_action_2d: Optional[np.ndarray] = None,
+    language_feedback: Optional[str] = None,
 ) -> np.ndarray:
     """Draw projected waypoints plus a black text panel like main_carla.py.
 
@@ -328,10 +418,11 @@ def _annotate_frame(
         else:
             expert_str = ""
 
+        lang_fb_str = f"LangFB: {_clip_text(language_feedback)}" if language_feedback else ""
         lines = [
             f"Reward train={train_reward} env={env_reward} | speed={current_speed:.2f} m/s | collision={'YES' if collision_now else 'no'} c={collision_count} e={collision_events}",
             f"Action base=({base_action[0]:+.2f},{base_action[1]:+.3f}) residual=({residual[0]:+.2f},{residual[1]:+.3f}) final=({final_action[0]:+.2f},{final_action[1]:+.3f}){('  ' + expert_str) if expert_str else ''}",
-            f"Meta-action: {_clip_text(meta_action) if meta_action else '(none)'}",
+            lang_fb_str if lang_fb_str else f"Meta-action: {_clip_text(meta_action) if meta_action else '(none)'}",
             f"Prompt: {_clip_text(prompt)}",
             f"Reasoning: {_clip_text(language) if language else '(no language output)'}",
             f"Pen: coll={pen_coll:+.1f}{'(bb)' if contact else ''}  route={pen_route:+.1f}  traf={pen_traf:+.1f}(n={traf_count})  crash={pen_crash:+.1f}  term={pen_term:+.1f}",
@@ -422,6 +513,13 @@ class CarlaEnvProxy:
         obs = self._wire_to_obs(resp["obs"])
         return obs, resp["reward"], resp["terminated"], resp["truncated"], resp.get("info", {})
 
+    def step_expert(self) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
+        """Step the env using PDM-Lite's direct control output (re-plans every tick)."""
+        self._send({"expert_step": True})
+        resp = json.loads(self._readline())
+        obs = self._wire_to_obs(resp["obs"])
+        return obs, resp["reward"], resp["terminated"], resp["truncated"], resp.get("info", {})
+
     @staticmethod
     def _wire_to_obs(wire: Dict) -> Dict[str, Any]:
         img_bytes = base64.b64decode(wire["simlingo_image_b64"])
@@ -436,6 +534,7 @@ class CarlaEnvProxy:
         }
         if expert_raw is not None:
             obs["expert_action"] = np.array(expert_raw, dtype=np.float32)
+        obs["scene_context"] = wire.get("scene_context") or {}
         return obs
 
     def close(self):
@@ -555,6 +654,67 @@ def _residual_clip_limit(global_step: int, warmup_steps: int, schedule_steps: in
     return min(1.0, post_warmup / schedule_steps)
 
 
+# ── Observation histogram ─────────────────────────────────────────────────────
+
+def _plot_obs_histograms(
+    embed_samples: List[np.ndarray],
+    other_samples: Dict[str, List[np.ndarray]],
+    save_dir: Path,
+    step: int,
+    obs_mode: str,
+) -> str:
+    """Plot per-component element histograms of obs and save as PNG.
+
+    embed_samples: list of (D_embed,) arrays, one per step
+    other_samples: ordered dict of {label: list of (D,) arrays}
+    Returns path to the saved PNG.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    panels = [("VLM embedding", embed_samples, "steelblue")] + [
+        (label, samples, color)
+        for (label, samples), color in zip(
+            other_samples.items(),
+            ["darkorange", "seagreen", "mediumpurple", "crimson", "goldenrod"],
+        )
+        if samples
+    ]
+    n_panels = len(panels)
+    ncols = min(3, n_panels)
+    nrows = (n_panels + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4.5 * nrows), squeeze=False)
+    axes_flat = axes.ravel()
+
+    for i, (label, samples, color) in enumerate(panels):
+        flat = np.concatenate([s.ravel() for s in samples])
+        n_bins = min(200, max(50, int(np.sqrt(len(flat)))))
+        axes_flat[i].hist(flat, bins=n_bins, color=color, alpha=0.85, edgecolor="none")
+        dim_str = f"D={samples[0].shape[0]}" if samples else "D=?"
+        extra = f"  ({obs_mode})" if i == 0 else ""
+        axes_flat[i].set_title(
+            f"{label}{extra}\n"
+            f"n_steps={len(samples)}  {dim_str}\n"
+            f"mean={flat.mean():.4f}  std={flat.std():.4f}  [{flat.min():.3f}, {flat.max():.3f}]",
+            fontsize=9,
+        )
+        axes_flat[i].set_xlabel("element value")
+        axes_flat[i].set_ylabel("count")
+
+    for j in range(i + 1, len(axes_flat)):
+        axes_flat[j].set_visible(False)
+
+    fig.suptitle(f"Observation element distributions  (global_step={step})", fontsize=11)
+    fig.tight_layout()
+
+    out_path = save_dir / f"obs_histograms_step{step:06d}.png"
+    fig.savefig(str(out_path), dpi=120)
+    plt.close(fig)
+    return str(out_path)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(_argv):
@@ -584,21 +744,28 @@ def main(_argv):
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Load SimLingo base policy ─────────────────────────────────────────────
-    print(f"[main] Loading SimLingo policy (mode={FLAGS.policy_mode}) ...", flush=True)
-    from vlas.simlingo_base import HierarchicalSimLingoPolicy, SimLingoBase, VLM_FEATURE_DIM, VLM_ENCODER_FEATURE_DIM  # type: ignore
-    if FLAGS.policy_mode == "hierarchical":
-        simlingo_base = HierarchicalSimLingoPolicy(
-            high_checkpoint_path=FLAGS.high_level_checkpoint,
-            low_checkpoint_path=FLAGS.low_level_checkpoint,
-            device=FLAGS.device,
-            high_hydra_config_path=FLAGS.high_level_hydra_config,
-            low_hydra_config_path=FLAGS.low_level_hydra_config,
-            source_root=FLAGS.hierarchical_source_root if FLAGS.hierarchical_source_root else None,
-            high_source_root=FLAGS.high_level_source_root,
-            low_source_root=FLAGS.low_level_source_root,
-        )
+    # pid_only when expert_debug with no SAC checkpoint: skip the heavy VLA model load.
+    _expert_debug_only = (FLAGS.expert_debug or FLAGS.expert_recover_debug) and not FLAGS.expert_checkpoint
+    if _expert_debug_only:
+        print("[main] expert_debug mode — skipping VLA model load, PID controllers only.", flush=True)
+        from vlas.simlingo_base import SimLingoBase, VLM_FEATURE_DIM, VLM_ENCODER_FEATURE_DIM  # type: ignore
+        simlingo_base = SimLingoBase("", pid_only=True)
     else:
-        simlingo_base = SimLingoBase(FLAGS.simlingo_checkpoint, device=FLAGS.device)
+        print(f"[main] Loading SimLingo policy (mode={FLAGS.policy_mode}) ...", flush=True)
+        from vlas.simlingo_base import HierarchicalSimLingoPolicy, SimLingoBase, VLM_FEATURE_DIM, VLM_ENCODER_FEATURE_DIM  # type: ignore
+        if FLAGS.policy_mode == "hierarchical":
+            simlingo_base = HierarchicalSimLingoPolicy(
+                high_checkpoint_path=FLAGS.high_level_checkpoint,
+                low_checkpoint_path=FLAGS.low_level_checkpoint,
+                device=FLAGS.device,
+                high_hydra_config_path=FLAGS.high_level_hydra_config,
+                low_hydra_config_path=FLAGS.low_level_hydra_config,
+                source_root=FLAGS.hierarchical_source_root if FLAGS.hierarchical_source_root else None,
+                high_source_root=FLAGS.high_level_source_root,
+                low_source_root=FLAGS.low_level_source_root,
+            )
+        else:
+            simlingo_base = SimLingoBase(FLAGS.simlingo_checkpoint, device=FLAGS.device)
 
     # ── Start CARLA env server ────────────────────────────────────────────────
     # Read the initial obs (server sends it right after ready signal)
@@ -612,15 +779,14 @@ def main(_argv):
         terminate_on_infraction=FLAGS.terminate_on_infraction,
     )
 
-    # Read the initial obs that the server sends after startup
-    # (the server sends ready + initial obs automatically)
-    # We need to read that initial obs line:
-    init_line = env._readline()
-    init_resp = json.loads(init_line)
-    initial_obs = CarlaEnvProxy._wire_to_obs(init_resp["obs"])
+    initial_obs, _ = env.reset()
 
     def _get_features(obs):
         """Return (desired_speeds, route_interp, obs_features) based on obs_mode flag."""
+        if _expert_debug_only:
+            # No VLA model in expert debug mode — return dummy features.
+            _feat_dim = VLM_FEATURE_DIM if FLAGS.obs_mode == "vlm_hidden" else VLM_ENCODER_FEATURE_DIM
+            return np.zeros(FLAGS.chunk_size, dtype=np.float32), None, np.zeros(_feat_dim, dtype=np.float32)
         desired_speeds, route_interp, vlm_feats = simlingo_base.get_chunk_and_features(
             simlingo_image=obs["simlingo_image"],
             ego_state=obs["state"],
@@ -808,7 +974,28 @@ def main(_argv):
             actor_l2_reg=FLAGS.actor_l2_reg,
             state_dim=_state_dim,
         )
+        if FLAGS.pretrained_critic:
+            _load_pretrained_critic_simlingo(agent, FLAGS.pretrained_critic)
         buffer: Any = DaggerBuffer(capacity=FLAGS.buffer_capacity, vlm_dim=vlm_dim, state_dim=_state_dim)
+
+        _expert_sac_agent = None
+        if FLAGS.expert_checkpoint:
+            _expert_sac_agent = ResidualSACAgent(
+                vlm_feature_dim=vlm_dim,
+                action_dim=2,
+                hidden_dims=(256, 256, 256),
+                gamma=FLAGS.gamma,
+                tau=FLAGS.tau,
+                actor_lr=FLAGS.actor_lr,
+                critic_lr=FLAGS.critic_lr,
+                device=FLAGS.device,
+                actor_l2_reg=FLAGS.actor_l2_reg,
+                state_dim=_state_dim,
+                coach_label_dim=0,
+                expert_action_dim=0,
+            )
+            _expert_sac_agent.load(FLAGS.expert_checkpoint)
+            print(f"[main] Loaded SAC expert from {FLAGS.expert_checkpoint}", flush=True)
 
         log_path = save_dir / "train_log.jsonl"
         log_file = open(log_path, "w")
@@ -899,8 +1086,11 @@ def main(_argv):
                             _expert_action_to_accel_steer(current_expert_action_40d, simlingo_base, chunk_start_speed),
                             -1.0, 1.0,
                         ).astype(np.float32)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        print(f"[expert_debug] _expert_action_to_accel_steer failed: {_exc}", flush=True)
+            if (FLAGS.expert_debug or _in_expert_recovery) and episode_steps % 20 == 0:
+                ea_norm = float(np.linalg.norm(current_expert_action_40d)) if current_expert_action_40d is not None else -1.0
+                print(f"[expert_debug] step={episode_steps} ea_norm={ea_norm:.4f} expert_action={'SET' if _expert_debug_action is not None else 'NONE'}", flush=True)
 
             chunk_reward = 0.0
             chunk_env_reward = 0.0
@@ -920,15 +1110,18 @@ def main(_argv):
                     else:
                         base_steer = simlingo_base.steer_for_speed(actual_speed)
                     base_action = np.array([base_accel, base_steer], dtype=np.float32)
-                    if _expert_debug_action is not None:
-                        final_action = _expert_debug_action
+                    image_for_video = obs["simlingo_image"]
+                    target_points_for_video = obs.get("target_points")
+                    if FLAGS.expert_debug or _in_expert_recovery:
+                        # Use PDM-Lite's direct control output — re-plans every tick,
+                        # avoids the 5-tick stale-action delay of the 40D encode/decode.
+                        next_obs, reward, terminated, truncated, info = env.step_expert()
+                        final_action = _expert_debug_action if _expert_debug_action is not None else base_action
                     else:
                         final_action = np.clip(
                             base_action + _res_scale_vec * residual_action, -1.0, 1.0
                         ).astype(np.float32)
-                    image_for_video = obs["simlingo_image"]
-                    target_points_for_video = obs.get("target_points")
-                    next_obs, reward, terminated, truncated, info = env.step(final_action)
+                        next_obs, reward, terminated, truncated, info = env.step(final_action)
                     env_reward = float(reward)
                     last_env_reward = env_reward
                     last_actual_speed = actual_speed
@@ -971,7 +1164,21 @@ def main(_argv):
             # matching vlm_features (both from state s before the chunk).
             # chunk_start_speed and chunk_start_base_action align with that same state.
             expert_action_2d: Optional[np.ndarray] = None
-            if current_expert_action_40d is not None:
+            if _expert_sac_agent is not None:
+                # SAC checkpoint as expert: call deterministic policy.
+                try:
+                    expert_residual = _expert_sac_agent.get_eval_action(vlm_features, chunk_start_base_action, chunk_start_state)
+                    ea_2d = np.clip(
+                        chunk_start_base_action + _res_scale_vec * expert_residual, -1.0, 1.0
+                    ).astype(np.float32)
+                    last_expert_action_2d = ea_2d
+                    last_expert_residual_target = np.clip(
+                        (ea_2d - chunk_start_base_action) / np.maximum(_res_scale_vec, 1e-6), -1.0, 1.0
+                    ).astype(np.float32)
+                    expert_action_2d = ea_2d
+                except Exception as _ex:
+                    print(f"[dagger] SAC expert action failed: {_ex}", flush=True)
+            elif current_expert_action_40d is not None:
                 ea_40d = current_expert_action_40d
                 if not np.allclose(ea_40d, 0.0):
                     try:
@@ -1159,7 +1366,7 @@ def main(_argv):
 
     _state_dim = EGO_STATE_DIM if FLAGS.include_ego_state else 0
     chunk_size = FLAGS.chunk_size  # waypoints per VLM call (1–10)
-    # Each predicted waypoint covers WP_DILATION * DATA_SAVE_FREQ CARLA ticks.
+    # _WP_DILATION / _DATA_SAVE_FREQ are class-level constants; available even in pid_only mode.
     ticks_per_wp = simlingo_base._WP_DILATION * simlingo_base._DATA_SAVE_FREQ  # = 5
 
     # ── Gemini coach session (optional) ───────────────────────────────────────
@@ -1209,33 +1416,93 @@ def main(_argv):
             flush=True,
         )
 
+    # Programmatic language-bow critic: set coach_label_dim now (before buffer/agent init).
+    if FLAGS.use_language_bow_critic and not FLAGS.use_gemini_coach:
+        from coaches.expert_label import NUM_SCENE_DELTA_WORDS  # type: ignore
+        # +1 validity flag (1.0 = label was available this step; 0.0 = no expert action).
+        _coach_label_dim = NUM_SCENE_DELTA_WORDS + 1
+        print(
+            f"[main] Language-bow critic enabled: label_dim={_coach_label_dim} "
+            f"(SCENE_DELTA_VOCAB={NUM_SCENE_DELTA_WORDS} words + 1 validity)",
+            flush=True,
+        )
+
+    # Noise critic (ablation baseline): same dim as language_bow.
+    if FLAGS.use_noise_critic and not FLAGS.use_gemini_coach and not FLAGS.use_language_bow_critic:
+        from coaches.expert_label import NUM_SCENE_DELTA_WORDS  # type: ignore
+        _coach_label_dim = NUM_SCENE_DELTA_WORDS + 1
+        print(
+            f"[main] Noise critic enabled (ablation): label_dim={_coach_label_dim} i.i.d. Gaussian noise",
+            flush=True,
+        )
+
     # [accel, steer, valid] — the trailing validity flag distinguishes "expert
     # unavailable this step" from a genuine zero (coast, straight) action.
     _expert_action_dim = 3 if FLAGS.use_expert_in_critic else 0
+    # Separate 2D log-only buffer field for BoW/delta modes (not a critic input).
+    # Not needed when use_expert_in_critic is on — update() reads expert_actions[:, :2] directly.
+    _log_expert_dim = (
+        2 if FLAGS.log_q_expert_diff
+        and (FLAGS.use_language_bow_critic or FLAGS.use_gemini_coach)
+        and not FLAGS.use_expert_in_critic
+        else 0
+    )
 
-    agent = ResidualSACAgent(
-        vlm_feature_dim=vlm_dim,
-        action_dim=2,
-        hidden_dims=(256, 256, 256),
-        gamma=FLAGS.gamma,
-        tau=FLAGS.tau,
-        actor_lr=FLAGS.actor_lr,
-        critic_lr=FLAGS.critic_lr,
-        device=FLAGS.device,
-        actor_l2_reg=FLAGS.actor_l2_reg,
-        res_scale=_res_scale_vec,
-        state_dim=_state_dim,
-        ticks_per_wp=ticks_per_wp,
-        coach_label_dim=_coach_label_dim,
-        expert_action_dim=_expert_action_dim,
-    )
-    buffer = ReplayBuffer(
-        capacity=FLAGS.buffer_capacity,
-        vlm_dim=vlm_dim,
-        state_dim=_state_dim,
-        coach_label_dim=_coach_label_dim,
-        expert_action_dim=_expert_action_dim,
-    )
+    if not _expert_debug_only:
+        agent = ResidualSACAgent(
+            vlm_feature_dim=vlm_dim,
+            action_dim=2,
+            hidden_dims=(256, 256, 256),
+            gamma=FLAGS.gamma,
+            tau=FLAGS.tau,
+            actor_lr=FLAGS.actor_lr,
+            critic_lr=FLAGS.critic_lr,
+            device=FLAGS.device,
+            actor_l2_reg=FLAGS.actor_l2_reg,
+            res_scale=_res_scale_vec,
+            state_dim=_state_dim,
+            ticks_per_wp=ticks_per_wp,
+            coach_label_dim=_coach_label_dim,
+            expert_action_dim=_expert_action_dim,
+            log_q_expert_diff=FLAGS.log_q_expert_diff,
+        )
+        buffer = ReplayBuffer(
+            capacity=FLAGS.buffer_capacity,
+            vlm_dim=vlm_dim,
+            state_dim=_state_dim,
+            coach_label_dim=_coach_label_dim,
+            expert_action_dim=_expert_action_dim,
+            log_expert_dim=_log_expert_dim,
+        )
+        if FLAGS.pretrained_critic:
+            _load_pretrained_critic_simlingo(agent, FLAGS.pretrained_critic)
+    else:
+        agent = None
+        buffer = None
+
+    # Optional SAC checkpoint to use as expert instead of PDM-Lite autopilot.
+    # Always instantiate with 0 for coach/expert dims — these must match the
+    # checkpoint's own training config, not the current run's config.
+    _expert_sac_agent = None
+    if FLAGS.expert_checkpoint:
+        _expert_sac_agent = ResidualSACAgent(
+            vlm_feature_dim=vlm_dim,
+            action_dim=2,
+            hidden_dims=(256, 256, 256),
+            gamma=FLAGS.gamma,
+            tau=FLAGS.tau,
+            actor_lr=FLAGS.actor_lr,
+            critic_lr=FLAGS.critic_lr,
+            device=FLAGS.device,
+            actor_l2_reg=FLAGS.actor_l2_reg,
+            res_scale=_res_scale_vec,
+            state_dim=_state_dim,
+            ticks_per_wp=ticks_per_wp,
+            coach_label_dim=0,
+            expert_action_dim=0,
+        )
+        _expert_sac_agent.load(FLAGS.expert_checkpoint)
+        print(f"[main] Loaded SAC expert from {FLAGS.expert_checkpoint}", flush=True)
 
     log_path = save_dir / "train_log.jsonl"
     log_file = open(log_path, "w")
@@ -1282,9 +1549,23 @@ def main(_argv):
     last_update_time = 0.0
     video = _open_video(num_episodes)
     last_expert_action_2d = np.zeros(2, dtype=np.float32)
+    last_language_feedback: Optional[str] = None
+    # For language_bow: track previous step's buffer ptr for next_coach_label backfill.
+    _prev_lang_bow_ptr: Optional[int] = None
     # True when the previous buffer slot belongs to a finished episode — guards the
     # next-expert backfill below from writing the new episode's expert action into it.
     _prev_transition_done = True
+
+    # ── Obs histogram accumulators (debug_obs_hist mode) ─────────────────────
+    _hist_embed: List[np.ndarray] = []
+    _hist_other: Dict[str, List[np.ndarray]] = {
+        "ego state": [],
+        "base action": [],
+        "residual action": [],
+        "expert action (critic)": [],
+        "language BoW (critic)": [],
+        "noise label (critic)": [],
+    }
 
     for global_step in range(FLAGS.total_steps):
         t_sample_start = time.time()
@@ -1300,18 +1581,47 @@ def main(_argv):
         # Only update normalizer stats before learning starts (i.e. during the
         # random/zero-residual phase).  Freezing after that keeps the state
         # representation consistent for every (s, a, r, s') tuple in the buffer.
-        if global_step < FLAGS.learning_starts:
+        if agent is not None and global_step < FLAGS.learning_starts:
             agent.update_state_normalizer(current_obs_state)
-        current_base_action = np.array([
+        current_base_action = np.zeros(2, dtype=np.float32) if _expert_debug_only else np.array([
             simlingo_base.accel_for_desired_speed(desired_speeds[0], current_speed),
             simlingo_base.steer_for_speed(current_speed),
         ], dtype=np.float32)
-        if in_warmup:
+        if _expert_debug_only or in_warmup or agent is None:
             residual_action = np.zeros(2, dtype=np.float32)
         else:
             residual_action = agent.sample_actions(vlm_features, current_base_action, current_obs_state)
             residual_action = np.clip(residual_action, -sac_clip_limit, sac_clip_limit)
         t_sample_end = time.time()
+
+        # Expert intervention debug: precompute expert action for this chunk.
+        _expert_debug_action: Optional[np.ndarray] = None
+        if FLAGS.expert_debug:
+            if _expert_sac_agent is not None:
+                # Use past SAC checkpoint as expert.
+                try:
+                    expert_residual = _expert_sac_agent.get_eval_action(vlm_features, current_base_action, current_obs_state)
+                    _expert_debug_action = np.clip(
+                        current_base_action + _res_scale_vec * expert_residual, -1.0, 1.0
+                    ).astype(np.float32)
+                except Exception as _exc:
+                    print(f"[expert_debug] SAC expert action failed: {_exc}", flush=True)
+            elif current_expert_action_40d is not None and not np.allclose(current_expert_action_40d, 0.0):
+                try:
+                    _expert_debug_action = np.clip(
+                        _expert_action_to_accel_steer(current_expert_action_40d, simlingo_base, current_speed),
+                        -1.0, 1.0,
+                    ).astype(np.float32)
+                except Exception as _exc:
+                    print(f"[expert_debug] _expert_action_to_accel_steer failed: {_exc}", flush=True)
+        if FLAGS.expert_debug and episode_steps % 20 == 0:
+            if _expert_sac_agent is not None:
+                act_str = f"accel={_expert_debug_action[0]:.3f} steer={_expert_debug_action[1]:.3f}" if _expert_debug_action is not None else "NONE"
+                print(f"[expert_debug] step={episode_steps} SAC_expert {act_str}", flush=True)
+            else:
+                ea_norm = float(np.linalg.norm(current_expert_action_40d)) if current_expert_action_40d is not None else -1.0
+                act_str = f"accel={_expert_debug_action[0]:.3f} steer={_expert_debug_action[1]:.3f}" if _expert_debug_action is not None else "NONE"
+                print(f"[expert_debug] step={episode_steps} ea_norm={ea_norm:.4f} {act_str}", flush=True)
 
         chunk_reward = 0.0
         chunk_reward_discounted = 0.0  # gamma-weighted sum stored in the replay buffer
@@ -1334,12 +1644,20 @@ def main(_argv):
                 else:
                     base_steer = simlingo_base.steer_for_speed(actual_speed)
                 base_action = np.array([base_accel, base_steer], dtype=np.float32)
-                final_action = np.clip(
-                    base_action + _res_scale_vec * residual_action, -1.0, 1.0
-                ).astype(np.float32)
                 image_for_video = obs["simlingo_image"]
                 target_points_for_video = obs.get("target_points")
-                next_obs, reward, terminated, truncated, info = env.step(final_action)
+                if FLAGS.expert_debug and _expert_sac_agent is None:
+                    # Use PDM-Lite's direct control output — re-plans every tick.
+                    next_obs, reward, terminated, truncated, info = env.step_expert()
+                    final_action = _expert_debug_action if _expert_debug_action is not None else base_action
+                elif _expert_debug_action is not None:
+                    final_action = _expert_debug_action
+                    next_obs, reward, terminated, truncated, info = env.step(final_action)
+                else:
+                    final_action = np.clip(
+                        base_action + _res_scale_vec * residual_action, -1.0, 1.0
+                    ).astype(np.float32)
+                    next_obs, reward, terminated, truncated, info = env.step(final_action)
                 env_reward = float(reward)
                 if FLAGS.debug_neg_speed_reward:
                     reward = -float(next_obs["state"][15])
@@ -1361,6 +1679,10 @@ def main(_argv):
                 episode_collision_count = max(episode_collision_count, collision_count)
                 episode_collision_events += last_collision_delta
                 prev_collision_count = collision_count
+                _show_expert = (
+                    (FLAGS.use_expert_in_critic or FLAGS.use_language_bow_critic)
+                    and not np.allclose(last_expert_action_2d, 0.0)
+                )
                 annotated = _annotate_frame(
                     image_for_video,
                     simlingo_base,
@@ -1372,6 +1694,8 @@ def main(_argv):
                     env_reward_value=env_reward,
                     info=info,
                     collision_events=last_collision_delta,
+                    expert_action_2d=last_expert_action_2d if _show_expert else None,
+                    language_feedback=last_language_feedback,
                 )
                 _write_frame(video, image_for_video, annotated)
                 # Coach: record every CARLA tick as a video frame.
@@ -1424,17 +1748,105 @@ def main(_argv):
             # the *previous* transition, so its TD target conditions the target
             # critic on the matched pair. Skipped across episode resets (the
             # bootstrap is masked at terminals anyway).
-            if len(buffer) > 0 and not _prev_transition_done:
+            if buffer is not None and len(buffer) > 0 and not _prev_transition_done:
                 buffer.update_next_expert_at(buffer.last_ptr, _sac_expert_3d)
-        buffer.add(
-            vlm_features, next_vlm_features,
-            current_base_action, next_base_action,
-            actor_chosen_final_action,
-            current_obs_state, obs["state"][6:],
-            chunk_reward_discounted, done,  # discounted: r0 + γ·r1 + … + γ^(n-1)·r_{n-1}
-            expert_action=_sac_expert_3d,
-        )
+
+        # ── Language-bow critic: compute expert vs agent delta with scene grounding ──
+        _lang_bow_label: Optional[np.ndarray] = None
+        _lang_expert_2d: Optional[np.ndarray] = None
+        if FLAGS.use_language_bow_critic and not _expert_debug_only:
+            # Resolve expert action for this step (prefer language_bow-specific path;
+            # shares conversion with use_expert_in_critic if both are on).
+            _lang_expert_2d = _sac_expert_2d
+            if _lang_expert_2d is None and current_expert_action_40d is not None:
+                if not np.allclose(current_expert_action_40d, 0.0):
+                    try:
+                        _lang_expert_2d = _expert_action_to_accel_steer(
+                            current_expert_action_40d, simlingo_base, current_speed
+                        )
+                        last_expert_action_2d = _lang_expert_2d
+                    except Exception:
+                        pass
+            if _lang_expert_2d is not None:
+                try:
+                    from coaches.expert_label import delta_commentary_accel_steer_grounded, NUM_SCENE_DELTA_WORDS  # type: ignore
+                    _scene_ctx = obs.get("scene_context") or {}
+                    _lang_text, _lang_bow = delta_commentary_accel_steer_grounded(
+                        actor_chosen_final_action, _lang_expert_2d, _scene_ctx,
+                    )
+                    last_language_feedback = _lang_text
+                    # Append validity flag (1.0 = label available).
+                    _lang_bow_label = np.concatenate([_lang_bow, [1.0]]).astype(np.float32)
+                except Exception as _lang_ex:
+                    print(f"[language_bow] label computation failed: {_lang_ex}", flush=True)
+
+        # Noise critic (ablation): i.i.d. Gaussian noise, same dim as language_bow.
+        if FLAGS.use_noise_critic and buffer is not None and buffer.coach_label_dim > 0:
+            _noise_label = np.random.randn(buffer.coach_label_dim).astype(np.float32)
+
+        # For BoW/delta modes: expert action for Q comparison logging (log-only, not critic input).
+        _log_expert_2d: Optional[np.ndarray] = None
+        if FLAGS.log_q_expert_diff and buffer is not None and buffer.log_expert_dim > 0:
+            # Reuse _lang_expert_2d if computed (use_language_bow_critic), else compute for gemini.
+            _log_expert_2d = _lang_expert_2d
+            if _log_expert_2d is None and current_expert_action_40d is not None:
+                if not np.allclose(current_expert_action_40d, 0.0):
+                    try:
+                        _log_expert_2d = _expert_action_to_accel_steer(
+                            current_expert_action_40d, simlingo_base, current_speed
+                        )
+                    except Exception:
+                        pass
+
+        if buffer is not None:
+            buffer.add(
+                vlm_features, next_vlm_features,
+                current_base_action, next_base_action,
+                actor_chosen_final_action,
+                current_obs_state, obs["state"][6:],
+                chunk_reward_discounted, done,  # discounted: r0 + γ·r1 + … + γ^(n-1)·r_{n-1}
+                expert_action=_sac_expert_3d,
+                log_expert_action=_log_expert_2d,
+            )
+            if FLAGS.use_language_bow_critic and _lang_bow_label is not None:
+                _cur_ptr = buffer.last_ptr
+                # Write coach label for s_t immediately; approximate next_coach = current.
+                buffer.update_at(_cur_ptr, coach_label=_lang_bow_label, next_coach_label=_lang_bow_label)
+                # Correct previous step's next_coach_label with the current step's label.
+                if _prev_lang_bow_ptr is not None and not _prev_transition_done:
+                    buffer.update_next_coach_at(_prev_lang_bow_ptr, _lang_bow_label)
+                _prev_lang_bow_ptr = _cur_ptr
+            elif FLAGS.use_language_bow_critic:
+                # Expert unavailable this step — clear backfill chain to avoid stale carry-over.
+                _prev_lang_bow_ptr = None
+            if FLAGS.use_noise_critic:
+                buffer.update_at(buffer.last_ptr, coach_label=_noise_label, next_coach_label=_noise_label)
+
         _prev_transition_done = done
+
+        # ── Obs histogram collection ──────────────────────────────────────────
+        # Runs after critic labels are computed so we only collect what actually
+        # goes into the critic, not the raw 40D waypoint chunk.
+        if FLAGS.debug_obs_hist:
+            _hist_embed.append(vlm_features.copy())
+            _hist_other["ego state"].append(current_obs_state.copy())
+            _hist_other["base action"].append(current_base_action.copy())
+            _hist_other["residual action"].append(residual_action.copy())
+            if FLAGS.use_expert_in_critic and _sac_expert_3d is not None:
+                _hist_other["expert action (critic)"].append(_sac_expert_3d.copy())
+            if FLAGS.use_language_bow_critic and _lang_bow_label is not None:
+                _hist_other["language BoW (critic)"].append(_lang_bow_label.copy())
+            if FLAGS.use_noise_critic:
+                _hist_other["noise label (critic)"].append(_noise_label.copy())
+            if len(_hist_embed) >= FLAGS.debug_obs_hist_steps:
+                print(f"[debug_obs_hist] {len(_hist_embed)} samples collected — plotting histograms...", flush=True)
+                out_png = _plot_obs_histograms(_hist_embed, _hist_other, save_dir, global_step, FLAGS.obs_mode)
+                print(f"[debug_obs_hist] Saved to {out_png}", flush=True)
+                if FLAGS.wandb_mode != "disabled":
+                    wandb.log({"debug/obs_histograms": wandb.Image(out_png)}, step=global_step)
+                wandb.finish()
+                env.close()
+                return
 
         episode_reward += chunk_reward
         episode_env_reward += chunk_env_reward
@@ -1468,7 +1880,7 @@ def main(_argv):
 
         # ── SAC updates ───────────────────────────────────────────────────────
         t_update_start = time.time()
-        if len(buffer) >= FLAGS.learning_starts and not in_warmup:
+        if buffer is not None and agent is not None and len(buffer) >= FLAGS.learning_starts and not in_warmup:
             for _ in range(FLAGS.updates_per_step):
                 batch = buffer.sample(FLAGS.batch_size, torch.device(FLAGS.device))
                 last_sac_metrics = agent.update(batch)
@@ -1486,7 +1898,7 @@ def main(_argv):
                 "time/vlm_time": t_vlm_end - t_vlm_start,
                 "time/update_time": last_update_time,
                 "training/in_warmup": float(in_warmup),
-                "training/buffer_size": len(buffer),
+                "training/buffer_size": len(buffer) if buffer is not None else 0,
                 "training/total_updates": total_updates,
                 "reward/mode": reward_mode,
                 "reward/train": float(last_train_reward),
@@ -1657,6 +2069,8 @@ def main(_argv):
             episode_collision_count = 0
             episode_collision_events = 0
             prev_collision_count = 0
+            last_language_feedback = None
+            _prev_lang_bow_ptr = None
             video = _open_video(num_episodes)
             desired_speeds, _route_interp, vlm_features = _get_features(obs)
 
@@ -1669,19 +2083,22 @@ def main(_argv):
             # route_interp is already stored in simlingo_base._last_route_interp
 
         # ── Periodic checkpoint ───────────────────────────────────────────────
-        if global_step > 0 and global_step % FLAGS.save_interval == 0:
+        if agent is not None and global_step > 0 and global_step % FLAGS.save_interval == 0:
             ckpt_path = str(save_dir / f"residual_sac_{global_step}.pt")
             agent.save(ckpt_path)
             print(f"[step {global_step}] Saved checkpoint to {ckpt_path}", flush=True)
 
     # ── Final save ────────────────────────────────────────────────────────────
     _close_video(video)
-    final_path = str(save_dir / "residual_sac_final.pt")
-    agent.save(final_path)
+    if agent is not None:
+        final_path = str(save_dir / "residual_sac_final.pt")
+        agent.save(final_path)
+        print(f"\n[train] Done. Final checkpoint at {final_path}", flush=True)
+    else:
+        print("\n[train] Done (expert debug mode — no agent checkpoint).", flush=True)
     log_file.close()
     wandb.finish()
     env.close()
-    print(f"\n[train] Done. Final checkpoint at {final_path}", flush=True)
 
 
 if __name__ == "__main__":

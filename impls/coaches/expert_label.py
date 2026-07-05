@@ -182,6 +182,139 @@ def collision_override_delta_commentary() -> tuple[str, np.ndarray]:
 
 
 # ---------------------------------------------------------------------------
+# Scene-grounded delta commentary (accel/steer action space)
+# ---------------------------------------------------------------------------
+
+# Extended vocab for scene-grounded corrective feedback.  Superset of
+# DELTA_COMMENTARY_VOCAB that adds nouns/prepositions needed for grounding
+# ("ahead", "for", "light", "pedestrian", "red", "sign", "toward", "vehicle").
+SCENE_DELTA_VOCAB: list[str] = sorted({
+    "accelerate", "adjust", "ahead", "brake", "current", "decelerate", "due",
+    "follow", "for", "heavily", "left", "light", "maintain", "more",
+    "now", "pedestrian", "red", "right", "route", "sign", "speed",
+    "stop", "the", "toward", "vehicle", "your",
+})
+NUM_SCENE_DELTA_WORDS: int = len(SCENE_DELTA_VOCAB)
+_SCENE_DELTA_WORD_TO_IDX: dict[str, int] = {w: i for i, w in enumerate(SCENE_DELTA_VOCAB)}
+
+
+def scene_delta_commentary_to_bow(text: str) -> np.ndarray:
+    """Multi-hot BoW encoding of ``text`` over ``SCENE_DELTA_VOCAB``."""
+    bow = np.zeros(NUM_SCENE_DELTA_WORDS, dtype=np.float32)
+    for w in re.findall(r"[a-z']+", text.lower()):
+        idx = _SCENE_DELTA_WORD_TO_IDX.get(w)
+        if idx is not None:
+            bow[idx] = 1.0
+    return bow
+
+
+def delta_commentary_accel_steer_grounded(
+    final_action: np.ndarray,
+    expert_action: np.ndarray,
+    scene_context: "dict | None" = None,
+    *,
+    accel_tol: float = 0.10,
+    accel_strong_tol: float = 0.30,
+    steer_tol: float = 0.05,
+    steer_strong_tol: float = 0.20,
+) -> tuple[str, np.ndarray]:
+    """Generate scene-grounded corrective language from (accel, steer) action delta.
+
+    Compares the actually-executed ``final_action`` to the ``expert_action`` (both
+    in ``[accel, steer]`` space) and produces a corrective feedback phrase with
+    optional grounding in the nearest visible scene object when the correction is
+    speed-related.
+
+    Parameters
+    ----------
+    final_action : (2,) float — [accel, steer] executed by the agent.
+    expert_action : (2,) float — [accel, steer] from the expert planner.
+    scene_context : dict with optional keys
+        vehicle_ahead (bool), vehicle_ahead_dist_m (float),
+        pedestrian_in_fov (bool), traffic_light_state (str: "red"/"green"/"yellow"/"none"),
+        stop_sign_ahead (bool).
+    """
+    ctx = scene_context or {}
+    fa = np.asarray(final_action, dtype=np.float32).reshape(-1)
+    ea = np.asarray(expert_action, dtype=np.float32).reshape(-1)
+
+    if fa.shape[0] < 2 or ea.shape[0] < 2:
+        text = "Follow the route. Maintain your current speed."
+        return text, scene_delta_commentary_to_bow(text)
+
+    # CARLA steer convention: positive = right.  steer_delta > 0 means expert
+    # wants the wheel turned more to the right than the agent applied.
+    steer_delta = float(ea[1]) - float(fa[1])
+    accel_delta = float(ea[0]) - float(fa[0])
+    expert_accel = float(ea[0])
+
+    # Lateral correction text
+    if steer_delta >= steer_strong_tol:
+        route_text = "Adjust right more."
+    elif steer_delta >= steer_tol:
+        route_text = "Adjust right."
+    elif steer_delta <= -steer_strong_tol:
+        route_text = "Adjust left more."
+    elif steer_delta <= -steer_tol:
+        route_text = "Adjust left."
+    else:
+        route_text = "Follow the route."
+
+    # Scene context flags (only ground when object is in FoV)
+    vehicle_ahead = bool(ctx.get("vehicle_ahead", False))
+    pedestrian = bool(ctx.get("pedestrian_in_fov", False))
+    tl_state = str(ctx.get("traffic_light_state", "none"))
+    stop_sign = bool(ctx.get("stop_sign_ahead", False))
+
+    # Speed correction text — most-specific scene grounding takes priority
+    if expert_accel < -0.05 and abs(float(fa[0])) < 0.10:
+        # Expert wants to stop; agent is barely moving or stopped
+        if pedestrian:
+            speed_text = "Stop now for the pedestrian."
+        elif tl_state == "red":
+            speed_text = "Stop now toward the red light."
+        elif stop_sign:
+            speed_text = "Stop now toward the sign."
+        elif vehicle_ahead:
+            speed_text = "Stop now for the vehicle ahead."
+        else:
+            speed_text = "Stop now."
+    elif accel_delta >= accel_strong_tol:
+        speed_text = "Accelerate more heavily."
+    elif accel_delta >= accel_tol:
+        speed_text = "Accelerate."
+    elif accel_delta <= -accel_strong_tol:
+        if pedestrian:
+            speed_text = "Brake more heavily for the pedestrian."
+        elif tl_state == "red":
+            speed_text = "Decelerate more heavily toward the red light."
+        elif stop_sign:
+            speed_text = "Decelerate more heavily toward the sign."
+        elif vehicle_ahead:
+            speed_text = "Decelerate more heavily due to the vehicle ahead."
+        else:
+            speed_text = "Decelerate more heavily."
+    elif accel_delta <= -accel_tol:
+        if pedestrian:
+            speed_text = "Brake for the pedestrian."
+        elif tl_state == "red":
+            speed_text = "Decelerate toward the red light."
+        elif stop_sign:
+            speed_text = "Decelerate toward the sign."
+        elif vehicle_ahead:
+            speed_text = "Decelerate due to the vehicle ahead."
+        else:
+            speed_text = "Decelerate."
+    else:
+        speed_text = "Maintain your current speed."
+
+    text = f"{route_text} {speed_text}".replace("..", ".").strip()
+    if not text.endswith("."):
+        text += "."
+    return text, scene_delta_commentary_to_bow(text)
+
+
+# ---------------------------------------------------------------------------
 # Commentary text generation phrases (words must all be in COMMENTARY_VOCAB)
 # ---------------------------------------------------------------------------
 

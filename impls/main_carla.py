@@ -112,6 +112,27 @@ flags.DEFINE_bool(
 flags.DEFINE_string("save_dir", "/home/celinet/carla_exps", "Save directory.")
 flags.DEFINE_string("restore_path", None, "Restore path for JAX agents.")
 flags.DEFINE_integer("restore_epoch", None, "Restore epoch.")
+flags.DEFINE_string(
+    "pretrained_critic", None,
+    "Path to a pretrained critic .pkl checkpoint from pretrain_critic.py. "
+    "Injects the obs_encoder and critic params into the freshly created agent, "
+    "leaving the actor/noise modules at random init. "
+    "The checkpoint must have been created with a compatible config (same "
+    "image_encoder, critic_hidden_dims, action_mode, and critic_feedback_mode=none).",
+)
+
+flags.DEFINE_string(
+    "qgf_critic_ckpt", None,
+    "Path to a pretrain_critic.py .pkl checkpoint for QGF inference-time guidance. "
+    "When set together with --qgf_guidance_weight, injects Q-gradient guidance into "
+    "each pi0 denoising step at test time (no actor training). The checkpoint must "
+    "use action_mode=waypoints (40-D) and SigLIP image-only obs (1152-D).",
+)
+flags.DEFINE_float(
+    "qgf_guidance_weight", 0.0,
+    "Scale for Q-gradient added to pi0 flow velocity at each denoising step. "
+    "0.0 disables QGF (default). Typical range: 0.01-0.5; sweep to find best value.",
+)
 
 flags.DEFINE_integer("online_steps", 1000, "Number of online environment steps to run.")
 flags.DEFINE_integer("log_interval", 1, "Logging interval (env steps).")
@@ -151,6 +172,57 @@ config_flags.DEFINE_config_file("agent", "jax_agents/dsrl.py", lock_config=False
 # --------------------------------------------------------------------------- #
 # Helpers                                                                     #
 # --------------------------------------------------------------------------- #
+
+
+def _load_pretrained_critic(agent, checkpoint_path: str):
+    """Inject pretrained critic (and obs_encoder) params from a pretrain_critic.py checkpoint.
+
+    Loads modules_obs_encoder and modules_critic from the checkpoint and injects them
+    into the agent's network params.  modules_target_critic is synced to modules_critic.
+    All other modules (noise_actor, noise_critic, flow) keep their random-init params.
+
+    The checkpoint must have been created with a compatible config (same image_encoder,
+    critic_hidden_dims, action_dim, and critic_feedback_mode=none / language_label_dim=0).
+    """
+    import pickle
+    import jax
+
+    with open(checkpoint_path, "rb") as f:
+        state = pickle.load(f)
+    pretrained_params = state["params"]
+
+    new_params = dict(agent.network.params)
+    injected = []
+    for key in ("modules_obs_encoder", "modules_critic"):
+        if key in pretrained_params:
+            new_params[key] = jax.tree_util.tree_map(
+                lambda x: jax.device_put(x), pretrained_params[key]
+            )
+            injected.append(key)
+    if "modules_critic" in pretrained_params:
+        new_params["modules_target_critic"] = new_params["modules_critic"]
+        injected.append("modules_target_critic (= modules_critic)")
+
+    agent = agent.replace(network=agent.network.replace(params=new_params))
+    print(f"[main_carla] Pretrained critic loaded from {checkpoint_path}")
+    print(f"[main_carla]   Injected: {injected}")
+    return agent
+
+
+def _setup_qgf_guidance(steervla_actor, ckpt_path: str, guidance_weight: float, siglip_encoder) -> None:
+    """Wire QGF inference-time Q-gradient guidance into SteerVLAActor.
+
+    Loads the pretrained critic from ckpt_path and calls steervla_actor.setup_qgf().
+    siglip_encoder must be a SigLIPEncoder that supports .encode(image) → 1152-D embedding.
+    """
+    from qgf_guidance import load_pretrained_critic
+
+    critic_def, critic_params = load_pretrained_critic(ckpt_path)
+    steervla_actor.setup_qgf(critic_def, critic_params, guidance_weight, siglip_encoder)
+    print(
+        f"[main_carla] QGF guidance enabled: ckpt={ckpt_path} weight={guidance_weight}",
+        flush=True,
+    )
 
 
 def _configure_jax_training_device(training_gpu_rank: int) -> None:
@@ -425,7 +497,10 @@ class CarlaEnvSubprocess:
         return self._decode_obs(msg["obs"]), msg["reward"], msg["terminated"], msg["truncated"], msg["info"]
 
     def step_expert(self, obs_raw=None):
-        self._proc.stdin.write(json.dumps({"expert_step": True}) + "\n")
+        ea = None
+        if obs_raw is not None and obs_raw.get("expert_action") is not None:
+            ea = obs_raw["expert_action"].tolist()
+        self._proc.stdin.write(json.dumps({"expert_step": True, "expert_action": ea}) + "\n")
         self._proc.stdin.flush()
         msg = self._read_obs_msg()
         return self._decode_obs(msg["obs"]), msg["reward"], msg["terminated"], msg["truncated"], msg["info"]
@@ -556,6 +631,10 @@ def run_online_carla(
     batch_size = int(agent_config.get("batch_size", 256))
     _online_training_mode = str(agent_config.get("online_training_mode", "rl")).strip().lower()
     _residual_warmup = int(agent_config.get("residual_warmup_steps", 0))
+    # Rollout flow-latent scale for the frozen Pi0 base policy (see _sample_agent_action).
+    _vla_noise_scale = float(agent_config.get("vla_noise_scale", 1.0))
+    if _vla_noise_scale != 1.0:
+        print(f"[main_carla] VLA rollout noise: tanh(N(0,1)) * {_vla_noise_scale}", flush=True)
     _residual_append_state = bool(agent_config.get("residual_append_state", False))
     _residual_obs_dim = int(agent_config.get("residual_obs_dim", 25))
     # Welford online stats for residual obs normalization (updated during residual warmup).
@@ -949,6 +1028,7 @@ def run_online_carla(
         *,
         reward_value: float,
         critic_text: str,
+        critic_mode: str = "none",
         base_action: np.ndarray | None = None,
         composed_action: np.ndarray | None = None,
     ) -> np.ndarray:
@@ -990,8 +1070,14 @@ def run_online_carla(
                 a = np.asarray(arr, dtype=np.float32).reshape(-1)
                 return " ".join(f"{v:+.3f}" for v in a[:min(a.size, 6)])
 
+            if critic_mode == "expert_action":
+                _critic_line = f"CriticIn[exp+valid]: {_clip_text(critic_text) if critic_text else '?'}"
+            elif critic_mode == "action_delta":
+                _critic_line = f"CriticIn[delta]: {_clip_text(critic_text) if critic_text else '?'}"
+            else:
+                _critic_line = f"Expert: {_clip_text(critic_text) if critic_text else '?'}"
             lines = [
-                f"Expert: {_clip_text(critic_text) if critic_text else '?'}",
+                _critic_line,
                 f"ExpertAct[0]: {expert_action_str or '?'}",
                 f"Prompt: {_clip_text(prompt)}",
                 f"Reasoning: {_clip_text(reasoning)}",
@@ -1045,6 +1131,7 @@ def run_online_carla(
                     final_raw,
                     reward_value=final_reward,
                     critic_text=final_critic_text,
+                    critic_mode=_critic_feedback_mode,
                     base_action=_f_base,
                     composed_action=last_policy_action if _f_base is not None else None,
                 )
@@ -1068,6 +1155,13 @@ def run_online_carla(
         """Rollout policy; returns ``(action, base_action_or_None)``."""
         if _online_training_mode in {"sac_residual", "dagger_residual"} and hasattr(agent, "sample_actions_sac_residual"):
             noise = jax.random.normal(subkey, (1, agent._flat_noise_dim()))
+            # Match master's rollout noise (untrained tanh noise actor * noise_scale=5):
+            # the pi05 checkpoint barely creeps from standstill, and only the variance of
+            # large flow latents stochastically kicks the car out of the brake-ratio
+            # stall (verified on generalization-wall-1095: unit noise = permanent 0 m/s,
+            # tanh*5 noise = takeoff at ~step 60 then 6-10 m/s cruise).
+            if _vla_noise_scale != 1.0:
+                noise = jax.numpy.tanh(noise) * _vla_noise_scale
             if _residual_2d:
                 chunk = agent._clip_actions_to_env(
                     jax.numpy.asarray(agent.vla_sample_fn(obs[None], noise))
@@ -1115,9 +1209,24 @@ def run_online_carla(
         in_warmup = warmup > 0 and step <= warmup
         if image_encoder == "siglip" and siglip_include_prompt_subtask:
             obs = _extract_agent_obs(env, obs_raw, obs_mode, **_extract_obs_kwargs)
+        # Figure capture: record every env step's action + Q-value for the whole trajectory.
+        # Saved to disk at episode end (or run end). The figure script picks the
+        # interesting window post-hoc rather than guessing it upfront.
+        _qgf_cfg = getattr(steervla_actor, "_qgf_config", None) if steervla_actor else None
+        if steervla_actor is not None:
+            if not hasattr(steervla_actor, "_traj_capture"):
+                steervla_actor._traj_capture = []
+            # For QGF runs, arm per-step denoising capture every step.
+            if _qgf_cfg is not None:
+                _qgf_cfg["capture_step"] = step
+                _qgf_cfg["capture_data"] = []   # reset each step; denoising fills it
+            # For baseline, arm the one-shot holder every step.
+            else:
+                steervla_actor._baseline_capture_holder = {"ready": False}
+
         base_action_np: np.ndarray | None = None
         if FLAGS.expert_debug or _in_expert_recovery or agent is None:
-            action = np.zeros(env.action_space.shape, dtype=np.float32)
+            action = np.zeros((action_dim,), dtype=np.float32)
         else:
             action_jax, base_action_jax = _sample_agent_action(sub)
             _block_until_ready_tree((action_jax, base_action_jax))
@@ -1126,6 +1235,47 @@ def run_online_carla(
             if base_action_jax is not None:
                 base_action_np = np.asarray(base_action_jax[0], dtype=np.float32)
                 _last_base_action_np = base_action_np
+
+            # Accumulate per-step capture into the trajectory buffer.
+            import pickle as _pkl
+            if steervla_actor is not None and hasattr(steervla_actor, "_traj_capture"):
+                state_vec_cap = obs_raw.get("state", np.zeros(25))
+                if _qgf_cfg is not None and _qgf_cfg.get("capture_data"):
+                    # QGF: store the denoising trace + final action from this env step.
+                    denoising = _qgf_cfg["capture_data"]
+                    final_action = denoising[-1]["x_t_after"] if denoising else None
+                    steervla_actor._traj_capture.append({
+                        "step": step,
+                        "state": np.array(state_vec_cap),
+                        "final_action_flat": final_action,
+                        "q_at_final": denoising[-1]["q_bc"] if denoising else None,
+                        "qgrad_norm": denoising[-1]["qgrad_norm"] if denoising else None,
+                        "obs_enc": denoising[-1]["obs_enc"] if denoising else None,
+                        "denoising": denoising,  # full 10-step trace
+                    })
+                    _qgf_cfg["capture_data"] = None
+                else:
+                    # Baseline: store the final unguided action from this env step.
+                    holder = getattr(steervla_actor, "_baseline_capture_holder", None)
+                    if holder is not None and holder.get("ready"):
+                        steervla_actor._traj_capture.append({
+                            "step": step,
+                            "state": np.array(state_vec_cap),
+                            "final_action_flat": holder["action_flat"],
+                        })
+
+            # Every 100 steps, flush trajectory to disk (episode-end flush happens below).
+            _traj = getattr(steervla_actor, "_traj_capture", None) if steervla_actor else None
+            if step % 100 == 0 and _traj and len(_traj) > 0:
+                guidance_weight = _qgf_cfg["guidance_weight"] if _qgf_cfg else 0.0
+                _traj_path = os.path.join(
+                    FLAGS.save_dir, f"traj_capture_w{guidance_weight}_ep{episode_count}.pkl"
+                )
+                with open(_traj_path, "wb") as _f:
+                    _pkl.dump({"guidance_weight": guidance_weight, "steps": _traj}, _f)
+                print(f"[traj-capture] flushed {len(_traj)} steps → {_traj_path}", flush=True)
+                steervla_actor._traj_capture = []
+
         t_sample_end = time.time()
 
         t_step_start = time.time()
@@ -1160,11 +1310,11 @@ def run_online_carla(
             if _residual_2d and _expert_first is None:
                 _lang = _zero_label  # expert unavailable this step (validity flag stays 0)
             else:
-                _lang = compute_expert_target(obs_raw, agent, agent_config, expert_first=_expert_first)
+                _lang = compute_expert_target(obs_raw, agent, agent_config, expert_first=_expert_first)[:_lang_dim]
             if _residual_2d:
                 _next_lang = _zero_label  # backfilled next step (see below)
             else:
-                _next_lang = compute_expert_target(next_obs_raw, agent, agent_config)
+                _next_lang = compute_expert_target(next_obs_raw, agent, agent_config)[:_lang_dim]
         elif _critic_feedback_mode == "action_delta":
             _expert_first = _critic_expert_first(obs_raw)
             if _residual_2d and _expert_first is None:
@@ -1324,6 +1474,7 @@ def run_online_carla(
                     cot_obs_raw,
                     reward_value=float(reward),
                     critic_text=_critic_text_for_video,
+                    critic_mode=_critic_feedback_mode,
                     base_action=_vid_base,
                     composed_action=_vid_comp,
                 )
@@ -1447,6 +1598,18 @@ def run_online_carla(
                 final_critic_text=last_video_critic_text,
             )
             wandb.log(rollout_log, step=step)
+
+            # Flush any remaining trajectory capture for this episode.
+            _traj_ep = getattr(steervla_actor, "_traj_capture", None) if steervla_actor else None
+            if _traj_ep and len(_traj_ep) > 0:
+                import pickle as _pkl2
+                _gw = _qgf_cfg["guidance_weight"] if _qgf_cfg else 0.0
+                _ep_path = os.path.join(FLAGS.save_dir, f"traj_capture_w{_gw}_ep{episode_count}.pkl")
+                with open(_ep_path, "wb") as _f2:
+                    _pkl2.dump({"guidance_weight": _gw, "steps": _traj_ep}, _f2)
+                print(f"[traj-capture] episode end flush: {len(_traj_ep)} steps → {_ep_path}", flush=True)
+                steervla_actor._traj_capture = []
+
             obs_raw, _info = env.reset(seed=FLAGS.seed + episode_count)
             if raw_obs_holder is not None:
                 raw_obs_holder["obs"] = obs_raw
@@ -1481,6 +1644,7 @@ def run_online_carla(
         update_times = []
         if (
             (not FLAGS.expert_debug)
+            and (not FLAGS.eval_only)
             and agent is not None
             and not in_warmup
             and buffer.size >= batch_size
@@ -1508,10 +1672,14 @@ def run_online_carla(
         if step % FLAGS.log_interval == 0:
             metrics = {
                 "time/steps_per_sec": FLAGS.log_interval / max(time.time() - last_log_time, 1e-6),
-                "time/update_time": np.mean(update_times),
+                "time/update_time": float(np.mean(update_times)) if update_times else 0.0,
             }
             if last_update_info is not None:
-                metrics.update({f"training/{k}": float(v) for k, v in last_update_info.items()})
+                metrics.update({
+                    f"training/{k}": float(v)
+                    for k, v in last_update_info.items()
+                    if np.asarray(v).ndim == 0
+                })
                 metrics["training/buffer_size"] = int(buffer.size)
             last_log_time = time.time()
             wandb.log(metrics, step=step)
@@ -1610,8 +1778,9 @@ def main(_):
     if critic_feedback_mode == "none":
         config.language_label_dim = 0
     elif critic_feedback_mode == "expert_action":
-        # first_step(expert) + trailing validity flag.
-        config.language_label_dim = int(config.get("critic_action_dim", 4)) + 1
+        if not config.get("language_label_dim"):
+            # first_step(expert) + trailing validity flag.
+            config.language_label_dim = int(config.get("critic_action_dim", 4)) + 1
     elif critic_feedback_mode == "action_delta":
         config.language_label_dim = int(config.get("critic_action_dim", 4))
     elif critic_feedback_mode in ("delta_commentary_bow", "vlm_chunk_bow"):
@@ -1741,6 +1910,13 @@ def main(_):
 
             if FLAGS.restore_path is not None:
                 agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
+
+            if FLAGS.pretrained_critic is not None:
+                agent = _load_pretrained_critic(agent, FLAGS.pretrained_critic)
+
+            # QGF: inject inference-time Q-gradient guidance into pi0 denoising.
+            if FLAGS.qgf_critic_ckpt and FLAGS.qgf_guidance_weight > 0.0 and steervla_actor is not None:
+                _setup_qgf_guidance(steervla_actor, FLAGS.qgf_critic_ckpt, FLAGS.qgf_guidance_weight, siglip_encoder)
 
         if FLAGS.eval_only:
             # No offline-eval pipeline yet for CARLA; do a single rollout.

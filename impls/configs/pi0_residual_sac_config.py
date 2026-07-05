@@ -67,6 +67,11 @@ def get_config():
     # Run pure Pi0 (zero residual) for this many steps before applying the
     # trained residual to avoid corrupting rollouts early in training.
     config.residual_warmup_steps = 500
+    # Rollout flow-latent scale for the frozen Pi0 base chunk: tanh(N(0,1)) * scale
+    # when != 1.0 (master uses its untrained noise actor * noise_scale=5.0, whose
+    # variance is what stochastically breaks the standstill brake-ratio stall —
+    # A/B on generalization-wall-1095, 2026-06-11). Kept at 1.0 (plain unit normal).
+    config.vla_noise_scale = 1.0
 
     # ── Critic / buffer ───────────────────────────────────────────────────
     config.batch_size = 16

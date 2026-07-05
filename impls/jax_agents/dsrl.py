@@ -135,10 +135,6 @@ def _critic_loss_vla_pure_math(
         network, batch, obs_key="next_observations", embed_key="critic_next_obs_e", params=network.params,
     )
     _next_critic_obs_e = _critic_obs_e(next_obs_e, batch, "next_language_label")
-    if "base_next_actions" in batch:
-        _next_critic_obs_e = jnp.concatenate(
-            [_next_critic_obs_e, jnp.asarray(batch["base_next_actions"], dtype=jnp.float32)], axis=-1
-        )
     next_qs = network.select("target_critic")(_next_critic_obs_e, next_actions_critic)
     next_q = jnp.min(next_qs, axis=0)
     if next_log_pi is not None and alpha is not None:
@@ -149,10 +145,6 @@ def _critic_loss_vla_pure_math(
         network, batch, obs_key="observations", embed_key="critic_obs_e", params=grad_params,
     )
     _curr_critic_obs_e = _critic_obs_e(obs_e, batch, "language_label")
-    if "base_actions" in batch:
-        _curr_critic_obs_e = jnp.concatenate(
-            [_curr_critic_obs_e, jnp.asarray(batch["base_actions"], dtype=jnp.float32)], axis=-1
-        )
     qs = network.select("critic")(_curr_critic_obs_e, critic_actions, params=grad_params)
     critic_loss = jnp.square(qs - target_q[None]).mean()
     return critic_loss, {
@@ -1166,11 +1158,6 @@ class DSRLAgent(flax.struct.PyTreeNode):
         critic_obs_e_sg = new_self._critic_obs_e_with_lang(
             critic_encoder_obs_e_sg, batch.get("language_label")
         )
-        if "base_actions" in batch:
-            critic_obs_e_sg = jnp.concatenate(
-                [critic_obs_e_sg, jax.lax.stop_gradient(jnp.asarray(batch["base_actions"], dtype=jnp.float32))],
-                axis=-1,
-            )
         new_residual, residual_info = new_self.sac_residual_agent.update_actor(
             obs_e_sg=obs_e_sg,
             base_action=base_action,
@@ -1331,11 +1318,8 @@ class DSRLAgent(flax.struct.PyTreeNode):
         else:
             lang_dim = int(config.get("language_label_dim", 119))
         batch_shape = ex_observations.shape[:1]
-        base_action_critic_dim = (
-            env_action_dim if str(config.get("online_training_mode", "")) == "sac_residual" else 0
-        )
         ex_embedded = jnp.zeros(batch_shape + (embed_dim,), dtype=jnp.float32)
-        ex_critic_embedded = jnp.zeros(batch_shape + (embed_dim + lang_dim + base_action_critic_dim,), dtype=jnp.float32)
+        ex_critic_embedded = jnp.zeros(batch_shape + (embed_dim + lang_dim,), dtype=jnp.float32)
         ex_env_actions = jnp.zeros(batch_shape + (env_action_dim,), dtype=jnp.float32)
         ex_noise_actions = jnp.zeros(batch_shape + (noise_action_dim,), dtype=jnp.float32)
         ex_t = jnp.zeros(batch_shape + (1,), dtype=jnp.float32)

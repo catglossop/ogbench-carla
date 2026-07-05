@@ -282,6 +282,7 @@ class ReplayBuffer:
         state_dim: int = EGO_STATE_DIM,
         coach_label_dim: int = 0,
         expert_action_dim: int = 0,
+        log_expert_dim: int = 0,
     ):
         self.capacity = capacity
         self.vlm_dim = vlm_dim
@@ -289,6 +290,7 @@ class ReplayBuffer:
         self.state_dim = state_dim
         self.coach_label_dim = coach_label_dim
         self.expert_action_dim = expert_action_dim
+        self.log_expert_dim = log_expert_dim
         self._obs = np.zeros((capacity, vlm_dim), dtype=np.float32)
         self._next_obs = np.zeros((capacity, vlm_dim), dtype=np.float32)
         self._final_actions = np.zeros((capacity, action_dim), dtype=np.float32)
@@ -310,6 +312,12 @@ class ReplayBuffer:
         else:
             self._expert_actions = None
             self._next_expert_actions = None
+        if log_expert_dim > 0:
+            self._log_expert = np.zeros((capacity, log_expert_dim), dtype=np.float32)
+            self._log_expert_valid = np.zeros(capacity, dtype=np.float32)
+        else:
+            self._log_expert = None
+            self._log_expert_valid = None
         self._ptr = 0
         self._size = 0
 
@@ -330,6 +338,7 @@ class ReplayBuffer:
         reward: float,
         done: bool,
         expert_action: Optional[np.ndarray] = None,
+        log_expert_action: Optional[np.ndarray] = None,
     ) -> None:
         self._obs[self._ptr] = obs
         self._next_obs[self._ptr] = next_obs
@@ -347,6 +356,13 @@ class ReplayBuffer:
         if self._expert_actions is not None:
             self._expert_actions[self._ptr] = expert_action if expert_action is not None else 0.0
             self._next_expert_actions[self._ptr] = 0.0  # backfilled via update_next_expert_at
+        if self._log_expert is not None:
+            if log_expert_action is not None:
+                self._log_expert[self._ptr] = log_expert_action
+                self._log_expert_valid[self._ptr] = 1.0
+            else:
+                self._log_expert[self._ptr] = 0.0
+                self._log_expert_valid[self._ptr] = 0.0
         self._ptr = (self._ptr + 1) % self.capacity
         self._size = min(self._size + 1, self.capacity)
 
@@ -377,6 +393,20 @@ class ReplayBuffer:
             n = min(len(next_label), self.coach_label_dim - 1)
             self._next_coach_labels[idx, :n] = next_label[:n]
             self._next_coach_labels[idx, -1] = 1.0
+
+    def update_next_coach_at(self, idx: int, next_coach_label: np.ndarray) -> None:
+        """Overwrite the next-state coach label for an existing buffer slot.
+
+        Used by the synchronous language-bow critic mode to backfill
+        ``next_coach_label`` at step t with the label computed at step t+1.
+        """
+        if self._next_coach_labels is None:
+            return
+        if not (0 <= idx < self.capacity):
+            return
+        label = np.asarray(next_coach_label, dtype=np.float32)
+        n = min(len(label), self.coach_label_dim)
+        self._next_coach_labels[idx, :n] = label[:n]
 
     def update_next_expert_at(self, idx: int, next_expert_action: np.ndarray) -> None:
         """Backfill the next-state expert action for an existing slot.
@@ -411,6 +441,9 @@ class ReplayBuffer:
         if self._expert_actions is not None:
             batch["expert_actions"] = torch.from_numpy(self._expert_actions[idx]).to(device)
             batch["next_expert_actions"] = torch.from_numpy(self._next_expert_actions[idx]).to(device)
+        if self._log_expert is not None:
+            batch["log_expert_actions"] = torch.from_numpy(self._log_expert[idx]).to(device)
+            batch["log_expert_valid"] = torch.from_numpy(self._log_expert_valid[idx]).to(device)
         return batch
 
     def __len__(self) -> int:
@@ -494,6 +527,7 @@ class ResidualSACAgent:
         ticks_per_wp: int = 1,
         coach_label_dim: int = 0,
         expert_action_dim: int = 0,
+        log_q_expert_diff: bool = False,
     ):
         self.gamma = gamma
         # Each SAC "step" covers ticks_per_wp CARLA ticks.  The Bellman discount
@@ -504,6 +538,7 @@ class ResidualSACAgent:
         self.state_dim = state_dim
         self.coach_label_dim = coach_label_dim
         self.expert_action_dim = expert_action_dim
+        self.log_q_expert_diff = log_q_expert_diff
         self.device = torch.device(device)
         self.actor_l2_reg = actor_l2_reg
 
@@ -615,6 +650,32 @@ class ResidualSACAgent:
         critic_loss.backward()
         self.critic_opt.step()
 
+        # ── Q(expert) vs Q(buffer) logging ───────────────────────────────────
+        _q_expert_metrics: Dict[str, float] = {}
+        if self.log_q_expert_diff:
+            # use_expert_in_critic: expert_actions[:, :2] = [accel, steer], [:, 2] = valid
+            if self.expert_action_dim > 0 and expert_actions is not None:
+                _expert_for_q = expert_actions[:, :2]
+                _expert_valid = expert_actions[:, 2] > 0.5
+            # BoW/delta modes: separately stored log_expert_actions
+            elif "log_expert_actions" in batch:
+                _expert_for_q = batch["log_expert_actions"]
+                _expert_valid = batch["log_expert_valid"] > 0.5
+            else:
+                _expert_for_q = None
+                _expert_valid = None
+            if _expert_for_q is not None and _expert_valid is not None and _expert_valid.any():
+                with torch.no_grad():
+                    q1_exp, q2_exp = self.critic(obs, base_actions, _expert_for_q, states, coach_labels, expert_actions)
+                    min_q_exp = torch.min(q1_exp, q2_exp)[_expert_valid]
+                    min_q_buf = torch.min(q1.detach(), q2.detach())[_expert_valid]
+                _q_expert_metrics = {
+                    "q_expert_mean": float(min_q_exp.mean()),
+                    "q_buffer_at_expert_steps": float(min_q_buf.mean()),
+                    "q_expert_minus_buffer": float((min_q_exp - min_q_buf).mean()),
+                    "expert_valid_frac": float(_expert_valid.float().mean()),
+                }
+
         # ── Actor update ──────────────────────────────────────────────────────
         pi, log_probs = self.actor.sample(obs, base_actions, states)
         pi_final = torch.clamp(base_actions + self.res_scale * pi, -1.0, 1.0)
@@ -649,6 +710,7 @@ class ResidualSACAgent:
             "entropy": float(-log_probs.mean()),
             "q_mean": float(min_q_pi.mean()),
             "actor_l2_loss": float(l2_loss),
+            **_q_expert_metrics,
         }
 
     # ── DAgger BC update ──────────────────────────────────────────────────────
