@@ -369,9 +369,23 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
 
     rng = jax.random.PRNGKey(FLAGS.seed)
 
+    # Base flow noise is sized to the MODEL action tensor (action_horizon x
+    # model_action_dim, e.g. 10 x 32), not the env chunk (action_horizon x
+    # vla_action_dim, 10 x 4). This mirrors main_carla.py's rollout
+    # (DSRLAgent._flat_noise_dim): a model-dim draw is written into horizon step 0 of
+    # the flow-noise tensor, whereas a short env-dim draw is broadcast across all
+    # horizon steps. Fall back to the env dim only when the model isn't loaded
+    # (e.g. remote actor, where the noise is ignored server-side anyway).
+    _base_model = getattr(steervla_actor, "model", None)
+    base_noise_dim = (
+        int(_base_model.action_horizon) * int(_base_model.action_dim)
+        if _base_model is not None
+        else action_dim
+    )
+
     def _draw_base_noise(key: jax.Array) -> jnp.ndarray:
         """Fresh Gaussian seed for the base flow ODE (``x ~ N(0, I)``)."""
-        return jax.random.normal(key, (1, action_dim), dtype=jnp.float32)
+        return jax.random.normal(key, (1, base_noise_dim), dtype=jnp.float32)
 
     # Base chunk before encode: it samples + stashes the CoT that the rl_token
     # encoder needs to reproduce the prefix the policy acted on (no-op for others).

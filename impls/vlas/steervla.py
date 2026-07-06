@@ -902,6 +902,7 @@ class SteerVLAActor:
         cfg_ah = min(int(self.action_horizon), model_ah)
         cfg_ad = min(int(self.action_dim), model_ad)
         noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
+        write_ah = cfg_ah
         if input_noise.ndim == 3:
             noise_chunk = input_noise[:, :cfg_ah, :cfg_ad]
         elif int(input_noise.shape[-1]) == int(self.action_horizon) * int(self.action_dim):
