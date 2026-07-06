@@ -146,7 +146,7 @@ _REWARD_KEYS = (
     "reward_terminal",
     "penalty_collision",
     "penalty_outside_route",
-    "penalty_speeding",
+    "penalty_traffic_violation",
     "penalty_steer",
     "penalty_brake",
     "penalty_speed_limit",
@@ -155,11 +155,11 @@ _REWARD_KEYS = (
 # Per-step driving diagnostics (logged under rollout/*).
 _DRIVE_KEYS = (
     "route_progress_pct",
+    "route_progress_delta",
     "lane_offset_m",
     "heading_error_rad",
     "speed_norm",
     "overspeed_frac",
-    "overspeed_kmh",
     "collision_count",
 )
 
@@ -262,19 +262,40 @@ def _viz_frame(obs: dict) -> Optional[np.ndarray]:
     return frame
 
 
-def _annotate_reward(frame: np.ndarray, reward_value: float) -> np.ndarray:
-    """Draw ``r=<value>`` in the top-left corner; no-op if cv2 is unavailable."""
+def _annotate_frame(frame: np.ndarray, obs: dict, *, reward: float, action_flat=None, exec_cfg=None) -> np.ndarray:
+    """Overlay predicted waypoints + a bottom text panel (reward, prompt, reasoning, subtask).
+
+    Prompt/reasoning/subtask are the SteerVLA CoT strings the actor stashes back onto the
+    gym obs dict. No-op passthrough if cv2 is unavailable.
+    """
     try:
         import cv2  # type: ignore
-
-        out = np.ascontiguousarray(frame)
-        cv2.putText(
-            out, f"r={reward_value:+.3f}", (6, 18),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA,
-        )
-        return out
     except Exception:
         return frame
+    out = np.ascontiguousarray(frame)
+    if exec_cfg is not None and action_flat is not None:
+        try:
+            from ogbench.carla.waypoint_viz import annotate_waypoints_on_frame
+
+            out = annotate_waypoints_on_frame(out, action_flat=np.asarray(action_flat), exec_cfg=exec_cfg)
+        except Exception:
+            pass
+
+    def _s(key: str) -> str:
+        v = obs.get(key) if isinstance(obs, dict) else None
+        return v.strip()[:110] if isinstance(v, str) else ""
+
+    lines = [
+        f"r={reward:+.3f}",
+        f"Prompt: {_s('openpi_prompt_text')}",
+        f"Reasoning: {_s('reasoning_text') or _s('reasoning')}",
+        f"Subtask: {_s('subtask_text') or _s('subtask')}",
+    ]
+    h, w = out.shape[:2]
+    canvas = np.vstack([out, np.zeros((13 * len(lines) + 4, w, 3), dtype=np.uint8)])
+    for i, line in enumerate(lines):
+        cv2.putText(canvas, line, (4, h + 13 * (i + 1)), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (255, 255, 255), 1, cv2.LINE_AA)
+    return canvas
 
 
 def _episode_video(frames: list[np.ndarray], fps: float):
@@ -289,13 +310,13 @@ def _episode_video(frames: list[np.ndarray], fps: float):
 
 def _maybe_capture_frame(
     frames: list[np.ndarray], obs: dict, reward: float, *, episode_steps: int, done: bool,
-    log_video: bool, video_every: int,
+    log_video: bool, video_every: int, action_flat=None, exec_cfg=None,
 ) -> None:
     """Append an annotated frame on capture steps (every Nth step + the terminal one)."""
     if log_video and (episode_steps % video_every == 0 or done):
         frame = _viz_frame(obs)
         if frame is not None:
-            frames.append(_annotate_reward(frame, float(reward)))
+            frames.append(_annotate_frame(frame, obs, reward=float(reward), action_flat=action_flat, exec_cfg=exec_cfg))
 
 
 def _log_episode_end(
@@ -323,7 +344,7 @@ def _log_episode_end(
 # --------------------------------------------------------------------------- #
 
 
-def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_holder, state_encoder):
+def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_holder, state_encoder, exec_cfg=None):
     """Residual-SAC online loop. One env.step == one CARLA tick == one transition."""
     base_only = agent is None
     vla_action_dim = int(config["steervla"]["action_dim"])
@@ -418,6 +439,7 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
             _maybe_capture_frame(
                 episode_frames, next_obs, reward, episode_steps=episode_steps, done=done,
                 log_video=log_video, video_every=video_every,
+                action_flat=final, exec_cfg=exec_cfg,
             )
 
             train_info: dict[str, Any] = {}
@@ -564,6 +586,7 @@ def main(_):
             steervla_actor=steervla_actor,
             raw_holder=raw_holder,
             state_encoder=state_encoder,
+            exec_cfg=exec_cfg,
         )
     finally:
         try:

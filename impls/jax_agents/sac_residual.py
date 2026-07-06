@@ -201,10 +201,10 @@ def get_config():
             layer_norm=True,
             discount=0.99,
             tau=0.005,
-            residual_scale=0.3,  # Max residual magnitude (normalized chunk units).
+            residual_scale=0.1,  # Max residual magnitude (normalized chunk units).
             target_entropy=ml_collections.config_dict.placeholder(float),  # None -> auto.
             target_entropy_multiplier=0.5,
-            residual_warmup_steps=100,  # Pure-base env steps before applying the residual.
+            residual_warmup_steps=2000,  # Pure-base env steps before applying the residual.
             updates_per_step=10,
         )
     )
