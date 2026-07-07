@@ -29,6 +29,21 @@ from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import GCValue, LogParam, MLP, default_init
 
 
+def _apply_debug_stop_reward_relabel(batch: dict) -> dict:
+    """Debug task: replace env reward with ``-ego_speed`` (m/s) to encourage stopping.
+
+    Requires the replay field ``ego_speed`` (stored by main_carla_residual when
+    ``debug_task`` is set). Keeps the stored env reward intact for logging.
+    """
+    if "ego_speed" not in batch:
+        raise KeyError(
+            "debug_task requires replay field 'ego_speed' (store CARLA speed m/s in main_carla_residual)."
+        )
+    out = dict(batch)
+    out["rewards"] = -jnp.asarray(out["ego_speed"], dtype=jnp.float32)
+    return out
+
+
 class ResidualActor(nn.Module):
     """Tanh-squashed diagonal-Gaussian residual conditioned on ``(x, base_action)``.
 
@@ -113,6 +128,9 @@ class SACResidualAgent(flax.struct.PyTreeNode):
         rng = rng if rng is not None else self.rng
         rng, actor_rng, critic_rng = jax.random.split(rng, 3)
 
+        if bool(self.config.get("debug_task", False)):
+            batch = _apply_debug_stop_reward_relabel(batch)
+
         critic_loss, critic_info = self.critic_loss(batch, grad_params, critic_rng)
         for k, v in critic_info.items():
             info[f"critic/{k}"] = v
@@ -186,6 +204,7 @@ class SACResidualAgent(flax.struct.PyTreeNode):
             discount=float(config["discount"]),
             tau=float(config["tau"]),
             target_entropy=float(target_entropy),
+            debug_task=bool(config.get("debug_task", False)),
         )
         return cls(rng=rng, network=network, config=flax.core.FrozenDict(agent_config))
 
@@ -214,5 +233,9 @@ def get_config():
             target_entropy_multiplier=0.5,
             residual_warmup_steps=2000,  # Pure-base env steps before applying the residual.
             updates_per_step=10,
+            # Debug task: RL updates use reward = -ego_speed (m/s) instead of env reward,
+            # so the policy should learn to brake to a stop. main_carla_residual stores the
+            # required per-step ``ego_speed`` field only when this is True.
+            debug_task=False,
         )
     )

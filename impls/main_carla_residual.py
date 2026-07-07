@@ -192,6 +192,19 @@ def _ego_control_log(obs: dict) -> dict[str, float]:
     }
 
 
+def _ego_speed_mps(obs: dict) -> np.float32:
+    """CARLA ego speed (m/s) from the gym state vector; 0.0 if unavailable.
+
+    Used only for the ``debug_task`` stop reward (reward = -ego_speed).
+    """
+    if not isinstance(obs, dict):
+        return np.float32(0.0)
+    s = np.asarray(obs.get("state"), dtype=np.float32).reshape(-1)
+    if s.size <= _EGO_STATE_IDX_SPEED:
+        return np.float32(0.0)
+    return np.float32(s[_EGO_STATE_IDX_SPEED])
+
+
 def _chunk_stats_log(name: str, chunk_flat: np.ndarray, action_dim: int) -> dict[str, float]:
     """Per-component scalar summaries of a flattened ``(H, action_dim)`` chunk.
 
@@ -368,6 +381,9 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
     batch_size = int(config["batch_size"])
     updates_per_step = int(config["updates_per_step"])
     capacity = int(config["buffer_capacity"])
+    # Debug task: store per-step ego speed so the agent can relabel reward to -ego_speed
+    # (learn to stop). Keeps the real env reward in the buffer for logging.
+    debug_task = bool(config.get("debug_task", False))
     enable_updates = bool(FLAGS.enable_updates) if FLAGS.enable_updates is not None else bool(config["enable_updates"])
     if base_only:
         print("[main_carla_residual] base_only=True: rolling out the frozen base policy (no RL).", flush=True)
@@ -502,6 +518,9 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
                     next_base_actions=next_base,
                     masks=np.float32(1.0 - float(terminated)),
                 )
+                if debug_task:
+                    # Speed at the state the action was taken from (matches main_carla.py).
+                    transition["ego_speed"] = _ego_speed_mps(obs)
                 if buffer is None:
                     buffer = ReplayBuffer.create(transition, size=capacity)
                 buffer.add_transition(transition)
