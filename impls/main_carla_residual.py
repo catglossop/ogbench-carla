@@ -218,6 +218,21 @@ def _chunk_stats_log(name: str, chunk_flat: np.ndarray, action_dim: int) -> dict
     return out
 
 
+def _accel_steer_stats_log(name: str, vec: np.ndarray) -> dict[str, float]:
+    """Scalar summaries of a 2-D ``[accel, steer]`` action for W&B line charts.
+
+    Used in ``residual_action_space='accel_steer'`` mode, where base/final/residual
+    actions live in the bounded control space rather than the waypoint chunk.
+    """
+    a = np.asarray(vec, dtype=np.float32).reshape(-1)
+    out: dict[str, float] = {}
+    if a.size >= 1:
+        out[f"action/{name}_accel"] = float(a[0])
+    if a.size >= 2:
+        out[f"action/{name}_steer"] = float(a[1])
+    return out
+
+
 def _reward_breakdown_log(info: dict) -> dict[str, float]:
     """Flatten the env reward components + drive diagnostics into a W&B log dict."""
     out: dict[str, float] = {}
@@ -387,10 +402,52 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
         """Fresh Gaussian seed for the base flow ODE (``x ~ N(0, I)``)."""
         return jax.random.normal(key, (1, base_noise_dim), dtype=jnp.float32)
 
+    # Residual action space (see steervla_residual_config.py):
+    #   "waypoint_chunk" (default): the residual acts on the raw normalized 40-D chunk;
+    #       the env decodes the corrected chunk -> waypoints -> PID. The residual thus
+    #       reshapes the waypoints (visible per-step jitter once active).
+    #   "accel_steer": the frozen base chunk is PID-decoded to a bounded 2-D
+    #       [accel, steer] BEFORE the residual (matches routing-commands). The residual
+    #       acts on that 2-D control, the env executes it via _action_to_control, and the
+    #       drawn waypoints stay the (smooth) base plan. Better-conditioned RL problem.
+    # The frozen VLA still produces the 40-D chunk either way; only what the agent /
+    # buffer / env see downstream changes.
+    residual_space = str(config.get("residual_action_space", "waypoint_chunk")).strip().lower()
+    accel_steer = residual_space == "accel_steer"
+    accel_steer_decoder = None
+    if accel_steer:
+        if exec_cfg is None:
+            raise ValueError(
+                "residual_action_space='accel_steer' requires the SteerVLA action-execution "
+                "config (chunk layout) to PID-decode the base chunk into [accel, steer]."
+            )
+        from ogbench.carla.steervla_simlingo_control import SimlingoStyleWaypointDecoder
+
+        accel_steer_decoder = SimlingoStyleWaypointDecoder()
+
+    def _agent_base_action(o: dict, base_chunk: np.ndarray) -> np.ndarray:
+        """Frozen VLA chunk -> agent-facing base action (chunk, or PID-decoded [accel, steer])."""
+        if not accel_steer:
+            return base_chunk
+        return np.asarray(
+            accel_steer_decoder.flat_action_to_accel_steer(
+                base_chunk,
+                state_vec=np.asarray(o["state"], dtype=np.float32),
+                output_action_format=str(exec_cfg["output_action_format"]),
+                action_horizon=int(exec_cfg["action_horizon"]),
+                action_dim=int(exec_cfg["action_dim"]),
+                action_input_space=str(exec_cfg.get("action_input_space", "normalized")),
+            ),
+            dtype=np.float32,
+        )
+
     # Base chunk before encode: it samples + stashes the CoT that the rl_token
     # encoder needs to reproduce the prefix the policy acted on (no-op for others).
+    # ``base_chunk`` is always the raw 40-D VLA chunk (used for the waypoint overlay);
+    # ``base`` is what the agent conditions on (chunk or 2-D [accel, steer]).
     rng, nk = jax.random.split(rng)
-    base = _base_chunk(vla_sample_fn, raw_holder, obs, _draw_base_noise(nk))
+    base_chunk = _base_chunk(vla_sample_fn, raw_holder, obs, _draw_base_noise(nk))
+    base = _agent_base_action(obs, base_chunk)
     x = None if state_encoder is None else state_encoder.encode(obs)
 
     buffer: Optional[ReplayBuffer] = None
@@ -431,7 +488,8 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
             done = bool(terminated or truncated)
 
             rng, nk = jax.random.split(rng)
-            next_base = _base_chunk(vla_sample_fn, raw_holder, next_obs, _draw_base_noise(nk))
+            next_base_chunk = _base_chunk(vla_sample_fn, raw_holder, next_obs, _draw_base_noise(nk))
+            next_base = _agent_base_action(next_obs, next_base_chunk)
             next_x = None if state_encoder is None else state_encoder.encode(next_obs)
 
             if agent is not None:
@@ -450,10 +508,15 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
 
             episode_return += float(reward)
             episode_steps += 1
+            # In accel_steer mode ``final`` is a 2-D control and can't be projected as
+            # waypoints, so draw the (smooth) base chunk plan -- matching how
+            # main_carla.py overlays base waypoints. In chunk mode draw the executed
+            # (residual-perturbed) chunk.
+            viz_action = base_chunk if accel_steer else final
             _maybe_capture_frame(
                 episode_frames, next_obs, reward, episode_steps=episode_steps, done=done,
                 log_video=log_video, video_every=video_every,
-                action_flat=final, exec_cfg=exec_cfg,
+                action_flat=viz_action, exec_cfg=exec_cfg,
             )
 
             train_info: dict[str, Any] = {}
@@ -478,11 +541,25 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
                 # unreadable time-heatmap and mixes 10 horizon steps x 4 heterogeneous
                 # dims; the splits below are the readable, diagnostic signals.)
                 log.update(_ego_control_log(next_obs))
-                log.update(_chunk_stats_log("base", base, vla_action_dim))
-                if agent is not None:
-                    log.update(_chunk_stats_log("final", final, vla_action_dim))
-                    if last_residual is not None:
-                        log.update(_chunk_stats_log("residual", last_residual, vla_action_dim))
+                if accel_steer:
+                    # No waypoint viz for the executed 2-D control, so log it explicitly:
+                    # base = frozen-policy [accel, steer], final = executed, residual =
+                    # applied delta (final - base, i.e. post-clip; 0 during warmup). The
+                    # base_chunk_* stats still track the underlying (drawn) waypoint plan.
+                    log.update(_accel_steer_stats_log("base", base))
+                    log.update(_chunk_stats_log("base_chunk", base_chunk, vla_action_dim))
+                    if agent is not None:
+                        log.update(_accel_steer_stats_log("final", final))
+                        log.update(_accel_steer_stats_log(
+                            "residual",
+                            np.asarray(final, dtype=np.float32) - np.asarray(base, dtype=np.float32),
+                        ))
+                else:
+                    log.update(_chunk_stats_log("base", base, vla_action_dim))
+                    if agent is not None:
+                        log.update(_chunk_stats_log("final", final, vla_action_dim))
+                        if last_residual is not None:
+                            log.update(_chunk_stats_log("residual", last_residual, vla_action_dim))
                 wandb.log(log, step=step)
                 train_logger.log(log, step=step)
 
@@ -501,10 +578,11 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
                 obs, _info = env.reset(seed=FLAGS.seed + episode_count)
                 steervla_actor.reset_action_cache()
                 rng, nk = jax.random.split(rng)
-                base = _base_chunk(vla_sample_fn, raw_holder, obs, _draw_base_noise(nk))
+                base_chunk = _base_chunk(vla_sample_fn, raw_holder, obs, _draw_base_noise(nk))
+                base = _agent_base_action(obs, base_chunk)
                 x = None if state_encoder is None else state_encoder.encode(obs)
             else:
-                obs, x, base = next_obs, next_x, next_base
+                obs, x, base, base_chunk = next_obs, next_x, next_base, next_base_chunk
     finally:
         train_logger.close()
         _flush_checkpoint(last_step or FLAGS.online_steps)
@@ -580,13 +658,28 @@ def main(_):
             from encoders import build_state_encoder
 
             state_encoder = build_state_encoder(config, steervla_actor)
-            action_dim = int(steervla_cfg["action_horizon"]) * int(steervla_cfg["action_dim"])
+            # accel_steer -> the residual acts on the 2-D [accel, steer] control the env
+            # executes; otherwise on the full flattened waypoint chunk.
+            residual_space = str(config.get("residual_action_space", "waypoint_chunk")).strip().lower()
+            if residual_space == "accel_steer":
+                if exec_cfg is None:
+                    raise ValueError(
+                        "residual_action_space='accel_steer' requires the SteerVLA action-execution "
+                        "config (set carla_config['steervla_action_execution'])."
+                    )
+                action_dim = 2
+            else:
+                action_dim = int(steervla_cfg["action_horizon"]) * int(steervla_cfg["action_dim"])
             # Probe the encoded-state width once so the agent's MLPs are sized correctly
             # (encoder output dim is not known until the SteerVLA model loads).
             x_dim = int(state_encoder.encode(obs).shape[-1])
             ex_obs = np.zeros((1, x_dim), dtype=np.float32)
             ex_base = np.zeros((1, action_dim), dtype=np.float32)
-            print(f"[main_carla_residual] state_encoder={state_encoder.name}; x_dim={x_dim}; action_dim={action_dim}", flush=True)
+            print(
+                f"[main_carla_residual] state_encoder={state_encoder.name}; x_dim={x_dim}; "
+                f"action_dim={action_dim}; residual_action_space={residual_space}",
+                flush=True,
+            )
 
             from jax_agents.sac_residual import SACResidualAgent
 

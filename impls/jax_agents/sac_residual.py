@@ -201,7 +201,15 @@ def get_config():
             layer_norm=True,
             discount=0.99,
             tau=0.005,
-            residual_scale=0.1,  # Max residual magnitude (normalized chunk units).
+            residual_scale=0.1,  # Max residual magnitude (units depend on residual_action_space).
+            # Consumed by main_carla_residual.py (the SAC agent itself is space-agnostic):
+            #   "accel_steer" (default) -> base chunk is PID-decoded to a 2-D [accel, steer]
+            #                       control first; the residual acts there (waypoints stay the
+            #                       base plan). Well-conditioned; typically wants residual_scale
+            #                       ~0.5-0.6 since the control is already in [-1, 1].
+            #   "waypoint_chunk" -> residual acts on the flattened normalized 40-D chunk
+            #                       (reshapes the executed waypoints).
+            residual_action_space="accel_steer",
             target_entropy=ml_collections.config_dict.placeholder(float),  # None -> auto.
             target_entropy_multiplier=0.5,
             residual_warmup_steps=2000,  # Pure-base env steps before applying the residual.
