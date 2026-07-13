@@ -39,7 +39,7 @@ def get_config():
     # Each step runs one batched CoT forward plus ``action_decode_batch_size`` micro-batches
     # for action decoding — keep this modest for interactive CARLA rollouts.
     config.best_of_n = 10
-    config.bon_viz_interval = 50
+    config.bon_viz_interval = 100
     # Temperature for the best-of-N CoT sampling (>0 so candidates differ).
     config.vla_cot_temperature = 1.0
     # Denoise steps for the frozen VLA bootstrap forward during RL up\dates.
@@ -54,7 +54,7 @@ def get_config():
     config.update_interval = 10
     # Set to false for rollout-only runs (no RL gradient updates).
     config.enable_updates = True
-    config.buffer_capacity = 1_000
+    config.buffer_capacity = 5_000
     # When true, RL updates use reward = -ego_speed (m/s) instead of env reward.
     config.debug_task = False
     # Best-of-N selects over CoT candidates (not random noise), so the noise-sweep debug is off.
@@ -94,7 +94,9 @@ def get_config():
     # language_label_dim is auto-set from siglip_embed_dim in main_carla.py.
     
     # Critic weights
-    config.critic_pretrained_weights = "/scratch/current/celinet/critic_pretrain/run_20260617_212839/8000"
+    config.critic_pretrained_weights = "/hdd/critic_carla/run_20260617_212839/4000"
+    # config.critic_pretrained_weights = "/hdd/critic_carla/run_20260617_212839/8000"
+    # config.critic_pretrained_weights = "/hdd/critic_carla/run_20260701_233000/80000"
 
     config.steervla = ml_collections.ConfigDict(
         dict(

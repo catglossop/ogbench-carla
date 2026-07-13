@@ -132,7 +132,7 @@ flags.DEFINE_bool(
 )
 
 # flags.DEFINE_string("save_dir", "/raid/users/celine/carla_exps", "Save directory.")
-flags.DEFINE_string("save_dir", "/home/cglossop/exps", "Save directory.")
+flags.DEFINE_string("save_dir", "/home/carla/exps", "Save directory.")
 flags.DEFINE_string("restore_path", None, "Restore path for JAX agents.")
 flags.DEFINE_integer("restore_epoch", None, "Restore epoch.")
 

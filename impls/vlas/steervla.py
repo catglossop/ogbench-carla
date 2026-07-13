@@ -76,7 +76,7 @@ CARLA_STEERVLA_IMAGE_KEYS: tuple[str, ...] = ("base_0_rgb",)
 # ``<OPENPI_DATA_HOME>/<netloc>/<path>``. Point the cache at NFS so large GCS
 # checkpoints are shared across hosts/users instead of filling each box's home dir;
 # the on-disk layout under it is unchanged.
-STEERVLA_CACHE_DIR = "/home/cglossop/.cache/openpi"
+STEERVLA_CACHE_DIR = "/home/carla/.cache/openpi"
 
 
 def _ensure_openpi_cache_dir() -> None:
