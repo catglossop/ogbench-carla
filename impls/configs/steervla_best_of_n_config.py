@@ -39,7 +39,7 @@ def get_config():
     # Each step runs one batched CoT forward plus ``action_decode_batch_size`` micro-batches
     # for action decoding — keep this modest for interactive CARLA rollouts.
     config.best_of_n = 10
-    config.bon_viz_interval = 50
+    config.bon_viz_interval = 100
     # Temperature for the best-of-N CoT sampling (>0 so candidates differ).
     config.vla_cot_temperature = 1.0
     # Denoise steps for the frozen VLA bootstrap forward during RL up\dates.
