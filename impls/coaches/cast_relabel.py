@@ -13,13 +13,27 @@ Pipeline (see ``OnlineCastRelabelSession`` for the online wiring):
 3. **Credit assignment** — a second VLM call maps those GOOD/BAD moments onto the
    specific action chunks in the window.
 4. For each chunk, the VLM suggests several subtasks that would improve the behavior,
-   seeded (open-vocab) by :data:`SEED_SUBTASKS`.
+   seeded (open-vocab) by :data:`SEED_SUBTASKS`, **and** (for chunks whose subtask it
+   changes) a fresh chain-of-thought reasoning trace that justifies the corrected subtask.
 
-Consumption for now is **artifacts + wandb only**: each window is written to a
-``cast_relabel.json`` and, when ``debug`` is enabled, an annotated video (original
-subtask + waypoints/actions already drawn upstream, plus per-chunk GOOD/BAD labels
-and suggested subtasks) is logged to Weights & Biases. Nothing is backfilled into the
-replay buffer or fed to the DSRL critic yet.
+Consumption:
+
+- **Artifacts + wandb** — each window is written to a ``cast_relabel.json`` and, when
+  ``debug`` is enabled, an annotated video (original subtask + waypoints/actions already
+  drawn upstream, plus per-chunk GOOD/BAD labels and suggested subtasks) is logged to W&B.
+- **High-level (VLM backbone) dataset** — every BAD/relabeled chunk is written out as a SteerVLA
+  *high-level* training sample (image + ego state + prompt + corrected subtask + new reasoning
+  trace + the executed action chunk with ``action_loss_mask`` all-``False``). When
+  ``store_good_chunks`` is set (default), GOOD and unlabeled chunks are also stored, but with the
+  **original** subtask/reasoning the model produced (reinforcing good behavior rather than
+  correcting it) instead of a VLM-suggested target.
+  This mirrors OpenPI's ``steervla_hl_datasets`` / ``steervla_hl_dataset_format`` path (see
+  ``openpi.training.steervla_rlds_dataset``), where ``action_supervision=False`` zeroes the
+  action-flow loss so only the CoT/VLM backbone is supervised. These samples are consumed
+  online: ``SteerVLAActor.update_hl`` (``impls/vlas/steervla.py``) loads them, tokenizes the
+  subtask/reasoning as CoT targets with ``action_loss_mask`` all-``False``, and runs an OpenPI
+  gradient step on the trainable SteerVLA train state (``steervla.load_trainable_params``). It is
+  driven from ``DSRLAgent.update_with_vla(..., run_hl=True)`` (gated by ``enable_updates_bc_hl``).
 """
 
 from __future__ import annotations
@@ -45,6 +59,11 @@ from coaches.vlm_feedback import CoachEvent, create_coach
 
 # Default number of subtask suggestions produced per chunk that needs improvement.
 DEFAULT_NUM_SUBTASK_SUGGESTIONS = 3
+
+# Default env action dim for the stored high-level (VLM-backbone) samples. The action head
+# is masked out for HL samples (``action_loss_mask`` all-False), so this only fixes the shape
+# of the stored (unsupervised) action chunk; it should match ``steervla.action_dim``.
+DEFAULT_HL_ACTION_DIM = 4
 
 # Seed phrases for the open-vocabulary subtask generation in step 4. The VLM is told it
 # MAY reuse these verbatim or propose new phrases in the same style. Provided by the user;
@@ -157,12 +176,16 @@ SEED_SUBTASKS: tuple[str, ...] = (
 
 @dataclass(frozen=True)
 class ChunkCredit:
-    """Credit assignment + suggested subtasks for a single action chunk."""
+    """Credit assignment + suggested subtasks (and a new reasoning trace) for one action chunk."""
 
     chunk_index: int
     label: str | None  # "GOOD" | "BAD" | None (no clear signal)
     rationale: str = ""
     suggested_subtasks: tuple[str, ...] = ()
+    # Fresh chain-of-thought reasoning that justifies the corrected subtask. Only populated for
+    # chunks whose subtask the VLM changes (BAD chunks); empty otherwise. Used as the ``reasoning``
+    # target of the stored high-level SteerVLA sample.
+    suggested_reasoning: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -170,6 +193,7 @@ class ChunkCredit:
             "label": self.label,
             "rationale": self.rationale,
             "suggested_subtasks": list(self.suggested_subtasks),
+            "suggested_reasoning": self.suggested_reasoning,
         }
 
     @classmethod
@@ -191,6 +215,7 @@ class ChunkCredit:
             label=label,
             rationale=str(raw.get("rationale", "")).strip(),
             suggested_subtasks=suggested,
+            suggested_reasoning=str(raw.get("suggested_reasoning", "")).strip(),
         )
 
 
@@ -282,6 +307,13 @@ def build_credit_relabel_prompt(
           prematurely while the route is unfinished and the way ahead is clear (no red light,
           stop sign, close leading vehicle, or pedestrian/yield), suggest a subtask that has it
           accelerate and make forward progress along the route.
+        - suggested_reasoning: for BAD chunks whose subtask you are changing, write a fresh,
+          concise chain-of-thought (1-3 sentences, present tense) that a driver would think
+          BEFORE arriving at the corrected subtask — describe what is observed in the scene and
+          why the corrected action is right. This becomes the reasoning that leads to the first
+          corrected subtask. Leave it as "" for GOOD or null chunks (no change needed).
+        
+        **IMPORTANT:** Also try to smooth the subtasks relative to the adjacent subtasks in the chunk. If there is rapid changes of the subtask, you can suggest a subtask that smooths the transition.
 
         Return ONLY valid JSON (no markdown fences):
         {{
@@ -292,7 +324,8 @@ def build_credit_relabel_prompt(
               "rationale": "Overlaps the 2.5s near-miss with the pedestrian.",
               "suggested_subtasks": [
                 "The vehicle smoothly decelerates to a stop, cautiously adjusting course to the left due to a pedestrian."
-              ]
+              ],
+              "suggested_reasoning": "A pedestrian is stepping into the lane ahead on the left, so the vehicle must brake now and ease left to keep clear rather than continue at speed."
             }}
           ]
         }}
@@ -302,6 +335,7 @@ def build_credit_relabel_prompt(
         - Use null (not "none") for label when no event applies.
         - Keep rationale under 50 words.
         - Never exceed {num_suggestions} suggested subtasks per chunk.
+        - suggested_reasoning must be "" unless the chunk is BAD and you changed its subtask.
         """
     ).strip()
 
@@ -330,6 +364,7 @@ def parse_credit_relabel_response(
                 label=credit.label,
                 rationale=credit.rationale,
                 suggested_subtasks=credit.suggested_subtasks[:num_suggestions],
+                suggested_reasoning=credit.suggested_reasoning,
             )
         by_index[credit.chunk_index] = credit
 
@@ -373,6 +408,7 @@ def assemble_cast_relabel_json(
                 "label": credit.label,
                 "rationale": credit.rationale,
                 "suggested_subtasks": list(credit.suggested_subtasks),
+                "suggested_reasoning": credit.suggested_reasoning,
             }
         )
     return {
@@ -439,6 +475,225 @@ def generate_cast_relabel(
         num_suggestions=num_suggestions,
     )
     return events, cast_json
+
+
+# ── High-level (VLM-backbone) dataset in steervla_hl_dataset_format ───────────────────
+
+
+@dataclass
+class HLSample:
+    """One SteerVLA high-level training sample (``steervla_hl_dataset_format`` schema).
+
+    Mirrors the per-frame dict the OpenPI SteerVLA RLDS loader emits for an HL dataset
+    (``openpi.training.steervla_rlds_dataset`` SIMLINGO restructure + ``enable_cot``):
+    an image + ego state + prompt, plus the CoT ``subtask`` / ``reasoning`` targets, and an
+    action chunk whose ``action_loss_mask`` is all-``False`` (``action_supervision=False``) so
+    only the VLM backbone is supervised.
+
+    ``state`` is stored as the **raw CARLA ego-state vector** (index 15 = speed m/s, index 5 =
+    yaw deg) rather than the loader's pre-normalized proprio, so the downstream SteerVLA input
+    transform can normalize it exactly like the online actor does from the same raw obs.
+    """
+
+    image: np.ndarray  # (H, W, 3) uint8
+    state: np.ndarray  # raw CARLA ego-state vector, float32
+    current_speed: float
+    prompt: str
+    subtask: str
+    reasoning: str
+    actions: np.ndarray  # (action_chunk_steps, action_dim) float32 (unsupervised placeholder ok)
+    action_loss_mask: np.ndarray  # (action_chunk_steps,) bool — all False for HL
+    # Provenance (kept in the manifest, not fed to the model).
+    episode: int
+    window_index: int
+    chunk_index: int
+    episode_step: int
+    label: str | None
+
+    def manifest_entry(self, sample_file: str) -> dict[str, Any]:
+        return {
+            "sample_file": sample_file,
+            "prompt": self.prompt,
+            "subtask": self.subtask,
+            "reasoning": self.reasoning,
+            "episode": self.episode,
+            "window_index": self.window_index,
+            "chunk_index": self.chunk_index,
+            "episode_step": self.episode_step,
+            "label": self.label,
+            "image_shape": [int(x) for x in self.image.shape],
+            "state_dim": int(self.state.shape[-1]),
+            "action_chunk_steps": int(self.actions.shape[0]),
+            "action_dim": int(self.actions.shape[-1]),
+            "action_supervision": False,
+        }
+
+
+def _resolve_hl_targets(
+    chunk: dict[str, Any],
+    model_input: dict[str, Any],
+) -> tuple[str, str] | None:
+    """Pick the ``(subtask, reasoning)`` HL targets for one chunk, or ``None`` to skip it.
+
+    - **BAD** chunks are *corrected*: the first suggested subtask becomes the target and the
+      freshly-generated ``suggested_reasoning`` (falling back to the credit rationale) the
+      reasoning. Skipped when the VLM offered no suggestion (nothing to correct toward).
+    - **GOOD / unlabeled** chunks are *reinforced as-is*: the original subtask + reasoning the
+      model produced at rollout (stashed on ``model_input``) become the targets, so good
+      high-level behavior is imitated rather than corrected. Skipped when no original subtask
+      was captured (nothing to reinforce).
+    """
+    label = chunk.get("label")
+    label_str = str(label).strip().upper() if label is not None else ""
+    if label_str == "BAD":
+        suggested = chunk.get("suggested_subtasks") or []
+        if not suggested:
+            return None
+        subtask_target = str(suggested[0]).strip()
+        reasoning_target = str(chunk.get("suggested_reasoning") or "").strip()
+        if not reasoning_target:
+            reasoning_target = str(chunk.get("rationale") or "").strip()
+        return subtask_target, reasoning_target
+
+    # GOOD or no label -> reinforce the original CoT the model produced for this chunk.
+    subtask_target = str(model_input.get("subtask") or "").strip()
+    if not subtask_target:
+        return None
+    reasoning_target = str(model_input.get("reasoning") or "").strip()
+    return subtask_target, reasoning_target
+
+
+def build_hl_samples_from_window(
+    cast_json: dict[str, Any],
+    chunk_specs: list[ActionChunkSpec],
+    traj_window: list[dict[str, Any]],
+    model_inputs: dict[int, dict[str, Any]],
+    *,
+    action_chunk_steps: int,
+    action_dim: int,
+    episode: int,
+    window_index: int,
+    store_good_chunks: bool = True,
+) -> list[HLSample]:
+    """Turn a window's chunks into ``steervla_hl_dataset_format`` samples.
+
+    BAD/relabeled chunks are stored as *corrective* targets. When ``store_good_chunks`` is set,
+    GOOD and unlabeled chunks are also stored, *reinforcing* the original subtask/reasoning the
+    model produced (see :func:`_resolve_hl_targets`). The model input (image / raw state / speed /
+    prompt / executed chunk) is looked up by the chunk's absolute start episode step. Every HL
+    sample keeps ``action_loss_mask`` all-``False`` (``action_supervision=False``): ``update_hl``
+    supervises only the VLM backbone, so GOOD and BAD chunks alike train the CoT, not the action.
+    """
+    specs_by_index = {int(s.chunk_index): s for s in chunk_specs}
+    samples: list[HLSample] = []
+    for chunk in cast_json.get("action_chunks", []):
+        label = chunk.get("label")
+        label_str = str(label).strip().upper() if label is not None else ""
+        is_bad = label_str == "BAD"
+        if not is_bad and not store_good_chunks:
+            continue
+        chunk_index = int(chunk.get("chunk_index", -1))
+        spec = specs_by_index.get(chunk_index)
+        if spec is None:
+            continue
+        # Window-relative 1-based start step -> the recorded trajectory step -> absolute episode step.
+        traj_idx = int(spec.episode_step_start) - 1
+        if traj_idx < 0 or traj_idx >= len(traj_window):
+            continue
+        abs_episode_step = int(traj_window[traj_idx].get("episode_step", -1))
+        model_input = model_inputs.get(abs_episode_step)
+        if model_input is None or model_input.get("image") is None:
+            # No captured model input for this chunk start (e.g. state-only obs); skip.
+            continue
+
+        targets = _resolve_hl_targets(chunk, model_input)
+        if targets is None:
+            continue
+        subtask_target, reasoning_target = targets
+
+        prompt = str(model_input.get("prompt") or "").strip()
+        actions_src = model_input.get("action_chunk")
+        actions = _shape_hl_action_chunk(actions_src, action_chunk_steps, action_dim)
+        action_loss_mask = np.zeros((int(action_chunk_steps),), dtype=bool)
+
+        samples.append(
+            HLSample(
+                image=np.asarray(model_input["image"], dtype=np.uint8),
+                state=np.asarray(model_input.get("state"), dtype=np.float32).reshape(-1),
+                current_speed=float(model_input.get("current_speed", 0.0)),
+                prompt=prompt,
+                subtask=subtask_target,
+                reasoning=reasoning_target,
+                actions=actions,
+                action_loss_mask=action_loss_mask,
+                episode=int(episode),
+                window_index=int(window_index),
+                chunk_index=chunk_index,
+                episode_step=abs_episode_step,
+                label=(label_str or None),
+            )
+        )
+    return samples
+
+
+def _shape_hl_action_chunk(
+    actions_src: Any,
+    action_chunk_steps: int,
+    action_dim: int,
+) -> np.ndarray:
+    """Coerce a (possibly flattened / missing) executed chunk to ``(action_chunk_steps, action_dim)``.
+
+    The stored chunk is unsupervised for HL samples (``action_loss_mask`` all-False), so a
+    zero placeholder is fine when the executed action is unavailable or mis-shaped.
+    """
+    steps = int(action_chunk_steps)
+    dim = int(action_dim)
+    out = np.zeros((steps, dim), dtype=np.float32)
+    if actions_src is None:
+        return out
+    arr = np.asarray(actions_src, dtype=np.float32).reshape(-1)
+    if arr.size == steps * dim:
+        return arr.reshape(steps, dim)
+    if arr.size == dim:  # single-step action; place it in the first row.
+        out[0, :] = arr
+    return out
+
+
+def write_hl_samples(samples: list[HLSample], out_dir: Path) -> list[dict[str, Any]]:
+    """Persist HL samples: one ``.npz`` (arrays) per sample + a ``hl_samples.json`` manifest.
+
+    Layout (per window ``tag`` dir)::
+
+        <out_dir>/sample_0000.npz   # image, state, current_speed, actions, action_loss_mask
+        <out_dir>/hl_samples.json   # dataset_format + per-sample text targets + provenance
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest: list[dict[str, Any]] = []
+    for i, s in enumerate(samples):
+        sample_file = f"sample_{i:04d}.npz"
+        np.savez_compressed(
+            out_dir / sample_file,
+            image=s.image,
+            state=s.state,
+            current_speed=np.float32(s.current_speed),
+            actions=s.actions,
+            action_loss_mask=s.action_loss_mask,
+        )
+        manifest.append(s.manifest_entry(sample_file))
+    (out_dir / "hl_samples.json").write_text(
+        json.dumps(
+            {
+                "dataset_format": "steervla_hl_dataset_format",
+                "action_supervision": False,
+                "num_samples": len(manifest),
+                "samples": manifest,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return manifest
 
 
 # ── Debug annotation (GOOD/BAD + suggested subtasks side panel) ───────────────────────
@@ -555,6 +810,16 @@ class OnlineCastRelabelSession:
         self.save_artifacts = bool(self.cfg.get("save_artifacts", True))
         self.debug = bool(self.cfg.get("debug", False))
         self.query_on_episode_end = bool(self.cfg.get("query_on_episode_end", True))
+        # High-level (VLM-backbone) dataset storage: persist BAD/relabeled chunks as SteerVLA
+        # ``steervla_hl_dataset_format`` samples for a later VLM-backbone fine-tuning step.
+        self.store_hl_dataset = bool(self.cfg.get("store_hl_dataset", True))
+        # Also reinforce GOOD/unlabeled chunks by storing their original (uncorrected) subtask +
+        # reasoning as HL samples. Set False to keep the dataset corrective (BAD chunks only).
+        self.store_good_chunks = bool(self.cfg.get("store_good_chunks", True))
+        self.hl_action_dim = int(self.cfg.get("hl_action_dim", DEFAULT_HL_ACTION_DIM))
+        self.hl_dataset_dir = self.save_dir / str(self.cfg.get("hl_dataset_subdir", "cast_relabel_hl_dataset"))
+        if self.store_hl_dataset:
+            self.hl_dataset_dir.mkdir(parents=True, exist_ok=True)
         # When set, render the trajectory graphs (speed / throttle / steer / brake / route
         # progress vs video time) per window and attach them to the VLM coach prompt.
         self.include_plots_in_prompt = bool(self.cfg.get("include_plots_in_prompt", False))
@@ -586,6 +851,7 @@ class OnlineCastRelabelSession:
                     flush=True,
                 )
         self.window_count = 0
+        self.hl_sample_count = 0
         self.reset_episode()
 
     # ── recording ────────────────────────────────────────────────────────────────
@@ -600,6 +866,9 @@ class OnlineCastRelabelSession:
         self._traj_cursor = 0
         self._last_query_episode_step = 0
         self.route_command_plan: list[dict[str, Any]] = []
+        # Raw model inputs captured at chunk-start steps (abs episode step -> dict), used to build
+        # high-level dataset samples at window review time. Cleared per window.
+        self._model_inputs: dict[int, dict[str, Any]] = {}
 
     def begin_episode(
         self,
@@ -623,6 +892,41 @@ class OnlineCastRelabelSession:
 
     def record_trajectory_step(self, step_record: dict[str, Any]) -> None:
         self.trajectory_steps.append(dict(step_record))
+
+    def record_model_input(
+        self,
+        *,
+        episode_step: int,
+        image: np.ndarray | None,
+        state: np.ndarray | None,
+        current_speed: float = 0.0,
+        prompt: str = "",
+        subtask: str = "",
+        reasoning: str = "",
+        action_chunk: np.ndarray | None = None,
+    ) -> None:
+        """Stash the raw SteerVLA model input for the high-level dataset (chunk-start steps only).
+
+        Called every env step; only the first step of each action chunk is retained (that's the
+        one frame we need per chunk). ``image``/``state`` are the raw pre-step obs the action was
+        taken from (``obs["image"]`` / ``obs["state"]``), not the annotated video frame. ``subtask``
+        / ``reasoning`` are the **original** CoT targets the model produced for this chunk — used as
+        the HL supervision targets when a GOOD/unlabeled chunk is reinforced as-is.
+        """
+        if not self.store_hl_dataset or image is None:
+            return
+        # Chunk starts are every ``action_chunk_steps`` env steps from the (1-based) episode start.
+        if (int(episode_step) - 1) % max(1, self.action_chunk_steps) != 0:
+            return
+        self._model_inputs[int(episode_step)] = {
+            "image": np.asarray(image, dtype=np.uint8),
+            "state": None if state is None else np.asarray(state, dtype=np.float32).reshape(-1),
+            "current_speed": float(current_speed),
+            "prompt": str(prompt or ""),
+            "subtask": str(subtask or ""),
+            "reasoning": str(reasoning or ""),
+            "action_chunk": None if action_chunk is None else np.asarray(action_chunk, dtype=np.float32),
+        }
 
     # ── querying ─────────────────────────────────────────────────────────────────
     def should_query(self, episode_step: int, *, force: bool = False) -> bool:
@@ -662,6 +966,7 @@ class OnlineCastRelabelSession:
             traceback.print_exc()
             self._frames_cursor = len(self.frames)
             self._traj_cursor = len(self.trajectory_steps)
+            self._model_inputs = {}
         self._last_query_episode_step = episode_step
         return True
 
@@ -791,16 +1096,65 @@ class OnlineCastRelabelSession:
         )
         (work_dir / "cast_relabel.json").write_text(json.dumps(cast_json, indent=2), encoding="utf-8")
 
+        # Persist BAD/relabeled chunks as high-level (VLM-backbone) SteerVLA samples.
+        n_hl = self._store_hl_samples(cast_json, metadata, traj_window, tag)
+
         if self.debug:
             self._log_debug_video(frames_window, subtasks_window, cast_json, global_step=global_step)
-        self._log_scalars(events, cast_json, global_step=global_step)
+        self._log_scalars(events, cast_json, n_hl_samples=n_hl, global_step=global_step)
 
         # Advance cursors so the next window starts fresh.
         self._frames_cursor = len(self.frames)
         self._traj_cursor = len(self.trajectory_steps)
+        self._model_inputs = {}
 
         if self.save_artifacts:
             print(f"[cast_relabel] saved artifacts under {work_dir}", flush=True)
+
+    def _store_hl_samples(
+        self,
+        cast_json: dict[str, Any],
+        metadata: dict[str, Any],
+        traj_window: list[dict[str, Any]],
+        tag: str,
+    ) -> int:
+        """Build + persist high-level dataset samples for this window; return the count stored."""
+        if not self.store_hl_dataset:
+            return 0
+        try:
+            chunk_specs = build_action_chunk_specs(
+                metadata,
+                steps_per_chunk=self.action_chunk_steps,
+                chunk_duration_sec=self.chunk_duration_sec,
+            )
+            hl_samples = build_hl_samples_from_window(
+                cast_json,
+                chunk_specs,
+                traj_window,
+                self._model_inputs,
+                action_chunk_steps=self.action_chunk_steps,
+                action_dim=self.hl_action_dim,
+                episode=self.episode_count,
+                window_index=self.window_count,
+                store_good_chunks=self.store_good_chunks,
+            )
+            if not hl_samples:
+                return 0
+            hl_dir = self.hl_dataset_dir / tag
+            write_hl_samples(hl_samples, hl_dir)
+            self.hl_sample_count += len(hl_samples)
+            print(
+                f"[cast_relabel] wrote {len(hl_samples)} high-level samples "
+                f"(total {self.hl_sample_count}) -> {hl_dir}",
+                flush=True,
+            )
+            return len(hl_samples)
+        except Exception as exc:  # noqa: BLE001 - HL storage must never break the run.
+            import traceback
+
+            print(f"[cast_relabel] HL sample storage failed (non-fatal): {exc}", flush=True)
+            traceback.print_exc()
+            return 0
 
     # ── logging ──────────────────────────────────────────────────────────────────
     def _log_debug_video(
@@ -837,6 +1191,7 @@ class OnlineCastRelabelSession:
         events: list[CoachEvent],
         cast_json: dict[str, Any],
         *,
+        n_hl_samples: int = 0,
         global_step: int | None,
     ) -> None:
         try:
@@ -856,15 +1211,20 @@ class OnlineCastRelabelSession:
             "cast_relabel/n_good_chunks": n_good,
             "cast_relabel/n_bad_chunks": n_bad,
             "cast_relabel/n_relabeled_chunks": n_relabeled,
+            "cast_relabel/n_hl_samples_window": int(n_hl_samples),
+            "cast_relabel/hl_samples_total": int(self.hl_sample_count),
         }
         if self.debug and chunks:
-            tbl = wandb.Table(columns=["chunk_index", "label", "rationale", "suggested_subtasks"])
+            tbl = wandb.Table(
+                columns=["chunk_index", "label", "rationale", "suggested_subtasks", "suggested_reasoning"]
+            )
             for c in chunks:
                 tbl.add_data(
                     c.get("chunk_index"),
                     c.get("label"),
                     c.get("rationale"),
                     " | ".join(c.get("suggested_subtasks") or []),
+                    c.get("suggested_reasoning"),
                 )
             log["cast_relabel/chunks"] = tbl
         wandb.log(log, step=global_step)

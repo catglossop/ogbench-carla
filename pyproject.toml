@@ -17,6 +17,7 @@ dependencies = [
     "carla",
     "jax[cuda12]>=0.5.3",
     "google-genai>=2.5.0",
+    "distrax>=0.1.5",
 ]
 authors = [
     { name = "Seohong Park" },

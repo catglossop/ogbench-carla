@@ -34,7 +34,7 @@ def get_config():
     config = best_of_n_agent.get_config()
 
     config.lr = 3e-4
-    config.batch_size = 32
+    config.batch_size = 256
     # Number of CoT candidates sampled per env step; the critic picks the argmax-Q chunk.
     # Each step runs one batched CoT forward plus ``action_decode_batch_size`` micro-batches
     # for action decoding — keep this modest for interactive CARLA rollouts.
@@ -47,14 +47,21 @@ def get_config():
     config.noise_scale = 1.0
     config.alpha = 0.1
     # Collect transitions with the rollout policy but skip RL updates for this many env steps.
-    config.warmup_steps = 200
+    config.warmup_steps = 500
     config.warmup_use_random_actions = False
     config.updates_per_step = 5
     # Run RL gradient updates every N env steps (still ``updates_per_step`` per update).
     config.update_interval = 10
-    # Set to false for rollout-only runs (no RL gradient updates).
-    config.enable_updates = True
-    config.buffer_capacity = 1_000
+    # Master switch: set to false for rollout-only runs (no gradient updates of any kind).
+    config.enable_updates = False
+    # Per-kind switches, each ANDed with ``enable_updates``:
+    #   rl    -> critic/actor (RL) updates
+    #   bc    -> full BC / DAgger imitation path (``update_dagger``)
+    #   bc_hl -> high-level VLM backbone update (no-op for best-of-N; kept for parity)
+    config.enable_updates_rl = False
+    config.enable_updates_bc = False
+    config.enable_updates_bc_hl = False
+    config.buffer_capacity = 5_000
     # When true, RL updates use reward = -ego_speed (m/s) instead of env reward.
     config.debug_task = False
     # Best-of-N selects over CoT candidates (not random noise), so the noise-sweep debug is off.
@@ -75,12 +82,13 @@ def get_config():
     config.image_encoder = "siglip"
     config.siglip_model_id = "google/siglip2-so400m-patch14-384"
     # Subtask is the critic label, so the observation can stay image-only (no prompt/subtask concat).
-    config.siglip_include_prompt_subtask = False
+    config.siglip_include_prompt_subtask = True
     # Run SigLIP on GPU. Within the run's CUDA_VISIBLE_DEVICES this maps to the same
     # physical GPU as JAX (the sim renderer is on a different GPU via carla_config.gpu_rank).
     # Keep this on GPU on many-core machines: SigLIP-on-CPU oversubscribes torch's intra-op
     # thread pool (defaults to core count) and thrashes the box.
-    config.siglip_device = "cuda"
+    # Relative to CUDA_VISIBLE_DEVICES (set to the physical training GPU, e.g. 6).
+    config.siglip_device = "cuda:0"
     config.image_keys = ("base_0_rgb",)
     # JAX RL device: ``-1`` = unset. CARLA uses ``gpu_rank`` in carla_config.yaml.
     config.training_gpu_rank = 0
@@ -94,7 +102,7 @@ def get_config():
     # language_label_dim is auto-set from siglip_embed_dim in main_carla.py.
     
     # Critic weights
-    config.critic_pretrained_weights = "/scratch/current/celinet/critic_pretrain/run_20260617_212839/8000"
+    config.critic_pretrained_weights = "/raid/users/cglossop/critic_carla/run_20260701_233000/4000"
 
     config.steervla = ml_collections.ConfigDict(
         dict(

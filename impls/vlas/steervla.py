@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import json
 import re
 import time
 from pathlib import Path
@@ -119,9 +120,164 @@ def restore_openpi_params_on_single_gpu(
         device = gpus[idx]
     else:
         device = jax.devices()[0]
-    sharding = SingleDeviceSharding(device)
-    params = _openpi_model.restore_params(params_dir, sharding=sharding)
+    single_sharding = SingleDeviceSharding(device)
+    params = _openpi_model.restore_params(params_dir, sharding=single_sharding)
     return params, device
+
+
+def _pick_single_gpu_device(training_gpu_rank: int = -1) -> jax.Device:
+    """Resolve the single accelerator to place SteerVLA on (same policy as the restore helper)."""
+    try:
+        gpus = jax.devices("gpu")
+    except RuntimeError:
+        gpus = []
+    if gpus:
+        idx = training_gpu_rank if training_gpu_rank >= 0 else 0
+        idx = min(max(idx, 0), len(gpus) - 1)
+        return gpus[idx]
+    return jax.devices()[0]
+
+
+def _load_weights_and_validate(
+    loader: _weight_loaders.WeightLoader,
+    params_shape: at.Params,
+) -> at.Params:
+    """Load + validate a checkpoint subset against the target param shapes.
+
+    Verbatim port of ``scripts/train.py :: _load_weights_and_validate`` so the trainable-state path
+    here matches OpenPI training exactly.
+    """
+    loaded_params = loader.load(params_shape)
+    at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
+    # Drop jax.ShapeDtypeStruct leaves so only the actually-loaded params are returned.
+    return traverse_util.unflatten_dict(
+        {
+            k: v
+            for k, v in traverse_util.flatten_dict(loaded_params).items()
+            if not isinstance(v, jax.ShapeDtypeStruct)
+        }
+    )
+
+
+def init_openpi_train_state_single_gpu(
+    train_cfg: openpi_train_config.TrainConfig,
+    *,
+    training_gpu_rank: int = -1,
+):
+    """Build a **full trainable** OpenPI ``TrainState`` pinned to one accelerator.
+
+    Mirrors ``scripts/train.py :: init_train_state`` (fresh model → merge checkpoint params →
+    cast frozen params to bf16 → optimizer + ``opt_state`` over the trainable filter), but places
+    the whole state on a single-device mesh instead of the training FSDP mesh so the online CARLA
+    actor does not replicate weights across every visible GPU.
+
+    Returns ``(train_state, mesh, device)``. ``train_state.tx`` / ``opt_state`` are ready for
+    gradient steps; ``nnx.merge(train_state.model_def, train_state.params)`` reconstructs the model.
+    """
+    device = _pick_single_gpu_device(training_gpu_rank)
+    mesh = jax.sharding.Mesh(
+        np.asarray([device]).reshape(1, 1),
+        (sharding.BATCH_AXIS, sharding.FSDP_AXIS),
+    )
+    replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+    tx = _optimizer.create_optimizer(train_cfg.optimizer, train_cfg.lr_schedule, weight_decay_mask=None)
+
+    def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
+        rng, model_rng = jax.random.split(rng)
+        model = train_cfg.model.create(model_rng)
+        if partial_params is not None:
+            graphdef, state = nnx.split(model)
+            # Errors if the partial params are not a subset of the state.
+            state.replace_by_pure_dict(partial_params)
+            model = nnx.merge(graphdef, state)
+        params = nnx.state(model)
+        # Convert frozen params to bfloat16 (trainable params stay full precision).
+        params = nnx_utils.state_map(
+            params, train_cfg.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16))
+        )
+        return training_utils.TrainState(
+            step=0,
+            params=params,
+            model_def=nnx.graphdef(model),
+            tx=tx,
+            opt_state=tx.init(params.filter(train_cfg.trainable_filter)),
+            ema_decay=train_cfg.ema_decay,
+            ema_params=None if train_cfg.ema_decay is None else params,
+        )
+
+    init_rng = jax.random.key(0)
+    train_state_shape = jax.eval_shape(init, init_rng)
+    state_sharding = sharding.fsdp_sharding(train_state_shape, mesh, log=False)
+
+    partial_params = _load_weights_and_validate(train_cfg.weight_loader, train_state_shape.params.to_pure_dict())
+
+    train_state = jax.jit(
+        init,
+        donate_argnums=(1,),  # donate the partial params buffer.
+        in_shardings=replicated_sharding,
+        out_shardings=state_sharding,
+    )(init_rng, partial_params)
+
+    return train_state, mesh, device
+
+
+def _openpi_hl_train_step(
+    config: openpi_train_config.TrainConfig,
+    rng: jax.Array,
+    state: training_utils.TrainState,
+    batch: tuple[_openpi_model.Observation, jnp.ndarray],
+):
+    """One OpenPI gradient step, jit-friendly (bind ``config`` via ``functools.partial``).
+
+    Verbatim port of ``scripts/train.py :: train_step`` (grads filtered to
+    ``config.trainable_filter``, ``tx.update`` + ``optax.apply_updates``, EMA). For the CAST-relabel
+    high-level (VLM-backbone) update the batch is built with ``action_loss_mask`` all-``False`` so the
+    action-flow loss is zero — the action-expert params receive no gradient and only the CoT/VLM
+    backbone is updated, exactly like OpenPI's ``steervla_hl_datasets`` (``action_supervision=False``).
+    """
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
+
+    def loss_fn(model, rng, observation, actions):
+        if hasattr(model, "compute_loss_with_aux"):
+            chunked_loss, aux_metrics = model.compute_loss_with_aux(rng, observation, actions, train=True)
+        else:
+            chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+            aux_metrics = {}
+        loss = jnp.mean(chunked_loss)
+        reduced_aux = {k: jnp.mean(v) for k, v in aux_metrics.items()}
+        return loss, reduced_aux
+
+    train_rng = jax.random.fold_in(rng, state.step)
+    observation, actions = batch
+
+    diff_state = nnx.DiffState(0, config.trainable_filter)
+    (loss, aux_metrics), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
+
+    params = state.params.filter(config.trainable_filter)
+    updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+
+    nnx.update(model, new_params)
+    new_params = nnx.state(model)
+
+    new_state = dataclasses.replace(state, step=state.step + 1, params=new_params, opt_state=new_opt_state)
+    if state.ema_decay is not None:
+        new_state = dataclasses.replace(
+            new_state,
+            ema_params=jax.tree.map(
+                lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new,
+                state.ema_params,
+                new_params,
+            ),
+        )
+
+    info = {"loss": loss, "grad_norm": optax.global_norm(grads)}
+    info.update(aux_metrics)
+    return new_state, info
 
 
 @dataclasses.dataclass(frozen=True)
@@ -654,6 +810,11 @@ class SteerVLAActor:
         sample_actions_num_steps: int = 10,
         action_decode_batch_size: int = 2,
         training_gpu_rank: int = -1,
+        load_trainable_params: bool = False,
+        hl_dataset_dir: str | Path | None = None,
+        hl_update_every: int = 1,
+        hl_update_batch_size: int = 2,
+        hl_update_num_steps: int = 1,
         return_normalized_action_chunk: bool = False,
         fixed_subtask_text: Optional[str] = None,
         fixed_reasoning_text: Optional[str] = None,
@@ -673,6 +834,18 @@ class SteerVLAActor:
 
         self.actor_config = actor_config
         self.checkpoint_path = checkpoint_path
+        self.load_trainable_params = bool(load_trainable_params)
+        # High-level (VLM-backbone) online update from a stored steervla_hl_dataset_format dataset
+        # (written by coaches.cast_relabel). Consumed by :meth:`update_hl`, which the DSRL agent
+        # calls from ``update_with_vla``. ``hl_dataset_dir`` is usually set by ``main_carla`` after
+        # construction (it links the actor to the CAST-relabel session's dataset dir).
+        self.hl_dataset_dir: Path | None = Path(hl_dataset_dir) if hl_dataset_dir is not None else None
+        self.hl_update_every = max(1, int(hl_update_every))
+        self.hl_update_batch_size = max(1, int(hl_update_batch_size))
+        self.hl_update_num_steps = max(1, int(hl_update_num_steps))
+        self._hl_train_step = None
+        self._hl_update_calls = 0
+        self._weights_dirty = False
         self.raw_obs_holder = raw_obs_holder
         self.routing_command = routing_command
         self.cot_temperature = float(cot_temperature)
@@ -770,10 +943,26 @@ class SteerVLAActor:
             weight_loader=_weight_loaders.CheckpointWeightLoader(str(params_dir)),
         )
 
-        params, device = restore_openpi_params_on_single_gpu(params_dir=params_dir, training_gpu_rank=training_gpu_rank)
-        
-        self.model = self.train_cfg.model.load(params)
-        self._jax_device = device
+        if self.load_trainable_params:
+            # Full trainable state (optimizer + opt_state + freeze/trainable filters), pinned to one
+            # GPU. Matches ``scripts/train.py :: init_train_state`` so the actor's weights can be
+            # gradient-updated. ``self.model`` is reconstructed from the live (non-EMA) params.
+            print("Loading SteerVLA as a trainable model (full train state).", flush=True)
+            train_state, mesh, device = init_openpi_train_state_single_gpu(
+                self.train_cfg,
+                training_gpu_rank=training_gpu_rank,
+            )
+            self._train_state = train_state
+            self._mesh = mesh
+            self.model = nnx.merge(train_state.model_def, train_state.params)
+            self._jax_device = device
+        else:
+            # Inference-only: restore params once onto a single GPU and share them with the model.
+            params, device = restore_openpi_params_on_single_gpu(
+                params_dir=params_dir, training_gpu_rank=training_gpu_rank
+            )
+            self.model = self.train_cfg.model.load(params)
+            self._jax_device = device
 
         self.tokenizer = CoTPaligemmaTokenizer(
             max_prompt_len=model_cfg.max_token_len,
@@ -787,6 +976,22 @@ class SteerVLAActor:
             self.train_cfg,
             ckpt_root,
         )
+        self._build_sample_wrappers()
+
+        if self.load_trainable_params and self._train_state is not None:
+            # Jitted high-level train step; ``config`` is bound via partial so it stays static.
+            self._hl_train_step = jax.jit(functools.partial(_openpi_hl_train_step, self.train_cfg))
+            if self._train_rng is None:
+                self._train_rng = jax.random.key(0)
+
+        self._local_ready = True
+
+    def _build_sample_wrappers(self) -> None:
+        """(Re)build the jitted inference kernels bound to the current ``self.model``.
+
+        ``nnx_utils.module_jit`` freezes the module state at creation, so these must be rebuilt
+        after any in-place weight update (see :meth:`_refresh_inference_weights`).
+        """
         self._sample_actions = nnx_utils.module_jit(
             self.model.sample_actions,
             static_argnames=(
@@ -803,8 +1008,190 @@ class SteerVLAActor:
                 "image_keys",
             ),
         )
-        
-        self._local_ready = True
+
+    def _refresh_inference_weights(self) -> None:
+        """Rebuild the model + inference kernels from the train state after a HL update.
+
+        Called lazily at the start of each inference entrypoint so multiple HL updates between
+        rollouts trigger at most one rebuild. ``module_jit`` snapshots weights, hence the rebuild.
+        """
+        if not self._weights_dirty or self._train_state is None:
+            return
+        self.model = nnx.merge(self._train_state.model_def, self._train_state.params)
+        self._build_sample_wrappers()
+        self._weights_dirty = False
+
+    # ------------------------------------------------------------------
+    # High-level (VLM-backbone) online update from the cast_relabel HL dataset
+    # ------------------------------------------------------------------
+
+    def _scan_hl_dataset(self) -> list[dict[str, Any]]:
+        """List all stored high-level samples (one entry per ``sample_*.npz`` + its text targets)."""
+        entries: list[dict[str, Any]] = []
+        root = self.hl_dataset_dir
+        if root is None or not Path(root).is_dir():
+            return entries
+        for manifest_path in sorted(Path(root).glob("*/hl_samples.json")):
+            try:
+                manifest = json.loads(manifest_path.read_text())
+            except Exception:
+                continue
+            work_dir = manifest_path.parent
+            for s in manifest.get("samples", []):
+                entries.append(
+                    {
+                        "dir": work_dir,
+                        "file": s.get("sample_file"),
+                        "prompt": s.get("prompt", ""),
+                        "subtask": s.get("subtask", ""),
+                        "reasoning": s.get("reasoning", ""),
+                    }
+                )
+        return entries
+
+    def _load_hl_batch(self, batch_size: int):
+        """Sample a full batch (without replacement) of stored HL samples.
+
+        Returns ``None`` until the dataset holds at least ``batch_size`` samples, so the first
+        VLM-backbone gradient step only fires once enough distinct cast_relabel windows have been
+        collected. Once the pool is large enough, ``batch_size`` samples are drawn uniformly at
+        random without replacement (a fresh random subset each call).
+        """
+        bs = int(batch_size)
+        entries = self._scan_hl_dataset()
+        if len(entries) < bs:
+            return None
+        idxs = np.random.choice(len(entries), size=bs, replace=False)
+        images, states, prompts, subtasks, reasonings = [], [], [], [], []
+        for i in idxs:
+            e = entries[int(i)]
+            npz_path = Path(e["dir"]) / str(e["file"])
+            if not npz_path.is_file():
+                continue
+            with np.load(npz_path) as z:
+                images.append(np.asarray(z["image"], dtype=np.uint8))
+                states.append(np.asarray(z["state"], dtype=np.float32).reshape(-1))
+            prompts.append(str(e.get("prompt", "")))
+            subtasks.append(str(e.get("subtask", "")))
+            reasonings.append(str(e.get("reasoning", "")))
+        if not images:
+            return None
+        return images, states, prompts, subtasks, reasonings
+
+    def _build_hl_observation_batch(self, images, states, prompts, subtasks, reasonings):
+        """Build ``(Observation, actions)`` for :meth:`update_hl` with CoT targets and a zero action mask.
+
+        Mirrors :meth:`build_observation_batch_numpy` (image / proprio / prompt tokenization) but the
+        reasoning + subtask tokens are the **training targets** and ``action_loss_mask`` is all-``False``
+        so only the VLM backbone is supervised (the action head gets zero flow-loss gradient).
+        """
+        assert self.model is not None and self.model_cfg is not None and self.tokenizer is not None
+        model_action_dim = int(self.model_cfg.action_dim)
+        model_ah = int(self.model.action_horizon)
+        model_ad = int(self.model.action_dim)
+
+        img_batch, state_batch = [], []
+        prompt_ids, prompt_masks = [], []
+        rea_ids, rea_masks, sub_ids, sub_masks = [], [], [], []
+        for image, state_vec, prompt, subtask, reasoning in zip(images, states, prompts, subtasks, reasonings):
+            state_pad = carla_state_vec_to_steervla_state(
+                state_vec,
+                include_ego_history=self.include_ego_history,
+                proprio_norm=self.proprio_norm,
+            )
+            prompt_text = (str(prompt).strip() or self.routing_command)
+            tok_ids, tok_mask = self.tokenizer.tokenize_prompt(
+                prompt_text, state_pad, state_dim=self.prompt_state_dim
+            )
+            state_norm = self._normalize_state_batch(state_pad)[0]
+            state_for_model = pad_to_dim(state_norm, model_action_dim)
+
+            rea_tok, rea_mask = self.tokenizer.tokenize_reasoning(str(reasoning).strip() or "Follow the route.")
+            sub_tok, sub_mask = self.tokenizer.tokenize_subtask(str(subtask).strip() or "Follow the route.")
+
+            img_batch.append(np.asarray(image, dtype=np.uint8))
+            state_batch.append(np.asarray(state_for_model, dtype=np.float32))
+            prompt_ids.append(np.asarray(tok_ids, dtype=np.int32))
+            prompt_masks.append(np.asarray(tok_mask, dtype=bool))
+            rea_ids.append(np.asarray(rea_tok, dtype=np.int32))
+            rea_masks.append(np.asarray(rea_mask, dtype=bool))
+            sub_ids.append(np.asarray(sub_tok, dtype=np.int32))
+            sub_masks.append(np.asarray(sub_mask, dtype=bool))
+
+        batch_size = len(img_batch)
+        # SteerVLA/Pi0 preprocess (inside compute_loss) requires all of ``_model.IMAGE_KEYS``.
+        # Match the training format (openpi.policies.steervla_policy): the front camera is real and
+        # unmasked; the wrist streams are zeros with ``image_mask=False`` so only ``base_0_rgb``
+        # contributes ("base_0_rgb only" in effect). Inference restricts to base via CARLA_STEERVLA_IMAGE_KEYS.
+        base_imgs = np.stack(img_batch, axis=0)
+        zero_imgs = np.zeros_like(base_imgs)
+        image_dict: dict[str, np.ndarray] = {}
+        image_mask_dict: dict[str, np.ndarray] = {}
+        for i, key in enumerate(_openpi_model.IMAGE_KEYS):
+            image_dict[key] = base_imgs if i == 0 else zero_imgs
+            image_mask_dict[key] = (
+                np.ones(batch_size, dtype=bool) if i == 0 else np.zeros(batch_size, dtype=bool)
+            )
+        data = {
+            "image": image_dict,
+            "image_mask": image_mask_dict,
+            "state": np.stack(state_batch, axis=0),
+            "tokenized_prompt": np.stack(prompt_ids, axis=0),
+            "tokenized_prompt_mask": np.stack(prompt_masks, axis=0),
+            "tokenized_reasoning": np.stack(rea_ids, axis=0),
+            "tokenized_reasoning_mask": np.stack(rea_masks, axis=0),
+            "tokenized_subtask": np.stack(sub_ids, axis=0),
+            "tokenized_subtask_mask": np.stack(sub_masks, axis=0),
+            # HL only: zero the action-flow loss (steervla_hl_datasets action_supervision=False).
+            "action_loss_mask": np.zeros((batch_size, model_ah), dtype=bool),
+        }
+        observation = _openpi_model.Observation.from_dict(data)
+        actions = np.zeros((batch_size, model_ah, model_ad), dtype=np.float32)
+
+        device = self._jax_device
+        observation = jax.tree.map(lambda x: jax.device_put(jnp.asarray(x), device), observation)
+        actions = jax.device_put(jnp.asarray(actions), device)
+        return observation, actions
+
+    def update_hl(self, *, batch_size: int | None = None, num_steps: int | None = None, rng=None) -> dict[str, float]:
+        """Run high-level (VLM-backbone) gradient steps on the stored cast_relabel HL dataset.
+
+        No-op (returns ``{}``) unless the actor was loaded trainable (``load_trainable_params``) and the
+        HL dataset holds at least ``batch_size`` samples (so the first update waits for a full,
+        randomly-sampled batch). Throttled by ``hl_update_every`` calls. Updates ``self._train_state``
+        in place and marks the inference weights dirty so the next rollout uses the updated backbone.
+        """
+        if self._remote is not None or self._train_state is None or self._hl_train_step is None:
+            return {}
+        self._hl_update_calls += 1
+        if self.hl_update_every > 1 and (self._hl_update_calls % self.hl_update_every != 0):
+            return {}
+
+        bs = int(batch_size or self.hl_update_batch_size)
+        ns = int(num_steps or self.hl_update_num_steps)
+        loaded = self._load_hl_batch(bs)
+        if loaded is None:
+            return {}
+        images, states, prompts, subtasks, reasonings = loaded
+        observation, actions = self._build_hl_observation_batch(images, states, prompts, subtasks, reasonings)
+
+        info: dict[str, Any] = {}
+        for _ in range(max(1, ns)):
+            if rng is None:
+                self._train_rng, step_rng = jax.random.split(self._train_rng)
+            else:
+                step_rng = rng
+            self._train_state, info = self._hl_train_step(step_rng, self._train_state, (observation, actions))
+        self._weights_dirty = True
+
+        out: dict[str, float] = {}
+        for k, v in info.items():
+            try:
+                out[str(k)] = float(jax.device_get(v))
+            except Exception:
+                continue
+        out["n_samples"] = float(len(images))
+        return out
 
     def _state_for_transform(self, state: np.ndarray | jax.Array) -> np.ndarray:
         """Proprio slice passed to OpenPI ``Normalize`` / ``Unnormalize`` (2 or 8 dims, not padded)."""
@@ -1225,6 +1612,7 @@ class SteerVLAActor:
         force_accel_steer: bool = False,
     ) -> jax.Array:
         assert self.model is not None and self._jax_device is not None
+        self._refresh_inference_weights()
         if rng is None:
             self._call_counter += 1
             rng = jax.random.PRNGKey(self._call_counter)
@@ -1675,6 +2063,7 @@ class SteerVLAActor:
             return self._remote.get_cot(state)
 
         assert self.model is not None and self.tokenizer is not None and self._jax_device is not None
+        self._refresh_inference_weights()
         self._call_counter += 1
         rng = jax.random.PRNGKey(self._call_counter)
 
@@ -1716,6 +2105,7 @@ class SteerVLAActor:
             and self._jax_device is not None
             and self.tokenizer is not None
         ), "sample_candidates requires a local SteerVLAActor (checkpoint loaded)."
+        self._refresh_inference_weights()
         n = max(1, int(n))
         if rng is None:
             self._call_counter += 1
@@ -1851,6 +2241,11 @@ def create_steervla_pi0_cot_sample_fn(
         sample_actions_num_steps=int(steervla_cfg.get("sample_actions_num_steps", 10)),
         action_decode_batch_size=int(steervla_cfg.get("action_decode_batch_size", 2)),
         training_gpu_rank=int(srank),
+        load_trainable_params=bool(steervla_cfg.get("load_trainable_params", False)),
+        hl_dataset_dir=steervla_cfg.get("hl_dataset_dir"),
+        hl_update_every=int(steervla_cfg.get("hl_update_every", 1)),
+        hl_update_batch_size=int(steervla_cfg.get("hl_update_batch_size", 2)),
+        hl_update_num_steps=int(steervla_cfg.get("hl_update_num_steps", 1)),
         return_normalized_action_chunk=bool(steervla_cfg.get("use_pi_action_chunk_for_env", True)),
         fixed_subtask_text=steervla_cfg.get("fixed_subtask_text"),
         fixed_reasoning_text=steervla_cfg.get("fixed_reasoning_text"),

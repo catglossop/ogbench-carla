@@ -259,6 +259,7 @@ def build_coaching_prompt(
           changing lanes, etc.), and is it in the correct lane and position to do so?
 
         For example, you can ask these questions to guide your analysis: 
+        - Does the vehicle's behavior conflict with the route command plan? (if yes, BAD; if no, GOOD)
         - Is the vehicle maintaining a safe distance from the front car? (if yes, GOOD; if no, BAD)
         - Is the vehicle maintaining a safe speed? (if yes, GOOD; if no, BAD)
         - Did the vehicle get dangerously close to any other vehicles and/or collide with any other vehicles? (if yes, BAD; if no, GOOD)

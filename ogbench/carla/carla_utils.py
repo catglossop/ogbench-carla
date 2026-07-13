@@ -257,16 +257,30 @@ SUCCESS_BONUS = 50.0
 FAILURE_BONUS = -20.0
 
 
-def _find_free_port(starting_port: int) -> int:
-    """Find a free localhost TCP port starting from ``starting_port``."""
+def _find_free_port(starting_port: int, span: int = 1) -> int:
+    """Find the start of ``span`` consecutive free localhost TCP ports from ``starting_port``.
+
+    A CARLA server bound with ``-carla-rpc-port=N`` also listens on the streaming ports ``N+1``
+    and ``N+2`` (there is no separate free-port search for those). Pass ``span=3`` for the rpc
+    port so the whole block is reserved up front; otherwise two concurrent servers can pass the
+    single-port check yet collide on streaming, crashing the second one at boot with
+    ``bind: Address already in use``.
+    """
     port = max(int(starting_port), 1)
+    span = max(int(span), 1)
     while True:
+        socks: list[socket.socket] = []
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("localhost", port))
-                return port
+            for offset in range(span):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("localhost", port + offset))
+                socks.append(s)
+            return port
         except OSError:
             port += 1
+        finally:
+            for s in socks:
+                s.close()
 
 
 def _display_lock_path(display_num: int) -> Path:
@@ -563,7 +577,8 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
 
         rpc_port = int(getattr(args, "port", 0) or 0)
         if rpc_port <= 0:
-            rpc_port = _find_free_port(2000)
+            # Reserve rpc + the two streaming ports (rpc+1, rpc+2) as one free block.
+            rpc_port = _find_free_port(2000, span=3)
         args.port = rpc_port
 
         display_num = int(getattr(args, "x_display_num", 0) or 0)

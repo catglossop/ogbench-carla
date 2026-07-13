@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = "==3.11.*"
 resolution-markers = [
     "sys_platform == 'darwin'",
@@ -2193,6 +2193,7 @@ version = "1.2.1"
 source = { editable = "." }
 dependencies = [
     { name = "carla" },
+    { name = "distrax" },
     { name = "dm-control" },
     { name = "google-genai" },
     { name = "gymnasium", extra = ["mujoco"] },
@@ -2268,6 +2269,7 @@ train-tpu = [
 requires-dist = [
     { name = "bench2drive", marker = "extra == 'carla'", git = "https://github.com/catglossop/Bench2Drive.git" },
     { name = "carla" },
+    { name = "distrax", specifier = ">=0.1.5" },
     { name = "distrax", marker = "extra == 'train-gpu'", specifier = ">=0.1.5" },
     { name = "distrax", marker = "extra == 'train-tpu'", specifier = ">=0.1.5" },
     { name = "dm-control", specifier = ">=1.0.20" },
