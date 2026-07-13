@@ -378,6 +378,21 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
     vla_action_dim = int(config["steervla"]["action_dim"])
     action_dim = int(config["steervla"]["action_horizon"]) * vla_action_dim
     warmup = int(config["residual_warmup_steps"])
+    # Warm-start ramp: residual authority (scale) is 0 through warmup, then linearly rises
+    # to the target ``residual_scale`` over ``residual_ramp_steps`` env steps. Starting the
+    # ramp at 0 exactly at the warmup boundary avoids any magnitude jump at handover, and the
+    # gradual rise keeps the critic in-distribution as the executed policy drifts off base.
+    ramp_steps = max(0, int(config.get("residual_ramp_steps", 0)))
+    target_scale = float(config["residual_scale"])
+
+    def _residual_scale(step: int) -> float:
+        """Annealed residual authority at ``step`` (0 during warmup, linear ramp, then target)."""
+        if step <= warmup:
+            return 0.0
+        if ramp_steps <= 0 or step >= warmup + ramp_steps:
+            return target_scale
+        return target_scale * float(step - warmup) / float(ramp_steps)
+
     batch_size = int(config["batch_size"])
     updates_per_step = int(config["updates_per_step"])
     capacity = int(config["buffer_capacity"])
@@ -489,12 +504,15 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
     try:
         for step in tqdm.tqdm(range(1, FLAGS.online_steps + 1), dynamic_ncols=True):
             last_step = step
+            # Annealed residual authority for this step (0 during warmup -> target after ramp).
+            scale_now = _residual_scale(step)
+            scale_j = jnp.asarray(scale_now, dtype=jnp.float32)
             residual_active = (
                 agent is not None and step > warmup and buffer is not None and buffer.size >= batch_size
             )
             if residual_active:
                 rng, sample_key = jax.random.split(rng)
-                final_b, residual_b = agent.sample_actions(x[None], base[None], seed=sample_key)
+                final_b, residual_b = agent.sample_actions(x[None], base[None], scale_j, seed=sample_key)
                 final = np.asarray(jax.device_get(final_b), dtype=np.float32).reshape(-1)
                 last_residual = np.asarray(jax.device_get(residual_b), dtype=np.float32).reshape(-1)
             else:
@@ -539,9 +557,15 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
             )
 
             train_info: dict[str, Any] = {}
-            if agent is not None and enable_updates and buffer is not None and buffer.size >= batch_size:
+            # Hold updates until warmup ends: warmup is a pure-base baseline phase, and at
+            # scale=0 the residual can't affect the executed action so its gradient is
+            # degenerate. The ramp then starts near 0, giving the critic room to warm up.
+            if (
+                agent is not None and enable_updates and step > warmup
+                and buffer is not None and buffer.size >= batch_size
+            ):
                 for _ in range(updates_per_step):
-                    agent, train_info = agent.update(buffer.sample(batch_size))
+                    agent, train_info = agent.update(buffer.sample(batch_size), scale_j)
 
             if step % FLAGS.log_interval == 0:
                 log = {
@@ -552,6 +576,7 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
                 if agent is not None:
                     log["env/buffer_size"] = int(buffer.size) if buffer is not None else 0
                     log["env/residual_active"] = int(residual_active)
+                    log["env/residual_scale"] = float(scale_now)
                 log.update(_reward_breakdown_log(info))
                 if train_info:
                     log.update({k: float(jax.device_get(v)) for k, v in train_info.items()})

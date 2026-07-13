@@ -75,13 +75,13 @@ class SACResidualAgent(flax.struct.PyTreeNode):
     network: Any
     config: Any = nonpytree_field()
 
-    def _final_action(self, base_action, residual):
-        return jnp.clip(base_action + self.config["residual_scale"] * residual, -1.0, 1.0)
+    def _final_action(self, base_action, residual, scale):
+        return jnp.clip(base_action + scale * residual, -1.0, 1.0)
 
-    def critic_loss(self, batch, grad_params, rng):
+    def critic_loss(self, batch, grad_params, rng, scale):
         next_dist = self.network.select("actor")(batch["next_observations"], batch["next_base_actions"])
         next_residual, next_log_probs = next_dist.sample_and_log_prob(seed=rng)
-        next_actions = self._final_action(batch["next_base_actions"], next_residual)
+        next_actions = self._final_action(batch["next_base_actions"], next_residual, scale)
 
         next_qs = self.network.select("target_critic")(batch["next_observations"], None, actions=next_actions)
         next_q = jnp.min(next_qs, axis=0)
@@ -100,10 +100,10 @@ class SACResidualAgent(flax.struct.PyTreeNode):
             "target_q_mean": target_q.mean(),
         }
 
-    def actor_loss(self, batch, grad_params, rng):
+    def actor_loss(self, batch, grad_params, rng, scale):
         dist = self.network.select("actor")(batch["observations"], batch["base_actions"], params=grad_params)
         residual, log_probs = dist.sample_and_log_prob(seed=rng)
-        actions = self._final_action(batch["base_actions"], residual)
+        actions = self._final_action(batch["base_actions"], residual, scale)
 
         q = jnp.min(self.network.select("critic")(batch["observations"], None, actions=actions), axis=0)
 
@@ -119,11 +119,12 @@ class SACResidualAgent(flax.struct.PyTreeNode):
             "alpha_loss": alpha_loss,
             "alpha": alpha,
             "entropy": -log_probs.mean(),
-            "residual_abs_mean": jnp.abs(self.config["residual_scale"] * residual).mean(),
+            "residual_scale": scale,
+            "residual_abs_mean": jnp.abs(scale * residual).mean(),
         }
 
     @jax.jit
-    def total_loss(self, batch, grad_params, rng=None):
+    def total_loss(self, batch, grad_params, scale, rng=None):
         info = {}
         rng = rng if rng is not None else self.rng
         rng, actor_rng, critic_rng = jax.random.split(rng, 3)
@@ -131,10 +132,10 @@ class SACResidualAgent(flax.struct.PyTreeNode):
         if bool(self.config.get("debug_task", False)):
             batch = _apply_debug_stop_reward_relabel(batch)
 
-        critic_loss, critic_info = self.critic_loss(batch, grad_params, critic_rng)
+        critic_loss, critic_info = self.critic_loss(batch, grad_params, critic_rng, scale)
         for k, v in critic_info.items():
             info[f"critic/{k}"] = v
-        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
+        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng, scale)
         for k, v in actor_info.items():
             info[f"actor/{k}"] = v
 
@@ -149,22 +150,24 @@ class SACResidualAgent(flax.struct.PyTreeNode):
         network.params[f"modules_target_{module_name}"] = new_target_params
 
     @jax.jit
-    def update(self, batch):
+    def update(self, batch, scale):
+        """One SAC update. ``scale`` is the current residual authority (jax scalar so the
+        annealing schedule doesn't trigger a recompile each step)."""
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
-            return self.total_loss(batch, grad_params, rng=rng)
+            return self.total_loss(batch, grad_params, scale, rng=rng)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, "critic")
         return self.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
-    def sample_actions(self, observations, base_actions, seed=None, temperature=1.0):
-        """Sample ``(final_action, residual)`` for a batched state + base chunk."""
+    def sample_actions(self, observations, base_actions, scale, seed=None, temperature=1.0):
+        """Sample ``(final_action, residual)`` for a batched state + base chunk at ``scale``."""
         dist = self.network.select("actor")(observations, base_actions, temperature=temperature)
         residual = dist.sample(seed=seed)
-        return self._final_action(base_actions, residual), residual
+        return self._final_action(base_actions, residual, scale), residual
 
     @classmethod
     def create(cls, seed, ex_observations, ex_base_actions, config):
@@ -200,7 +203,6 @@ class SACResidualAgent(flax.struct.PyTreeNode):
         network.params["modules_target_critic"] = network.params["modules_critic"]
 
         agent_config = dict(
-            residual_scale=float(config["residual_scale"]),
             discount=float(config["discount"]),
             tau=float(config["tau"]),
             target_entropy=float(target_entropy),
@@ -220,7 +222,7 @@ def get_config():
             layer_norm=True,
             discount=0.99,
             tau=0.005,
-            residual_scale=0.1,  # Max residual magnitude (units depend on residual_action_space).
+            residual_scale=0.1,
             # Consumed by main_carla_residual.py (the SAC agent itself is space-agnostic):
             #   "accel_steer" (default) -> base chunk is PID-decoded to a 2-D [accel, steer]
             #                       control first; the residual acts there (waypoints stay the
@@ -231,11 +233,16 @@ def get_config():
             residual_action_space="accel_steer",
             target_entropy=ml_collections.config_dict.placeholder(float),  # None -> auto.
             target_entropy_multiplier=0.5,
-            residual_warmup_steps=2000,  # Pure-base env steps before applying the residual.
+            # Warm-start schedule (applied in main_carla_residual via a step-dependent scale):
+            #   step <= residual_warmup_steps           -> scale 0 (pure base policy; also the
+            #                                              in-run base baseline + no RL updates)
+            #   warmup < step <= warmup + ramp_steps     -> scale ramps 0 -> residual_scale (linear)
+            #   step  > warmup + ramp_steps              -> scale = residual_scale (full authority)
+            residual_warmup_steps=2000,
+            residual_ramp_steps=3000,
             updates_per_step=10,
             # Debug task: RL updates use reward = -ego_speed (m/s) instead of env reward,
-            # so the policy should learn to brake to a stop. main_carla_residual stores the
-            # required per-step ``ego_speed`` field only when this is True.
+            # so the policy should learn to brake to a stop.
             debug_task=False,
         )
     )
