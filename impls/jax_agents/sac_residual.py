@@ -78,17 +78,51 @@ class SACResidualAgent(flax.struct.PyTreeNode):
     def _final_action(self, base_action, residual, scale):
         return jnp.clip(base_action + scale * residual, -1.0, 1.0)
 
+    def _edit(self, x, base_action, scale, rng):
+        """EXPO edit: ã = clip(base + scale * residual), residual ~ π_edit(·|x, base)."""
+        dist = self.network.select("actor")(x, base_action)
+        residual = dist.sample(seed=rng)
+        return self._final_action(base_action, residual, scale)
+
+    def _otf_next_q(self, next_obs_cands, next_base_cands, scale, rng):
+        """EXPO hard-max TD target: edit each of N base cands 1:1, take max_i min-ensemble
+        Q_target over the 2N base+edited pool. No entropy term (argmax has no log-prob).
+
+        next_base_cands (B, N, adim); next_obs_cands (B, K, embed), K in {1, N} broadcast to N.
+        """
+        b, n, adim = next_base_cands.shape
+        edim = next_obs_cands.shape[-1]
+        obs_cands = jnp.broadcast_to(next_obs_cands, (b, n, edim))
+        edited = self._edit(obs_cands.reshape(b * n, edim), next_base_cands.reshape(b * n, adim), scale, rng)
+        edited = edited.reshape(b, n, adim)
+        pool_states = jnp.concatenate([obs_cands, obs_cands], axis=1)
+        pool_actions = jnp.concatenate([next_base_cands, edited], axis=1)
+        m = 2 * n
+        qs = self.network.select("target_critic")(
+            pool_states.reshape(b * m, edim), None, actions=pool_actions.reshape(b * m, adim)
+        )
+        q = jnp.min(qs, axis=0).reshape(b, m)
+        return jnp.max(q, axis=1)
+
     def critic_loss(self, batch, grad_params, rng, scale):
-        next_dist = self.network.select("actor")(batch["next_observations"], batch["next_base_actions"])
-        next_residual, next_log_probs = next_dist.sample_and_log_prob(seed=rng)
-        next_actions = self._final_action(batch["next_base_actions"], next_residual, scale)
-
-        next_qs = self.network.select("target_critic")(batch["next_observations"], None, actions=next_actions)
-        next_q = jnp.min(next_qs, axis=0)
-
-        alpha = self.network.select("alpha")()
-        bootstrap = self.config["discount"] * batch["masks"]
-        target_q = batch["rewards"] + bootstrap * (next_q - alpha * next_log_probs)
+        if self.config["expo"] and self.config["otf_td_backup"]:
+            next_q = self._otf_next_q(batch["next_obs_cands"], batch["next_base_cands"], scale, rng)
+            target_q = batch["rewards"] + self.config["discount"] * batch["masks"] * next_q
+            extra = {}
+        else:
+            # Plain soft SAC backup over the first stored base candidate (regular residual SAC
+            # when expo=False, or the rollout-only EXPO ablation when otf_td_backup=False).
+            next_obs = batch["next_obs_cands"][:, 0, :]
+            next_base = batch["next_base_cands"][:, 0, :]
+            next_dist = self.network.select("actor")(next_obs, next_base)
+            next_residual, next_log_probs = next_dist.sample_and_log_prob(seed=rng)
+            next_actions = self._final_action(next_base, next_residual, scale)
+            next_qs = self.network.select("target_critic")(next_obs, None, actions=next_actions)
+            next_q = jnp.min(next_qs, axis=0)
+            alpha = self.network.select("alpha")()
+            bootstrap = self.config["discount"] * batch["masks"]
+            target_q = batch["rewards"] + bootstrap * (next_q - alpha * next_log_probs)
+            extra = {"next_entropy": -next_log_probs.mean()}
         target_q = jax.lax.stop_gradient(target_q)
 
         q = self.network.select("critic")(batch["observations"], None, actions=batch["actions"], params=grad_params)
@@ -98,6 +132,7 @@ class SACResidualAgent(flax.struct.PyTreeNode):
             "critic_loss": critic_loss,
             "q_mean": q.mean(),
             "target_q_mean": target_q.mean(),
+            **extra,
         }
 
     def actor_loss(self, batch, grad_params, rng, scale):
@@ -169,6 +204,28 @@ class SACResidualAgent(flax.struct.PyTreeNode):
         residual = dist.sample(seed=seed)
         return self._final_action(base_actions, residual, scale), residual
 
+    @jax.jit
+    def select_action_otf(self, x_cands, base_cands, scale, seed):
+        """EXPO rollout: edit each of N base cands 1:1, execute the argmax-min-ensemble-Q of the
+        2N base+edited pool.
+
+        base_cands (N, adim); x_cands (K, embed), K in {1, N} broadcast to N. Returns
+        (executed, winner_base, winner_x, q_all (2N,), winner_idx); winner_idx >= N -> an edit won.
+        """
+        n, adim = base_cands.shape
+        edim = x_cands.shape[-1]
+        x_full = jnp.broadcast_to(x_cands, (n, edim))
+        dist = self.network.select("actor")(x_full, base_cands)
+        residual = dist.sample(seed=seed)
+        edited = self._final_action(base_cands, residual, scale)
+        pool_states = jnp.concatenate([x_full, x_full], axis=0)
+        pool_actions = jnp.concatenate([base_cands, edited], axis=0)
+        qs = self.network.select("critic")(pool_states, None, actions=pool_actions)
+        q = jnp.min(qs, axis=0)
+        winner = jnp.argmax(q)
+        j = jnp.mod(winner, n)
+        return pool_actions[winner], base_cands[j], x_full[j], q, winner
+
     @classmethod
     def create(cls, seed, ex_observations, ex_base_actions, config):
         rng = jax.random.PRNGKey(seed)
@@ -207,6 +264,8 @@ class SACResidualAgent(flax.struct.PyTreeNode):
             tau=float(config["tau"]),
             target_entropy=float(target_entropy),
             debug_task=bool(config.get("debug_task", False)),
+            expo=bool(config.get("expo", True)),
+            otf_td_backup=bool(config.get("otf_td_backup", True)),
         )
         return cls(rng=rng, network=network, config=flax.core.FrozenDict(agent_config))
 
@@ -240,6 +299,13 @@ def get_config():
             #   step  > warmup + ramp_steps              -> scale = residual_scale (full authority)
             residual_warmup_steps=2000,
             residual_ramp_steps=3000,
+            # EXPO (arXiv:2507.07986): N base actions from distinct SteerVLA CoTs, each edited 1:1,
+            # execute argmax-Q of the 2N pool. ~best_of_n x SteerVLA forwards per step.
+            # expo=False -> plain residual SAC (single edit acting + soft SAC backup, no best-of-N).
+            expo=True,
+            best_of_n=8,
+            vla_cot_temperature=1.0,  # >0 so the N sampled CoTs/subtasks differ (0 = greedy = identical).
+            otf_td_backup=True,  # True: hard-max OTF TD target. False: rollout-only soft SAC ablation.
             updates_per_step=10,
             # Debug task: RL updates use reward = -ego_speed (m/s) instead of env reward,
             # so the policy should learn to brake to a stop.

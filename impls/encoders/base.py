@@ -20,6 +20,10 @@ class StateEncoder(abc.ABC):
     #: Short identifier, used in logging / run names.
     name: str = "base"
 
+    #: Does the state depend on the sampled CoT? True for token encoders (pi_prefix / rl_token),
+    #: False for perception-only (siglip_pool). EXPO encodes one state per candidate iff True.
+    cot_dependent: bool = True
+
     @abc.abstractmethod
     def encode(self, obs: dict) -> np.ndarray:
         """Return a 1-D ``float32`` state vector for one env observation."""

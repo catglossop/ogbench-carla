@@ -17,6 +17,7 @@ class SiglipPoolEncoder(StateEncoder):
     """
 
     name = "siglip_pool"
+    cot_dependent = False  # image-only (vision tower, no LLM) -> CoT-independent state.
 
     def __init__(self, steervla_actor):
         self._actor = steervla_actor

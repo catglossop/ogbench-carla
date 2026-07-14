@@ -929,6 +929,80 @@ class SteerVLAActor:
         out = jnp.asarray(first_step, dtype=jnp.float32)
         return out
 
+    def sample_candidates(
+        self,
+        n: int,
+        *,
+        temperature: float,
+        raw: Optional[Dict[str, Any]] = None,
+        rng: jax.Array | None = None,
+    ) -> dict[str, Any]:
+        """Best-of-N / EXPO: sample ``n`` CoTs at ``temperature`` (one batched forward), decode a
+        chunk per candidate. Diversity comes from the CoTs/subtasks, not the flow noise.
+
+        Returns ``actions`` (n, action_horizon * action_dim), ``subtask_texts`` (per candidate),
+        and the batched ``cot_out`` (row i = candidate i's tokens, overlaid via ``_last_cot_out``).
+        """
+        assert (
+            self.model is not None and self._jax_device is not None and self.tokenizer is not None
+        ), "sample_candidates requires a local SteerVLAActor (checkpoint loaded)."
+        n = max(1, int(n))
+        if rng is None:
+            self._call_counter += 1
+            rng = jax.random.PRNGKey(self._call_counter)
+        else:
+            rng = jax.random.fold_in(jnp.asarray(rng), self._call_counter)
+        rng_cot, rng_act, rng_noise = jax.random.split(rng, 3)
+
+        obs_np_struct = self.build_observation_batch_numpy(n, raw=raw)
+        obs_jax = jax.tree.map(
+            lambda x: jax.device_put(jnp.asarray(x), self._jax_device), obs_np_struct
+        )
+
+        # n diverse CoTs in one batched call (temperature gives independent per-row samples).
+        cot_out = self._sample_cot(
+            rng_cot,
+            obs_jax,
+            temperature=float(temperature),
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+
+        subtask_tokens = np.asarray(jax.device_get(cot_out["tokenized_subtask"]), dtype=np.int32)
+        subtask_mask = np.asarray(jax.device_get(cot_out["tokenized_subtask_mask"]), dtype=bool)
+        subtask_texts = [
+            self.tokenizer._tokenizer.decode(subtask_tokens[i][subtask_mask[i]].tolist()) for i in range(n)
+        ]
+
+        obs_full = _merge_cot_output_into_observation(obs_jax, cot_out)
+
+        # One N(0, I) flow seed per candidate (cfg region only), as flow_sample does.
+        model_ah = int(self.model.action_horizon)
+        model_ad = int(self.model.action_dim)
+        cfg_ah = min(int(self.action_horizon), model_ah)
+        cfg_ad = min(int(self.action_dim), model_ad)
+        noise_chunk = jax.random.normal(rng_noise, (n, cfg_ah, cfg_ad), dtype=jnp.float32)
+        noise_full = jnp.zeros((n, model_ah, model_ad), dtype=jnp.float32)
+        noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(
+            jax.device_put(noise_chunk, self._jax_device)
+        )
+
+        traj = self._sample_actions(
+            rng_act,
+            obs_full,
+            noise=noise_full,
+            num_steps=int(self.sample_actions_num_steps),
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+        jax.block_until_ready(traj)
+        traj_np = self._postprocess_action_trajectory(traj, observation_state=obs_jax.state)
+        actions_flat = np.asarray(traj_np, dtype=np.float32).reshape(n, -1)
+
+        return {
+            "actions": actions_flat,
+            "subtask_texts": subtask_texts,
+            "cot_out": cot_out,
+        }
+
     def _routing_for_raw(self, raw: Dict[str, Any]) -> str:
         rc = raw.get("routing_command")
         if rc is not None and isinstance(rc, str) and rc.strip():

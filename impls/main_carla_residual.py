@@ -246,6 +246,32 @@ def _accel_steer_stats_log(name: str, vec: np.ndarray) -> dict[str, float]:
     return out
 
 
+def _expo_candidate_log(base_cands: np.ndarray, q_all: np.ndarray, winner_idx: int, n: int) -> dict[str, float]:
+    """EXPO diagnostics for one step's 2N pool: Q spread, base-vs-edit winner + margin, and
+    base-action diversity as per-dim Gaussian entropy 0.5*log(2*pi*e*var). q_all is (2N,) min-
+    ensemble Q (first N base, last N edits); base_cands is (N, adim)."""
+    out: dict[str, float] = {}
+    q = np.asarray(q_all, dtype=np.float64).reshape(-1)
+    if q.size:
+        out["expo/q_max"] = float(q.max())
+        out["expo/q_min"] = float(q.min())
+        out["expo/q_mean"] = float(q.mean())
+        if q.size >= 2 * n and n > 0:
+            out["expo/q_base_mean"] = float(q[:n].mean())
+            out["expo/q_edit_mean"] = float(q[n:].mean())
+        srt = np.sort(q)[::-1]
+        out["expo/q_margin"] = float(srt[0] - srt[1]) if q.size > 1 else 0.0
+    out["expo/winner_is_edit"] = float(int(winner_idx) >= n)
+    out["expo/winner_idx"] = float(int(winner_idx))
+    bc = np.asarray(base_cands, dtype=np.float64).reshape(n, -1)
+    var = bc.var(axis=0)  # (adim,) diversity of the N base actions per dim
+    ent = 0.5 * np.log(2.0 * np.pi * np.e * np.maximum(var, 1e-12))
+    for d in range(ent.shape[0]):
+        out[f"expo/base_entropy/dim_{d}"] = float(ent[d])
+    out["expo/base_entropy_mean"] = float(ent.mean())
+    return out
+
+
 def _reward_breakdown_log(info: dict) -> dict[str, float]:
     """Flatten the env reward components + drive diagnostics into a W&B log dict."""
     out: dict[str, float] = {}
@@ -472,14 +498,54 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
             dtype=np.float32,
         )
 
-    # Base chunk before encode: it samples + stashes the CoT that the rl_token
-    # encoder needs to reproduce the prefix the policy acted on (no-op for others).
-    # ``base_chunk`` is always the raw 40-D VLA chunk (used for the waypoint overlay);
-    # ``base`` is what the agent conditions on (chunk or 2-D [accel, steer]).
+    # EXPO best-of-N: each step samples n_cand base actions from distinct SteerVLA CoTs, the
+    # agent edits each 1:1, and executes the argmax-Q of the 2N pool. During warmup/base_only we
+    # take the cheap single-base path tiled to N so the buffer schema stays uniform. expo=False ->
+    # plain residual SAC (n_cand=1, execute the single edit, no critic selection).
+    use_otf = agent is not None and bool(config.get("expo", True))
+    n_cand = max(1, int(config.get("best_of_n", 8))) if use_otf else 1
+    cot_temp = float(config.get("vla_cot_temperature", 1.0))
+    # Token encoders (pi_prefix / rl_token) fold the CoT into the state -> one state per candidate
+    # (K=N). siglip_pool is image-only -> one shared state (K=1) broadcast across candidates. K is
+    # fixed per run so next_obs_cands has a uniform shape.
+    state_cot_dependent = bool(getattr(state_encoder, "cot_dependent", True)) if state_encoder is not None else False
+    k_state = n_cand if state_cot_dependent else 1
+
+    def _encode_state(o: dict, cands) -> Optional[np.ndarray]:
+        """Encode the (K, embed) state(s) for one obs. cands=None (warmup) -> encode once, tile to
+        K. cot-dependent -> one row per candidate, each with that candidate's CoT via _last_cot_out."""
+        if state_encoder is None:
+            return None
+        if not state_cot_dependent or cands is None:
+            xi = np.asarray(state_encoder.encode(o), dtype=np.float32).reshape(-1)
+            return np.tile(xi[None, :], (k_state, 1))
+        rows = []
+        for i in range(n_cand):
+            steervla_actor._last_cot_out = {kk: vv[i : i + 1] for kk, vv in cands["cot_out"].items()}
+            rows.append(np.asarray(state_encoder.encode(o), dtype=np.float32).reshape(-1))
+        return np.stack(rows, axis=0)
+
+    def _compute_base(o: dict, otf_mode: bool, key: jax.Array):
+        """Returns (base_cands (N, adim), x_cands (K, embed)|None, chunks (N, 40), cands|None).
+        base_cands is what the agent conditions on; chunks are the raw VLA chunks (waypoint overlay).
+        otf_mode -> N diverse CoT samples; else one base tiled to N."""
+        if otf_mode:
+            cands = steervla_actor.sample_candidates(n_cand, temperature=cot_temp, rng=key)
+            chunks = np.asarray(cands["actions"], dtype=np.float32).reshape(n_cand, -1)
+            base_cands = np.stack(
+                [np.asarray(_agent_base_action(o, chunks[i]), dtype=np.float32) for i in range(n_cand)],
+                axis=0,
+            )
+            return base_cands, _encode_state(o, cands), chunks, cands
+        bc = _base_chunk(vla_sample_fn, raw_holder, o, _draw_base_noise(key))
+        b = np.asarray(_agent_base_action(o, bc), dtype=np.float32)
+        base_cands = np.tile(b[None, :], (n_cand, 1))
+        chunks = np.tile(np.asarray(bc, dtype=np.float32).reshape(1, -1), (n_cand, 1))
+        return base_cands, _encode_state(o, None), chunks, None
+
+    # Initial base rep (step 1 is in warmup -> single-base). cands feeds subtask-diversity logging.
     rng, nk = jax.random.split(rng)
-    base_chunk = _base_chunk(vla_sample_fn, raw_holder, obs, _draw_base_noise(nk))
-    base = _agent_base_action(obs, base_chunk)
-    x = None if state_encoder is None else state_encoder.encode(obs)
+    base_cands, x_cands, base_chunks, cands = _compute_base(obs, use_otf and 1 > warmup, nk)
 
     buffer: Optional[ReplayBuffer] = None
     episode_return = 0.0
@@ -507,37 +573,58 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
             # Annealed residual authority for this step (0 during warmup -> target after ramp).
             scale_now = _residual_scale(step)
             scale_j = jnp.asarray(scale_now, dtype=jnp.float32)
-            residual_active = (
-                agent is not None and step > warmup and buffer is not None and buffer.size >= batch_size
-            )
-            if residual_active:
+            # OTF selection needs a training critic -> active only past warmup (else execute base).
+            residual_active = agent is not None and step > warmup
+            q_all: Optional[np.ndarray] = None
+            winner_idx = 0
+            if residual_active and use_otf:
                 rng, sample_key = jax.random.split(rng)
-                final_b, residual_b = agent.sample_actions(x[None], base[None], scale_j, seed=sample_key)
+                exe_b, wbase_b, wx_b, q_b, widx_b = agent.select_action_otf(
+                    jnp.asarray(x_cands), jnp.asarray(base_cands), scale_j, sample_key
+                )
+                final = np.asarray(jax.device_get(exe_b), dtype=np.float32).reshape(-1)
+                winner_base = np.asarray(jax.device_get(wbase_b), dtype=np.float32).reshape(-1)
+                winner_x = np.asarray(jax.device_get(wx_b), dtype=np.float32).reshape(-1)
+                q_all = np.asarray(jax.device_get(q_b), dtype=np.float32).reshape(-1)
+                winner_idx = int(jax.device_get(widx_b))
+                last_residual = final - winner_base
+            elif residual_active:
+                # Regular residual SAC: execute the single edit, no best-of-N selection.
+                rng, sample_key = jax.random.split(rng)
+                final_b, _res_b = agent.sample_actions(
+                    jnp.asarray(x_cands[0][None]), jnp.asarray(base_cands[0][None]), scale_j, seed=sample_key
+                )
                 final = np.asarray(jax.device_get(final_b), dtype=np.float32).reshape(-1)
-                last_residual = np.asarray(jax.device_get(residual_b), dtype=np.float32).reshape(-1)
+                winner_base = base_cands[0]
+                winner_x = None if x_cands is None else x_cands[0]
+                last_residual = final - winner_base
             else:
-                final = base
+                final = base_cands[0]
+                winner_base = base_cands[0]
+                winner_x = None if x_cands is None else x_cands[0]
+            # Winner's raw VLA chunk drives the waypoint overlay in accel_steer mode.
+            base_chunk = base_chunks[winner_idx % n_cand]
 
             next_obs, reward, terminated, truncated, info = env.step(final)
             done = bool(terminated or truncated)
 
+            # Next base cands are diverse iff the next step runs OTF (step >= warmup).
             rng, nk = jax.random.split(rng)
-            next_base_chunk = _base_chunk(vla_sample_fn, raw_holder, next_obs, _draw_base_noise(nk))
-            next_base = _agent_base_action(next_obs, next_base_chunk)
-            next_x = None if state_encoder is None else state_encoder.encode(next_obs)
+            next_base_cands, next_x_cands, next_base_chunks, next_cands = _compute_base(
+                next_obs, use_otf and step >= warmup, nk
+            )
 
             if agent is not None:
                 transition = dict(
-                    observations=x,
+                    observations=winner_x,
                     actions=final,
-                    base_actions=base,
+                    base_actions=winner_base,
                     rewards=np.float32(reward),
-                    next_observations=next_x,
-                    next_base_actions=next_base,
+                    next_obs_cands=next_x_cands,  # (K, embed)
+                    next_base_cands=next_base_cands,  # (N, adim)
                     masks=np.float32(1.0 - float(terminated)),
                 )
                 if debug_task:
-                    # Speed at the state the action was taken from (matches main_carla.py).
                     transition["ego_speed"] = _ego_speed_mps(obs)
                 if buffer is None:
                     buffer = ReplayBuffer.create(transition, size=capacity)
@@ -586,24 +673,34 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
                 # dims; the splits below are the readable, diagnostic signals.)
                 log.update(_ego_control_log(next_obs))
                 if accel_steer:
-                    # No waypoint viz for the executed 2-D control, so log it explicitly:
-                    # base = frozen-policy [accel, steer], final = executed, residual =
-                    # applied delta (final - base, i.e. post-clip; 0 during warmup). The
-                    # base_chunk_* stats still track the underlying (drawn) waypoint plan.
-                    log.update(_accel_steer_stats_log("base", base))
+                    # 2-D control has no waypoint viz, so log base/final/residual explicitly;
+                    # base_chunk_* still tracks the underlying waypoint plan.
+                    log.update(_accel_steer_stats_log("base", winner_base))
                     log.update(_chunk_stats_log("base_chunk", base_chunk, vla_action_dim))
                     if agent is not None:
                         log.update(_accel_steer_stats_log("final", final))
                         log.update(_accel_steer_stats_log(
                             "residual",
-                            np.asarray(final, dtype=np.float32) - np.asarray(base, dtype=np.float32),
+                            np.asarray(final, dtype=np.float32) - np.asarray(winner_base, dtype=np.float32),
                         ))
                 else:
-                    log.update(_chunk_stats_log("base", base, vla_action_dim))
+                    log.update(_chunk_stats_log("base", winner_base, vla_action_dim))
                     if agent is not None:
                         log.update(_chunk_stats_log("final", final, vla_action_dim))
                         if last_residual is not None:
                             log.update(_chunk_stats_log("residual", last_residual, vla_action_dim))
+                # EXPO 2N-pool diagnostics (only meaningful once OTF is active).
+                if residual_active and q_all is not None:
+                    log.update(_expo_candidate_log(base_cands, q_all, winner_idx, n_cand))
+                    if cands is not None:
+                        subtasks = cands["subtask_texts"]
+                        log["expo/n_unique_subtasks"] = float(len(set(subtasks)))
+                        won = "edit" if winner_idx >= n_cand else "base"
+                        print(
+                            f"[expo] step={step} winner={won} q={float(q_all[winner_idx]):.3f} "
+                            f"subtask={subtasks[winner_idx % n_cand]!r} ({len(set(subtasks))}/{n_cand} unique)",
+                            flush=True,
+                        )
                 wandb.log(log, step=step)
                 train_logger.log(log, step=step)
 
@@ -622,11 +719,14 @@ def run_online(env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_ho
                 obs, _info = env.reset(seed=FLAGS.seed + episode_count)
                 steervla_actor.reset_action_cache()
                 rng, nk = jax.random.split(rng)
-                base_chunk = _base_chunk(vla_sample_fn, raw_holder, obs, _draw_base_noise(nk))
-                base = _agent_base_action(obs, base_chunk)
-                x = None if state_encoder is None else state_encoder.encode(obs)
+                base_cands, x_cands, base_chunks, cands = _compute_base(
+                    obs, use_otf and step + 1 > warmup, nk
+                )
             else:
-                obs, x, base, base_chunk = next_obs, next_x, next_base, next_base_chunk
+                obs = next_obs
+                base_cands, x_cands, base_chunks, cands = (
+                    next_base_cands, next_x_cands, next_base_chunks, next_cands,
+                )
     finally:
         train_logger.close()
         _flush_checkpoint(last_step or FLAGS.online_steps)
