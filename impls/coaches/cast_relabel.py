@@ -209,6 +209,94 @@ def _extract_json_payload(text: str) -> dict[str, Any]:
         raise ValueError("CAST relabel response must be a JSON object.")
     return payload
 
+def build_debug_task_prompt(
+    *,
+    events: list[CoachEvent],
+    chunk_specs: list[ActionChunkSpec],
+    metadata: dict[str, Any],
+    seed_subtasks: tuple[str, ...] = SEED_SUBTASKS,
+    num_suggestions: int = DEFAULT_NUM_SUBTASK_SUGGESTIONS,
+    max_seed_examples: int = 40,
+) -> str:
+    """Prompt that does credit assignment (step 3) + subtask suggestion (step 4)."""
+    events_payload = [
+        {
+            "timestamp_sec": e.timestamp_sec,
+            "label": e.label,
+            "description": e.description,
+            "correction": e.correction,
+        }
+        for e in events
+    ]
+    chunks_payload = [
+        {
+            "chunk_index": s.chunk_index,
+            "episode_step_start": s.episode_step_start,
+            "episode_step_end": s.episode_step_end,
+            "video_time_start_sec": round(s.video_time_start_sec, 3),
+            "video_time_end_sec": round(s.video_time_end_sec, 3),
+        }
+        for s in chunk_specs
+    ]
+    # Present a bounded sample of seed subtasks to keep the prompt small.
+    seeds = list(seed_subtasks)[:max_seed_examples]
+    seed_block = "\n".join(f"- {s}" for s in seeds)
+
+    return textwrap.dedent(
+        f"""
+        You previously reviewed a short driving rollout window and flagged GOOD and BAD
+        moments (below). For this debug task, relabel all the segments to subtasks that result in the vehicle remaining stopped or slowing down.
+
+        Each action chunk spans a fixed number of env steps; the chunk timing (in the same
+        video seconds as the events) is given below.
+
+        Window summary (``route_progress_end_pct`` < 100 means the route is unfinished — making
+        forward progress toward completion is a primary objective):
+        ```json
+        {json.dumps({k: metadata.get(k) for k in ("episode", "route", "episode_steps", "window_index", "success", "route_progress_start_pct", "route_progress_end_pct", "route_completed", "mean_end_speed_mps")}, indent=2)}
+        ```
+
+        GOOD/BAD events from the window review (timestamps are video seconds):
+        ```json
+        {json.dumps(events_payload, indent=2)}
+        ```
+
+        Action chunks in this window:
+        ```json
+        {json.dumps(chunks_payload, indent=2)}
+        ```
+
+        Example subtask phrasings (open vocabulary — reuse verbatim OR write new phrases in
+        the SAME concise style; describe what the vehicle should do, not meta commentary). For this debug task, the subtasks should be the ones that result in the vehicle remaining stopped or slowing down.:
+        {seed_block}
+
+        For EVERY chunk_index above, return:
+        - label: "GOOD", "BAD", or null. Does not matter for this debug task.
+        - rationale: one short sentence describing the slow down or stop behavior.
+        - suggested_subtasks: up to {num_suggestions} subtask phrases that would result in the vehicle remaining stopped or slowing down.
+
+        Return ONLY valid JSON (no markdown fences):
+        {{
+          "chunk_credits": [
+            {{
+              "chunk_index": 0,
+              "label": "BAD",
+              "rationale": "The vehicle must slow down.",
+              "suggested_subtasks": [
+                "The vehicle smoothly decelerates to a stop."
+              ]
+            }}
+          ]
+        }}
+
+        Rules:
+        - Include exactly one entry per chunk_index listed above.
+        - Use null (not "none") for label when no event applies.
+        - Keep rationale under 50 words.
+        - Never exceed {num_suggestions} suggested subtasks per chunk.
+        """
+    ).strip()
+
 
 def build_credit_relabel_prompt(
     *,
@@ -305,7 +393,6 @@ def build_credit_relabel_prompt(
         """
     ).strip()
 
-
 def parse_credit_relabel_response(
     text: str,
     *,
@@ -399,6 +486,7 @@ def generate_cast_relabel(
     num_suggestions: int = DEFAULT_NUM_SUBTASK_SUGGESTIONS,
     plot_paths: list[Path] | None = None,
     include_plots_in_prompt: bool = False,
+    debug_task: bool = False,
 ) -> tuple[list[CoachEvent], dict[str, Any]]:
     """Full pipeline for one window: review -> credit assignment -> subtask suggestion.
 
@@ -419,6 +507,7 @@ def generate_cast_relabel(
     # Steps 3 + 4: credit assignment onto chunks + suggested subtasks per chunk.
     if not hasattr(coach, "complete_text"):
         raise RuntimeError(f"Coach {type(coach).__name__} does not support text completion.")
+        
     prompt = build_credit_relabel_prompt(
         events=events,
         chunk_specs=chunk_specs,
@@ -426,6 +515,15 @@ def generate_cast_relabel(
         seed_subtasks=seed_subtasks,
         num_suggestions=num_suggestions,
     )
+    
+    if debug_task:
+        prompt = build_debug_task_prompt(
+            events=events,
+            chunk_specs=chunk_specs,
+            metadata=metadata,
+            seed_subtasks=seed_subtasks,
+            num_suggestions=num_suggestions,
+        )
     response_text = coach.complete_text(prompt)
     credits = parse_credit_relabel_response(
         response_text, num_chunks=len(chunk_specs), num_suggestions=num_suggestions
@@ -438,6 +536,7 @@ def generate_cast_relabel(
         seed_subtasks=seed_subtasks,
         num_suggestions=num_suggestions,
     )
+        
     return events, cast_json
 
 
@@ -788,6 +887,7 @@ class OnlineCastRelabelSession:
             num_suggestions=self.num_subtask_suggestions,
             plot_paths=plot_paths,
             include_plots_in_prompt=self.include_plots_in_prompt,
+            debug_task=self.debug_task,
         )
         (work_dir / "cast_relabel.json").write_text(json.dumps(cast_json, indent=2), encoding="utf-8")
 

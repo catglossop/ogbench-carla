@@ -103,7 +103,7 @@ XLA_PYTHON_CLIENT_PREALLOCATE="true" \
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 \
 WANDB_MODE=online \
 uv run python impls/main_carla.py \
-  --agent=impls/configs/steervla_best_of_n_config.py \
+  --agent=impls/configs/steervla_cast_relabel_config.py \
   --route=generalization-wall-1095 \
   --online_steps=50000 \
   --save_buffer=true \

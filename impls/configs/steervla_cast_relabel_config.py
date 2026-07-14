@@ -38,6 +38,7 @@ def get_config():
             enabled=True,
             # Log annotated debug videos (per-chunk GOOD/BAD + suggested subtasks) to wandb.
             debug=True,
+            debug_task=True,
             # Review one window every N env steps (rounded down to whole action chunks).
             # A window can be as small as one chunk or as large as a whole episode.
             query_every_n_episode_steps=128,
