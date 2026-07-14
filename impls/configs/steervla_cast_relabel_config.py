@@ -30,8 +30,24 @@ def get_config():
     config = get_dsrl_config()
 
     # CAST relabel is a pure observer; don't also spin up the DSRL VLM critic coach.
+    config.lr = 3e-5
     config.language_feedback.source = "expert"
     config.language_feedback.expert_mode = "none"
+    config.training_gpu_rank = 0
+    config.siglip_device = "cuda:0"
+    config.batch_size = 128
+    config.warmup_steps = 500
+    
+    config.enable_updates = True
+    # Per-kind switches, each ANDed with ``enable_updates``:
+    #   rl    -> critic/actor (RL) updates
+    #   bc    -> full BC / DAgger imitation path (``update_dagger``)
+    #   bc_hl -> high-level VLM backbone update: DSRLAgent.update_with_vla(run_hl=True) calls
+    #            SteerVLAActor.update_hl, which fine-tunes the CoT/VLM backbone on the
+    #            cast_relabel HL samples (subtask + reasoning targets, action loss masked out).
+    config.enable_updates_rl = True
+    config.enable_updates_bc = False
+    config.enable_updates_bc_hl = True
 
     config.cast_relabel = ml_collections.ConfigDict(
         dict(
@@ -41,7 +57,7 @@ def get_config():
             debug_task=True,
             # Review one window every N env steps (rounded down to whole action chunks).
             # A window can be as small as one chunk or as large as a whole episode.
-            query_every_n_episode_steps=128,
+            query_every_n_episode_steps=200,
             query_on_episode_end=True,
             provider="gemini",
             gemini_model="gemini-3.5-flash",
@@ -53,6 +69,18 @@ def get_config():
             video_fps=10.0,
             video_frame_stride=2,
             save_artifacts=True,
+            # Persist every BAD/relabeled chunk as a SteerVLA high-level (VLM-backbone) training
+            # sample in the steervla_hl_dataset_format schema (image + ego state + prompt +
+            # corrected subtask + new reasoning trace + masked action chunk). These are consumed
+            # online by SteerVLAActor.update_hl (gated by enable_updates_bc_hl above), which runs a
+            # real OpenPI gradient step supervising the CoT/VLM backbone on the subtask + reasoning.
+            store_hl_dataset=True,
+            # Also reinforce GOOD/unlabeled chunks: store their *original* (uncorrected) subtask +
+            # reasoning as HL samples so good behavior is imitated. False -> corrective (BAD) only.
+            store_good_chunks=True,
+            hl_dataset_subdir="cast_relabel_hl_dataset",
+            # Shape of the (unsupervised) stored action chunk; match config.steervla.action_dim.
+            hl_action_dim=4,
             # Leave empty to use coaches.cast_relabel.SEED_SUBTASKS; set a list to override.
             seed_subtasks=[],
         )
@@ -61,6 +89,23 @@ def get_config():
     config.steervla = ml_collections.ConfigDict(
         dict(
             enabled=True,
+            # Load SteerVLA as a trainable model: build the full OpenPI TrainState
+            # (optimizer + opt_state + freeze/trainable filters) like scripts/train.py,
+            # instead of an inference-only param restore. Needed for the cast_relabel
+            # fine-tuning step. Set False for a frozen inference-only actor.
+            load_trainable_params=True,
+            # High-level (VLM-backbone) update knobs, consumed by SteerVLAActor.update_hl.
+            # This is the gradient step that supervises the CoT/VLM backbone on the cast_relabel
+            # subtask + reasoning targets (action loss masked out). Only active when
+            # load_trainable_params=True and enable_updates_bc_hl=True.
+            #   hl_update_batch_size -> HL samples per gradient step (default 2, too small).
+            #     NOTE: this is a full Pi0-CoT forward+backward per sample; 256 may OOM the
+            #     training GPU, so start at 128 and bump to 256 if memory allows.
+            #   hl_update_every      -> run update_hl once every N update_with_vla calls (1 = every).
+            #   hl_update_num_steps  -> gradient steps taken per update_hl call.
+            hl_update_batch_size=16,
+            hl_update_every=10,
+            hl_update_num_steps=1,
             # Local OpenPI inference (ignored when actor_url is set):
             actor_config="pi05_steervla_cot_simplified_reasoning",
             checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",

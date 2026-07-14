@@ -45,8 +45,15 @@ def get_config():
     config.updates_per_step = 5
     # Run RL gradient updates every N env steps (still ``updates_per_step`` per update).
     config.update_interval = 10
-    # Set to false for rollout-only runs (no RL gradient updates).
+    # Master switch: set to false for rollout-only runs (no gradient updates of any kind).
     config.enable_updates = True
+    # Per-kind switches, each ANDed with ``enable_updates``:
+    #   rl    -> DSRL critic/actor (RL) updates
+    #   bc    -> full BC / DAgger imitation path (``update_dagger``)
+    #   bc_hl -> high-level VLM backbone update (``update_hl`` on cast_relabel data)
+    config.enable_updates_rl = True
+    config.enable_updates_bc = True
+    config.enable_updates_bc_hl = True
     config.buffer_capacity = 1_000
     # When true, RL updates use reward = -ego_speed (m/s) instead of env reward.
     config.debug_task = False

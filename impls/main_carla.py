@@ -15,6 +15,9 @@ Three calling patterns:
 
    Set ``enable_updates=false`` in the agent config (or ``--enable_updates=false``)
    to run rollout-only: collect transitions and log videos without gradient updates.
+   Individual update kinds can be toggled with ``enable_updates_rl`` (DSRL critic/actor),
+   ``enable_updates_bc`` (full DAgger imitation path), and ``enable_updates_bc_hl`` (the
+   high-level VLM backbone update on relabeled data) — each is ANDed with ``enable_updates``.
 
    Live rollout video (single overwriting MP4 + browser UI)::
 
@@ -170,8 +173,26 @@ flags.DEFINE_string(
 flags.DEFINE_bool(
     "enable_updates",
     None,
-    "If false, skip RL gradient updates (rollout/buffer logging only). "
+    "Master switch: if false, skip ALL gradient updates (rollout/buffer logging only). "
     "Default: agent config ``enable_updates`` (true).",
+)
+flags.DEFINE_bool(
+    "enable_updates_rl",
+    None,
+    "If false, skip DSRL critic/actor (RL) gradient updates. ANDed with ``enable_updates``. "
+    "Default: agent config ``enable_updates_rl`` (true).",
+)
+flags.DEFINE_bool(
+    "enable_updates_bc",
+    None,
+    "If false, skip the full BC / DAgger imitation update (``update_dagger``). "
+    "ANDed with ``enable_updates``. Default: agent config ``enable_updates_bc`` (true).",
+)
+flags.DEFINE_bool(
+    "enable_updates_bc_hl",
+    None,
+    "If false, skip the high-level VLM backbone update (``update_hl`` on relabeled data). "
+    "ANDed with ``enable_updates``. Default: agent config ``enable_updates_bc_hl`` (true).",
 )
 flags.DEFINE_bool(
     "live_policy_view",
@@ -469,17 +490,40 @@ def run_online_carla(
     if update_interval < 1:
         raise ValueError(f"update_interval must be >= 1, got {update_interval}")
     batch_size = int(agent_config.get("batch_size", 256))
+    # Master switch (all updates) plus per-kind switches. Each per-kind flag is ANDed with the
+    # master, so ``enable_updates=False`` still disables everything (back-compat). CLI flags
+    # override the config values when provided.
     enable_updates = bool(agent_config.get("enable_updates", True))
     if FLAGS.enable_updates is not None:
         enable_updates = bool(FLAGS.enable_updates)
+    enable_updates_rl = bool(agent_config.get("enable_updates_rl", True))
+    if FLAGS.enable_updates_rl is not None:
+        enable_updates_rl = bool(FLAGS.enable_updates_rl)
+    enable_updates_bc = bool(agent_config.get("enable_updates_bc", True))
+    if FLAGS.enable_updates_bc is not None:
+        enable_updates_bc = bool(FLAGS.enable_updates_bc)
+    enable_updates_bc_hl = bool(agent_config.get("enable_updates_bc_hl", True))
+    if FLAGS.enable_updates_bc_hl is not None:
+        enable_updates_bc_hl = bool(FLAGS.enable_updates_bc_hl)
+    # Effective per-kind gates: RL = DSRL critic/actor, BC = full DAgger imitation path,
+    # HL = high-level VLM backbone update (``update_hl`` on cast_relabel data).
+    rl_updates_on = enable_updates and enable_updates_rl
+    bc_updates_on = enable_updates and enable_updates_bc
+    hl_updates_on = enable_updates and enable_updates_bc_hl
+    any_updates_on = rl_updates_on or bc_updates_on or hl_updates_on
 
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, "train.csv"))
-    if not enable_updates:
-        print("[main_carla] enable_updates=False: rollout-only (no RL gradient updates)", flush=True)
+    if not any_updates_on:
+        print("[main_carla] all updates disabled: rollout-only (no gradient updates)", flush=True)
+    else:
+        print(
+            f"[main_carla] updates enabled -> rl={rl_updates_on} bc={bc_updates_on} hl={hl_updates_on}",
+            flush=True,
+        )
     if warmup > 0 and agent is not None and not FLAGS.expert_debug:
-        print(f"[main_carla] warmup: no RL updates while step < {warmup}", flush=True)
-    if update_interval > 1 and agent is not None and enable_updates:
-        print(f"[main_carla] RL updates every {update_interval} env steps", flush=True)
+        print(f"[main_carla] warmup: no updates while step < {warmup}", flush=True)
+    if update_interval > 1 and agent is not None and any_updates_on:
+        print(f"[main_carla] updates every {update_interval} env steps", flush=True)
     if warmup_expo > 0:
         if warmup_expo <= warmup:
             raise ValueError(
@@ -605,6 +649,17 @@ def run_online_carla(
             f"window={_cast_relabel.window_env_steps} env steps, debug={_cast_relabel.debug})",
             flush=True,
         )
+        # Point the (trainable) SteerVLA actor at the CAST-relabel HL dataset so its high-level
+        # update (run from DSRL ``update_with_vla``) trains on the stored steervla_hl_dataset_format
+        # samples as they accumulate.
+        if steervla_actor is not None and getattr(steervla_actor, "load_trainable_params", False):
+            steervla_actor.hl_dataset_dir = _cast_relabel.hl_dataset_dir
+            print(
+                f"[main_carla] SteerVLA high-level update wired to HL dataset dir "
+                f"{steervla_actor.hl_dataset_dir} (every {steervla_actor.hl_update_every} vla updates, "
+                f"batch {steervla_actor.hl_update_batch_size}).",
+                flush=True,
+            )
         capture_rollout_video = True
     _online_training_mode = str(agent_config.get("online_training_mode", "rl")).strip().lower()
     _lang_dim = critic_language_dim(agent_config)
@@ -1335,6 +1390,19 @@ def run_online_carla(
             )
             _cast_step_record["prompt"] = _format_text_field(cot_obs_raw, "openpi_prompt_text")
             _cast_relabel.record_trajectory_step(_cast_step_record)
+            # Stash the raw SteerVLA model input (pre-step obs the action was taken from) so the
+            # window review can persist BAD/relabeled chunks as high-level dataset samples. The
+            # session keeps only chunk-start steps, so calling this every step is cheap.
+            _cast_relabel.record_model_input(
+                episode_step=episode_steps,
+                image=cot_obs_raw.get("image"),
+                state=cot_obs_raw.get("state"),
+                current_speed=float(_ego_speed_mps_from_raw(cot_obs_raw)),
+                prompt=_cast_step_record["prompt"],
+                subtask=_cast_step_record["subtask"],
+                reasoning=_cast_step_record["reasoning"],
+                action_chunk=replay_action,
+            )
             # A mid-route window review makes blocking Gemini calls (video upload + two
             # model queries) that can exceed the CARLA leaderboard watchdog timeout. Pause
             # the watchdogs/pseudo-sensors across the query so the route isn't stopped for
@@ -1402,6 +1470,9 @@ def run_online_carla(
         step_wb["training/in_warmup"] = float(in_warmup)
         step_wb["training/in_expo_warmup"] = float(in_expo_warmup)
         step_wb["training/enable_updates"] = float(enable_updates)
+        step_wb["training/rl_updates_on"] = float(rl_updates_on)
+        step_wb["training/bc_updates_on"] = float(bc_updates_on)
+        step_wb["training/hl_updates_on"] = float(hl_updates_on)
         if "episode_step_count" in info:
             step_wb["rollout/episode_step"] = float(info["episode_step_count"])
 
@@ -1544,7 +1615,7 @@ def run_online_carla(
 
         update_times = []
         if (
-            enable_updates
+            any_updates_on
             and (not FLAGS.expert_debug)
             and agent is not None
             and not in_warmup
@@ -1555,16 +1626,26 @@ def run_online_carla(
                 t_update_start = time.time()
                 use_vla_update = getattr(agent, "vla_sample_fn", None) is not None
                 batch = buffer.sample(batch_size)
+                update_info = None
                 if _online_training_mode == "dagger":
-                    agent, update_info = agent.update_dagger(batch)
+                    # Full BC / DAgger imitation path.
+                    if bc_updates_on:
+                        agent, update_info = agent.update_dagger(batch)
                 elif use_vla_update:
-                    agent, update_info = agent.update_with_vla(batch)
+                    # ``update_with_vla`` runs the DSRL critic/actor (RL) step and the HL VLM
+                    # backbone update; each is gated independently.
+                    if rl_updates_on or hl_updates_on:
+                        agent, update_info = agent.update_with_vla(
+                            batch, run_rl=rl_updates_on, run_hl=hl_updates_on,
+                        )
                 else:
-                    agent, update_info = agent.update(batch)
-                _block_until_ready_tree((agent, update_info))
+                    if rl_updates_on:
+                        agent, update_info = agent.update(batch)
+                if update_info is not None:
+                    _block_until_ready_tree((agent, update_info))
+                    last_update_info = update_info
                 t_update_end = time.time()
                 update_times.append(t_update_end - t_update_start)
-            last_update_info = update_info
             
 
         if step % FLAGS.log_interval == 0:
@@ -1579,7 +1660,7 @@ def run_online_carla(
             wandb.log(metrics, step=step)
             train_logger.log(metrics, step=step)
 
-        if agent is not None and enable_updates and step % FLAGS.save_interval == 0:
+        if agent is not None and any_updates_on and step % FLAGS.save_interval == 0:
             save_agent(agent, FLAGS.save_dir, step)
 
     train_logger.close()

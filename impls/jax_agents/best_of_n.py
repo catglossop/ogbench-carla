@@ -591,9 +591,15 @@ class BestOfNAgent(flax.struct.PyTreeNode):
         )
         return {"next_actions_critic": next_actions}
 
-    def update_with_vla(self, batch):
-        """Flax update via :meth:`total_loss_vla` with eager VLA forwards and a jitted gradient core."""
+    def update_with_vla(self, batch, run_rl: bool = True, run_hl: bool = True):
+        """Flax update via :meth:`total_loss_vla` with eager VLA forwards and a jitted gradient core.
+
+        ``run_rl`` gates the critic/actor gradient step. ``run_hl`` is accepted for signature parity
+        with :class:`DSRLAgent` but is a no-op here — best-of-N has no high-level VLM backbone update.
+        """
         new_rng, rng = jax.random.split(self.rng)
+        if not run_rl:
+            return self.replace(rng=new_rng), {}
         batch = self._prepare_vla_batch(batch)
         vla_cache = self._precompute_vla_loss_cache(batch, rng)
 

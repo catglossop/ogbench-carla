@@ -61,12 +61,18 @@ uv run ruff check .
 uv run ruff format .
 ```
 
-There is no unit test suite (`pytest` is a dependency but no `tests/` exists). Don't claim a "single test" command — there isn't one.
+There is no unit test suite (`pytest` is a dependency but no `tests/` exists). Don't claim a "single test" command — there isn't one. The one exception is `impls/coaches/test_action_chunk_feedback_integration.py`, a standalone integration script you run directly, not via a test runner.
+
+### Recovering from a crashed run
+
+CARLA runs leave orphaned processes (UE4 server, `main_carla`, `Xvfb`, wandb helpers) that hold GPU VRAM and ports. `./reset_carla.sh` SIGKILLs all of them and cleans stale `/tmp/.X*-lock` files. Run it before restarting after any crash. Note its caveat: zombie/`<defunct>` processes and primary/display GPUs can't be reset live — a reboot is the only fix; secondary (headless) GPUs may respond to `sudo nvidia-smi --gpu-reset -i <index>`.
 
 ## Required env vars / external state
 
 - `CARLA_ROOT=/home/carla/carla-0-9-16` (or `CARLA_PYTHON_API_ROOT=<root>/PythonAPI/carla`) — `ogbench/carla/carla.py` prepends this to `sys.path` before importing `leaderboard`/`srunner`. Without it the env will not import.
-- A running CARLA UE4 server reachable at `host:port` from `impls/configs/carla_config.yaml`. `run_carla.sh` does **not** launch CARLA itself — start it separately (see `README_celine.md` for the `pkill`/launch patterns used on this box).
+- A packaged CARLA install at `CARLA_ROOT` (its `CarlaUE4.sh` must be runnable). You do **not** start the UE4 server yourself: `CarlaBench2DriveWrapper._setup_simulation` (`ogbench/carla/carla_utils.py`) launches its own Xvfb + `CarlaUE4.sh` per run, using `port`/`streaming_port`/`traffic_manager_port`/`x_display_num`/`gpu_rank` from `carla_config.yaml`. Any of those left as `0` is auto-assigned to a free port/display; at startup the wrapper kills only stale processes matching *its own* rpc-port/display (`carla_utils.py` `_kill_stale_carla_processes`), so distinct ports are fully isolated.
+- Running several jobs at once: use `./carla_job.sh` (start/list/logs/stop/stop-all). It derives disjoint ports/display per integer `--job k` and its `stop` mirrors the wrapper's scoped kill, so it never disturbs sibling jobs — unlike `reset_carla.sh`, which SIGKILLs **all** CARLA processes on the box.
+- For **Fail2Drive** routes: the loose-asset content pack must be dropped into your packaged CARLA install first via `./install_f2d_content.sh CARLA_ROOT ZIP`. It only adds `.uasset` files (animal walkers, occluder/wall props) and does not touch bench2drive features.
 - `WANDB_MODE` (`online`/`offline`/`disabled`). `run_carla.sh` and `main_carla.py` both honor it.
 - For OpenPI checkpoints loaded from GCS: standard `gcloud auth` / Application Default Credentials.
 
@@ -109,7 +115,7 @@ CARLA's UE4 renderer and JAX run on **different GPUs**, and the rank conventions
 
 `run_carla.sh` doesn't edit your configs in place. It writes two temp files under `.run_carla/run.XXXXXX/`:
 
-- `agent_config.py` — `runpy`-loads `impls/configs/steervla_dsrl_config.py`, then overrides `training_gpu_rank`, `critic_feedback_mode`, and `online_training_mode` from CLI flags. So `--critic-mode {none|delta|delta-lang|expert-lang}` and `--train-mode {rl|dagger}` are the canonical user-facing knobs; **don't edit `steervla_dsrl_config.py` to change them per-run**.
+- `agent_config.py` — `runpy`-loads `impls/configs/steervla_dsrl_config.py` (the default; other experiment variants live alongside it — `steervla_best_of_n_config.py`, `steervla_cast_relabel_config.py`, `steervla_dsrl_config_no_subtask_attention.py` — selected via `--agent=`), then overrides `training_gpu_rank`, `critic_feedback_mode`, and `online_training_mode` from CLI flags. So `--critic-mode {none|delta|delta-lang|expert-lang}` and `--train-mode {rl|dagger}` are the canonical user-facing knobs; **don't edit `steervla_dsrl_config.py` to change them per-run**.
 - `carla_config.yaml` — loads the base yaml and overrides `host`/`port`/`streaming_port`/`traffic_manager_port`/`gpu_rank`/`x_display_num`. `use_cuda_visible_devices` is forced to `False` because the script is already managing GPU pinning.
 
 ## Custom Python packages

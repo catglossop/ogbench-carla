@@ -32,8 +32,16 @@
 fail2drive_carla_root: ''
 
 host: localhost
-port: 2001
-traffic_manager_port: 8002
+# 0 = auto-assign a free port/display at startup (carla_utils._setup_simulation):
+#   port -> first free >= 2000, traffic_manager_port -> first free >= 8000,
+#   x_display_num -> first free display. streaming_port has no auto-free logic and
+#   defaults to rpc_port + 1. Using 0 keeps concurrent direct `main_carla.py` runs from
+#   colliding on (or killing) each other's CARLA server. Set an explicit port only when
+#   you deliberately want to pin one. (run_carla.sh / carla_job.sh override these anyway.)
+port: 0
+streaming_port: 0
+x_display_num: 0
+traffic_manager_port: 0
 traffic_manager_seed: 0
 debug: 0
 record: ''
@@ -57,7 +65,7 @@ crash_stuck_steps: 20
 crash_stuck_penalty: -5.0
 
 # Force a new episode after this many env steps (0 = no limit).
-max_episode_steps: 1000
+max_episode_steps: 2000
 
 # Per-step reward shaping (defaults in carla_utils.py). Example:
 # speed_limit_penalty_weight: 0.1  # penalty = weight * max(0, speed/limit - 1)
