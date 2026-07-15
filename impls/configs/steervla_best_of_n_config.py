@@ -131,6 +131,15 @@ def get_config():
             # Decode action chunks in small micro-batches (CoT stays batched). Large
             # batched _sample_actions forwards can trigger native aborts on some drivers.
             action_decode_batch_size=2,
+            # Context-Smoothed Pre-training (CSP) noise level for the action expert. Only valid
+            # for a checkpoint trained with ``Pi0CoTConfig.context_smoothing`` enabled; omit both
+            # keys (the default) for the clean, precise-imitation regime.
+            #   sample_t_context=True  -> fresh t_context ~ U[t_context_min, t_context_max] per
+            #                             model query (independent per best-of-N candidate).
+            #   t_context=<float>      -> pin a fixed level (0 = clean, 1 = uninformative context).
+            # sample_t_context=True,
+            # t_context_min=0.0,
+            # t_context_max=1.0,
             # Remote HTTP actor is NOT supported for best-of-N (needs local sample_candidates):
             # actor_url="http://35.186.30.251:8000",
         )
