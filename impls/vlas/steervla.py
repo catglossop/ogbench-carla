@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import inspect
 import json
 import re
 import time
@@ -828,6 +829,10 @@ class SteerVLAActor:
         debug_noise_episode: int = 0,
         debug_noise_episode_step: int = 0,
         noise_scale: float = 1.0,
+        t_context: float | None = None,
+        sample_t_context: bool = False,
+        t_context_min: float = 0.0,
+        t_context_max: float = 1.0,
     ) -> None:
         self.actor_url = actor_url
         self._remote: Optional[RemoteActor] = None
@@ -877,6 +882,24 @@ class SteerVLAActor:
         self.debug_noise_episode = int(debug_noise_episode)
         self.debug_noise_episode_step = int(debug_noise_episode_step)
         self.noise_scale = float(noise_scale)
+        # Context-Smoothed Pre-training (CSP): the context noise level fed to the action expert.
+        # ``None`` (and sample_t_context=False) is the clean regime -- identical to a model trained
+        # without CSP, and the only setting that works with a non-CSP checkpoint. ``sample_t_context``
+        # draws a fresh t_context ~ U[t_context_min, t_context_max] per row on every model query;
+        # ``t_context`` alone pins a fixed level (what a TMRL high-level policy would select).
+        self.t_context = None if t_context is None else float(t_context)
+        self.sample_t_context = bool(sample_t_context)
+        self.t_context_min = float(t_context_min)
+        self.t_context_max = float(t_context_max)
+        if self.t_context is not None and not 0.0 <= self.t_context <= 1.0:
+            raise ValueError(f"t_context must be in [0, 1], got {self.t_context}")
+        if not 0.0 <= self.t_context_min <= self.t_context_max <= 1.0:
+            raise ValueError(
+                "t_context_min/t_context_max must satisfy 0 <= min <= max <= 1, got "
+                f"({self.t_context_min}, {self.t_context_max})"
+            )
+        # Most recent per-row t_context actually used (numpy, shape (b,)); None in the clean regime.
+        self._last_t_context: np.ndarray | None = None
         self.prompt_state_dim = steervla_prompt_state_dim(include_ego_history=include_ego_history)
         self._call_counter = 0
         self._cached_action_chunk: np.ndarray | None = None
@@ -1008,6 +1031,74 @@ class SteerVLAActor:
                 "image_keys",
             ),
         )
+
+    # ------------------------------------------------------------------
+    # Context-Smoothed Pre-training (CSP): context noise level ``t_context``
+    # ------------------------------------------------------------------
+    def set_t_context(
+        self,
+        t_context: float | None,
+        *,
+        sample: bool | None = None,
+        t_context_min: float | None = None,
+        t_context_max: float | None = None,
+    ) -> None:
+        """Set the context noise level used by subsequent action samples.
+
+        Call this per action chunk to drive the policy from a high-level (TMRL) controller:
+        ``set_t_context(0.0)`` for precise imitation, values toward 1.0 for the broad marginal.
+        ``sample=True`` switches to a fresh uniform draw on every model query instead.
+        """
+        self.t_context = None if t_context is None else float(t_context)
+        if sample is not None:
+            self.sample_t_context = bool(sample)
+        if t_context_min is not None:
+            self.t_context_min = float(t_context_min)
+        if t_context_max is not None:
+            self.t_context_max = float(t_context_max)
+
+    def _context_smoothing_supported(self) -> bool:
+        """True iff the checkpoint was trained with CSP *and* this openpi exposes ``t_context``."""
+        if self.model is None or getattr(self.model, "context_smoothing", None) is None:
+            return False
+        try:
+            return "t_context" in inspect.signature(type(self.model).sample_actions).parameters
+        except (TypeError, ValueError):
+            return False
+
+    def _resolve_t_context(self, rng: jax.Array, batch_size: int) -> jax.Array | None:
+        """Per-row context noise level in [0, 1], or ``None`` for the clean (no-CSP) regime.
+
+        Always returns an array of shape ``(b,)`` rather than a Python float so that a new value
+        does not force ``module_jit`` to retrace ``sample_actions``.
+        """
+        if self.t_context is None and not self.sample_t_context:
+            return None
+        if not self._context_smoothing_supported():
+            raise ValueError(
+                "t_context / sample_t_context require a checkpoint trained with "
+                "context_smoothing enabled (Pi0CoTConfig.context_smoothing) and an openpi build "
+                "whose Pi0CoT.sample_actions accepts t_context. Loaded config "
+                f"{self.actor_config!r} does not."
+            )
+        if self.sample_t_context:
+            t = jax.random.uniform(
+                rng,
+                (batch_size,),
+                dtype=jnp.float32,
+                minval=self.t_context_min,
+                maxval=self.t_context_max,
+            )
+        else:
+            t = jnp.full((batch_size,), float(self.t_context), dtype=jnp.float32)
+        t = jax.device_put(t, self._jax_device)
+        self._last_t_context = np.asarray(jax.device_get(t), dtype=np.float32)
+        return t
+
+    @property
+    def last_t_context(self) -> np.ndarray | None:
+        """Per-row ``t_context`` used by the most recent action sample (``None`` if clean)."""
+        return self._last_t_context
 
     def _refresh_inference_weights(self) -> None:
         """Rebuild the model + inference kernels from the train state after a HL update.
@@ -1674,6 +1765,13 @@ class SteerVLAActor:
             cfg_ah = 1
         noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(noise_chunk)
         
+        # Context noise level (CSP). Derived with fold_in so the CoT/action rng streams above are
+        # unchanged when the feature is off. Passed only when set, so a non-CSP openpi still works.
+        t_context = self._resolve_t_context(jax.random.fold_in(rng, 7), batch_size)
+        t_context_kw = {} if t_context is None else {"t_context": t_context}
+        if t_context is not None:
+            print(f"[DEBUG - steervla] t_context: {np.asarray(self._last_t_context).round(3).tolist()}")
+
         # Sample the actions
         sample_actions_time = time.time()
         traj = self._sample_actions(
@@ -1682,6 +1780,7 @@ class SteerVLAActor:
             noise=noise_full,
             num_steps=int(self.sample_actions_num_steps),
             image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+            **t_context_kw,
         )
         jax.block_until_ready(traj)
         sample_actions_time = time.time() - sample_actions_time
@@ -1798,11 +1897,17 @@ class SteerVLAActor:
         scores: list[float] = []
         xy_avgs: list[tuple[float, float]] = []
         xy_cumsum_steps: list[np.ndarray] = []
+        # Each _forward_pi0 draws its own t_context (when sample_t_context is on), so this sweep
+        # searches jointly over action noise AND context noise. Record the per-candidate level so a
+        # candidate's score can be attributed to one or the other after the fact.
+        candidate_t_contexts: list[np.ndarray | None] = []
         for i in range(n):
             noise_i = jnp.asarray(candidate_noises[i], dtype=jnp.float32)
             out = self._forward_pi0(batch_size, noise_i * self.noise_scale, raw=None)
             score = self._debug_speed_score_from_flat(out)
             scores.append(score)
+            last_t = self._last_t_context
+            candidate_t_contexts.append(None if last_t is None else np.array(last_t, copy=True))
             cumsum_xy = self._debug_xy_cumsum_from_flat(out)
             xy_cumsum_steps.append(cumsum_xy)
             final_xy = cumsum_xy[-1]
@@ -1811,6 +1916,19 @@ class SteerVLAActor:
                 best_score = score
                 best_out = out
                 best_idx = i
+
+        # (n, b) per-candidate context noise level; all-NaN in the clean regime.
+        t_context_arr = np.asarray(
+            [
+                np.full((batch_size,), np.nan) if t is None else np.asarray(t, dtype=np.float64)
+                for t in candidate_t_contexts
+            ],
+            dtype=np.float64,
+        )
+        # _last_t_context is left pointing at the final candidate's draw; restore the executed one
+        # so downstream logging/replay records the t_context that actually produced the action.
+        if self.use_best_noise and best_idx >= 0 and candidate_t_contexts[best_idx] is not None:
+            self._last_t_context = candidate_t_contexts[best_idx]
 
         scores_arr = np.asarray(scores, dtype=np.float64)
         xy_arr = np.asarray(xy_avgs, dtype=np.float64)
@@ -1826,7 +1944,22 @@ class SteerVLAActor:
         if should_log_plot:
             fig, (ax_score, ax_xy) = plt.subplots(1, 2, figsize=(13, 5))
 
-            ax_score.scatter(range(n), scores_arr, alpha=0.75, label="candidates")
+            if np.all(np.isnan(t_context_arr)):
+                ax_score.scatter(range(n), scores_arr, alpha=0.75, label="candidates")
+            else:
+                # Color by context noise level: makes it obvious when the score spread is driven by
+                # t_context rather than by the action noise this sweep is nominally searching over.
+                sc = ax_score.scatter(
+                    range(n),
+                    scores_arr,
+                    c=np.nanmean(t_context_arr, axis=1),
+                    cmap="viridis",
+                    vmin=0.0,
+                    vmax=1.0,
+                    alpha=0.85,
+                    label="candidates",
+                )
+                fig.colorbar(sc, ax=ax_score, label="t_context")
             if self.use_best_noise and best_idx >= 0:
                 ax_score.scatter(
                     [best_idx],
@@ -1964,6 +2097,7 @@ class SteerVLAActor:
             np.savez(
                 npz_path,
                 candidate_noises=candidate_noises,
+                candidate_t_contexts=t_context_arr,
                 scores=scores_arr,
                 xy_final=xy_arr,
                 xy_cumsum=xy_cumsum_arr,
@@ -1978,9 +2112,18 @@ class SteerVLAActor:
 
         best_speed_str = f"{best_score:.4f}" if best_idx >= 0 else "n/a"
         plot_msg = f" plot={plot_path} npz={npz_path}" if should_log_plot else " plot=skipped"
+        t_context_msg = ""
+        if not np.all(np.isnan(t_context_arr)):
+            best_t_str = (
+                f"{np.nanmean(t_context_arr[best_idx]):.3f}" if best_idx >= 0 else "n/a"
+            )
+            t_context_msg = (
+                f" t_context=[{np.nanmin(t_context_arr):.3f}, {np.nanmax(t_context_arr):.3f}] "
+                f"best_t_context={best_t_str}"
+            )
         print(
             f"[debug_noise] step={self.debug_noise_episode_step} candidates={n} "
-            f"use_best_noise={self.use_best_noise} "
+            f"use_best_noise={self.use_best_noise}{t_context_msg} "
             f"best_idx={best_idx} best_speed_delta_xy={best_speed_str} "
             f"mean={score_mean:.4f} std={score_std:.4f} "
             f"min={score_min:.4f} max={score_max:.4f}{plot_msg}",
@@ -2171,6 +2314,16 @@ class SteerVLAActor:
             jax.device_put(noise_chunk, self._jax_device)
         )
 
+        # One independent context noise level per candidate: with sample_t_context the best-of-N
+        # search then ranges over t_context as well as over the sampled CoT.
+        t_context = self._resolve_t_context(jax.random.fold_in(rng, 7), n)
+        if t_context is not None:
+            print(
+                f"[best_of_n] t_context per candidate: "
+                f"{np.asarray(self._last_t_context).round(3).tolist()}",
+                flush=True,
+            )
+
         decode_bs = min(n, int(self.action_decode_batch_size))
         traj_parts: list[np.ndarray] = []
         for start in range(0, n, decode_bs):
@@ -2178,12 +2331,14 @@ class SteerVLAActor:
             chunk_rng = jax.random.fold_in(rng_act, start)
             chunk_obs = jax.tree.map(lambda x: x[start:end], obs_full)
             chunk_noise = noise_full[start:end]
+            t_context_kw = {} if t_context is None else {"t_context": t_context[start:end]}
             traj = self._sample_actions(
                 chunk_rng,
                 chunk_obs,
                 noise=chunk_noise,
                 num_steps=int(self.sample_actions_num_steps),
                 image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+                **t_context_kw,
             )
             jax.block_until_ready(traj)
             traj_np = self._postprocess_action_trajectory(
@@ -2197,6 +2352,8 @@ class SteerVLAActor:
             "subtask_texts": subtask_texts,
             "reasoning_texts": reasoning_texts,
             "cot_out": cot_out,
+            # (n,) context noise level per candidate, or None in the clean regime.
+            "t_context": None if t_context is None else np.asarray(self._last_t_context, dtype=np.float32),
         }
 
     def stash_candidate_cot(
@@ -2256,6 +2413,13 @@ def create_steervla_pi0_cot_sample_fn(
             steervla_cfg.get("debug_noise_log_every_n_steps", 5)
         ),
         noise_scale=float(steervla_cfg.get("noise_scale", noise_scale)),
+        # CSP context noise. Requires a checkpoint trained with context_smoothing enabled.
+        t_context=(
+            None if steervla_cfg.get("t_context") is None else float(steervla_cfg["t_context"])
+        ),
+        sample_t_context=bool(steervla_cfg.get("sample_t_context", False)),
+        t_context_min=float(steervla_cfg.get("t_context_min", 0.0)),
+        t_context_max=float(steervla_cfg.get("t_context_max", 1.0)),
     )
 
     if url_clean:
