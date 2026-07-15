@@ -35,7 +35,7 @@ def get_config():
     config.language_feedback.expert_mode = "none"
     config.training_gpu_rank = 0
     config.siglip_device = "cuda:0"
-    config.batch_size = 128
+    config.batch_size = 32
     config.warmup_steps = 500
     
     config.enable_updates = True
@@ -45,8 +45,8 @@ def get_config():
     #   bc_hl -> high-level VLM backbone update: DSRLAgent.update_with_vla(run_hl=True) calls
     #            SteerVLAActor.update_hl, which fine-tunes the CoT/VLM backbone on the
     #            cast_relabel HL samples (subtask + reasoning targets, action loss masked out).
-    config.enable_updates_rl = True
-    config.enable_updates_bc = False
+    config.enable_updates_rl = False
+    config.enable_updates_bc = True
     config.enable_updates_bc_hl = True
 
     config.cast_relabel = ml_collections.ConfigDict(
