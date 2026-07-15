@@ -78,7 +78,7 @@ CARLA_STEERVLA_IMAGE_KEYS: tuple[str, ...] = ("base_0_rgb",)
 # ``<OPENPI_DATA_HOME>/<netloc>/<path>``. Point the cache at NFS so large GCS
 # checkpoints are shared across hosts/users instead of filling each box's home dir;
 # the on-disk layout under it is unchanged.
-STEERVLA_CACHE_DIR = "/home/carla/.cache/openpi"
+STEERVLA_CACHE_DIR = "/scratch/current/cglossop/openpi"
 
 
 def _ensure_openpi_cache_dir() -> None:
@@ -1282,6 +1282,34 @@ class SteerVLAActor:
             except Exception:
                 continue
         out["n_samples"] = float(len(images))
+
+        # True device memory around the HL gradient step. ``nvidia-smi`` only shows the
+        # preallocated XLA pool (XLA_PYTHON_CLIENT_MEM_FRACTION), not live usage, so read it
+        # from JAX directly. Block first so the step has actually materialized before we
+        # sample ``peak_bytes_in_use`` (async dispatch would otherwise read a stale peak).
+        try:
+            jax.block_until_ready(self._train_state.params)
+            dev = self._jax_device or jax.local_devices()[0]
+            stats = dev.memory_stats() or {}
+            live = stats.get("bytes_in_use")
+            peak = stats.get("peak_bytes_in_use")
+            limit = stats.get("bytes_limit")
+            if live is not None:
+                out["hl_mem_live_gb"] = float(live) / 1e9
+            if peak is not None:
+                out["hl_mem_peak_gb"] = float(peak) / 1e9
+            if limit is not None:
+                out["hl_mem_limit_gb"] = float(limit) / 1e9
+            print(
+                f"[steervla.update_hl] device={dev} live={out.get('hl_mem_live_gb', float('nan')):.2f}GB "
+                f"peak={out.get('hl_mem_peak_gb', float('nan')):.2f}GB "
+                f"limit={out.get('hl_mem_limit_gb', float('nan')):.2f}GB "
+                f"(bs={len(images)}, steps={ns})",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - memory telemetry must never break the update.
+            print(f"[steervla.update_hl] memory_stats unavailable ({exc}).", flush=True)
+
         return out
 
     def _state_for_transform(self, state: np.ndarray | jax.Array) -> np.ndarray:

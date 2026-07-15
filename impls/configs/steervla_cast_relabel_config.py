@@ -35,8 +35,8 @@ def get_config():
     config.language_feedback.expert_mode = "none"
     config.training_gpu_rank = 0
     config.siglip_device = "cuda:0"
-    config.batch_size = 32
-    config.warmup_steps = 500
+    config.batch_size = 0
+    config.warmup_steps = 10
     
     config.enable_updates = True
     # Per-kind switches, each ANDed with ``enable_updates``:
@@ -46,7 +46,7 @@ def get_config():
     #            SteerVLAActor.update_hl, which fine-tunes the CoT/VLM backbone on the
     #            cast_relabel HL samples (subtask + reasoning targets, action loss masked out).
     config.enable_updates_rl = False
-    config.enable_updates_bc = True
+    config.enable_updates_bc = False
     config.enable_updates_bc_hl = True
 
     config.cast_relabel = ml_collections.ConfigDict(

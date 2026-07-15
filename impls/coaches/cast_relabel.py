@@ -561,13 +561,13 @@ def generate_cast_relabel(
             num_suggestions=num_suggestions,
         )
     response_text = coach.complete_text(prompt)
-    credits = parse_credit_relabel_response(
+    creds = parse_credit_relabel_response(
         response_text, num_chunks=len(chunk_specs), num_suggestions=num_suggestions
     )
     cast_json = assemble_cast_relabel_json(
         metadata,
         events=events,
-        credits=credits,
+        credits=creds,
         chunk_specs=chunk_specs,
         seed_subtasks=seed_subtasks,
         num_suggestions=num_suggestions,
@@ -908,6 +908,9 @@ class OnlineCastRelabelSession:
         )
         self.save_artifacts = bool(self.cfg.get("save_artifacts", True))
         self.debug = bool(self.cfg.get("debug", False))
+        # Debug relabel task: swap the credit/subtask prompt for build_debug_task_prompt, which
+        # forces every chunk's suggested subtasks toward "remain stopped / slow down".
+        self.debug_task = bool(self.cfg.get("debug_task", False))
         self.query_on_episode_end = bool(self.cfg.get("query_on_episode_end", True))
         # High-level (VLM-backbone) dataset storage: persist BAD/relabeled chunks as SteerVLA
         # ``steervla_hl_dataset_format`` samples for a later VLM-backbone fine-tuning step.

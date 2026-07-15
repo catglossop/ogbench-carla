@@ -32,11 +32,11 @@ from jax_agents import dsrl as dsrl_agent
 def get_config():
     config = dsrl_agent.get_config()
 
-    config.lr = 3e-4
-    config.batch_size = 32
+    config.lr = 3e-5
+    config.batch_size = 128
     # Denoise steps for frozen VLA forwards during RL updates (rollout uses steervla.sample_actions_num_steps).
     config.vla_update_flow_steps = 5
-    config.noise_scale = 5.0
+    config.noise_scale = 1.0
     config.alpha = 0.1
     # Collect transitions with the rollout policy (SteerVLA / DSRL) but skip RL updates.
     config.warmup_steps = 200
@@ -46,23 +46,23 @@ def get_config():
     # Run RL gradient updates every N env steps (still ``updates_per_step`` per update).
     config.update_interval = 10
     # Master switch: set to false for rollout-only runs (no gradient updates of any kind).
-    config.enable_updates = False
+    config.enable_updates = True
     # Per-kind switches, each ANDed with ``enable_updates``:
     #   rl    -> DSRL critic/actor (RL) updates
     #   bc    -> full BC / DAgger imitation path (``update_dagger``)
     #   bc_hl -> high-level VLM backbone update (``update_hl`` on cast_relabel data)
-    config.enable_updates_rl = False
+    config.enable_updates_rl = True
     config.enable_updates_bc = False
     config.enable_updates_bc_hl = False
     config.buffer_capacity = 1_000
     # When true, RL updates use reward = -ego_speed (m/s) instead of env reward.
-    config.debug_task = False
+    config.debug_task = True
     # Rollout-only: best-of-N random VLA noises minimizing first-step speed delta_xy.
-    config.debug_noise = True
+    config.debug_noise = False
     config.debug_noise_samples = 8
     config.debug_noise_log_every_n_steps = 10
     # When debug_noise=True: if True, execute the slowest candidate; if False, log only and use actor noise.
-    config.use_best_noise = True
+    config.use_best_noise = False
     config.image_log_curr_interval = 10
     config.critic_action_dim = 4
     config.vla_action_dim = 4
