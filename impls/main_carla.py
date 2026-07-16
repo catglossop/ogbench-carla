@@ -790,18 +790,21 @@ def _maybe_capture_frame(
 def _log_episode_end(
     info: dict, *, episode_return: float, episode_steps: int, episode_index: int,
     frames: list[np.ndarray], log_video: bool, video_fps: float, step: int, train_logger: CsvLogger,
-    collision_events: int = 0,
+    collision_events: int = 0, debug_task: bool = False, debug_return: float = 0.0,
 ) -> None:
     """Log per-episode rollout metrics (+ video) to W&B and CSV, then clear ``frames``."""
     rollout_log: dict[str, Any] = {
-        "rollout/episode_return": episode_return,
         "rollout/episode_length": episode_steps,
         "rollout/episodes": episode_index,
-        "rollout/episode_collision_events": float(collision_events),
-        "rollout/collisions_over_episode": float(collision_events) / max(float(episode_steps), 1.0),
     }
-    rollout_log.update(_episode_summary_log(info))
-    rollout_log.update(_final_step_reward_log(info))
+    if debug_task:
+        rollout_log["debug/episode_return"] = debug_return
+    else:
+        rollout_log["rollout/episode_return"] = episode_return
+        rollout_log["rollout/episode_collision_events"] = float(collision_events)
+        rollout_log["rollout/collisions_over_episode"] = float(collision_events) / max(float(episode_steps), 1.0)
+        rollout_log.update(_episode_summary_log(info))
+        rollout_log.update(_final_step_reward_log(info))
     if log_video:
         video = _episode_video(frames, video_fps)
         if video is not None:
@@ -1644,6 +1647,7 @@ def run_online_residual(
 
     buffer: Optional[ReplayBuffer] = None
     episode_return = 0.0
+    debug_return = 0.0  # sum of the debug objective (-ego_speed) over the episode; only used when debug_task.
     episode_steps = 0
     episode_count = 0
     episode_collision_count = 0
@@ -1733,12 +1737,16 @@ def run_online_residual(
                 buffer.add_transition(transition)
 
             episode_return += float(reward)
+            # Debug objective: reward = -ego_speed (matches the relabel the agent trains on).
+            debug_step_reward = -float(_ego_speed_mps(obs)) if debug_task else 0.0
+            debug_return += debug_step_reward
             episode_steps += 1
             # In accel_steer mode ``final`` is a 2-D control (no waypoint projection), so draw the
             # (smooth) base chunk plan; in chunk mode draw the executed (perturbed) chunk.
             viz_action = base_chunk if accel_steer else final
             _maybe_capture_frame(
-                episode_frames, next_obs, reward, episode_steps=episode_steps, done=done,
+                episode_frames, next_obs, debug_step_reward if debug_task else reward,
+                episode_steps=episode_steps, done=done,
                 log_video=log_video, video_every=video_every,
                 action_flat=viz_action, exec_cfg=exec_cfg,
                 collision=(collision_count, episode_collision_events) if collision_delta > 0 else None,
@@ -1761,21 +1769,24 @@ def run_online_residual(
 
             if step % FLAGS.log_interval == 0:
                 log = {
-                    "env/reward": float(reward),
                     "env/episode_count": episode_count,
                     "env/sps": step / max(time.time() - start_time, 1e-6),
                 }
+                if debug_task:
+                    log["debug/step_reward"] = debug_step_reward
+                else:
+                    log["env/reward"] = float(reward)
+                    log["rollout/collision_events"] = float(collision_delta)
+                    log.update(_reward_breakdown_log(info))
                 if agent is not None:
                     log["env/buffer_size"] = int(buffer.size) if buffer is not None else 0
                     log["env/residual_active"] = int(residual_active)
                     log["env/residual_scale"] = float(scale_now)
-                log["rollout/collision_events"] = float(collision_delta)
                 log["training/in_warmup"] = float(step <= warmup)
                 log["training/in_ramp"] = float(ramp_steps > 0 and warmup < step < warmup + ramp_steps)
                 log["training/enable_updates"] = float(enable_updates)
                 log["time/step_time"] = t_step_end - t_step_start
                 log["time/update_time"] = t_update_end - t_update_start
-                log.update(_reward_breakdown_log(info))
                 if train_info:
                     log.update({k: float(jax.device_get(v)) for k, v in train_info.items()})
                 # Executed control + per-component chunk stats as scalar line charts.
@@ -1821,9 +1832,11 @@ def run_online_residual(
                     episode_index=episode_count + 1, frames=episode_frames, log_video=log_video,
                     video_fps=video_fps, step=step, train_logger=train_logger,
                     collision_events=episode_collision_events,
+                    debug_task=debug_task, debug_return=debug_return,
                 )
                 episode_count += 1
                 episode_return = 0.0
+                debug_return = 0.0
                 episode_steps = 0
                 episode_collision_count = 0
                 episode_collision_events = 0
