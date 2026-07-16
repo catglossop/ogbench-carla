@@ -283,29 +283,17 @@ def get_config():
             tau=0.005,
             residual_scale=0.1,
             # Consumed by main_carla.py (the SAC agent itself is space-agnostic):
-            #   "accel_steer" (default) -> base chunk is PID-decoded to a 2-D [accel, steer]
-            #                       control first; the residual acts there (waypoints stay the
-            #                       base plan). Well-conditioned; typically wants residual_scale
-            #                       ~0.5-0.6 since the control is already in [-1, 1].
+            #   "accel_steer" (default) -> base chunk is PID-decoded to a 2-D [accel, steer] before residual is applied.
             #   "waypoint_chunk" -> residual acts on the flattened normalized 40-D chunk
-            #                       (reshapes the executed waypoints).
             residual_action_space="accel_steer",
             target_entropy=ml_collections.config_dict.placeholder(float),  # None -> auto.
             target_entropy_multiplier=0.5,
-            # Warm-start schedule (applied in main_carla via a step-dependent scale):
-            #   step <= residual_warmup_steps           -> scale 0 (pure base policy; also the
-            #                                              in-run base baseline + no RL updates)
-            #   warmup < step <= warmup + ramp_steps     -> scale ramps 0 -> residual_scale (linear)
-            #   step  > warmup + ramp_steps              -> scale = residual_scale (full authority)
             residual_warmup_steps=2000,
             residual_ramp_steps=3000,
-            # EXPO (arXiv:2507.07986): N base actions from distinct SteerVLA CoTs, each edited 1:1,
-            # execute argmax-Q of the 2N pool. ~best_of_n x SteerVLA forwards per step.
-            # expo=False -> plain residual SAC (single edit acting + soft SAC backup, no best-of-N).
             expo=False,
             best_of_n=8,
-            vla_cot_temperature=1.0,  # >0 so the N sampled CoTs/subtasks differ (0 = greedy = identical).
-            otf_td_backup=False,  # True: hard-max OTF TD target. False: rollout-only soft SAC ablation.
+            vla_cot_temperature=1.0,
+            otf_td_backup=False,
             updates_per_step=10,
             # Debug task: RL updates use reward = -ego_speed (m/s) instead of env reward,
             # so the policy should learn to brake to a stop.
