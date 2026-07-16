@@ -4,7 +4,7 @@ set -euo pipefail
 # Single launch wrapper for the residual-RL CARLA stack.
 # Writes temp agent + CARLA configs under .run_carla/ (so your base configs are
 # never edited in place), pins the two GPUs (JAX learner vs. CARLA renderer),
-# and invokes impls/main_carla_residual.py.
+# and invokes impls/main_carla.py (residual/EXPO path, selected by the agent config).
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
@@ -38,7 +38,7 @@ EXTRA_ARGS=()
 usage() {
   cat <<'EOF'
 Usage:
-  bash run_carla.sh [options] [-- extra args passed to impls/main_carla_residual.py]
+  bash run_carla.sh [options] [-- extra args passed to impls/main_carla.py]
 
 Options:
   --route NAME              Bench2Drive route name/id. Default: parking-cut-in-001
@@ -196,7 +196,11 @@ echo "[run_carla.sh] save_buffer=${SAVE_BUFFER} online_steps=${ONLINE_STEPS}"
 echo "[run_carla.sh] temp agent config: ${AGENT_CFG_TMP}"
 echo "[run_carla.sh] temp carla config: ${CARLA_CFG_TMP}"
 
-WANDB_MODE="${WANDB_MODE}" uv run python impls/main_carla_residual.py \
+# main_carla.py dispatches to the residual/EXPO path when the agent config's
+# agent_name == "sac_residual" (steervla_residual_config.py). log_interval/save_interval are
+# the residual cadence (main_carla's DSRL defaults are 1 / 100000); placed before EXTRA_ARGS so
+# a caller can still override them via `-- --log_interval=...`.
+WANDB_MODE="${WANDB_MODE}" uv run python impls/main_carla.py \
   --agent="${AGENT_CFG_TMP}" \
   --carla_config="${CARLA_CFG_TMP}" \
   --route="${ROUTE}" \
@@ -204,4 +208,6 @@ WANDB_MODE="${WANDB_MODE}" uv run python impls/main_carla_residual.py \
   --save_buffer="${SAVE_BUFFER}" \
   --seed="${SEED}" \
   --run_group="${RUN_GROUP}" \
+  --log_interval=10 \
+  --save_interval=5000 \
   "${EXTRA_ARGS[@]}"

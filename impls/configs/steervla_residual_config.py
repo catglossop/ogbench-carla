@@ -1,7 +1,8 @@
 """``get_config()`` for the residual-RL stack on CARLA Bench2Drive.
 
-Use with ``--agent=impls/configs/steervla_residual_config.py`` (the default for
-``impls/main_carla_residual.py``). This wraps :func:`jax_agents.sac_residual.get_config`
+Use with ``--agent=impls/configs/steervla_residual_config.py``; ``main_carla.py`` dispatches
+to the residual/EXPO path when this config's ``agent_name == "sac_residual"``. This wraps
+:func:`jax_agents.sac_residual.get_config`
 (the residual SAC agent) and adds the run-level wiring: the state encoder used to
 build the RL state and the frozen SteerVLA base policy.
 """

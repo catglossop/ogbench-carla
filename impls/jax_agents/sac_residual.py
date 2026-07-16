@@ -32,12 +32,12 @@ from utils.networks import GCValue, LogParam, MLP, default_init
 def _apply_debug_stop_reward_relabel(batch: dict) -> dict:
     """Debug task: replace env reward with ``-ego_speed`` (m/s) to encourage stopping.
 
-    Requires the replay field ``ego_speed`` (stored by main_carla_residual when
+    Requires the replay field ``ego_speed`` (stored by main_carla when
     ``debug_task`` is set). Keeps the stored env reward intact for logging.
     """
     if "ego_speed" not in batch:
         raise KeyError(
-            "debug_task requires replay field 'ego_speed' (store CARLA speed m/s in main_carla_residual)."
+            "debug_task requires replay field 'ego_speed' (store CARLA speed m/s in main_carla)."
         )
     out = dict(batch)
     out["rewards"] = -jnp.asarray(out["ego_speed"], dtype=jnp.float32)
@@ -282,7 +282,7 @@ def get_config():
             discount=0.99,
             tau=0.005,
             residual_scale=0.1,
-            # Consumed by main_carla_residual.py (the SAC agent itself is space-agnostic):
+            # Consumed by main_carla.py (the SAC agent itself is space-agnostic):
             #   "accel_steer" (default) -> base chunk is PID-decoded to a 2-D [accel, steer]
             #                       control first; the residual acts there (waypoints stay the
             #                       base plan). Well-conditioned; typically wants residual_scale
@@ -292,7 +292,7 @@ def get_config():
             residual_action_space="accel_steer",
             target_entropy=ml_collections.config_dict.placeholder(float),  # None -> auto.
             target_entropy_multiplier=0.5,
-            # Warm-start schedule (applied in main_carla_residual via a step-dependent scale):
+            # Warm-start schedule (applied in main_carla via a step-dependent scale):
             #   step <= residual_warmup_steps           -> scale 0 (pure base policy; also the
             #                                              in-run base baseline + no RL updates)
             #   warmup < step <= warmup + ramp_steps     -> scale ramps 0 -> residual_scale (linear)
