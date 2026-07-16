@@ -541,6 +541,16 @@ def _expo_candidate_log(base_cands: np.ndarray, q_all: np.ndarray, winner_idx: i
     return out
 
 
+def _drive_diagnostics_log(info: dict) -> dict[str, float]:
+    """Per-step rollout diagnostics (route progress, centering, heading). Objective-agnostic, so
+    these are logged in debug runs too."""
+    out: dict[str, float] = {}
+    for k in _DRIVE_KEYS:
+        if k in info:
+            out[f"rollout/{k}"] = float(info[k])
+    return out
+
+
 def _reward_breakdown_log(info: dict) -> dict[str, float]:
     """Flatten the env reward components + drive diagnostics into a W&B log dict."""
     out: dict[str, float] = {}
@@ -548,9 +558,7 @@ def _reward_breakdown_log(info: dict) -> dict[str, float]:
         for k in _REWARD_KEYS:
             if k in info:
                 out[f"reward/{k}"] = float(info[k])
-    for k in _DRIVE_KEYS:
-        if k in info:
-            out[f"rollout/{k}"] = float(info[k])
+    out.update(_drive_diagnostics_log(info))
     return out
 
 
@@ -793,17 +801,20 @@ def _log_episode_end(
     collision_events: int = 0, debug_task: bool = False, debug_return: float = 0.0,
 ) -> None:
     """Log per-episode rollout metrics (+ video) to W&B and CSV, then clear ``frames``."""
+    # Descriptive rollout data (progress %, success, driving score, collisions, video) is logged in
+    # both modes. Debug runs swap the env reward return for the -ego_speed objective and drop the
+    # env-reward terminal breakdown.
     rollout_log: dict[str, Any] = {
         "rollout/episode_length": episode_steps,
         "rollout/episodes": episode_index,
+        "rollout/episode_collision_events": float(collision_events),
+        "rollout/collisions_over_episode": float(collision_events) / max(float(episode_steps), 1.0),
     }
+    rollout_log.update(_episode_summary_log(info))
     if debug_task:
         rollout_log["debug/episode_return"] = debug_return
     else:
         rollout_log["rollout/episode_return"] = episode_return
-        rollout_log["rollout/episode_collision_events"] = float(collision_events)
-        rollout_log["rollout/collisions_over_episode"] = float(collision_events) / max(float(episode_steps), 1.0)
-        rollout_log.update(_episode_summary_log(info))
         rollout_log.update(_final_step_reward_log(info))
     if log_video:
         video = _episode_video(frames, video_fps)
@@ -1772,12 +1783,16 @@ def run_online_residual(
                     "env/episode_count": episode_count,
                     "env/sps": step / max(time.time() - start_time, 1e-6),
                 }
+                # Rollout diagnostics (route progress, collisions, controls) are objective-agnostic,
+                # so keep them in both modes. Only the env reward channel is swapped for the debug
+                # objective: drop env/reward + reward-component breakdown, log -ego_speed instead.
+                log["rollout/collision_events"] = float(collision_delta)
                 if debug_task:
                     log["debug/step_reward"] = debug_step_reward
+                    log.update(_drive_diagnostics_log(info))
                 else:
                     log["env/reward"] = float(reward)
-                    log["rollout/collision_events"] = float(collision_delta)
-                    log.update(_reward_breakdown_log(info))
+                    log.update(_reward_breakdown_log(info))  # reward components + drive diagnostics
                 if agent is not None:
                     log["env/buffer_size"] = int(buffer.size) if buffer is not None else 0
                     log["env/residual_active"] = int(residual_active)
