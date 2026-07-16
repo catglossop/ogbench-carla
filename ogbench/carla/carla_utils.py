@@ -435,7 +435,12 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
             "-RenderOffScreen",
             "-nosound",
             f"-carla-rpc-port={rpc_port}",
-            f"-graphicsadapter=0",
+            # Select the render GPU. Under the NVIDIA container runtime NVIDIA_VISIBLE_DEVICES
+            # scopes to a single device (so adapter 0 == that GPU); on bare metal that var is a
+            # no-op and every GPU stays visible, so we must pass the physical rank here. Note
+            # CARLA/UE4's Vulkan adapter ordering can differ from nvtop/nvidia-smi (see the
+            # gpu_rank comment in carla_config.yaml) -- pick the value empirically via nvtop.
+            f"-graphicsadapter={int(sim_gpu_rank)}",
         ]
         streaming_port = int(getattr(args, "streaming_port", 0) or 0)
         if streaming_port > 0:
