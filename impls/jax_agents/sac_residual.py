@@ -302,10 +302,10 @@ def get_config():
             # EXPO (arXiv:2507.07986): N base actions from distinct SteerVLA CoTs, each edited 1:1,
             # execute argmax-Q of the 2N pool. ~best_of_n x SteerVLA forwards per step.
             # expo=False -> plain residual SAC (single edit acting + soft SAC backup, no best-of-N).
-            expo=True,
+            expo=False,
             best_of_n=8,
             vla_cot_temperature=1.0,  # >0 so the N sampled CoTs/subtasks differ (0 = greedy = identical).
-            otf_td_backup=True,  # True: hard-max OTF TD target. False: rollout-only soft SAC ablation.
+            otf_td_backup=False,  # True: hard-max OTF TD target. False: rollout-only soft SAC ablation.
             updates_per_step=10,
             # Debug task: RL updates use reward = -ego_speed (m/s) instead of env reward,
             # so the policy should learn to brake to a stop.
