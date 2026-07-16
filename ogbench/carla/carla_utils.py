@@ -435,11 +435,6 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
             "-RenderOffScreen",
             "-nosound",
             f"-carla-rpc-port={rpc_port}",
-            # Select the render GPU. Under the NVIDIA container runtime NVIDIA_VISIBLE_DEVICES
-            # scopes to a single device (so adapter 0 == that GPU); on bare metal that var is a
-            # no-op and every GPU stays visible, so we must pass the physical rank here. Note
-            # CARLA/UE4's Vulkan adapter ordering can differ from nvtop/nvidia-smi (see the
-            # gpu_rank comment in carla_config.yaml) -- pick the value empirically via nvtop.
             f"-graphicsadapter={int(sim_gpu_rank)}",
         ]
         streaming_port = int(getattr(args, "streaming_port", 0) or 0)
@@ -1139,7 +1134,10 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             try:
                 from ogbench.carla.steervla_simlingo_control import SimlingoStyleWaypointDecoder
 
-                self._steervla_decoder = SimlingoStyleWaypointDecoder()
+                self._steervla_decoder = SimlingoStyleWaypointDecoder(
+                    creep_speed=float(exec_raw.get("creep_speed", 0.0)),
+                    creep_throttle=float(exec_raw.get("creep_throttle", 0.4)),
+                )
             except ImportError as e:
                 raise ImportError(
                     "SteerVLA waypoint decoding failed to load dependencies "

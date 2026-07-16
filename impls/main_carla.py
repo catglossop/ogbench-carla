@@ -355,6 +355,9 @@ def _steervla_action_execution_cfg(steervla_cfg, *, residual: bool = False) -> d
         "action_horizon": ah,
         "action_dim": ad,
         "action_input_space": action_input_space,
+        # Anti-cold-start creep in the PID decoder (0 disables). See SimlingoStyleWaypointDecoder.
+        "creep_speed": float(steervla_cfg.get("creep_speed", 0.0)),
+        "creep_throttle": float(steervla_cfg.get("creep_throttle", 0.4)),
     }
 
 
@@ -801,9 +804,6 @@ def _log_episode_end(
     collision_events: int = 0, debug_task: bool = False, debug_return: float = 0.0,
 ) -> None:
     """Log per-episode rollout metrics (+ video) to W&B and CSV, then clear ``frames``."""
-    # Descriptive rollout data (progress %, success, driving score, collisions, video) is logged in
-    # both modes. Debug runs swap the env reward return for the -ego_speed objective and drop the
-    # env-reward terminal breakdown.
     rollout_log: dict[str, Any] = {
         "rollout/episode_length": episode_steps,
         "rollout/episodes": episode_index,
@@ -1783,9 +1783,7 @@ def run_online_residual(
                     "env/episode_count": episode_count,
                     "env/sps": step / max(time.time() - start_time, 1e-6),
                 }
-                # Rollout diagnostics (route progress, collisions, controls) are objective-agnostic,
-                # so keep them in both modes. Only the env reward channel is swapped for the debug
-                # objective: drop env/reward + reward-component breakdown, log -ego_speed instead.
+
                 log["rollout/collision_events"] = float(collision_delta)
                 if debug_task:
                     log["debug/step_reward"] = debug_step_reward
