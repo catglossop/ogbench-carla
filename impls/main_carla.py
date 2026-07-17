@@ -127,8 +127,28 @@ flags.DEFINE_integer("restore_epoch", None, "Restore epoch.")
 flags.DEFINE_integer("online_steps", 1000, "Number of online environment steps to run.")
 flags.DEFINE_integer("log_interval", 1, "Logging interval (env steps).")
 flags.DEFINE_integer("save_interval", 100_000, "Agent-checkpoint interval (env steps).")
+flags.DEFINE_integer(
+    "resume_interval",
+    1000,
+    "Crash-recovery checkpoint interval (env steps) for the residual loop: how often the agent + "
+    "replay buffer + resume_state are committed so --resume can continue near the crash point. "
+    "Smaller = less lost progress per crash, more I/O. 0 disables periodic recovery checkpoints.",
+)
 flags.DEFINE_bool("save_buffer", False, "Dump the replay buffer to <save_dir>/buffer.npz at the end.")
 flags.DEFINE_string("buffer_path", None, "Optional explicit path for the saved buffer.")
+
+flags.DEFINE_string(
+    "exp_name",
+    None,
+    "Fixed experiment/run name (overrides the timestamped default). The run_carla.sh crash "
+    "supervisor sets this so save_dir + the W&B run stay stable across relaunches.",
+)
+flags.DEFINE_bool(
+    "resume",
+    False,
+    "Resume the residual run from <save_dir>/resume_state.json (restores agent + replay buffer + "
+    "step counter). Used by the restart supervisor to recover from CARLA native crashes.",
+)
 
 flags.DEFINE_bool(
     "eval_only",
@@ -1505,13 +1525,18 @@ def run_online_carla(
 
 
 def run_online_residual(
-    env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_holder, state_encoder, exec_cfg=None
+    env, agent, config, obs, *, vla_sample_fn, steervla_actor, raw_holder, state_encoder, exec_cfg=None,
+    start_step: int = 0, episode_count_start: int = 0, buffer: Optional[ReplayBuffer] = None,
 ) -> None:
     """Residual-SAC online loop. One env.step == one CARLA tick == one transition.
 
     SteerVLA proposes a base action chunk; the residual SAC agent (optionally EXPO best-of-N)
     edits it; the env executes one tick. Shares the module's SteerVLA/env/wandb/live-viewer
     scaffolding with :func:`run_online_carla`.
+
+    ``start_step`` / ``episode_count_start`` / ``buffer`` are non-defaults only when resuming after
+    a crash (see the run_carla.sh supervisor): the loop continues from ``start_step + 1`` with the
+    restored replay buffer, and the warmup/ramp schedule (keyed on absolute step) stays consistent.
     """
     base_only = agent is None
     vla_action_dim = int(config["steervla"]["action_dim"])
@@ -1560,6 +1585,10 @@ def run_online_residual(
     last_residual: Optional[np.ndarray] = None
 
     rng = jax.random.PRNGKey(FLAGS.seed)
+    if start_step:
+        # Resume: fold the start step into the key so the post-crash sampling stream differs from
+        # the pre-crash one (avoids replaying the exact same noise/CoT draws).
+        rng = jax.random.fold_in(rng, start_step)
 
     # Base flow noise is sized to the MODEL action tensor (action_horizon x model_action_dim),
     # not the env chunk. Mirrors DSRLAgent._flat_noise_dim; falls back to the env dim only when
@@ -1652,15 +1681,16 @@ def run_online_residual(
         chunks = np.tile(np.asarray(bc, dtype=np.float32).reshape(1, -1), (n_cand, 1))
         return base_cands, _encode_state(o, None), chunks, None
 
-    # Initial base rep (step 1 is in warmup -> single-base). cands feeds subtask-diversity logging.
+    # Initial base rep. cands feeds subtask-diversity logging. On resume the first step is
+    # start_step+1, so gate OTF on the absolute step (not a hardcoded 1).
+    first_step = start_step + 1
     rng, nk = jax.random.split(rng)
-    base_cands, x_cands, base_chunks, cands = _compute_base(obs, use_otf and 1 > warmup, nk)
+    base_cands, x_cands, base_chunks, cands = _compute_base(obs, use_otf and first_step > warmup, nk)
 
-    buffer: Optional[ReplayBuffer] = None
     episode_return = 0.0
     debug_return = 0.0  # sum of the debug objective (-ego_speed) over the episode; only used when debug_task.
     episode_steps = 0
-    episode_count = 0
+    episode_count = episode_count_start
     episode_collision_count = 0
     episode_collision_events = 0
     prev_collision_count = 0
@@ -1672,13 +1702,13 @@ def run_online_residual(
             return
         save_agent(agent, FLAGS.save_dir, step_tag)
         if FLAGS.save_buffer and buffer is not None:
-            path = FLAGS.buffer_path or os.path.join(FLAGS.save_dir, "buffer.npz")
-            saved = buffer.save(path)
-            print(f"[main_carla] Saved replay buffer ({buffer.size} transitions) -> {saved}", flush=True)
+            path = _buffer_persist_path(FLAGS.save_dir)
+            _atomic_buffer_save(buffer, path)
+            print(f"[main_carla] Saved replay buffer ({buffer.size} transitions) -> {path}", flush=True)
 
-    last_step = 0
+    last_step = start_step
     try:
-        for step in tqdm.tqdm(range(1, FLAGS.online_steps + 1), dynamic_ncols=True):
+        for step in tqdm.tqdm(range(first_step, FLAGS.online_steps + 1), dynamic_ncols=True):
             last_step = step
             scale_now = _residual_scale(step)
             scale_j = jnp.asarray(scale_now, dtype=jnp.float32)
@@ -1834,8 +1864,21 @@ def run_online_residual(
                 wandb.log(log, step=step)
                 train_logger.log(log, step=step)
 
-            if agent is not None and FLAGS.save_interval > 0 and step % FLAGS.save_interval == 0:
+            # Permanent milestone checkpoint (sparse; for eval / analysis).
+            milestone = FLAGS.save_interval > 0 and step % FLAGS.save_interval == 0
+            # Crash-recovery checkpoint (frequent): commit agent + buffer + resume_state together so
+            # --resume continues near this step. A SIGSEGV skips the finally block, so this periodic
+            # write is the only thing that survives; resume_state is written LAST as the commit
+            # marker (a crash mid-save leaves the previous consistent checkpoint intact).
+            recover = agent is not None and FLAGS.resume_interval > 0 and step % FLAGS.resume_interval == 0
+            if agent is not None and (milestone or recover):
                 save_agent(agent, FLAGS.save_dir, step)
+            if recover:
+                if FLAGS.save_buffer and buffer is not None:
+                    _atomic_buffer_save(buffer, _buffer_persist_path(FLAGS.save_dir))
+                _write_resume_state(
+                    FLAGS.save_dir, step=step, episode_count=episode_count, agent_epoch=step,
+                )
 
             if done:
                 if live_viewer is not None and episode_frames:
@@ -1874,6 +1917,52 @@ def run_online_residual(
 # Entrypoint                                                                  #
 # --------------------------------------------------------------------------- #
 
+_RESUME_STATE_NAME = "resume_state.json"
+
+
+def _resume_state_path(save_dir: str) -> str:
+    return os.path.join(save_dir, _RESUME_STATE_NAME)
+
+
+def _buffer_persist_path(save_dir: str) -> str:
+    """Where the replay buffer is checkpointed for crash-resume (same as the end-of-run dump).
+
+    Always ``.npz``-terminated so the periodic save and the resume-time load reference the exact
+    same file (ReplayBuffer.save force-appends ``.npz``, so an un-suffixed path would mismatch).
+    """
+    path = FLAGS.buffer_path or os.path.join(save_dir, "buffer.npz")
+    return path if path.endswith(".npz") else path + ".npz"
+
+
+def _atomic_buffer_save(buffer, path: str) -> None:
+    """Save the buffer to a temp file then os.replace into place, so a crash mid-write never
+    leaves a truncated .npz that would fail to load on resume."""
+    path = str(path)
+    if not path.endswith(".npz"):
+        path += ".npz"
+    written = buffer.save(path + ".tmp")  # ReplayBuffer.save appends .npz -> <path>.tmp.npz
+    os.replace(written, path)
+
+
+def _write_resume_state(save_dir: str, *, step: int, episode_count: int, agent_epoch: int) -> None:
+    """Atomically persist the minimal state a relaunch needs to continue (step/episode/ckpt)."""
+    tmp = _resume_state_path(save_dir) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"step": int(step), "episode_count": int(episode_count), "agent_epoch": int(agent_epoch)}, f)
+    os.replace(tmp, _resume_state_path(save_dir))
+
+
+def _read_resume_state(save_dir: str) -> Optional[dict]:
+    path = _resume_state_path(save_dir)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[main_carla] ignoring unreadable resume state {path}: {e}", flush=True)
+        return None
+
 
 def _run_residual_entry(config):
     """Residual-SAC / EXPO online CARLA RL entry (frozen SteerVLA base + state encoder)."""
@@ -1884,15 +1973,31 @@ def _run_residual_entry(config):
 
     wandb_mode = _resolve_wandb_mode()
     # Descriptive run name: <route>-<mode>-sd###_<ts>, where <mode> is the state encoder
-    # (rl runs) or "base" (no-RL baseline).
+    # (rl runs) or "base" (no-RL baseline). --exp_name pins this across restarts so save_dir and
+    # the W&B run id stay stable (the crash supervisor relies on this to resume, not fork).
     route_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", str(FLAGS.route)).strip("-")
     mode_tag = "base" if base_only else str(config.get("state_encoder", "pi_prefix"))
-    exp_name = f"{route_tag}-{mode_tag}-{get_exp_name(FLAGS.seed)}"
-    setup_wandb(project="OGBench-CARLA-Residual", group=FLAGS.run_group, name=exp_name, mode=wandb_mode)
+    exp_name = FLAGS.exp_name or f"{route_tag}-{mode_tag}-{get_exp_name(FLAGS.seed)}"
+    # W&B run id must be a stable, id-safe token; resume='allow' continues the same run on relaunch.
+    wandb_id = re.sub(r"[^A-Za-z0-9_-]+", "-", exp_name).strip("-")[:128] or None
+    setup_wandb(
+        project="OGBench-CARLA-Residual", group=FLAGS.run_group, name=exp_name, mode=wandb_mode,
+        id=wandb_id, resume=("allow" if FLAGS.resume else None),
+    )
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
     with open(os.path.join(FLAGS.save_dir, "flags.json"), "w") as f:
         json.dump(get_flag_dict(), f)
+
+    # Resume bookkeeping: if --resume and a prior resume_state exists, we continue from the last
+    # checkpointed step (restore agent + buffer below). resume_state is None -> fresh run.
+    resume_state = _read_resume_state(FLAGS.save_dir) if FLAGS.resume else None
+    if resume_state is not None:
+        print(
+            f"[main_carla] resuming from step {resume_state['step']} "
+            f"(episode {resume_state['episode_count']}, ckpt epoch {resume_state['agent_epoch']}).",
+            flush=True,
+        )
 
     carla_yaml = FLAGS.carla_config or str(_IMPLS_ROOT / "configs" / "carla_config.yaml")
 
@@ -1964,6 +2069,20 @@ def _run_residual_entry(config):
         if FLAGS.eval_only:
             FLAGS.online_steps = max(FLAGS.online_steps, 200)
 
+        # Restore agent + replay buffer from the last checkpoint when resuming after a crash.
+        start_step = 0
+        episode_count_start = 0
+        resumed_buffer: Optional[ReplayBuffer] = None
+        if resume_state is not None:
+            start_step = int(resume_state["step"])
+            episode_count_start = int(resume_state["episode_count"])
+            if agent is not None and int(resume_state["agent_epoch"]) >= 0:
+                agent = restore_agent(agent, FLAGS.save_dir, int(resume_state["agent_epoch"]))
+                bpath = _buffer_persist_path(FLAGS.save_dir)
+                if os.path.exists(bpath):
+                    resumed_buffer = ReplayBuffer.load(bpath, max_size=int(config["buffer_capacity"]))
+                    print(f"[main_carla] restored replay buffer ({resumed_buffer.size}) from {bpath}", flush=True)
+
         run_online_residual(
             env, agent, config, obs,
             vla_sample_fn=vla_sample_fn,
@@ -1971,6 +2090,9 @@ def _run_residual_entry(config):
             raw_holder=raw_holder,
             state_encoder=state_encoder,
             exec_cfg=exec_cfg,
+            start_step=start_step,
+            episode_count_start=episode_count_start,
+            buffer=resumed_buffer,
         )
     finally:
         try:

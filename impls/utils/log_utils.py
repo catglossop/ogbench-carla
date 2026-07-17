@@ -76,8 +76,14 @@ def setup_wandb(
     group=None,
     name=None,
     mode='online',
+    id=None,
+    resume=None,
 ):
-    """Set up Weights & Biases for logging."""
+    """Set up Weights & Biases for logging.
+
+    ``id`` + ``resume`` (e.g. ``resume='allow'``) let a relaunched process continue logging to the
+    same run, so a crash-restart supervisor keeps one continuous chart instead of many fragments.
+    """
     wandb_output_dir = tempfile.mkdtemp()
     tags = [group] if group is not None else None
 
@@ -96,6 +102,10 @@ def setup_wandb(
         mode=mode,
         save_code=True,
     )
+    if id is not None:
+        init_kwargs['id'] = id
+    if resume is not None:
+        init_kwargs['resume'] = resume
 
     run = wandb.init(**init_kwargs)
 

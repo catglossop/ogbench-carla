@@ -30,6 +30,10 @@ BASE_ONLY=""
 STATE_ENCODER=""
 RLT_CHECKPOINT=""
 
+# Crash supervisor: relaunch main_carla (resuming from checkpoint) after a CARLA native crash
+# (SIGSEGV/SIGABRT, exit code >=128). 0 disables the retry loop.
+MAX_RETRIES="${MAX_RETRIES:-50}"
+
 BASE_AGENT_CFG="impls/configs/steervla_residual_config.py"
 BASE_CARLA_CFG="impls/configs/carla_config.yaml"
 
@@ -65,6 +69,7 @@ Options:
 
   --agent-config PATH       Base agent config. Default: impls/configs/steervla_residual_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
+  --max-retries N           Auto-restart+resume this many times after a CARLA crash. Default: 50 (0 disables)
   -h, --help                Show this help
 
 Examples:
@@ -96,6 +101,7 @@ while [[ $# -gt 0 ]]; do
     --rlt-checkpoint) RLT_CHECKPOINT="$2"; shift 2 ;;
     --agent-config) BASE_AGENT_CFG="$2"; shift 2 ;;
     --carla-config) BASE_CARLA_CFG="$2"; shift 2 ;;
+    --max-retries) MAX_RETRIES="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; EXTRA_ARGS+=("$@"); break ;;
     *)
@@ -188,11 +194,16 @@ cfg["use_cuda_visible_devices"] = False
 Path(r"${CARLA_CFG_TMP}").write_text(yaml.safe_dump(cfg, sort_keys=False))
 EOF
 
+# Stable run name so save_dir + the W&B run id survive restarts (the supervisor resumes, not forks).
+ROUTE_TAG="$(printf '%s' "$ROUTE" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')"
+if [[ "${BASE_ONLY,,}" == "true" ]]; then MODE_TAG="base"; else MODE_TAG="${STATE_ENCODER:-pi_prefix}"; fi
+EXP_NAME="${ROUTE_TAG}-${MODE_TAG}-sd$(printf '%03d' "$SEED")_$(date +%Y%m%d_%H%M%S)"
+
 echo "[run_carla.sh] route=${ROUTE}"
 echo "[run_carla.sh] enable_updates=${ENABLE_UPDATES} base_only=${BASE_ONLY:-<config default>} state_encoder=${STATE_ENCODER:-<config default>}${RLT_CHECKPOINT:+ rlt_checkpoint=${RLT_CHECKPOINT}}"
 echo "[run_carla.sh] train_gpu_rank=${TRAIN_GPU_RANK} render_adapter=${SIM_GPU_RANK}"
 echo "[run_carla.sh] carla_host=${CARLA_HOST} carla_port=${CARLA_PORT} streaming_port=${CARLA_STREAMING_PORT} tm_port=${TM_PORT} x_display=:${X_DISPLAY_NUM}"
-echo "[run_carla.sh] save_buffer=${SAVE_BUFFER} online_steps=${ONLINE_STEPS}"
+echo "[run_carla.sh] save_buffer=${SAVE_BUFFER} online_steps=${ONLINE_STEPS} exp_name=${EXP_NAME} max_retries=${MAX_RETRIES}"
 echo "[run_carla.sh] temp agent config: ${AGENT_CFG_TMP}"
 echo "[run_carla.sh] temp carla config: ${CARLA_CFG_TMP}"
 
@@ -200,14 +211,52 @@ echo "[run_carla.sh] temp carla config: ${CARLA_CFG_TMP}"
 # agent_name == "sac_residual" (steervla_residual_config.py). log_interval/save_interval are
 # the residual cadence (main_carla's DSRL defaults are 1 / 100000); placed before EXTRA_ARGS so
 # a caller can still override them via `-- --log_interval=...`.
-WANDB_MODE="${WANDB_MODE}" uv run python impls/main_carla.py \
-  --agent="${AGENT_CFG_TMP}" \
-  --carla_config="${CARLA_CFG_TMP}" \
-  --route="${ROUTE}" \
-  --online_steps="${ONLINE_STEPS}" \
-  --save_buffer="${SAVE_BUFFER}" \
-  --seed="${SEED}" \
-  --run_group="${RUN_GROUP}" \
-  --log_interval=10 \
-  --save_interval=5000 \
-  "${EXTRA_ARGS[@]}"
+#
+# Supervisor loop: CARLA's leaderboard runs in-process and periodically segfaults on long runs
+# (killing our python outright, so no in-process try/except can catch it). On a crash-signal exit
+# (>=128) we kill any orphaned CARLA/Xvfb on this run's ports and relaunch with --resume=true, which
+# restores the agent + replay buffer + step counter from the last checkpoint. A clean exit (0),
+# SIGINT (130), or a non-crash error (<128, e.g. a config bug) stops the loop.
+attempt=0
+RESUME_FLAG="false"
+while :; do
+  set +e
+  WANDB_MODE="${WANDB_MODE}" uv run python impls/main_carla.py \
+    --agent="${AGENT_CFG_TMP}" \
+    --carla_config="${CARLA_CFG_TMP}" \
+    --route="${ROUTE}" \
+    --online_steps="${ONLINE_STEPS}" \
+    --save_buffer="${SAVE_BUFFER}" \
+    --seed="${SEED}" \
+    --run_group="${RUN_GROUP}" \
+    --exp_name="${EXP_NAME}" \
+    --resume="${RESUME_FLAG}" \
+    --log_interval=10 \
+    --save_interval=5000 \
+    "${EXTRA_ARGS[@]}"
+  CODE=$?
+  set -e
+
+  if [[ $CODE -eq 0 ]]; then
+    echo "[run_carla.sh] run completed (exit 0)."
+    break
+  fi
+  if [[ $CODE -eq 130 ]]; then
+    echo "[run_carla.sh] interrupted (SIGINT); not restarting."
+    exit 130
+  fi
+  if [[ $CODE -lt 128 ]]; then
+    echo "[run_carla.sh] exited with code ${CODE} (not a crash signal); not restarting."
+    exit "$CODE"
+  fi
+  attempt=$((attempt + 1))
+  if [[ "$MAX_RETRIES" -le 0 || $attempt -gt "$MAX_RETRIES" ]]; then
+    echo "[run_carla.sh] crash (exit ${CODE}); retry budget exhausted (${attempt}/${MAX_RETRIES}). Giving up."
+    exit "$CODE"
+  fi
+  echo "[run_carla.sh] main_carla crashed (exit ${CODE}, likely CARLA native SIGSEGV/SIGABRT); cleaning up + resuming (attempt ${attempt}/${MAX_RETRIES})."
+  pkill -9 -f "CarlaUE4.*-carla-rpc-port=${CARLA_PORT}" 2>/dev/null || true
+  pkill -9 -f "Xvfb :${X_DISPLAY_NUM} " 2>/dev/null || true
+  sleep 8
+  RESUME_FLAG="true"
+done
