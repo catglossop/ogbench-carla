@@ -1619,7 +1619,9 @@ def run_online_residual(
             )
         from ogbench.carla.steervla_simlingo_control import SimlingoStyleWaypointDecoder
 
-        accel_steer_decoder = SimlingoStyleWaypointDecoder()
+        accel_steer_decoder = SimlingoStyleWaypointDecoder(
+            brake_speed=float(exec_cfg.get("brake_speed", 0.1)),
+        )
 
     def _agent_base_action(o: dict, base_chunk: np.ndarray) -> np.ndarray:
         """Frozen VLA chunk -> agent-facing base action (chunk, or PID-decoded [accel, steer])."""
