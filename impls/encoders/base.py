@@ -10,6 +10,7 @@ once at startup by calling :meth:`StateEncoder.encode` on the first obs.
 from __future__ import annotations
 
 import abc
+import time
 
 import numpy as np
 
@@ -28,3 +29,15 @@ class StateEncoder(abc.ABC):
     def encode(self, obs: dict) -> np.ndarray:
         """Return a 1-D ``float32`` state vector for one env observation."""
         raise NotImplementedError
+
+    def encode_timed(self, obs: dict) -> tuple[np.ndarray, dict[str, float]]:
+        """Encode + return a per-phase wall-time breakdown (seconds) for speed profiling.
+
+        The default just reports ``{"total": ...}``. Encoders override to expose sub-phases
+        (e.g. ``obs_build`` / ``vlm`` / ``ae``) so different encoders can be compared. Sub-phase
+        timers must force any async device work to materialize (e.g. ``jax.device_get`` /
+        ``.cpu().numpy()``) inside the timed region, or the number is meaningless.
+        """
+        t0 = time.perf_counter()
+        vec = self.encode(obs)
+        return vec, {"total": time.perf_counter() - t0}

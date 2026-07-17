@@ -7,6 +7,8 @@ mean-pool we apply a frozen RL-Token autoencoder's encoder to compress the
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from .base import StateEncoder
@@ -49,9 +51,24 @@ class RLTokenEncoder(StateEncoder):
         self._model, self._cfg = load_autoencoder(checkpoint_path, device)
 
     def encode(self, obs: dict) -> np.ndarray:
+        return self.encode_timed(obs)[0]
+
+    def encode_timed(self, obs: dict) -> tuple[np.ndarray, dict[str, float]]:
+        """Timed encode split into the two dominant phases:
+
+        - ``vlm``: the SteerVLA prefix forward (full PaliGemma vision tower + Gemma LLM), forced to
+          host memory so the async JAX work is captured in the timing.
+        - ``ae``: the frozen RL-Token autoencoder's encoder, forced back to host.
+        """
         import torch
 
+        t0 = time.perf_counter()
         prefix_out, prefix_mask = self._actor.encode_prefix_tokens(obs)  # f32[1,M,D], bool[1,M]
+        # Materialize the prefix on host (blocks the async JAX forward) so ``vlm`` time is real.
+        prefix_out = np.ascontiguousarray(prefix_out)
+        prefix_mask = np.ascontiguousarray(prefix_mask)
+        t1 = time.perf_counter()
+
         m = int(prefix_out.shape[1])
         d = int(prefix_out.shape[2])
         if d != int(self._cfg.vla_embed_dim):
@@ -64,8 +81,10 @@ class RLTokenEncoder(StateEncoder):
                 f"RLT prefix length {m} exceeds autoencoder max_seq_len {self._cfg.max_seq_len}; "
                 "the inference token layout does not match the offline dump."
             )
-        z = torch.from_numpy(np.ascontiguousarray(prefix_out)).to(self._device).float()
-        mask = torch.from_numpy(np.ascontiguousarray(prefix_mask)).to(self._device).bool()
+        z = torch.from_numpy(prefix_out).to(self._device).float()
+        mask = torch.from_numpy(prefix_mask).to(self._device).bool()
         with torch.no_grad():
             z_rl = self._model.encode(z, mask)
-        return z_rl[0].cpu().numpy().astype(np.float32, copy=False)
+        out = z_rl[0].cpu().numpy().astype(np.float32, copy=False)
+        t2 = time.perf_counter()
+        return out, {"vlm": t1 - t0, "ae": t2 - t1, "total": t2 - t0}

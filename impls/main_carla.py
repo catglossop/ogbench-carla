@@ -1651,18 +1651,30 @@ def run_online_residual(
     state_cot_dependent = bool(getattr(state_encoder, "cot_dependent", True)) if state_encoder is not None else False
     k_state = n_cand if state_cot_dependent else 1
 
+    # Per-step state-encoder timing (summed over the K encodes done for the step; ``calls`` = K).
+    # Cleared before each next-obs encode; logged as encode/<name>/<phase>. Phases are per-encoder
+    # (rl_token: vlm/ae/total, pi_prefix: obs_build/vlm/total, siglip_pool: obs_build/vision/total).
+    enc_time_acc: dict[str, float] = {}
+
+    def _encode_one(o: dict) -> np.ndarray:
+        vec, breakdown = state_encoder.encode_timed(o)
+        for k, v in breakdown.items():
+            enc_time_acc[k] = enc_time_acc.get(k, 0.0) + float(v)
+        enc_time_acc["calls"] = enc_time_acc.get("calls", 0.0) + 1.0
+        return np.asarray(vec, dtype=np.float32).reshape(-1)
+
     def _encode_state(o: dict, cands) -> Optional[np.ndarray]:
         """Encode the (K, embed) state(s) for one obs. cands=None (warmup) -> encode once, tile to
         K. cot-dependent -> one row per candidate, each with that candidate's CoT via _last_cot_out."""
         if state_encoder is None:
             return None
         if not state_cot_dependent or cands is None:
-            xi = np.asarray(state_encoder.encode(o), dtype=np.float32).reshape(-1)
+            xi = _encode_one(o)
             return np.tile(xi[None, :], (k_state, 1))
         rows = []
         for i in range(n_cand):
             steervla_actor._last_cot_out = {kk: vv[i : i + 1] for kk, vv in cands["cot_out"].items()}
-            rows.append(np.asarray(state_encoder.encode(o), dtype=np.float32).reshape(-1))
+            rows.append(_encode_one(o))
         return np.stack(rows, axis=0)
 
     def _compute_base(o: dict, otf_mode: bool, key: jax.Array):
@@ -1759,9 +1771,12 @@ def run_online_residual(
 
             # Next base cands are diverse iff the next step runs OTF (step >= warmup).
             rng, nk = jax.random.split(rng)
+            enc_time_acc.clear()  # collect this step's per-encoder timing breakdown
+            t_base_start = time.time()
             next_base_cands, next_x_cands, next_base_chunks, next_cands = _compute_base(
                 next_obs, use_otf and step >= warmup, nk
             )
+            t_base_end = time.time()
 
             if agent is not None:
                 transition = dict(
@@ -1832,6 +1847,14 @@ def run_online_residual(
                 log["training/enable_updates"] = float(enable_updates)
                 log["time/step_time"] = t_step_end - t_step_start
                 log["time/update_time"] = t_update_end - t_update_start
+                # base = SteerVLA chunk sample + state encode (the encoder VLM pass). Compare against
+                # step_time (CARLA tick): whichever dominates is the real bottleneck.
+                log["time/base_encode_time"] = t_base_end - t_base_start
+                # State-encoder timing broken down by phase (summed over the step's K encodes), so
+                # encoder speeds (rl_token vs pi_prefix vs siglip_pool) are directly comparable.
+                if state_encoder is not None and enc_time_acc:
+                    for k, v in enc_time_acc.items():
+                        log[f"encode/{state_encoder.name}/{'calls' if k == 'calls' else k}"] = float(v)
                 if train_info:
                     log.update({k: float(jax.device_get(v)) for k, v in train_info.items()})
                 # Executed control + per-component chunk stats as scalar line charts.
