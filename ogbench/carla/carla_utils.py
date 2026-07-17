@@ -1135,8 +1135,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 from ogbench.carla.steervla_simlingo_control import SimlingoStyleWaypointDecoder
 
                 self._steervla_decoder = SimlingoStyleWaypointDecoder(
-                    creep_speed=float(exec_raw.get("creep_speed", 0.0)),
-                    creep_throttle=float(exec_raw.get("creep_throttle", 0.4)),
+                    brake_speed=float(exec_raw.get("brake_speed", 0.1)),
                 )
             except ImportError as e:
                 raise ImportError(

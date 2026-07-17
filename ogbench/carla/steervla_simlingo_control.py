@@ -104,9 +104,6 @@ class SimlingoStyleWaypointDecoder:
         speed_ki: float = 1.0,
         speed_kd: float = 2.0,
         speed_n: int = 20,
-        creep_speed: float = 0.0,
-        creep_throttle: float = 0.4,
-        creep_min_desired: float = 0.02,
     ) -> None:
         self.carla_fps = float(carla_fps)
         self.wp_dilation = int(wp_dilation)
@@ -115,10 +112,6 @@ class SimlingoStyleWaypointDecoder:
         self.brake_ratio = float(brake_ratio)
         self.clip_delta = float(clip_delta)
         self.clip_throttle = float(clip_throttle)
-        # Anti-cold-start creep (disabled when creep_speed <= 0). See control_pid.
-        self.creep_speed = float(creep_speed)
-        self.creep_throttle = float(creep_throttle)
-        self.creep_min_desired = float(creep_min_desired)
 
         self.speed_controller = PIDController(
             k_p=speed_kp, k_i=speed_ki, k_d=speed_kd, n=speed_n
@@ -160,17 +153,6 @@ class SimlingoStyleWaypointDecoder:
         throttle = self.speed_controller.step(delta)
         throttle = float(np.clip(throttle, 0.0, self.clip_throttle))
         throttle = throttle if not brake else 0.0
-
-        # Anti-cold-start creep: from a standstill the base can predict a desired speed just below
-        # brake_speed (e.g. ACC cold-start behind a distant lead), which brakes and traps the car at
-        # v=0 forever (throttle 0 -> speed 0 -> same prediction -> ...). When enabled, if we're
-        # essentially stopped but the model still wants to move forward (desired_speed above a small
-        # epsilon, i.e. not a hard stop), force a small sustained throttle to break the trap and let
-        # the "moving -> nonzero current speed in prompt -> higher predicted speed" feedback kick in.
-        # Genuine stops (desired_speed ~ 0, e.g. at the wall) are left to brake.
-        if self.creep_speed > 0.0 and speed < self.creep_speed and desired_speed > self.creep_min_desired:
-            brake = False
-            throttle = max(throttle, self.creep_throttle)
 
         route_interp = interpolate_waypoints(route_waypoints.squeeze())
         steer = float(self.turn_controller.step(route_interp, speed))

@@ -355,9 +355,9 @@ def _steervla_action_execution_cfg(steervla_cfg, *, residual: bool = False) -> d
         "action_horizon": ah,
         "action_dim": ad,
         "action_input_space": action_input_space,
-        # Anti-cold-start creep in the PID decoder (0 disables). See SimlingoStyleWaypointDecoder.
-        "creep_speed": float(steervla_cfg.get("creep_speed", 0.0)),
-        "creep_throttle": float(steervla_cfg.get("creep_throttle", 0.4)),
+        # PID brake threshold (m/s): desired speeds below this brake. Lower it to avoid the
+        # cold-start brake trap. See SimlingoStyleWaypointDecoder.control_pid.
+        "brake_speed": float(steervla_cfg.get("brake_speed", 0.1)),
     }
 
 

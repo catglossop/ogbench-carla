@@ -85,11 +85,10 @@ def get_config():
             actions_per_cot=1,
             output_action_format="DELTA_XY_T_DELTA_XY_SPACE",
             sample_actions_num_steps=10,
-            # Anti-cold-start creep in the PID decoder (0 disables). When the base predicts a
-            # near-stop speed at standstill (cold-start brake trap), force this throttle until the
-            # ego reaches creep_speed (m/s) so the car starts moving. Genuine stops are respected.
-            creep_speed=0.0,
-            creep_throttle=0.4,
+            # PID brake threshold (m/s) in the waypoint decoder: desired speeds below this brake.
+            # The default (0.1) can trap the car at a standstill when the base predicts a near-stop
+            # speed (cold-start brake trap); lower it (e.g. 0.01) so the car starts moving.
+            brake_speed=0.1,
             # Remote HTTP actor (leave unset for local checkpoint load). The
             # token-based encoders (pi_prefix / rl_token) require local mode.
             # actor_url="http://127.0.0.1:8000",
