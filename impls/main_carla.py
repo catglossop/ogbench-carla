@@ -1653,7 +1653,7 @@ def run_online_residual(
 
     # Per-step state-encoder timing (summed over the K encodes done for the step; ``calls`` = K).
     # Cleared before each next-obs encode; logged as encode/<name>/<phase>. Phases are per-encoder
-    # (rl_token: vlm/ae/total, pi_prefix: obs_build/vlm/total, siglip_pool: obs_build/vision/total).
+    # (rl_token: vlm/ae/total, pi_prefix: vlm/total, siglip_pool: vision/text/total).
     enc_time_acc: dict[str, float] = {}
 
     def _encode_one(o: dict) -> np.ndarray:
@@ -1669,11 +1669,14 @@ def run_online_residual(
         if state_encoder is None:
             return None
         if not state_cot_dependent or cands is None:
+            steervla_actor._prefix_cache_row = 0  # batch-1 cached prefix
             xi = _encode_one(o)
             return np.tile(xi[None, :], (k_state, 1))
         rows = []
         for i in range(n_cand):
+            # Line up candidate i's CoT and cached prefix row so the encoded state matches the base.
             steervla_actor._last_cot_out = {kk: vv[i : i + 1] for kk, vv in cands["cot_out"].items()}
+            steervla_actor._prefix_cache_row = i
             rows.append(_encode_one(o))
         return np.stack(rows, axis=0)
 
