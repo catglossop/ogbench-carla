@@ -41,8 +41,11 @@ def get_config():
     #                   forward over image + prompt, then mean-pool; deterministic,
     #                   stop-gradient). Speed + routing ride in via the prompt, so
     #                   no separate proprio vector is needed.
-    #   "siglip_pool" : frozen, mean-pooled SigLIP image feature (vision tower only,
-    #                   no Gemma LLM) — a perception-only lower-bound ablation.
+    #   "siglip_pool" : frozen HF SigLIP2 image embedding concatenated with a SigLIP2
+    #                   text embedding of the routing-command prompt (no Gemma LLM).
+    #                   Image + command share SigLIP's aligned space; folding in the
+    #                   prompt matches the language pi_prefix / rl_token get for free,
+    #                   so the comparison isolates the encoder (config.siglip below).
     #   "rl_token"    : frozen RLT autoencoder (trained offline) over the un-pooled
     #                   prefix tokens — same VLM-backbone input as pi_prefix, but a
     #                   learned compression to z_rl instead of mean-pool. Requires a
@@ -60,6 +63,20 @@ def get_config():
         dict(
             checkpoint_path="",
             device="cpu",
+        )
+    )
+
+    # ----- siglip_pool encoder (used only when state_encoder == "siglip_pool") - #
+    # Frozen HF SigLIP2 dual encoder. The state is [image_embed, prompt_embed]
+    # (both L2-normalized SigLIP embeddings in one aligned space). Set
+    # include_prompt=False for the image-only lower-bound ablation. device="cuda"
+    # keeps the ~400M SigLIP2 off the CPU (fast per-step, but shares the JAX GPU;
+    # set "cpu" to isolate it at a large latency cost).
+    config.siglip = ml_collections.ConfigDict(
+        dict(
+            model_id="google/siglip2-so400m-patch14-384",
+            device="cuda",
+            include_prompt=True,
         )
     )
 

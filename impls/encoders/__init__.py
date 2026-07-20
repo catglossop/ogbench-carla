@@ -23,7 +23,13 @@ def build_state_encoder(config, steervla_actor) -> StateEncoder:
     if name == "siglip_pool":
         from .siglip_pool import SiglipPoolEncoder
 
-        return SiglipPoolEncoder(steervla_actor)
+        siglip_cfg = config.get("siglip", {}) or {}
+        return SiglipPoolEncoder(
+            steervla_actor,
+            model_id=str(siglip_cfg.get("model_id", "google/siglip2-so400m-patch14-384")),
+            device=str(siglip_cfg.get("device", "cuda")),
+            include_prompt=bool(siglip_cfg.get("include_prompt", True)),
+        )
 
     if name == "rl_token":
         from .rlt import RLTokenEncoder
