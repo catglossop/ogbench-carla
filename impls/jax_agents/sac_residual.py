@@ -44,6 +44,31 @@ def _apply_debug_stop_reward_relabel(batch: dict) -> dict:
     return out
 
 
+class StateHead(nn.Module):
+    """Shared trainable bottleneck on the frozen state feature, consumed by both actor and critic.
+
+    Compresses the high-dim frozen encoder feature into a representation trained end-to-end by the
+    critic's TD loss (the actor sees it detached, SAC-AE style, so the actor objective can't collapse
+    the rep). ``mlp`` adds one GELU hidden layer -- worthwhile only when the feature exposes structure
+    to mix (e.g. pi_prefix_groups); a linear head on a single pooled vector is just a low-rank reparam.
+    Only created when ``state_head_dim > 0``.
+    """
+
+    out_dim: int
+    layer_norm: bool = True
+    mlp: bool = False
+
+    @nn.compact
+    def __call__(self, x):
+        if self.mlp:
+            x = nn.Dense(self.out_dim, kernel_init=default_init())(x)
+            x = nn.gelu(nn.LayerNorm()(x) if self.layer_norm else x)
+        x = nn.Dense(self.out_dim, kernel_init=default_init())(x)
+        if self.layer_norm:
+            x = nn.LayerNorm()(x)
+        return x
+
+
 class ResidualActor(nn.Module):
     """Tanh-squashed diagonal-Gaussian residual conditioned on ``(x, base_action)``.
 
@@ -78,28 +103,42 @@ class SACResidualAgent(flax.struct.PyTreeNode):
     def _final_action(self, base_action, residual, scale):
         return jnp.clip(base_action + scale * residual, -1.0, 1.0)
 
-    def _edit(self, x, base_action, scale, rng):
-        """EXPO edit: ã = clip(base + scale * residual), residual ~ π_edit(·|x, base)."""
-        dist = self.network.select("actor")(x, base_action)
+    def _enc(self, x, grad_params=None, target=False):
+        """Map the frozen state feature through the shared trainable head (identity if disabled).
+
+        Pass ``grad_params`` only on the critic's current-Q path so the rep is shaped by TD; the
+        actor calls this without ``grad_params`` (detached). ``target`` selects the slow target head,
+        paired with the target critic in TD backups.
+        """
+        if not self.config["use_state_head"]:
+            return x
+        return self.network.select("target_state_head" if target else "state_head")(x, params=grad_params)
+
+    def _edit(self, z, base_action, scale, rng):
+        """EXPO edit on an already head-encoded state ``z``: ã = clip(base + scale * residual)."""
+        dist = self.network.select("actor")(z, base_action)
         residual = dist.sample(seed=rng)
         return self._final_action(base_action, residual, scale)
 
     def _otf_next_q(self, next_obs_cands, next_base_cands, scale, rng):
-        """EXPO hard-max TD target: edit each of N base cands 1:1, take max_i min-ensemble
-        Q_target over the 2N base+edited pool. No entropy term (argmax has no log-prob).
+        """EXPO hard-max TD target: edit each of N base cands 1:1 (online actor over the online-encoded
+        state), take max_i min-ensemble Q_target (target critic over the target-encoded state) across
+        the 2N base+edited pool. No entropy term (argmax has no log-prob).
 
         next_base_cands (B, N, adim); next_obs_cands (B, K, embed), K in {1, N} broadcast to N.
         """
         b, n, adim = next_base_cands.shape
         edim = next_obs_cands.shape[-1]
         obs_cands = jnp.broadcast_to(next_obs_cands, (b, n, edim))
-        edited = self._edit(obs_cands.reshape(b * n, edim), next_base_cands.reshape(b * n, adim), scale, rng)
-        edited = edited.reshape(b, n, adim)
-        pool_states = jnp.concatenate([obs_cands, obs_cands], axis=1)
+        z_on = self._enc(obs_cands).reshape(b * n, -1)
+        edited = self._edit(z_on, next_base_cands.reshape(b * n, adim), scale, rng).reshape(b, n, adim)
+        z_tg = self._enc(obs_cands, target=True)
+        pool_states = jnp.concatenate([z_tg, z_tg], axis=1)
         pool_actions = jnp.concatenate([next_base_cands, edited], axis=1)
         m = 2 * n
+        d = pool_states.shape[-1]
         qs = self.network.select("target_critic")(
-            pool_states.reshape(b * m, edim), None, actions=pool_actions.reshape(b * m, adim)
+            pool_states.reshape(b * m, d), None, actions=pool_actions.reshape(b * m, adim)
         )
         q = jnp.min(qs, axis=0).reshape(b, m)
         return jnp.max(q, axis=1)
@@ -114,10 +153,10 @@ class SACResidualAgent(flax.struct.PyTreeNode):
             # when expo=False, or the rollout-only EXPO ablation when otf_td_backup=False).
             next_obs = batch["next_obs_cands"][:, 0, :]
             next_base = batch["next_base_cands"][:, 0, :]
-            next_dist = self.network.select("actor")(next_obs, next_base)
+            next_dist = self.network.select("actor")(self._enc(next_obs), next_base)
             next_residual, next_log_probs = next_dist.sample_and_log_prob(seed=rng)
             next_actions = self._final_action(next_base, next_residual, scale)
-            next_qs = self.network.select("target_critic")(next_obs, None, actions=next_actions)
+            next_qs = self.network.select("target_critic")(self._enc(next_obs, target=True), None, actions=next_actions)
             next_q = jnp.min(next_qs, axis=0)
             alpha = self.network.select("alpha")()
             bootstrap = self.config["discount"] * batch["masks"]
@@ -125,7 +164,12 @@ class SACResidualAgent(flax.struct.PyTreeNode):
             extra = {"next_entropy": -next_log_probs.mean()}
         target_q = jax.lax.stop_gradient(target_q)
 
-        q = self.network.select("critic")(batch["observations"], None, actions=batch["actions"], params=grad_params)
+        q = self.network.select("critic")(
+            self._enc(batch["observations"], grad_params=grad_params),
+            None,
+            actions=batch["actions"],
+            params=grad_params,
+        )
         critic_loss = jnp.square(q - target_q).mean()
 
         return critic_loss, {
@@ -136,11 +180,13 @@ class SACResidualAgent(flax.struct.PyTreeNode):
         }
 
     def actor_loss(self, batch, grad_params, rng, scale):
-        dist = self.network.select("actor")(batch["observations"], batch["base_actions"], params=grad_params)
+        # Detached rep (no grad_params): the head is trained by the critic TD loss only.
+        z = self._enc(batch["observations"])
+        dist = self.network.select("actor")(z, batch["base_actions"], params=grad_params)
         residual, log_probs = dist.sample_and_log_prob(seed=rng)
         actions = self._final_action(batch["base_actions"], residual, scale)
 
-        q = jnp.min(self.network.select("critic")(batch["observations"], None, actions=actions), axis=0)
+        q = jnp.min(self.network.select("critic")(z, None, actions=actions), axis=0)
 
         alpha = self.network.select("alpha")()
         actor_loss = (alpha * log_probs - q).mean()
@@ -195,12 +241,14 @@ class SACResidualAgent(flax.struct.PyTreeNode):
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, "critic")
+        if self.config["use_state_head"]:
+            self.target_update(new_network, "state_head")
         return self.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
     def sample_actions(self, observations, base_actions, scale, seed=None, temperature=1.0):
         """Sample ``(final_action, residual)`` for a batched state + base chunk at ``scale``."""
-        dist = self.network.select("actor")(observations, base_actions, temperature=temperature)
+        dist = self.network.select("actor")(self._enc(observations), base_actions, temperature=temperature)
         residual = dist.sample(seed=seed)
         return self._final_action(base_actions, residual, scale), residual
 
@@ -215,15 +263,18 @@ class SACResidualAgent(flax.struct.PyTreeNode):
         n, adim = base_cands.shape
         edim = x_cands.shape[-1]
         x_full = jnp.broadcast_to(x_cands, (n, edim))
-        dist = self.network.select("actor")(x_full, base_cands)
+        z = self._enc(x_full)
+        dist = self.network.select("actor")(z, base_cands)
         residual = dist.sample(seed=seed)
         edited = self._final_action(base_cands, residual, scale)
-        pool_states = jnp.concatenate([x_full, x_full], axis=0)
+        pool_states = jnp.concatenate([z, z], axis=0)
         pool_actions = jnp.concatenate([base_cands, edited], axis=0)
         qs = self.network.select("critic")(pool_states, None, actions=pool_actions)
         q = jnp.min(qs, axis=0)
         winner = jnp.argmax(q)
         j = jnp.mod(winner, n)
+        # Return the RAW feature x_full[j] as winner_x: the buffer stores frozen features and the
+        # head is re-applied inside the agent each update.
         return pool_actions[winner], base_cands[j], x_full[j], q, winner
 
     @classmethod
@@ -236,6 +287,16 @@ class SACResidualAgent(flax.struct.PyTreeNode):
         if target_entropy is None:
             target_entropy = -float(config["target_entropy_multiplier"]) * action_dim
 
+        # Optional shared bottleneck: actor/critic then consume the head's output (dim d), not the
+        # raw frozen feature. Size them on a d-wide example so their input dims match runtime.
+        state_head_dim = int(config.get("state_head_dim", 0))
+        use_state_head = state_head_dim > 0
+        ex_state = (
+            jnp.zeros((*ex_observations.shape[:-1], state_head_dim), dtype=jnp.float32)
+            if use_state_head
+            else ex_observations
+        )
+
         actor_def = ResidualActor(
             hidden_dims=tuple(config["actor_hidden_dims"]),
             action_dim=action_dim,
@@ -245,11 +306,19 @@ class SACResidualAgent(flax.struct.PyTreeNode):
         alpha_def = LogParam()
 
         network_info = dict(
-            critic=(critic_def, (ex_observations, None, ex_base_actions)),
-            target_critic=(copy.deepcopy(critic_def), (ex_observations, None, ex_base_actions)),
-            actor=(actor_def, (ex_observations, ex_base_actions)),
+            critic=(critic_def, (ex_state, None, ex_base_actions)),
+            target_critic=(copy.deepcopy(critic_def), (ex_state, None, ex_base_actions)),
+            actor=(actor_def, (ex_state, ex_base_actions)),
             alpha=(alpha_def, ()),
         )
+        if use_state_head:
+            head_def = StateHead(
+                out_dim=state_head_dim,
+                layer_norm=config["layer_norm"],
+                mlp=bool(config.get("state_head_mlp", False)),
+            )
+            network_info["state_head"] = (head_def, (ex_observations,))
+            network_info["target_state_head"] = (copy.deepcopy(head_def), (ex_observations,))
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
@@ -258,6 +327,8 @@ class SACResidualAgent(flax.struct.PyTreeNode):
         network_params = network_def.init(init_rng, **network_args)["params"]
         network = TrainState.create(network_def, network_params, tx=network_tx)
         network.params["modules_target_critic"] = network.params["modules_critic"]
+        if use_state_head:
+            network.params["modules_target_state_head"] = network.params["modules_state_head"]
 
         agent_config = dict(
             discount=float(config["discount"]),
@@ -266,6 +337,7 @@ class SACResidualAgent(flax.struct.PyTreeNode):
             debug_task=bool(config.get("debug_task", False)),
             expo=bool(config.get("expo", True)),
             otf_td_backup=bool(config.get("otf_td_backup", True)),
+            use_state_head=bool(use_state_head),
         )
         return cls(rng=rng, network=network, config=flax.core.FrozenDict(agent_config))
 
@@ -279,6 +351,13 @@ def get_config():
             actor_hidden_dims=(256, 256),
             value_hidden_dims=(256, 256),
             layer_norm=True,
+            # Shared trainable state bottleneck (Dense(state_head_dim)+LayerNorm on the frozen encoder
+            # feature) consumed by both actor and critic and trained by the critic TD loss (actor sees
+            # it detached). 0 disables it -> the frozen feature is fed straight to the MLPs.
+            state_head_dim=0,
+            # Make the head nonlinear (one GELU hidden layer). Only helps when the feature has structure
+            # to mix across (e.g. state_encoder="pi_prefix_groups"); pointless on a single pooled vector.
+            state_head_mlp=False,
             discount=0.99,
             tau=0.005,
             residual_scale=0.1,

@@ -64,7 +64,7 @@ Options:
 
   --enable-updates BOOL     true|false. false = rollout/buffer only (no RL updates). Default: true
   --base-only BOOL          true|false. true = no-RL baseline: roll out the frozen base policy only. Default: false
-  --state-encoder NAME      RL state encoder: pi_prefix|siglip_pool|rl_token. Default: config value (pi_prefix)
+  --state-encoder NAME      RL state encoder: pi_prefix|pi_prefix_groups|siglip_pool|rl_token. Default: config value (pi_prefix)
   --rlt-checkpoint PATH     RLT autoencoder checkpoint (only for --state-encoder rl_token).
 
   --agent-config PATH       Base agent config. Default: impls/configs/steervla_residual_config.py

@@ -1379,6 +1379,58 @@ class SteerVLAActor:
             return pooled
         return self._prefix_features_recompute(raw)
 
+    def _group_pool(self, prefix_out: jax.Array, prefix_mask: jax.Array) -> jax.Array:
+        """Masked-mean each of ``[image, prompt, reasoning, subtask]`` separately; concat -> [B, 4D].
+
+        ``prefix_out`` must be the non-FAST prefix (order ``[img, prompt, reasoning, subtask]``). Text
+        span lengths come from model_cfg (padded); the image span is inferred from the remainder, so
+        this works for any image tokenization.
+        """
+        cfg = self.model_cfg
+        n_prompt, n_reasoning, n_subtask = int(cfg.max_token_len), int(cfg.max_reasoning_len), int(cfg.max_subtask_len)
+        m = prefix_out.shape[1]
+        n_img = m - (n_prompt + n_reasoning + n_subtask)
+        bounds = (
+            (0, n_img),
+            (n_img, n_img + n_prompt),
+            (n_img + n_prompt, n_img + n_prompt + n_reasoning),
+            (n_img + n_prompt + n_reasoning, m),
+        )
+        pools = []
+        for s, e in bounds:
+            seg, msk = prefix_out[:, s:e], prefix_mask[:, s:e].astype(prefix_out.dtype)
+            denom = jnp.maximum(msk.sum(axis=1, keepdims=True), 1.0)
+            pools.append(jnp.sum(seg * msk[..., None], axis=1) / denom)
+        return jax.lax.stop_gradient(jnp.concatenate(pools, axis=-1))
+
+    def _prefix_group_recompute(self, raw: Dict[str, Any]) -> jax.Array:
+        """Fresh PaliGemma prefix forward (no FAST), per-group mean-pooled. Cache fallback."""
+        obs_proc = self._preprocess_observation_on_device(self.build_observation_batch_numpy(1, raw=raw))
+        prefix_out, prefix_mask = self._prefix_llm_forward(obs_proc, include_fast=False)
+        return self._group_pool(prefix_out, prefix_mask)
+
+    def encode_prefix_group_features(self, raw: Dict[str, Any]) -> jax.Array:
+        """Per-group mean-pooled prefix feature: concat of masked-mean over ``[image, prompt, reasoning,
+        subtask]`` -> f32[1, 4*D]. Same CoT / cache semantics as :meth:`encode_prefix_features`, but keeps
+        the four groups separate so a trained (ideally nonlinear) state head can weight them.
+        """
+        if self._remote is not None:
+            raise RuntimeError("Pi prefix features are not available in remote SteerVLAActor mode.")
+        if self.model is None or self._jax_device is None:
+            raise RuntimeError("Local SteerVLA model is not initialized.")
+
+        if self._prefix_reuse and self._last_prefix_out is not None:
+            row = int(self._prefix_cache_row)
+            keep = self._last_prefix_mask.shape[1] - int(self._last_prefix_n_fast)
+            pooled = self._group_pool(
+                self._last_prefix_out[row : row + 1, :keep],
+                self._last_prefix_mask[row : row + 1, :keep],
+            )
+            if _PREFIX_CACHE_CHECK:
+                self._check_prefix_cache(pooled, self._prefix_group_recompute(raw), "pi_prefix_groups")
+            return pooled
+        return self._prefix_group_recompute(raw)
+
     def _prefix_tokens_recompute(self, raw: Dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
         """Fresh PaliGemma prefix forward for RLT (incl. FAST), un-pooled. Cache fallback."""
         obs_proc = self._preprocess_observation_on_device(self.build_observation_batch_numpy(1, raw=raw))

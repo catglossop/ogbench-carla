@@ -20,6 +20,11 @@ def build_state_encoder(config, steervla_actor) -> StateEncoder:
 
         return PiPrefixPoolEncoder(steervla_actor)
 
+    if name == "pi_prefix_groups":
+        from .pi_prefix import PiPrefixGroupsEncoder
+
+        return PiPrefixGroupsEncoder(steervla_actor)
+
     if name == "siglip_pool":
         from .siglip_pool import SiglipPoolEncoder
 
@@ -42,7 +47,8 @@ def build_state_encoder(config, steervla_actor) -> StateEncoder:
         )
 
     raise ValueError(
-        f"Unknown state_encoder {name!r}; expected one of: pi_prefix, siglip_pool, rl_token."
+        f"Unknown state_encoder {name!r}; expected one of: "
+        "pi_prefix, pi_prefix_groups, siglip_pool, rl_token."
     )
 
 

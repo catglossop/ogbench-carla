@@ -41,6 +41,11 @@ def get_config():
     #                   forward over image + prompt, then mean-pool; deterministic,
     #                   stop-gradient). Speed + routing ride in via the prompt, so
     #                   no separate proprio vector is needed.
+    #   "pi_prefix_groups" : like pi_prefix but pools [image, prompt, reasoning, subtask]
+    #                   separately and concatenates (4*D). Keeps group structure so a
+    #                   trainable state head (agent.state_head_dim>0, ideally
+    #                   agent.state_head_mlp=True) has something to weight; a linear head
+    #                   on the single pi_prefix mean is only a low-rank reparam.
     #   "siglip_pool" : frozen HF SigLIP2 image embedding concatenated with a SigLIP2
     #                   text embedding of the routing-command prompt (no Gemma LLM).
     #                   Image + command share SigLIP's aligned space; folding in the
