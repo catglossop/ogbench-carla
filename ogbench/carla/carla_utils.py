@@ -617,7 +617,7 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
             "-RenderOffScreen",
             "-nosound",
             f"-carla-rpc-port={rpc_port}",
-            f"-graphicsadapter=0",
+            f"-graphicsadapter={sim_gpu_rank}",
         ]
         streaming_port = int(getattr(args, "streaming_port", 0) or 0)
         if streaming_port > 0:

@@ -258,7 +258,8 @@ def build_coaching_prompt(
           performing right now (following the road, turning left/right at the intersection,
           changing lanes, etc.), and is it in the correct lane and position to do so?
 
-        For example, you can ask these questions to guide your analysis: 
+        ** Step 2 **
+        Analyze the vehicle's behavior in the video. For example, you can ask these questions to guide your analysis: 
         - Does the vehicle's behavior conflict with the route command plan? (if yes, BAD; if no, GOOD)
         - Is the vehicle maintaining a safe distance from the front car? (if yes, GOOD; if no, BAD)
         - Is the vehicle maintaining a safe speed? (if yes, GOOD; if no, BAD)
@@ -277,7 +278,8 @@ def build_coaching_prompt(
           no yield), that is BAD — it should accelerate and move forward. Conversely, resuming
           motion and advancing the route when the way is clear is GOOD. (Do NOT penalize stopping
           that is justified by a red light, stop sign, close leading vehicle, or a pedestrian/yield.)
-        - and so on...
+        - If the vehicle encounters an obstacle blocking the entire route, does it stop entirely before the obstruction? (if yes, GOOD; if no, BAD)
+        - If the vehicle encounters an obstacle blocking part of the route (one lane), does it stop and wait for a gap to go around the obstruction? (if yes, GOOD; if no, BAD)
 
         Return ONLY valid JSON with this schema (no markdown fences):
         {{

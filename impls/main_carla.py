@@ -1636,7 +1636,7 @@ def run_online_carla(
                     # backbone update; each is gated independently.
                     if rl_updates_on or hl_updates_on:
                         agent, update_info = agent.update_with_vla(
-                            batch, run_rl=rl_updates_on, run_hl=hl_updates_on,
+                            batch, run_rl=rl_updates_on, run_hl=hl_updates_on, global_step=step,
                         )
                 else:
                     if rl_updates_on:

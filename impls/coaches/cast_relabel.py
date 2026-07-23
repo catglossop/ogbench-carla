@@ -11,7 +11,10 @@ Pipeline (see ``OnlineCastRelabelSession`` for the online wiring):
 2. A VLM reviews the *entire window* video and returns what the agent did **well**
    (``GOOD``) and **poorly** (``BAD``) as timestamped events (``coach.analyze``).
 3. **Credit assignment** — a second VLM call maps those GOOD/BAD moments onto the
-   specific action chunks in the window.
+   specific action chunks in the window. Credit is *causal*, not merely temporal: a chunk is
+   BAD either because a BAD event overlaps it (``credit_source="direct"``) or because it is
+   part of the lead-up that made a later BAD event hard to avoid (``credit_source="precursor"``),
+   so the corrected subtask can pre-empt the failure rather than only react to it.
 4. For each chunk, the VLM suggests several subtasks that would improve the behavior,
    seeded (open-vocab) by :data:`SEED_SUBTASKS`, **and** (for chunks whose subtask it
    changes) a fresh chain-of-thought reasoning trace that justifies the corrected subtask.
@@ -170,6 +173,58 @@ SEED_SUBTASKS: tuple[str, ...] = (
     "The vehicle remains stopped normally due to the red traffic light in 4.8 meters.",
 )
 
+SEED_REASONING: tuple[str, ...] = (
+    "Follow the route.",
+    "Follow the route. Remain stopped to stay behind the maroon car that is to the front that is stopped because of a red traffic light.",
+    "Follow the route. Maintain the reduced speed to stay behind the black car that is to the front.",
+    "Follow the route. Decelerate due to the stop sign in 1.0 meters.",
+    "Follow the route. Decelerate to stay behind the black bicycle that is to the front.",
+    "Steer clear of the parked vehicle. Wait for a gap in the traffic before changing lanes to the lane with oncoming traffic.",
+    "Turn left. Remain stopped to stay behind the navy car that is to the front left in 21.5 meters.",
+    "Follow the route. Decelerate to stay behind the maroon car that is to the front left.",
+    "Follow the route. Accelerate to follow the teal car that is to the front in 9.9 meters.",
+    "Follow the route. Decelerate to stay behind the black car that is to the front.",
+    "Follow the route. Decelerate to drive with the target speed.",
+    "Follow the route. Remain stopped to stay behind the black car that is to the front that is stopped because of a red traffic light.",
+    "Follow the route. Remain stopped to stay behind the maroon car that is to the front in 4.7 meters.",
+    "Turn right. Remain stopped due to the red traffic light in 1.5 meters.",
+    "Follow the route. Accelerate because the traffic light is green but pay attention to the vehicle coming towards the junction.",
+    "Follow the route. Accelerate to follow the black car that is to the front.",
+    "Follow the route. Maintain your current speed.",
+    "Follow the route. Accelerate because the traffic light is green and the other vehicles are stopped at the junction and the vehicle in the junction is moving away.",
+    "Stay on your current lane to overtake the bikes on your lane. Remain stopped to stay behind the black SUV that is to the front left.",
+    "Follow the route. Maintain the reduced speed to stay behind the silver car that is to the front.",
+    "Follow the route. Remain stopped to stay behind the black car that is to the front at 8.0 meters that is stopped because of a red traffic light.",
+    "Follow the route. Remain stopped to stay behind the gray car that is to the front that is stopped because of a red traffic light.",
+    "Turn left. Maintain your current speed to drive through the junction because the other vehicles are stopped at the junction and the junction is clear.",
+    "Follow the route. Remain stopped to stay behind the black car that is to the front that is stopped because of a red traffic light.",
+    "Follow the route. Remain stopped to stay behind the dark green SUV that is to the front.",
+    "Follow the route. Decelerate due to the pedestrian intersecting your path.",
+    "Follow the route. Accelerate since you cleared the stop sign but pay attention to the vehicle in the junction.",
+    "Follow the route. Accelerate to drive through the junction.",
+    "Follow the route. Maintain the reduced speed to stay behind the navy car that is to the front.",
+    "Follow the route. Accelerate to follow the black car that is to the front.",
+    "Follow the route. Accelerate to drive with the target speed.",
+    "Follow the route. Accelerate to drive through the junction.",
+    "Follow the route. Maintain the reduced speed to stay behind the dark blue car that is to the front in 12.5 meters.",
+    "Follow the route. Maintain the reduced speed to stay behind the yellow car that is to the front in 25.0 meters.",
+    "Turn right. Accelerate to drive with the target speed because the other vehicles are stopped at the junction and the junction is clear.",
+    "Shift a bit to the right to make space for the traffic that invades the lane because of the traffic cones. Maintain your current speed.",
+    "Shift a bit to the right to make space for the traffic that invades the lane because of the traffic cones. Maintain your current speed.",
+    "Follow the route. Maintain the reduced speed to stay behind the navy SUV that is to the front in 10.1 meters.",
+    "Follow the route. Decelerate to stay behind the maroon car that is to the front right.",
+    "Follow the route. Maintain the reduced speed to stay behind the dark green car that is to the front in 12.2 meters.",
+    "Follow the route. Remain stopped to stay behind the black car that is to the front that is stopped because of a red traffic light.",
+    "Follow the route. Decelerate to stay behind the maroon car that is to the front left.",
+    "Follow the route. Accelerate to follow the navy car that is to the front in 8.8 meters.",
+    "Follow the route. Accelerate to follow the maroon car that is to the front.",
+    "Follow the route. Accelerate since you cleared the stop sign and the other vehicles are stopped at the junction and the junction is clear.",
+    "Follow the route. Maintain the reduced speed to drive through the junction.",
+    "Return to your original route after avoiding the obstacle. Maintain the reduced speed.",
+    "Avoid the accident on your lane. Wait for a gap in the traffic before changing lanes to the lane with oncoming traffic.",
+)
+
+
 
 # ── Structured per-chunk credit + subtask suggestions ────────────────────────────────
 
@@ -186,6 +241,12 @@ class ChunkCredit:
     # chunks whose subtask the VLM changes (BAD chunks); empty otherwise. Used as the ``reasoning``
     # target of the stored high-level SteerVLA sample.
     suggested_reasoning: str = ""
+    # Why a BAD chunk is BAD: "direct" when a BAD event overlaps the chunk's own time range,
+    # "precursor" when the chunk itself looks unremarkable but set up a later BAD event and a
+    # different subtask here would have pre-empted it. Empty for GOOD/unlabeled chunks. Both
+    # kinds are corrected identically downstream (see :func:`_resolve_hl_targets`); this only
+    # records provenance for artifacts/metrics.
+    credit_source: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -194,6 +255,7 @@ class ChunkCredit:
             "rationale": self.rationale,
             "suggested_subtasks": list(self.suggested_subtasks),
             "suggested_reasoning": self.suggested_reasoning,
+            "credit_source": self.credit_source,
         }
 
     @classmethod
@@ -210,12 +272,23 @@ class ChunkCredit:
         if not isinstance(subtasks_raw, list):
             raise ValueError("suggested_subtasks must be a list of strings.")
         suggested = tuple(str(s).strip() for s in subtasks_raw if str(s).strip())
+        source_raw = raw.get("credit_source")
+        credit_source = str(source_raw).strip().lower() if source_raw is not None else ""
+        if credit_source not in ("", "direct", "precursor"):
+            raise ValueError(f"credit_source must be direct or precursor, got {source_raw!r}.")
+        if label == "BAD" and not credit_source:
+            # Older/looser responses omit the field; a BAD chunk with no stated source is the
+            # original overlap-based credit.
+            credit_source = "direct"
+        if label != "BAD":
+            credit_source = ""
         return cls(
             chunk_index=idx,
             label=label,
             rationale=str(raw.get("rationale", "")).strip(),
             suggested_subtasks=suggested,
             suggested_reasoning=str(raw.get("suggested_reasoning", "")).strip(),
+            credit_source=credit_source,
         )
 
 
@@ -240,6 +313,7 @@ def build_debug_task_prompt(
     chunk_specs: list[ActionChunkSpec],
     metadata: dict[str, Any],
     seed_subtasks: tuple[str, ...] = SEED_SUBTASKS,
+    seed_reasonings: tuple[str, ...] = SEED_REASONING,
     num_suggestions: int = DEFAULT_NUM_SUBTASK_SUGGESTIONS,
     max_seed_examples: int = 40,
 ) -> str:
@@ -264,8 +338,10 @@ def build_debug_task_prompt(
         for s in chunk_specs
     ]
     # Present a bounded sample of seed subtasks to keep the prompt small.
-    seeds = list(seed_subtasks)[:max_seed_examples]
-    seed_block = "\n".join(f"- {s}" for s in seeds)
+    seeds_subtasks = list(seed_subtasks)[:max_seed_examples]
+    seed_subtask_block = "\n".join(f"- {s}" for s in seeds_subtasks)
+    seeds_reasonings = list(seed_reasonings)[:max_seed_examples]
+    seed_reasoning_block = "\n".join(f"- {s}" for s in seeds_reasonings)
 
     return textwrap.dedent(
         f"""
@@ -329,6 +405,7 @@ def build_credit_relabel_prompt(
     chunk_specs: list[ActionChunkSpec],
     metadata: dict[str, Any],
     seed_subtasks: tuple[str, ...] = SEED_SUBTASKS,
+    seed_reasonings: tuple[str, ...] = SEED_REASONING,
     num_suggestions: int = DEFAULT_NUM_SUBTASK_SUGGESTIONS,
     max_seed_examples: int = 40,
 ) -> str:
@@ -353,14 +430,24 @@ def build_credit_relabel_prompt(
         for s in chunk_specs
     ]
     # Present a bounded sample of seed subtasks to keep the prompt small.
-    seeds = list(seed_subtasks)[:max_seed_examples]
-    seed_block = "\n".join(f"- {s}" for s in seeds)
+    seeds_subtasks = list(seed_subtasks)[:max_seed_examples]
+    seed_subtask_block = "\n".join(f"- {s}" for s in seeds_subtasks)
+    seeds_reasonings = list(seed_reasonings)[:max_seed_examples]
+    seed_reasoning_block = "\n".join(f"- {s}" for s in seeds_reasonings)
 
     return textwrap.dedent(
         f"""
         You previously reviewed a short driving rollout window and flagged GOOD and BAD
         moments (below). Now assign that credit to the specific action chunks the policy
         executed, and for each chunk propose subtasks that would improve the behavior.
+
+        Credit is CAUSAL, not just temporal. A bad driving outcome is usually already decided
+        several chunks before it becomes visible: the vehicle carried too much speed into the
+        approach, drifted toward the wrong lane, started braking too late, or committed to a gap
+        that was never there. Those earlier chunks are ALSO at fault, and fixing them is the only
+        way to prevent the failure — by the time the BAD event is on screen it is often too late.
+        So for each BAD event, walk BACKWARD through the preceding chunks and blame the ones that
+        set it up, giving each a subtask that pre-empts the failure.
 
         Each action chunk spans a fixed number of env steps; the chunk timing (in the same
         video seconds as the events) is given below.
@@ -382,24 +469,50 @@ def build_credit_relabel_prompt(
         ```
 
         Example subtask phrasings (open vocabulary — reuse verbatim OR write new phrases in
-        the SAME concise style; describe what the vehicle should do, not meta commentary):
-        {seed_block}
+        the SAME concise style; describe what the vehicle should do, not meta commentary). HOWEVER
+        the new subtasks should NOT reference objects in the scene and should focus on the driving behavior of
+        the vehicle to prevent out of distribution objects from destroying the training signal.:
+        {seed_subtask_block}
+        
+        Example reasoning phrasings (open vocabulary — reuse verbatim OR write new phrases in
+        the SAME concise style; describe what the driver would think before arriving at the corrected subtask.
+        The new reasoning should CAN reference objects in the scene and the driving behavior of the vehicle.):
+        {seed_reasoning_block}
 
         For EVERY chunk_index above, return:
-        - label: "GOOD", "BAD", or null. Assign GOOD/BAD by overlapping the chunk's time
-          range with the events. Use null only when no event overlaps the chunk.
-        - rationale: one short sentence tying the chunk to the nearest event (may be empty).
+        - label: "GOOD", "BAD", or null.
+          * BAD (direct) — a BAD event overlaps this chunk's time range.
+          * BAD (precursor) — no BAD event overlaps this chunk, but it is part of the lead-up
+            that made a later BAD event unavoidable or hard to avoid. Test each preceding chunk
+            with: "if the policy had executed a different subtask HERE, would the later event
+            have been prevented or clearly reduced?" If yes, this chunk is BAD/precursor.
+          * GOOD — a GOOD event overlaps the chunk AND it is not a precursor to any BAD event.
+            A chunk that looks smooth in isolation is NOT good if it set up a later failure;
+            prefer BAD/precursor in that case.
+          * null — no event applies and the chunk is not a precursor.
+        - credit_source: "direct" or "precursor" for BAD chunks (per above); "" otherwise.
+        - rationale: one short sentence tying the chunk to its event. For precursor chunks, say
+          which later event it leads to and what about this chunk causes it (e.g. "Still at
+          11 m/s approaching the occluded crosswalk that produces the 8.0s near-miss.").
         - suggested_subtasks: up to {num_suggestions} subtask phrases that would improve or
-          reinforce this chunk. For BAD chunks, suggest corrective subtasks. For GOOD chunks,
-          keep the original subtask. If a chunk is BAD because the vehicle stopped or crawled
-          prematurely while the route is unfinished and the way ahead is clear (no red light,
-          stop sign, close leading vehicle, or pedestrian/yield), suggest a subtask that has it
-          accelerate and make forward progress along the route.
-        - suggested_reasoning: for BAD chunks whose subtask you are changing, write a fresh,
-          concise chain-of-thought (1-3 sentences, present tense) that a driver would think
-          BEFORE arriving at the corrected subtask — describe what is observed in the scene and
-          why the corrected action is right. This becomes the reasoning that leads to the first
-          corrected subtask. Leave it as "" for GOOD or null chunks (no change needed).
+          reinforce this chunk. For BAD/direct chunks, suggest corrective subtasks. For
+          BAD/precursor chunks, suggest the subtask that should have been executed AT THIS
+          MOMENT to pre-empt the later event — the earlier, gentler action (start scrubbing
+          speed, hold the lane, wait for a real gap), NOT the emergency reaction that the
+          direct chunk needs. The correction must be justifiable from what is observable in
+          THIS chunk; do not suggest a subtask that only makes sense with hindsight of the
+          event. For GOOD chunks, keep the original subtask. If a chunk is BAD because the
+          vehicle stopped or crawled prematurely while the route is unfinished and the way
+          ahead is clear (no red light, stop sign, close leading vehicle, or pedestrian/yield),
+          suggest a subtask that has it accelerate and make forward progress along the route.
+        - suggested_reasoning: for BAD chunks whose subtask you are changing (direct AND
+          precursor), write a fresh, concise chain-of-thought (1-3 sentences, present tense)
+          that a driver would think BEFORE arriving at the corrected subtask — describe what is
+          observed in the scene and why the corrected action is right. For precursor chunks this
+          must read as anticipation from the current scene ("the crosswalk ahead is occluded by
+          the parked van, so ease off now"), never as knowledge of the future event. This becomes
+          the reasoning that leads to the first corrected subtask. Leave it as "" for GOOD or
+          null chunks (no change needed). The suggested reasoning can reference objects in the scene, but the subtasks should not.
         
         **IMPORTANT:** Also try to smooth the subtasks relative to the adjacent subtasks in the chunk. If there is rapid changes of the subtask, you can suggest a subtask that smooths the transition.
 
@@ -407,11 +520,22 @@ def build_credit_relabel_prompt(
         {{
           "chunk_credits": [
             {{
-              "chunk_index": 0,
+              "chunk_index": 3,
               "label": "BAD",
+              "credit_source": "precursor",
+              "rationale": "Holds full speed toward the crosswalk occluded by the parked van, leaving no room to stop for the 2.5s near-miss.",
+              "suggested_subtasks": [
+                "The vehicle cautiously reduces speed, maintaining steady lane keeping."
+              ],
+              "suggested_reasoning": "A parked van hides the crosswalk on the right, so the vehicle eases off the throttle now to keep a stopping margin if someone steps out."
+            }},
+            {{
+              "chunk_index": 4,
+              "label": "BAD",
+              "credit_source": "direct",
               "rationale": "Overlaps the 2.5s near-miss with the pedestrian.",
               "suggested_subtasks": [
-                "The vehicle smoothly decelerates to a stop, cautiously adjusting course to the left due to a pedestrian."
+                "The vehicle smoothly decelerates to a stop, cautiously adjusting course to the left."
               ],
               "suggested_reasoning": "A pedestrian is stepping into the lane ahead on the left, so the vehicle must brake now and ease left to keep clear rather than continue at speed."
             }}
@@ -424,6 +548,11 @@ def build_credit_relabel_prompt(
         - Keep rationale under 50 words.
         - Never exceed {num_suggestions} suggested subtasks per chunk.
         - suggested_reasoning must be "" unless the chunk is BAD and you changed its subtask.
+        - credit_source must be "" unless the chunk is BAD.
+        - Only walk blame back as far as it is genuinely actionable: stop once the hazard was not
+          yet observable from the vehicle's viewpoint, or the situation was still comfortably
+          recoverable by the chunks that follow. Do not blanket every preceding chunk in the
+          window — an unrelated chunk that merely happens to come earlier is null, not precursor.
         """
     ).strip()
 
@@ -452,6 +581,7 @@ def parse_credit_relabel_response(
                 rationale=credit.rationale,
                 suggested_subtasks=credit.suggested_subtasks[:num_suggestions],
                 suggested_reasoning=credit.suggested_reasoning,
+                credit_source=credit.credit_source,
             )
         by_index[credit.chunk_index] = credit
 
@@ -493,6 +623,7 @@ def assemble_cast_relabel_json(
                 "video_time_end_sec": spec.video_time_end_sec,
                 "original_subtask": metadata.get("chunk_original_subtask", {}).get(str(spec.chunk_index)),
                 "label": credit.label,
+                "credit_source": credit.credit_source,
                 "rationale": credit.rationale,
                 "suggested_subtasks": list(credit.suggested_subtasks),
                 "suggested_reasoning": credit.suggested_reasoning,
@@ -608,6 +739,13 @@ class HLSample:
     chunk_index: int
     episode_step: int
     label: str | None
+    # "direct" | "precursor" | "" — see ``ChunkCredit.credit_source``. Lets a later analysis
+    # separate reactive corrections from pre-emptive ones.
+    credit_source: str = ""
+    # True only when ``subtask``/``reasoning`` are the original CoT the model produced for ``actions``
+    # (the reinforce path), so the action is a valid FAST-supervision target. False on the correct/
+    # relabel path, where the subtask was replaced but the action is still the uncorrected one.
+    action_matches_subtask: bool = False
 
     def manifest_entry(self, sample_file: str) -> dict[str, Any]:
         return {
@@ -620,6 +758,8 @@ class HLSample:
             "chunk_index": self.chunk_index,
             "episode_step": self.episode_step,
             "label": self.label,
+            "credit_source": self.credit_source,
+            "action_matches_subtask": bool(self.action_matches_subtask),
             "image_shape": [int(x) for x in self.image.shape],
             "state_dim": int(self.state.shape[-1]),
             "action_chunk_steps": int(self.actions.shape[0]),
@@ -631,35 +771,58 @@ class HLSample:
 def _resolve_hl_targets(
     chunk: dict[str, Any],
     model_input: dict[str, Any],
-) -> tuple[str, str] | None:
-    """Pick the ``(subtask, reasoning)`` HL targets for one chunk, or ``None`` to skip it.
+    *,
+    relabel_all: bool = False,
+) -> tuple[str, str, bool] | None:
+    """Pick the ``(subtask, reasoning, action_matches_subtask)`` HL targets for one chunk, or ``None``.
+
+    ``action_matches_subtask`` is ``True`` only on the *reinforce* path, where the stored subtask is
+    the original CoT the model produced for the executed action chunk — so that chunk's action and
+    subtask are consistent and its FAST action tokens are a valid supervision target. On the *correct*
+    path (BAD or ``relabel_all``) the subtask is replaced but the stored action is still the original
+    (uncorrected) one, so the pair is inconsistent and the action must NOT be FAST-supervised under
+    the new subtask.
 
     - **BAD** chunks are *corrected*: the first suggested subtask becomes the target and the
       freshly-generated ``suggested_reasoning`` (falling back to the credit rationale) the
-      reasoning. Skipped when the VLM offered no suggestion (nothing to correct toward).
+      reasoning. Skipped when the VLM offered no suggestion (nothing to correct toward). This
+      covers both ``credit_source`` kinds — a "precursor" chunk (blamed for setting up a later
+      BAD event rather than overlapping one) is corrected exactly like a "direct" chunk, which
+      is the point: it teaches the pre-emptive subtask at the moment it was still actionable.
     - **GOOD / unlabeled** chunks are *reinforced as-is*: the original subtask + reasoning the
       model produced at rollout (stashed on ``model_input``) become the targets, so good
       high-level behavior is imitated rather than corrected. Skipped when no original subtask
       was captured (nothing to reinforce).
+
+    ``relabel_all`` (the cast_relabel **debug task**) forces *every* chunk to use its suggested
+    subtask regardless of ``label``. The debug prompt corrects every chunk toward "remain stopped
+    / slow down" but leaves ``label`` null, so without this the label gate would fall through to
+    "reinforce original" and store the model's original subtask instead of the relabel. When a
+    chunk has no suggestion, we fall back to reinforcing the original.
     """
     label = chunk.get("label")
     label_str = str(label).strip().upper() if label is not None else ""
-    if label_str == "BAD":
+    if relabel_all or label_str == "BAD":
         suggested = chunk.get("suggested_subtasks") or []
-        if not suggested:
+        subtask_target = str(suggested[0]).strip() if suggested else ""
+        if subtask_target:
+            reasoning_target = str(chunk.get("suggested_reasoning") or "").strip()
+            if not reasoning_target:
+                reasoning_target = str(chunk.get("rationale") or "").strip()
+            # Corrected subtask: the executed action no longer matches it.
+            return subtask_target, reasoning_target, False
+        if label_str == "BAD" and not relabel_all:
+            # BAD with nothing suggested: nothing to correct toward.
             return None
-        subtask_target = str(suggested[0]).strip()
-        reasoning_target = str(chunk.get("suggested_reasoning") or "").strip()
-        if not reasoning_target:
-            reasoning_target = str(chunk.get("rationale") or "").strip()
-        return subtask_target, reasoning_target
+        # relabel_all but no suggestion for this chunk -> fall back to reinforcing the original.
 
-    # GOOD or no label -> reinforce the original CoT the model produced for this chunk.
+    # GOOD or no label -> reinforce the original CoT the model produced for this chunk. The stored
+    # action was taken under exactly this subtask, so it is a valid FAST-supervision target.
     subtask_target = str(model_input.get("subtask") or "").strip()
     if not subtask_target:
         return None
     reasoning_target = str(model_input.get("reasoning") or "").strip()
-    return subtask_target, reasoning_target
+    return subtask_target, reasoning_target, True
 
 
 def build_hl_samples_from_window(
@@ -673,6 +836,7 @@ def build_hl_samples_from_window(
     episode: int,
     window_index: int,
     store_good_chunks: bool = True,
+    relabel_all: bool = False,
 ) -> list[HLSample]:
     """Turn a window's chunks into ``steervla_hl_dataset_format`` samples.
 
@@ -682,6 +846,10 @@ def build_hl_samples_from_window(
     prompt / executed chunk) is looked up by the chunk's absolute start episode step. Every HL
     sample keeps ``action_loss_mask`` all-``False`` (``action_supervision=False``): ``update_hl``
     supervises only the VLM backbone, so GOOD and BAD chunks alike train the CoT, not the action.
+
+    ``relabel_all`` (the cast_relabel debug task) uses the suggested subtask for *every* chunk
+    regardless of ``label`` and stores all chunks (the store_good_chunks gate is bypassed), so the
+    whole window is relabeled toward the debug target rather than only the BAD chunks.
     """
     specs_by_index = {int(s.chunk_index): s for s in chunk_specs}
     samples: list[HLSample] = []
@@ -689,7 +857,7 @@ def build_hl_samples_from_window(
         label = chunk.get("label")
         label_str = str(label).strip().upper() if label is not None else ""
         is_bad = label_str == "BAD"
-        if not is_bad and not store_good_chunks:
+        if not is_bad and not store_good_chunks and not relabel_all:
             continue
         chunk_index = int(chunk.get("chunk_index", -1))
         spec = specs_by_index.get(chunk_index)
@@ -705,10 +873,10 @@ def build_hl_samples_from_window(
             # No captured model input for this chunk start (e.g. state-only obs); skip.
             continue
 
-        targets = _resolve_hl_targets(chunk, model_input)
+        targets = _resolve_hl_targets(chunk, model_input, relabel_all=relabel_all)
         if targets is None:
             continue
-        subtask_target, reasoning_target = targets
+        subtask_target, reasoning_target, action_matches_subtask = targets
 
         prompt = str(model_input.get("prompt") or "").strip()
         actions_src = model_input.get("action_chunk")
@@ -730,6 +898,8 @@ def build_hl_samples_from_window(
                 chunk_index=chunk_index,
                 episode_step=abs_episode_step,
                 label=(label_str or None),
+                credit_source=str(chunk.get("credit_source") or ""),
+                action_matches_subtask=bool(action_matches_subtask),
             )
         )
     return samples
@@ -838,7 +1008,13 @@ def annotate_cast_relabel_frames(
             if label == "GOOD":
                 lines.append(("GOOD", (0, 220, 0), 2))
             elif label == "BAD":
-                lines.append(("BAD", (0, 0, 255), 2))
+                source = str(chunk.get("credit_source") or "").strip()
+                if source == "precursor":
+                    # Distinct colour: this chunk looks fine on screen, it is blamed for what
+                    # comes later, so a reviewer needs to see why it is flagged.
+                    lines.append(("BAD (precursor)", (0, 140, 255), 2))
+                else:
+                    lines.append(("BAD", (0, 0, 255), 2))
             else:
                 lines.append(("(no signal)", (160, 160, 160), 1))
             rationale = str(chunk.get("rationale", "")).strip()
@@ -1240,6 +1416,7 @@ class OnlineCastRelabelSession:
                 episode=self.episode_count,
                 window_index=self.window_count,
                 store_good_chunks=self.store_good_chunks,
+                relabel_all=self.debug_task,
             )
             if not hl_samples:
                 return 0
@@ -1306,6 +1483,12 @@ class OnlineCastRelabelSession:
         chunks = cast_json.get("action_chunks", [])
         n_good = sum(1 for c in chunks if c.get("label") == "GOOD")
         n_bad = sum(1 for c in chunks if c.get("label") == "BAD")
+        n_bad_direct = sum(
+            1 for c in chunks if c.get("label") == "BAD" and c.get("credit_source") != "precursor"
+        )
+        n_bad_precursor = sum(
+            1 for c in chunks if c.get("label") == "BAD" and c.get("credit_source") == "precursor"
+        )
         n_relabeled = sum(1 for c in chunks if c.get("suggested_subtasks"))
         log: dict[str, Any] = {
             "cast_relabel/window_index": self.window_count,
@@ -1313,18 +1496,28 @@ class OnlineCastRelabelSession:
             "cast_relabel/n_chunks": len(chunks),
             "cast_relabel/n_good_chunks": n_good,
             "cast_relabel/n_bad_chunks": n_bad,
+            "cast_relabel/n_bad_direct_chunks": n_bad_direct,
+            "cast_relabel/n_bad_precursor_chunks": n_bad_precursor,
             "cast_relabel/n_relabeled_chunks": n_relabeled,
             "cast_relabel/n_hl_samples_window": int(n_hl_samples),
             "cast_relabel/hl_samples_total": int(self.hl_sample_count),
         }
         if self.debug and chunks:
             tbl = wandb.Table(
-                columns=["chunk_index", "label", "rationale", "suggested_subtasks", "suggested_reasoning"]
+                columns=[
+                    "chunk_index",
+                    "label",
+                    "credit_source",
+                    "rationale",
+                    "suggested_subtasks",
+                    "suggested_reasoning",
+                ]
             )
             for c in chunks:
                 tbl.add_data(
                     c.get("chunk_index"),
                     c.get("label"),
+                    c.get("credit_source"),
                     c.get("rationale"),
                     " | ".join(c.get("suggested_subtasks") or []),
                     c.get("suggested_reasoning"),

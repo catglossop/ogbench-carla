@@ -778,6 +778,81 @@ def _maybe_set_jax_default_gpu(training_gpu_rank: int) -> None:
     jax.config.update("jax_default_device", gpus[idx])
 
 
+# PaliGemma location sentinels (``<loc0000>``..``<loc1023>``). The CoT decode
+# (``tokenizer._tokenizer.decode``) emits these verbatim, so the subtask/reasoning text captured
+# at rollout — and therefore any HL sample that *reinforces* the model's original CoT — carries
+# them: 1019-1022 wrap each segment, lower ids appear mid-text. They are not natural language and
+# must not be trained on as CoT targets.
+_LOC_SENTINEL_RE = re.compile(r"<loc\d+>")
+
+
+def strip_cot_sentinels(text: Any) -> str:
+    """Strip ``<locNNNN>`` sentinels from decoded CoT text and tidy the segment delimiter.
+
+    ``'<loc1022>The vehicle accelerates normally.;<loc1021>'`` -> ``'The vehicle accelerates normally.'``
+    Internal punctuation is preserved; only the trailing ``;`` left behind by the delimiter is
+    removed.
+    """
+    s = _LOC_SENTINEL_RE.sub(" ", str(text or ""))
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.rstrip(" ;").strip()
+
+
+# Model image resolution. The SteerVLA pretraining dataset was preprocessed by **stretching** each
+# camera frame to a square (a plain distorting resize to 224x224), NOT by aspect-preserving pad — the
+# stretch happened upstream during dataset creation, so it is invisible in the runtime transforms
+# (``ResizeImages`` -> ``resize_with_pad`` is then a near no-op on an already-square frame). The raw
+# CARLA obs image is rectangular (144x256), so to feed the backbone the same distribution it was
+# trained on we must stretch it to square here too — padding it would introduce black bars the model
+# never saw. This resolution is applied both to the HL training frames and (via
+# :meth:`build_observation_batch_numpy`) to the live rollout frame, so the two stay identical.
+_HL_IMAGE_HW: tuple[int, int] = (224, 224)
+
+# How many samples of an HL batch the wandb/disk visualization panel renders. Batches are typically
+# 32; rendering all of them makes an unreadably large figure and costs real wall-clock per update.
+_HL_BATCH_FIG_MAX_SAMPLES: int = 6
+
+
+def resize_stretch_np(image: Any, height: int, width: int) -> np.ndarray:
+    """Plain distorting resize (stretch) to ``(height, width)`` — no aspect preservation, no pad.
+
+    Matches how the SteerVLA pretraining dataset was preprocessed (frames stretched to square), so a
+    rectangular CARLA frame fills the whole square instead of being letterboxed. Uses bilinear to match
+    the model's own ``jax.image.resize`` LINEAR method.
+    """
+    import cv2  # type: ignore
+
+    img = np.asarray(image, dtype=np.uint8)
+    cur_h, cur_w = img.shape[:2]
+    if (cur_h, cur_w) == (height, width):
+        return np.ascontiguousarray(img)
+    resized = cv2.resize(img, (width, height), interpolation=cv2.INTER_LINEAR)
+    return np.ascontiguousarray(resized, dtype=np.uint8)
+
+
+def _resize_hl_image(image: Any, hw: tuple[int, int] = _HL_IMAGE_HW) -> np.ndarray:
+    """Resize an ``(H, W, 3)`` uint8 image to the model resolution (no-op if already there).
+
+    Stretches to square (see :func:`resize_stretch_np`) to match the pretraining preprocessing rather
+    than pad — a padded CARLA frame would train/query the backbone on black bars it never saw.
+    """
+    return resize_stretch_np(image, hw[0], hw[1])
+
+
+def _fit_chunk_to_horizon(chunk: np.ndarray, horizon: int, dim: int) -> np.ndarray:
+    """Coerce a ``(H, D)`` chunk to exactly ``(horizon, dim)`` (pad-last-row / truncate as needed)."""
+    arr = np.asarray(chunk, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, dim)
+    out = np.zeros((int(horizon), int(dim)), dtype=np.float32)
+    h = min(int(horizon), int(arr.shape[0]))
+    d = min(int(dim), int(arr.shape[1]))
+    out[:h, :d] = arr[:h, :d]
+    if arr.shape[0] < horizon and arr.shape[0] > 0:
+        out[arr.shape[0]:, :d] = arr[-1, :d]  # repeat last row (matches RLDS chunk padding).
+    return out
+
+
 class SteerVLAActor:
     """SteerVLA as a remote HTTP client or as local OpenPI Pi0-CoT inference.
 
@@ -816,6 +891,11 @@ class SteerVLAActor:
         hl_update_every: int = 1,
         hl_update_batch_size: int = 2,
         hl_update_num_steps: int = 1,
+        hl_freeze_regexes: list[str] | None = None,
+        hl_replay_root: str | Path | None = None,
+        hl_replay_pools: list[dict] | None = None,
+        hl_online_weight: float = 1.0,
+        hl_online_bad_fraction: float = -1.0,
         return_normalized_action_chunk: bool = False,
         fixed_subtask_text: Optional[str] = None,
         fixed_reasoning_text: Optional[str] = None,
@@ -848,8 +928,44 @@ class SteerVLAActor:
         self.hl_update_every = max(1, int(hl_update_every))
         self.hl_update_batch_size = max(1, int(hl_update_batch_size))
         self.hl_update_num_steps = max(1, int(hl_update_num_steps))
+        # Optional regexes of param paths to FREEZE in the trainable state (e.g. the SigLIP vision
+        # tower and the tied token embedder), so their grad + Adam buffers are dropped and the HL
+        # update fits. Applied in :meth:`setup` before the train state is built. None = full fine-tune.
+        self.hl_freeze_regexes: list[str] | None = (
+            [str(r) for r in hl_freeze_regexes if str(r).strip()] if hl_freeze_regexes else None
+        )
+        # HL replay pools: a small amount of the original pretraining data (pre-extracted to npz by
+        # ``impls/vlas/extract_hl_replay.py``) mixed into every HL update to stabilize the VLM
+        # backbone. Weighted like steervla-pi's dataset mixture: the online cast_relabel pool gets
+        # ``hl_online_weight`` and each replay pool its own weight; per HL update the batch is split
+        # across pools by normalized weight. Each replay pool carries its own supervision flags
+        # (``action_supervision`` = train the flow head; ``supervise_fast`` = train the FAST CE).
+        self.hl_online_weight = float(hl_online_weight)
+        # Within the online cast_relabel pool, bias the per-batch draw toward corrective chunks:
+        # ``hl_online_bad_fraction`` of each online-share slot is filled from the BAD / BAD(precursor)
+        # bucket (``label == "BAD"``, either ``credit_source``) and the remainder from the GOOD / null
+        # bucket (``label`` GOOD or absent). Whichever bucket is short is topped up from the other so a
+        # full batch is still produced. ``< 0`` disables the split (uniform draw over the online pool).
+        # Only the online pool is bucketed; replay pools keep their weighted share untouched.
+        self.hl_online_bad_fraction = float(hl_online_bad_fraction)
+        self._hl_replay_root: Path | None = Path(hl_replay_root) if hl_replay_root is not None else None
+        self._hl_replay_pool_specs: list[dict[str, Any]] = self._resolve_replay_pool_specs(hl_replay_pools)
+        self._hl_replay_logged_once = False
+        self._hl_replay_missing_warned = False
         self._hl_train_step = None
         self._hl_update_calls = 0
+        # Diagnostics for :meth:`update_hl`, whose skip paths are otherwise silent (it returns
+        # ``{}``), which makes an absent ``vla_hl/batch_text`` table impossible to explain.
+        self._hl_pool_size = 0
+        self._last_hl_skip_reason: str | None = None
+        self._hl_logged_batch_once = False
+        self._hl_logged_json_once = False
+        # Rows accumulated for the wandb step currently being logged. ``updates_per_step`` sends
+        # several update_with_vla calls per env step, all sharing one ``global_step``; wandb keeps
+        # only the LAST value logged per (step, key), so same-step batches are merged into a single
+        # table instead of overwriting each other.
+        self._hl_table_step: int | None = None
+        self._hl_table_rows: list[list[Any]] = []
         self._weights_dirty = False
         self.raw_obs_holder = raw_obs_holder
         self.routing_command = routing_command
@@ -966,6 +1082,21 @@ class SteerVLAActor:
             weight_loader=_weight_loaders.CheckpointWeightLoader(str(params_dir)),
         )
 
+        # Optional extra freeze filter, ORed onto the config's own freeze_filter. The HL update
+        # supervises only the CoT/VLM backbone (action loss masked out), so the big pretrained
+        # subtrees the caller lists here (e.g. ``.*img.*`` SigLIP vision tower, ``.*embedder.*``
+        # tied token embedder) rarely need to move. Freezing them drops their gradient + Adam
+        # (mu/nu) buffers and casts them to bf16 inside ``init_openpi_train_state_single_gpu``,
+        # which is what makes the update fit. Must be applied BEFORE the train state is built so
+        # ``opt_state`` is allocated over the trainable subset only.
+        if self.load_trainable_params and self.hl_freeze_regexes:
+            extra = [nnx_utils.PathRegex(r) for r in self.hl_freeze_regexes]
+            self.train_cfg = dataclasses.replace(
+                self.train_cfg,
+                freeze_filter=nnx.Any(self.train_cfg.freeze_filter, *extra),
+            )
+            print(f"[steervla] extra freeze regexes for trainable state: {self.hl_freeze_regexes}", flush=True)
+
         if self.load_trainable_params:
             # Full trainable state (optimizer + opt_state + freeze/trainable filters), pinned to one
             # GPU. Matches ``scripts/train.py :: init_train_state`` so the actor's weights can be
@@ -979,6 +1110,25 @@ class SteerVLAActor:
             self._mesh = mesh
             self.model = nnx.merge(train_state.model_def, train_state.params)
             self._jax_device = device
+
+            # Confirm the freeze actually matched: a regex that matches nothing would silently keep
+            # the whole model trainable and OOM again. Report trainable vs total param counts and the
+            # rough VRAM saved (frozen params drop grad + Adam mu/nu and go bf16 ~= 14 B/param).
+            try:
+                total = sum(int(x.size) for x in jax.tree.leaves(train_state.params.filter(nnx.Param)))
+                trainable = sum(
+                    int(x.size)
+                    for x in jax.tree.leaves(train_state.params.filter(self.train_cfg.trainable_filter))
+                )
+                frozen = max(0, total - trainable)
+                print(
+                    f"[steervla] trainable params {trainable / 1e6:.1f}M / {total / 1e6:.1f}M "
+                    f"({100.0 * trainable / max(1, total):.1f}%); frozen {frozen / 1e6:.1f}M "
+                    f"(~{14 * frozen / 1e9:.1f} GB saved vs full fine-tune).",
+                    flush=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - diagnostic only, never fatal.
+                print(f"[steervla] trainable-param diagnostic unavailable ({exc}).", flush=True)
         else:
             # Inference-only: restore params once onto a single GPU and share them with the model.
             params, device = restore_openpi_params_on_single_gpu(
@@ -1003,7 +1153,17 @@ class SteerVLAActor:
 
         if self.load_trainable_params and self._train_state is not None:
             # Jitted high-level train step; ``config`` is bound via partial so it stays static.
-            self._hl_train_step = jax.jit(functools.partial(_openpi_hl_train_step, self.train_cfg))
+            # Donate the input TrainState (arg index 1 after ``config`` is bound by partial) so XLA
+            # aliases the new state onto the old buffers instead of holding both (~40 GB each for a
+            # full-FT 3.3B model). Without this the step's input+output args double-count the state
+            # (seen as a ~107 GB I/O footprint / 71.5 GiB working set) and OOM. Matches the ``init``
+            # jit above and OpenPI ``scripts/train.py``. Safe: ``update_hl`` reassigns
+            # ``self._train_state`` to the output and never reuses the donated input. Only the state
+            # is donated, not the batch — the batch is reused across ``hl_update_num_steps`` steps.
+            self._hl_train_step = jax.jit(
+                functools.partial(_openpi_hl_train_step, self.train_cfg),
+                donate_argnums=(1,),
+            )
             if self._train_rng is None:
                 self._train_rng = jax.random.key(0)
 
@@ -1116,18 +1276,62 @@ class SteerVLAActor:
     # High-level (VLM-backbone) online update from the cast_relabel HL dataset
     # ------------------------------------------------------------------
 
-    def _scan_hl_dataset(self) -> list[dict[str, Any]]:
-        """List all stored high-level samples (one entry per ``sample_*.npz`` + its text targets)."""
+    def _resolve_replay_pool_specs(self, hl_replay_pools) -> list[dict[str, Any]]:
+        """Normalize the configured replay-pool list into ``{dir, name, weight, kind}`` specs.
+
+        Each entry is a ``{name, weight}`` dict (``name`` is a dir under ``hl_replay_root`` or an
+        absolute path). Supervision flags (``action_supervision`` / ``supervise_fast`` / state format)
+        are NOT set here — they live in each pool's ``hl_samples.json`` (written by
+        ``extract_hl_replay.py``) and are read at scan time.
+        """
+        specs: list[dict[str, Any]] = []
+        for p in (hl_replay_pools or []):
+            try:
+                p = dict(p)
+            except Exception:
+                continue
+            name = str(p.get("name") or p.get("dir") or "").strip()
+            weight = float(p.get("weight", 0.0) or 0.0)
+            if not name or weight <= 0.0:
+                continue
+            d = Path(name)
+            if not d.is_absolute() and self._hl_replay_root is not None:
+                d = self._hl_replay_root / name
+            specs.append({"dir": d, "name": name, "weight": weight, "kind": "replay"})
+        return specs
+
+    def _hl_pools(self) -> list[dict[str, Any]]:
+        """Active HL sources: the online cast_relabel pool plus any configured replay pools."""
+        pools: list[dict[str, Any]] = []
+        if self.hl_dataset_dir is not None and float(self.hl_online_weight) > 0.0:
+            pools.append(
+                {"dir": Path(self.hl_dataset_dir), "name": "online", "weight": float(self.hl_online_weight), "kind": "online"}
+            )
+        pools.extend(self._hl_replay_pool_specs)
+        return [p for p in pools if float(p.get("weight", 0.0)) > 0.0]
+
+    def _scan_pool(self, pool: dict[str, Any]) -> list[dict[str, Any]]:
+        """List all samples in one pool, tagging each with the pool's supervision flags.
+
+        The online cast_relabel dir keeps a ``hl_samples.json`` per window subdir; an extracted replay
+        pool keeps a single ``hl_samples.json`` at its root — both globs are checked. ``action_supervision``
+        / ``supervise_fast`` / ``state_format`` come from the manifest (defaults match the online
+        ``steervla_hl_dataset_format``: no flow, per-sample FAST, raw CARLA state).
+        """
         entries: list[dict[str, Any]] = []
-        root = self.hl_dataset_dir
+        root = pool.get("dir")
         if root is None or not Path(root).is_dir():
             return entries
-        for manifest_path in sorted(Path(root).glob("*/hl_samples.json")):
+        manifests = sorted(Path(root).glob("hl_samples.json")) + sorted(Path(root).glob("*/hl_samples.json"))
+        for manifest_path in manifests:
             try:
                 manifest = json.loads(manifest_path.read_text())
             except Exception:
                 continue
             work_dir = manifest_path.parent
+            pool_action_sup = bool(manifest.get("action_supervision", False))
+            pool_fast = manifest.get("supervise_fast", None)  # None -> resolve per-sample.
+            state_format = str(manifest.get("state_format", "carla_raw"))
             for s in manifest.get("samples", []):
                 entries.append(
                     {
@@ -1136,71 +1340,278 @@ class SteerVLAActor:
                         "prompt": s.get("prompt", ""),
                         "subtask": s.get("subtask", ""),
                         "reasoning": s.get("reasoning", ""),
+                        # Only reinforced (original) online chunks have an action matching their subtask.
+                        "action_matches_subtask": bool(s.get("action_matches_subtask", False)),
+                        # cast_relabel per-chunk verdict: "GOOD"/"BAD"/None and (for BAD) whether the
+                        # blame is "direct" or "precursor". Used to bucket the online pool 80/20
+                        # (BAD or BAD-precursor vs GOOD or null) in :meth:`_load_hl_batch`. Replay
+                        # pools have no such labels; they fall into the "not BAD" bucket harmlessly
+                        # (the label split is only applied to the online pool).
+                        "label": s.get("label"),
+                        "credit_source": s.get("credit_source", ""),
+                        "action_supervision": pool_action_sup,
+                        "supervise_fast": pool_fast,
+                        "state_format": state_format,
+                        "pool": pool.get("name", "online"),
                     }
                 )
         return entries
 
-    def _load_hl_batch(self, batch_size: int):
-        """Sample a full batch (without replacement) of stored HL samples.
+    @staticmethod
+    def _largest_remainder(total: int, fracs: list[float]) -> list[int]:
+        """Split ``total`` into integer per-source counts closest to ``fracs`` (sum == total)."""
+        raw = [f * total for f in fracs]
+        floors = [int(np.floor(x)) for x in raw]
+        rem = int(total - sum(floors))
+        if rem > 0:
+            order = np.argsort([-(raw[i] - floors[i]) for i in range(len(raw))])
+            for k in range(rem):
+                floors[int(order[k % len(order)])] += 1
+        return floors
 
-        Returns ``None`` until the dataset holds at least ``batch_size`` samples, so the first
-        VLM-backbone gradient step only fires once enough distinct cast_relabel windows have been
-        collected. Once the pool is large enough, ``batch_size`` samples are drawn uniformly at
-        random without replacement (a fresh random subset each call).
+    @staticmethod
+    def _is_bad_entry(e: dict[str, Any]) -> bool:
+        """True for a cast_relabel BAD / BAD(precursor) chunk (either ``credit_source``)."""
+        return str(e.get("label") or "").strip().upper() == "BAD"
+
+    def _order_online_entries(
+        self, entries: list[dict[str, Any]], cnt: int, bad_fraction: float
+    ) -> list[dict[str, Any]]:
+        """Order online-pool entries so the first ``cnt`` are ~``bad_fraction`` BAD, the rest GOOD/null.
+
+        BAD and BAD(precursor) chunks form the corrective bucket; GOOD and unlabeled/null chunks the
+        reinforce bucket. Selects ``round(cnt * bad_fraction)`` corrective + the remainder reinforce,
+        topping up from whichever bucket has spares when the other underfills so ``cnt`` is met when
+        possible. Remaining entries are appended (shuffled) as leftover top-up candidates for the
+        caller. The returned list is a full permutation of ``entries``.
+        """
+        bad = [e for e in entries if self._is_bad_entry(e)]
+        good = [e for e in entries if not self._is_bad_entry(e)]
+        np.random.shuffle(bad)
+        np.random.shuffle(good)
+        n_bad = min(len(bad), int(round(cnt * float(bad_fraction))))
+        n_good = cnt - n_bad
+        if n_good > len(good):  # reinforce bucket short -> pull more corrective to reach cnt.
+            n_good = len(good)
+            n_bad = min(len(bad), cnt - n_good)
+        selected = bad[:n_bad] + good[:n_good]
+        leftovers = bad[n_bad:] + good[n_good:]
+        np.random.shuffle(selected)
+        np.random.shuffle(leftovers)
+        return selected + leftovers
+
+    def _read_hl_record(self, e: dict[str, Any]) -> dict[str, Any] | None:
+        """Load one sample's arrays + resolve its per-sample supervision into a record dict."""
+        npz_path = Path(e["dir"]) / str(e["file"])
+        if not npz_path.is_file():
+            return None
+        try:
+            with np.load(npz_path) as z:
+                files = set(getattr(z, "files", []))
+                image = np.asarray(z["image"], dtype=np.uint8)
+                state = np.asarray(z["state"], dtype=np.float32).reshape(-1)
+                action = np.asarray(z["actions"], dtype=np.float32) if "actions" in files else None
+        except Exception:
+            # Half-written .npz (the coach writes these concurrently with training); skip it.
+            return None
+        # Strip PaliGemma <loc> sentinels from CoT targets (online reinforced samples carry them from
+        # the rollout decode; training the backbone on them teaches it to emit sentinels as prose).
+        subtask = strip_cot_sentinels(e.get("subtask", ""))
+        if not subtask:
+            return None
+        action_supervision = bool(e.get("action_supervision", False))
+        pool_fast = e.get("supervise_fast", None)
+        pool_name = str(e.get("pool", "online"))
+        # FAST supervision: explicit pool flag wins. The online cast_relabel pool NEVER supervises FAST
+        # — its sampled chunks (reinforced or relabeled) must not train the shared LLM's FAST head, or
+        # the action-token predictions drift. FAST is supervised only from the pretraining replay pools
+        # whose manifests set ``supervise_fast`` explicitly.
+        if pool_fast is not None:
+            supervise_fast = bool(pool_fast)
+        elif pool_name == "online":
+            supervise_fast = False
+        else:
+            supervise_fast = bool(e.get("action_matches_subtask", False))
+        # Drop the action if neither loss will use it, and never supervise a zero/absent chunk.
+        if not (supervise_fast or action_supervision):
+            action = None
+        if action is not None and not np.any(action):
+            action = None
+            supervise_fast = False
+            action_supervision = False
+        return {
+            "image": image,
+            "state": state,
+            "prompt": str(e.get("prompt", "")),
+            "subtask": subtask,
+            "reasoning": strip_cot_sentinels(e.get("reasoning", "")),
+            "action_chunk": action,
+            "action_supervision": action_supervision,
+            "supervise_fast": supervise_fast,
+            "state_format": str(e.get("state_format", "carla_raw")),
+            "pool": e.get("pool", "online"),
+            "label": e.get("label"),
+        }
+
+    def _load_hl_batch(self, batch_size: int):
+        """Draw a weighted mixed batch of HL records across the online + replay pools.
+
+        Counts are split across active pools by their (normalized) weights, mirroring steervla-pi's
+        dataset mixture. Returns ``None`` (skip/wait) until the online cast_relabel pool can supply
+        its full share, so every update includes fresh relabel data rather than only replay.
         """
         bs = int(batch_size)
-        entries = self._scan_hl_dataset()
-        if len(entries) < bs:
+        pools = self._hl_pools()
+        if not pools:
+            self._hl_pool_size = 0
             return None
-        idxs = np.random.choice(len(entries), size=bs, replace=False)
-        images, states, prompts, subtasks, reasonings = [], [], [], [], []
-        for i in idxs:
-            e = entries[int(i)]
-            npz_path = Path(e["dir"]) / str(e["file"])
-            if not npz_path.is_file():
-                continue
-            with np.load(npz_path) as z:
-                images.append(np.asarray(z["image"], dtype=np.uint8))
-                states.append(np.asarray(z["state"], dtype=np.float32).reshape(-1))
-            prompts.append(str(e.get("prompt", "")))
-            subtasks.append(str(e.get("subtask", "")))
-            reasonings.append(str(e.get("reasoning", "")))
-        if not images:
+        scanned = [{"pool": p, "entries": self._scan_pool(p)} for p in pools]
+        # Warn once if replay pools were configured but none resolved on disk (extraction not run).
+        if self._hl_replay_pool_specs and not getattr(self, "_hl_replay_missing_warned", False):
+            replay_have = any(
+                s["entries"] for s in scanned if s["pool"].get("kind") == "replay"
+            )
+            if not replay_have:
+                self._hl_replay_missing_warned = True
+                print(
+                    "[steervla.update_hl] WARNING: hl_replay_pools configured but no replay samples "
+                    f"found under {self._hl_replay_root} — training online-only. Run "
+                    "impls/vlas/extract_hl_replay.py to populate the pools.",
+                    flush=True,
+                )
+        online = next((s for s in scanned if s["pool"].get("kind") == "online"), None)
+        # ``_hl_pool_size`` reports the *online* pool fill (what the skip messages talk about).
+        self._hl_pool_size = (
+            len(online["entries"]) if online is not None else sum(len(s["entries"]) for s in scanned)
+        )
+        active = [s for s in scanned if s["entries"]]
+        if not active:
             return None
-        return images, states, prompts, subtasks, reasonings
+        wsum = sum(float(s["pool"]["weight"]) for s in active)
+        counts = self._largest_remainder(bs, [float(s["pool"]["weight"]) / wsum for s in active])
 
-    def _build_hl_observation_batch(self, images, states, prompts, subtasks, reasonings):
-        """Build ``(Observation, actions)`` for :meth:`update_hl` with CoT targets and a zero action mask.
+        # Gate on the online share so we never train on replay alone.
+        if online is not None:
+            if online not in active:
+                return None
+            need_online = counts[active.index(online)]
+            if len(online["entries"]) < need_online:
+                return None
 
-        Mirrors :meth:`build_observation_batch_numpy` (image / proprio / prompt tokenization) but the
-        reasoning + subtask tokens are the **training targets** and ``action_loss_mask`` is all-``False``
-        so only the VLM backbone is supervised (the action head gets zero flow-loss gradient).
+        records: list[dict[str, Any]] = []
+        leftovers: list[dict[str, Any]] = []
+        for s, cnt in zip(active, counts):
+            # The online pool is bucketed 80/20 (BAD/precursor vs GOOD/null) when enabled; replay
+            # pools (and disabled split) draw uniformly at random.
+            if s["pool"].get("kind") == "online" and self.hl_online_bad_fraction >= 0.0:
+                ordered = self._order_online_entries(s["entries"], cnt, self.hl_online_bad_fraction)
+            else:
+                ordered = [s["entries"][int(j)] for j in np.random.permutation(len(s["entries"]))]
+            taken = 0
+            for e in ordered:
+                if taken >= cnt:
+                    leftovers.append(e)  # spare candidate for top-up if another pool underfills.
+                    continue
+                rec = self._read_hl_record(e)
+                if rec is None:
+                    continue
+                records.append(rec)
+                taken += 1
+        if len(records) < bs and leftovers:
+            np.random.shuffle(leftovers)
+            for e in leftovers:
+                if len(records) >= bs:
+                    break
+                rec = self._read_hl_record(e)
+                if rec is not None:
+                    records.append(rec)
+        if len(records) < bs:
+            return self._hl_short_batch(len(records), bs)
+        records = records[:bs]
+        # Records are assembled pool-by-pool (online block, then each replay pool), so without this
+        # shuffle the batch — and the logged HL panel, which shows the leading rows — would be all
+        # online. Interleave the pools so the batch (and its inspection panel) is a random mix.
+        np.random.shuffle(records)
+        if not self._hl_replay_logged_once and (
+            self._hl_replay_pool_specs or self.hl_online_bad_fraction >= 0.0
+        ):
+            self._hl_replay_logged_once = True
+            comp = {}
+            for r in records:
+                comp[r["pool"]] = comp.get(r["pool"], 0) + 1
+            msg = f"[steervla.update_hl] HL batch mix (pool -> count): {comp}"
+            if self.hl_online_bad_fraction >= 0.0:
+                n_bad = sum(1 for r in records if r.get("pool") == "online" and self._is_bad_entry(r))
+                n_online = sum(1 for r in records if r.get("pool") == "online")
+                msg += f"; online label split (BAD/precursor -> {n_bad}, GOOD/null -> {n_online - n_bad})"
+            print(msg, flush=True)
+        return records
+
+    def _hl_short_batch(self, got: int, bs: int):
+        """Report an under-filled batch once, then skip the update rather than train on a partial one."""
+        self._hl_skip(
+            f"HL pool has {self._hl_pool_size} samples but only {got}/{bs} were readable "
+            f"(missing or half-written .npz under {self.hl_dataset_dir}); skipping this update"
+        )
+        return None
+
+    def _build_hl_observation_batch(self, records: list[dict[str, Any]]):
+        """Build ``(Observation, actions)`` for :meth:`update_hl` from mixed HL records.
+
+        Each record carries per-sample supervision resolved by :meth:`_read_hl_record`:
+
+        - ``action_supervision`` — when True the (real, consistent) action chunk is the flow-matching
+          target and ``action_loss_mask`` is True for that row (regular pretraining pools, e.g. the
+          SimLingo replay pool). When False the flow loss is masked (online cast_relabel samples and HL
+          pools like ``simplified_reasoning``).
+        - ``supervise_fast`` — when True the chunk is FAST-tokenized into ``tokenized_fast`` so the FAST
+          CE (``cot_fast_ce``) is supervised, mirroring OpenPI's ``TokenizeCoTPrompt``. When False the
+          FAST tokens are zero + masked (online relabeled chunks whose action no longer matches the
+          corrected subtask; the ``simplified_reasoning`` HL pool, which trains reasoning + subtask only).
+        - ``state_format`` — ``carla_raw`` runs the raw CARLA ego vector through
+          :func:`carla_state_vec_to_steervla_state`; ``proprio`` (extracted replay pools) uses the stored
+          normalized proprio directly.
+
+        Images are resized to the model resolution so online (CARLA) and replay (512px) frames stack.
         """
         assert self.model is not None and self.model_cfg is not None and self.tokenizer is not None
         model_action_dim = int(self.model_cfg.action_dim)
         model_ah = int(self.model.action_horizon)
         model_ad = int(self.model.action_dim)
+        use_fast = bool(getattr(self.tokenizer, "use_fast_tokens", False))
+        max_fast_len = int(self.tokenizer.max_fast_len)
 
         img_batch, state_batch = [], []
         prompt_ids, prompt_masks = [], []
         rea_ids, rea_masks, sub_ids, sub_masks = [], [], [], []
-        for image, state_vec, prompt, subtask, reasoning in zip(images, states, prompts, subtasks, reasonings):
-            state_pad = carla_state_vec_to_steervla_state(
-                state_vec,
-                include_ego_history=self.include_ego_history,
-                proprio_norm=self.proprio_norm,
-            )
-            prompt_text = (str(prompt).strip() or self.routing_command)
+        fast_ids, fast_masks = [], []
+        act_rows, loss_rows = [], []
+        for rec in records:
+            state_vec = np.asarray(rec["state"], dtype=np.float32).reshape(-1)
+            if str(rec.get("state_format", "carla_raw")) == "proprio":
+                # Already the normalized proprio the model consumes (extracted replay pools).
+                state_pad = state_vec
+            else:
+                state_pad = carla_state_vec_to_steervla_state(
+                    state_vec,
+                    include_ego_history=self.include_ego_history,
+                    proprio_norm=self.proprio_norm,
+                )
+            prompt_text = (str(rec.get("prompt", "")).strip() or self.routing_command)
             tok_ids, tok_mask = self.tokenizer.tokenize_prompt(
                 prompt_text, state_pad, state_dim=self.prompt_state_dim
             )
             state_norm = self._normalize_state_batch(state_pad)[0]
             state_for_model = pad_to_dim(state_norm, model_action_dim)
 
-            rea_tok, rea_mask = self.tokenizer.tokenize_reasoning(str(reasoning).strip() or "Follow the route.")
-            sub_tok, sub_mask = self.tokenizer.tokenize_subtask(str(subtask).strip() or "Follow the route.")
+            rea_tok, rea_mask = self.tokenizer.tokenize_reasoning(
+                str(rec.get("reasoning", "")).strip() or "Follow the route."
+            )
+            sub_tok, sub_mask = self.tokenizer.tokenize_subtask(
+                str(rec.get("subtask", "")).strip() or "Follow the route."
+            )
 
-            img_batch.append(np.asarray(image, dtype=np.uint8))
+            img_batch.append(_resize_hl_image(rec["image"]))
             state_batch.append(np.asarray(state_for_model, dtype=np.float32))
             prompt_ids.append(np.asarray(tok_ids, dtype=np.int32))
             prompt_masks.append(np.asarray(tok_mask, dtype=bool))
@@ -1208,6 +1619,35 @@ class SteerVLAActor:
             rea_masks.append(np.asarray(rea_mask, dtype=bool))
             sub_ids.append(np.asarray(sub_tok, dtype=np.int32))
             sub_masks.append(np.asarray(sub_mask, dtype=bool))
+
+            chunk = rec.get("action_chunk")
+            supervise_fast = bool(rec.get("supervise_fast")) and chunk is not None
+            action_supervised = bool(rec.get("action_supervision")) and chunk is not None
+            # Normalized chunk padded to the model action dim ((H, model_ad)); reused for both the flow
+            # target and FAST. Zero placeholder (unsupervised flow) when no usable chunk.
+            if chunk is not None:
+                chunk_padded = _pad_action_chunk_for_fast(
+                    np.asarray(chunk, dtype=np.float32), model_action_dim=model_ad
+                )
+                chunk_padded = _fit_chunk_to_horizon(chunk_padded, model_ah, model_ad)
+            else:
+                chunk_padded = np.zeros((model_ah, model_ad), dtype=np.float32)
+
+            if action_supervised:
+                act_rows.append(chunk_padded)
+                loss_rows.append(np.ones((model_ah,), dtype=bool))
+            else:
+                act_rows.append(np.zeros((model_ah, model_ad), dtype=np.float32))
+                loss_rows.append(np.zeros((model_ah,), dtype=bool))
+
+            if use_fast:
+                if supervise_fast:
+                    f_tok, f_mask = self.tokenizer.tokenize_fast_actions(chunk_padded)
+                else:
+                    f_tok = np.zeros((max_fast_len,), dtype=np.int32)
+                    f_mask = np.zeros((max_fast_len,), dtype=bool)
+                fast_ids.append(np.asarray(f_tok, dtype=np.int32))
+                fast_masks.append(np.asarray(f_mask, dtype=bool))
 
         batch_size = len(img_batch)
         # SteerVLA/Pi0 preprocess (inside compute_loss) requires all of ``_model.IMAGE_KEYS``.
@@ -1233,18 +1673,284 @@ class SteerVLAActor:
             "tokenized_reasoning_mask": np.stack(rea_masks, axis=0),
             "tokenized_subtask": np.stack(sub_ids, axis=0),
             "tokenized_subtask_mask": np.stack(sub_masks, axis=0),
-            # HL only: zero the action-flow loss (steervla_hl_datasets action_supervision=False).
-            "action_loss_mask": np.zeros((batch_size, model_ah), dtype=bool),
+            # Per-sample: True for action_supervision pools (flow trained), False otherwise.
+            "action_loss_mask": np.stack(loss_rows, axis=0),
         }
+        if use_fast and fast_ids:
+            # Supervise the FAST action-token CE (cot_fast_ce) only for rows with supervise_fast=True.
+            data["tokenized_fast"] = np.stack(fast_ids, axis=0)
+            data["tokenized_fast_mask"] = np.stack(fast_masks, axis=0)
         observation = _openpi_model.Observation.from_dict(data)
-        actions = np.zeros((batch_size, model_ah, model_ad), dtype=np.float32)
+        actions = np.stack(act_rows, axis=0).astype(np.float32)
 
         device = self._jax_device
         observation = jax.tree.map(lambda x: jax.device_put(jnp.asarray(x), device), observation)
         actions = jax.device_put(jnp.asarray(actions), device)
         return observation, actions
 
-    def update_hl(self, *, batch_size: int | None = None, num_steps: int | None = None, rng=None) -> dict[str, float]:
+    def _hl_skip(self, reason: str) -> dict[str, float]:
+        """No-op the HL update, printing *why* — but only when the reason changes.
+
+        ``update_hl`` runs on every ``update_with_vla`` call, so an unconditional print would
+        spam the log. Printing on transitions keeps one line per distinct cause (and re-prints
+        if the run regresses into a previously-cleared state).
+        """
+        if reason != self._last_hl_skip_reason:
+            print(f"[steervla.update_hl] no HL update: {reason}", flush=True)
+            self._last_hl_skip_reason = reason
+        return {}
+
+    def _render_hl_batch_figure(self, records: list[dict[str, Any]], *, global_step: int | None):
+        """Render the HL batch as a matplotlib grid: each sample's observation image with its
+        pool / supervision flags / prompt / subtask / reasoning printed underneath.
+
+        Same idea as the best-of-N candidate panel logged next to the rollout video — the point is
+        to *see* what the backbone is being trained on (is the image the frame you expect? does the
+        subtask match it?), which a text-only table can't answer. Returns an ``(H, W, 3)`` uint8
+        array, or ``None`` if the batch has no usable images.
+        """
+        import textwrap
+        from io import BytesIO
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        show = records[: _HL_BATCH_FIG_MAX_SAMPLES]
+        if not show:
+            return None
+
+        def _wrap(label: str, text: str, width: int = 62, max_lines: int = 6) -> str:
+            lines = textwrap.wrap(str(text), width=width) or ["(none)"]
+            if len(lines) > max_lines:
+                lines = lines[:max_lines] + ["..."]
+            return f"{label}: " + f"\n{' ' * (len(label) + 2)}".join(lines)
+
+        ncols = min(3, len(show))
+        nrows = int(np.ceil(len(show) / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(6.0 * ncols, 4.6 * nrows), squeeze=False)
+        for idx in range(nrows * ncols):
+            ax = axes[idx // ncols][idx % ncols]
+            ax.axis("off")
+            if idx >= len(show):
+                continue
+            rec = show[idx]
+            img = np.asarray(rec.get("image"))
+            if img.ndim == 3 and img.shape[0] in (1, 3) and img.shape[-1] not in (1, 3):
+                img = np.transpose(img, (1, 2, 0))  # CHW -> HWC
+            if img.ndim == 3 and img.shape[-1] == 1:
+                img = np.repeat(img, 3, axis=-1)
+            if img.ndim != 3 or img.shape[-1] != 3:
+                continue
+            # Show the model-resolution frame (same resize+pad _build_hl_observation_batch applies),
+            # so the panel reflects what the backbone actually sees, padding artifacts included.
+            ax.imshow(_resize_hl_image(img))
+            ax.set_title(
+                f"[{idx}] pool={rec.get('pool', '')}  "
+                f"fast={bool(rec.get('supervise_fast', False))}  "
+                f"flow={bool(rec.get('action_supervision', False))}",
+                fontsize=9,
+            )
+            caption = "\n".join(
+                [
+                    _wrap("prompt", rec.get("prompt", ""), max_lines=3),
+                    _wrap("subtask", rec.get("subtask", "")),
+                    _wrap("reasoning", rec.get("reasoning", "")),
+                ]
+            )
+            ax.text(
+                0.0,
+                -0.04,
+                caption,
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+                fontsize=6.5,
+                family="monospace",
+            )
+        fig.suptitle(
+            f"HL update batch — call {int(self._hl_update_calls)}"
+            + ("" if global_step is None else f" @ step {int(global_step)}")
+            + f" ({len(show)}/{len(records)} samples shown)"
+        )
+        # Leave vertical room for the out-of-axes captions between rows.
+        fig.subplots_adjust(top=0.92, hspace=0.75)
+        buf = BytesIO()
+        fig.savefig(buf, format="png", dpi=90, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        arr = plt.imread(buf)  # float32 RGBA in [0, 1]
+        return (np.asarray(arr)[..., :3] * 255.0).astype(np.uint8)
+
+    def _log_hl_batch_to_wandb(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        figure: np.ndarray | None = None,
+        global_step: int | None,
+    ) -> None:
+        """Log the HL update batch to wandb as **readable text** (prompt / subtask / reasoning).
+
+        These are the decoded supervision targets straight from the ``hl_samples.json`` manifest —
+        the actual strings the CoT/VLM backbone is trained on this step, NOT the tokenized ids.
+        Called on **every** successful :meth:`update_hl`, so each logged table is the complete batch
+        that update actually trained on.
+
+        wandb history holds one value per ``(step, key)``, and ``updates_per_step`` sends several
+        update_with_vla calls per env step under a single ``global_step``. Logging each batch
+        straight to ``vla_hl/batch_text`` would therefore leave only the last one visible. So
+        batches sharing a ``global_step`` are accumulated and re-logged as one merged table, with
+        ``hl_update_call`` identifying which update each row came from.
+
+        Three channels are logged, because a wandb ``Table`` alone is easy to miss (it renders only
+        in the run's Tables/media section and is silently dropped by some workspace configs):
+
+        - ``vla_hl/batch_text`` — the merged table.
+        - ``vla_hl/batch_images`` — the matplotlib panel from :meth:`_render_hl_batch_figure`.
+        - ``vla_hl/n_samples`` + ``vla_hl/pool/<name>`` — plain scalars, so the batch always shows
+          up in Charts even if the media panels don't.
+        """
+        try:
+            import wandb  # type: ignore
+        except ImportError:
+            return
+        if wandb.run is None:
+            print(
+                "[steervla.update_hl] wandb.run is None (WANDB_MODE=disabled?); "
+                "vla_hl/batch_text cannot be logged.",
+                flush=True,
+            )
+            return
+        try:
+            prompts = [str(r.get("prompt", "")) for r in records]
+            subtasks = [str(r.get("subtask", "")) for r in records]
+            reasonings = [str(r.get("reasoning", "")) for r in records]
+            pools = [str(r.get("pool", "online")) for r in records]
+            rows = [
+                [
+                    int(self._hl_update_calls),
+                    i,
+                    pools[i],
+                    prompts[i],
+                    subtasks[i],
+                    reasonings[i],
+                ]
+                for i in range(len(records))
+            ]
+            if global_step is not None and global_step == self._hl_table_step:
+                self._hl_table_rows.extend(rows)  # Same env step: merge, don't overwrite.
+            else:
+                self._hl_table_step = global_step
+                self._hl_table_rows = rows
+
+            table = wandb.Table(columns=["hl_update_call", "sample", "pool", "prompt", "subtask", "reasoning"])
+            for row in self._hl_table_rows:
+                table.add_data(*row)
+            payload: dict[str, Any] = {
+                "vla_hl/batch_text": table,
+                "vla_hl/n_samples": float(len(records)),
+                "vla_hl/hl_update_call": float(self._hl_update_calls),
+            }
+            for p in set(pools):
+                payload[f"vla_hl/pool/{p}"] = float(pools.count(p))
+            if figure is not None:
+                payload["vla_hl/batch_images"] = wandb.Image(
+                    figure,
+                    caption=f"HL update call {int(self._hl_update_calls)} @ step {global_step}",
+                )
+            # wandb silently drops a log whose ``step`` is behind the run's current step. The HL
+            # update runs after the env-step logging, so clamp forward rather than lose the batch.
+            step = None if global_step is None else max(int(global_step), int(getattr(wandb.run, "step", 0) or 0))
+            wandb.log(payload, step=step)
+            if not self._hl_logged_batch_once:
+                self._hl_logged_batch_once = True
+                print(
+                    f"[steervla.update_hl] logged first HL batch ({len(rows)} rows) at wandb step "
+                    f"{step} (global_step={global_step}): vla_hl/batch_text (Table), "
+                    f"vla_hl/batch_images ({'panel' if figure is not None else 'MISSING'}), "
+                    f"vla_hl/n_samples (scalar). Tables/Images live under the run's media panels, "
+                    f"not in Charts — vla_hl/n_samples is the one visible in Charts.",
+                    flush=True,
+                )
+        except Exception as exc:  # noqa: BLE001 - logging must never break the update.
+            print(f"[steervla.update_hl] wandb batch logging failed (non-fatal): {exc}", flush=True)
+
+    def _dump_hl_batch_json(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        figure: np.ndarray | None = None,
+        global_step: int | None,
+    ) -> None:
+        """Write the exact HL update batch (readable text + image panel) to local files.
+
+        Reliable, wandb-independent record of what each :meth:`update_hl` trained on: one JSON per
+        update call under ``<hl_dataset_dir>/hl_update_batches/`` (plus the matching ``.png`` panel),
+        and an appended one-line summary in ``hl_update_batches.jsonl``. Written unconditionally on
+        every successful update, so the batch is always inspectable on disk even when wandb is
+        disabled or drops the media table.
+        """
+        try:
+            prompts = [str(r.get("prompt", "")) for r in records]
+            subtasks = [str(r.get("subtask", "")) for r in records]
+            reasonings = [str(r.get("reasoning", "")) for r in records]
+            pools = [str(r.get("pool", "online")) for r in records]
+            root = self.hl_dataset_dir if self.hl_dataset_dir is not None else Path(".")
+            out_dir = Path(root) / "hl_update_batches"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            pool_mix: dict[str, int] = {}
+            for p in pools:
+                pool_mix[p] = pool_mix.get(p, 0) + 1
+            record = {
+                "hl_update_call": int(self._hl_update_calls),
+                "global_step": None if global_step is None else int(global_step),
+                "num_samples": len(subtasks),
+                "pool_mix": pool_mix,
+                "samples": [
+                    {
+                        "sample": i,
+                        "pool": pools[i],
+                        "prompt": prompts[i],
+                        "subtask": subtasks[i],
+                        "reasoning": reasonings[i],
+                        "supervise_fast": bool(records[i].get("supervise_fast", False)),
+                        "action_supervision": bool(records[i].get("action_supervision", False)),
+                    }
+                    for i in range(len(records))
+                ],
+            }
+            fname = f"hl_batch_call{int(self._hl_update_calls):06d}"
+            if global_step is not None:
+                fname += f"_step{int(global_step):09d}"
+            if figure is not None:
+                # Save the panel alongside the JSON via PIL (already a dep of the image pipeline);
+                # matplotlib is not re-imported here so the failure path stays cheap.
+                from PIL import Image as _PILImage
+
+                _PILImage.fromarray(np.asarray(figure, dtype=np.uint8)).save(out_dir / f"{fname}.png")
+                record["figure"] = f"{fname}.png"
+            (out_dir / f"{fname}.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+            with (out_dir / "hl_update_batches.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+            if not getattr(self, "_hl_logged_json_once", False):
+                self._hl_logged_json_once = True
+                print(
+                    f"[steervla.update_hl] writing HL update batches to {out_dir} "
+                    f"(one JSON + one PNG panel per update + hl_update_batches.jsonl).",
+                    flush=True,
+                )
+        except Exception as exc:  # noqa: BLE001 - local logging must never break the update.
+            print(f"[steervla.update_hl] local HL batch JSON dump failed (non-fatal): {exc}", flush=True)
+
+    def update_hl(
+        self,
+        *,
+        batch_size: int | None = None,
+        num_steps: int | None = None,
+        rng=None,
+        global_step: int | None = None,
+    ) -> dict[str, float]:
         """Run high-level (VLM-backbone) gradient steps on the stored cast_relabel HL dataset.
 
         No-op (returns ``{}``) unless the actor was loaded trainable (``load_trainable_params``) and the
@@ -1252,19 +1958,47 @@ class SteerVLAActor:
         randomly-sampled batch). Throttled by ``hl_update_every`` calls. Updates ``self._train_state``
         in place and marks the inference weights dirty so the next rollout uses the updated backbone.
         """
-        if self._remote is not None or self._train_state is None or self._hl_train_step is None:
-            return {}
+        if self._remote is not None:
+            return self._hl_skip(
+                "actor is remote (steervla.actor_url set); the HL update only runs for a local "
+                "trainable actor, so no vla_hl/batch_text will be logged"
+            )
+        if self._train_state is None or self._hl_train_step is None:
+            return self._hl_skip(
+                "actor was not loaded trainable (needs steervla.load_trainable_params=True)"
+            )
+        if self.hl_dataset_dir is None:
+            return self._hl_skip(
+                "hl_dataset_dir is unset — main_carla only wires it when cast_relabel.enabled "
+                "and load_trainable_params are both true"
+            )
         self._hl_update_calls += 1
         if self.hl_update_every > 1 and (self._hl_update_calls % self.hl_update_every != 0):
-            return {}
+            return {}  # Normal throttle, not a fault — stay silent.
 
         bs = int(batch_size or self.hl_update_batch_size)
         ns = int(num_steps or self.hl_update_num_steps)
         loaded = self._load_hl_batch(bs)
         if loaded is None:
-            return {}
-        images, states, prompts, subtasks, reasonings = loaded
-        observation, actions = self._build_hl_observation_batch(images, states, prompts, subtasks, reasonings)
+            return self._hl_skip(
+                f"waiting for a full HL batch: {self._hl_pool_size}/{bs} samples under "
+                f"{self.hl_dataset_dir} (lower steervla.hl_update_batch_size, or let more "
+                f"cast_relabel windows finish)"
+            )
+        records = loaded
+        self._last_hl_skip_reason = None  # Cleared: a later skip should re-announce itself.
+        # Log the batch (observation image + prompt / subtask / reasoning / source pool) to wandb AND
+        # to local files. The local dump is the reliable channel — it is written unconditionally on
+        # every HL update, independent of wandb run state / step ordering, so the exact batch each
+        # update trained on is always inspectable on disk.
+        try:
+            figure = self._render_hl_batch_figure(records, global_step=global_step)
+        except Exception as exc:  # noqa: BLE001 - visualization must never break the update.
+            print(f"[steervla.update_hl] HL batch figure render failed (non-fatal): {exc}", flush=True)
+            figure = None
+        self._log_hl_batch_to_wandb(records, figure=figure, global_step=global_step)
+        self._dump_hl_batch_json(records, figure=figure, global_step=global_step)
+        observation, actions = self._build_hl_observation_batch(records)
 
         info: dict[str, Any] = {}
         for _ in range(max(1, ns)):
@@ -1281,7 +2015,7 @@ class SteerVLAActor:
                 out[str(k)] = float(jax.device_get(v))
             except Exception:
                 continue
-        out["n_samples"] = float(len(images))
+        out["n_samples"] = float(len(records))
 
         # True device memory around the HL gradient step. ``nvidia-smi`` only shows the
         # preallocated XLA pool (XLA_PYTHON_CLIENT_MEM_FRACTION), not live usage, so read it
@@ -1304,7 +2038,7 @@ class SteerVLAActor:
                 f"[steervla.update_hl] device={dev} live={out.get('hl_mem_live_gb', float('nan')):.2f}GB "
                 f"peak={out.get('hl_mem_peak_gb', float('nan')):.2f}GB "
                 f"limit={out.get('hl_mem_limit_gb', float('nan')):.2f}GB "
-                f"(bs={len(images)}, steps={ns})",
+                f"(bs={len(records)}, steps={ns})",
                 flush=True,
             )
         except Exception as exc:  # noqa: BLE001 - memory telemetry must never break the update.
@@ -1474,7 +2208,12 @@ class SteerVLAActor:
                 raise RuntimeError('raw_obs_holder["obs"] must be set to the latest CARLA gym dict.')
             raw = raw_holder
 
-        img = np.asarray(raw["image"], dtype=np.uint8)
+        # Stretch the rectangular CARLA frame to the square model resolution to match the pretraining
+        # preprocessing (see ``resize_stretch_np``). Doing it here means the model's internal
+        # ``preprocess_observation`` resize_with_pad is a no-op (frame is already 224x224), so the
+        # backbone never sees the black bars an aspect-preserving pad would introduce — and the rollout
+        # frame is identical to what the HL update trains on (``_resize_hl_image``).
+        img = _resize_hl_image(np.asarray(raw["image"], dtype=np.uint8))
         if img.ndim == 3:
             img = np.broadcast_to(img[None], (batch_size, *img.shape))
         elif img.shape[0] != batch_size:
@@ -2431,6 +3170,12 @@ def create_steervla_pi0_cot_sample_fn(
         hl_update_every=int(steervla_cfg.get("hl_update_every", 1)),
         hl_update_batch_size=int(steervla_cfg.get("hl_update_batch_size", 2)),
         hl_update_num_steps=int(steervla_cfg.get("hl_update_num_steps", 1)),
+        hl_freeze_regexes=steervla_cfg.get("hl_freeze_regexes"),
+        # HL replay pools (pretraining-data stabilization). See extract_hl_replay.py.
+        hl_replay_root=steervla_cfg.get("hl_replay_root"),
+        hl_replay_pools=steervla_cfg.get("hl_replay_pools"),
+        hl_online_weight=float(steervla_cfg.get("hl_online_weight", 1.0)),
+        hl_online_bad_fraction=float(steervla_cfg.get("hl_online_bad_fraction", -1.0)),
         return_normalized_action_chunk=bool(steervla_cfg.get("use_pi_action_chunk_for_env", True)),
         fixed_subtask_text=steervla_cfg.get("fixed_subtask_text"),
         fixed_reasoning_text=steervla_cfg.get("fixed_reasoning_text"),

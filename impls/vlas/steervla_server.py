@@ -57,9 +57,19 @@ import openpi.transforms as openpi_transforms
 from openpi.models.pi0_config import Pi0CoTConfig
 
 if __package__ in (None, ""):
-    from steervla import CARLA_STEERVLA_IMAGE_KEYS, restore_openpi_params_on_single_gpu, steervla_physical_denormalize_actions
+    from steervla import (
+        CARLA_STEERVLA_IMAGE_KEYS,
+        resize_stretch_np,
+        restore_openpi_params_on_single_gpu,
+        steervla_physical_denormalize_actions,
+    )
 else:
-    from .steervla import CARLA_STEERVLA_IMAGE_KEYS, restore_openpi_params_on_single_gpu, steervla_physical_denormalize_actions
+    from .steervla import (
+        CARLA_STEERVLA_IMAGE_KEYS,
+        resize_stretch_np,
+        restore_openpi_params_on_single_gpu,
+        steervla_physical_denormalize_actions,
+    )
 
 # Tuple (not list): ``policy.Policy`` passes ``image_keys`` as a ``jax.jit`` static argument (must be hashable).
 _POLICY_IMAGE_KEYS = CARLA_STEERVLA_IMAGE_KEYS
@@ -207,7 +217,11 @@ def _infer_with_request_options(
 
 def _carla_gym_to_policy_obs(raw: dict[str, Any], *, default_routing: str) -> dict[str, Any]:
     """Map Bench2Drive / CARLA gym dict to keys expected by :class:`openpi.policies.steervla_policy.SteerVLAInputs`."""
-    img = raw["image"]
+    # Stretch the rectangular CARLA frame to the square model resolution to match the pretraining
+    # preprocessing (frames were stretched to square upstream). The policy's ResizeImages(224,224)
+    # transform then no-ops instead of padding, so remote inference sees the same distribution as the
+    # local actor (see SteerVLAActor.build_observation_batch_numpy).
+    img = resize_stretch_np(raw["image"], 224, 224)
     state_vec = np.asarray(raw["state"], dtype=np.float32).reshape(-1)
     spd = float(state_vec[15])
     yaw_deg = float(state_vec[5])

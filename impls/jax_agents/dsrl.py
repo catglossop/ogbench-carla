@@ -818,7 +818,7 @@ class DSRLAgent(flax.struct.PyTreeNode):
             "vla_actions_nc": vla_actions_nc,
         }
 
-    def update_with_vla(self, batch, run_rl: bool = True, run_hl: bool = True):
+    def update_with_vla(self, batch, run_rl: bool = True, run_hl: bool = True, global_step: int | None = None):
         """Flax update via :meth:`total_loss_vla` with eager VLA forwards and a jitted gradient core.
 
         Also runs the SteerVLA **high-level (VLM-backbone) update** in the same call: after the DSRL
@@ -850,7 +850,7 @@ class DSRLAgent(flax.struct.PyTreeNode):
 
         # High-level SteerVLA update (no-op unless the actor was loaded trainable and has HL data).
         if run_hl and agent.steervla_actor is not None and hasattr(agent.steervla_actor, "update_hl"):
-            hl_info = agent.steervla_actor.update_hl()
+            hl_info = agent.steervla_actor.update_hl(global_step=global_step)
             if hl_info:
                 info = {**info, **{f"vla_hl/{k}": v for k, v in hl_info.items()}}
 

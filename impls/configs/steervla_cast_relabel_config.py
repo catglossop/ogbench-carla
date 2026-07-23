@@ -35,8 +35,8 @@ def get_config():
     config.language_feedback.expert_mode = "none"
     config.training_gpu_rank = 0
     config.siglip_device = "cuda:0"
-    config.batch_size = 0
-    config.warmup_steps = 10
+    config.batch_size = 32
+    config.warmup_steps = 200
     
     config.enable_updates = True
     # Per-kind switches, each ANDed with ``enable_updates``:
@@ -54,7 +54,7 @@ def get_config():
             enabled=True,
             # Log annotated debug videos (per-chunk GOOD/BAD + suggested subtasks) to wandb.
             debug=True,
-            debug_task=True,
+            debug_task=False,
             # Review one window every N env steps (rounded down to whole action chunks).
             # A window can be as small as one chunk or as large as a whole episode.
             query_every_n_episode_steps=200,
@@ -103,12 +103,52 @@ def get_config():
             #     training GPU, so start at 128 and bump to 256 if memory allows.
             #   hl_update_every      -> run update_hl once every N update_with_vla calls (1 = every).
             #   hl_update_num_steps  -> gradient steps taken per update_hl call.
-            hl_update_batch_size=16,
+            hl_update_batch_size=32,
             hl_update_every=10,
             hl_update_num_steps=1,
+            # Freeze the memory-heavy pretrained subtrees for the HL (VLM-backbone) update so its
+            # grad + Adam(mu/nu) buffers fit. The HL step supervises only the CoT/subtask targets
+            # (action loss masked), so the SigLIP vision tower (``.*img.*``) and the tied Gemma token
+            # embedder (``.*embedder.*`` -- the ~2.1 GB buffer that OOM'd) don't need to train. Frees
+            # ~14 GB and keeps the LLM transformer blocks + action/CoT heads trainable. Set to [] for
+            # a full fine-tune. SteerVLAActor.setup prints the resulting trainable-param count.
+            hl_freeze_regexes=[".*img.*", ".*embedder.*"],
+            # HL replay: mix a small amount of the ORIGINAL pretraining data into every HL update to
+            # stabilize the VLM backbone (prevent it forgetting general CoT/FAST as it fine-tunes on
+            # relabeled subtasks). Pre-extract the pools once with impls/vlas/extract_hl_replay.py:
+            #   python impls/vlas/extract_hl_replay.py \
+            #     --data-dir /scratch/current/cglossop/steervla_datasets \
+            #     --out-root /scratch/current/cglossop/steervla_hl_pools \
+            #     --actor-config pi05_steervla_cot_simplified_reasoning \
+            #     --proprio-norm true --include-ego-history false \
+            #     --dataset simlingo_dataset_all_img512_1116 --kind regular --supervise-fast true  --n 2000 \
+            #     --dataset simplified_reasoning_dataset    --kind hl      --supervise-fast false --n 2000
+            # Weights follow the steervla-pi mixture convention (per-source; normalized internally):
+            #   online 0.6 / simlingo 0.3 / simplified_reasoning 0.1.
+            # Supervision per source is baked into each pool's hl_samples.json by the extractor:
+            #   simlingo (kind=regular)          -> flow + FAST + reasoning + subtask (everything).
+            #   simplified_reasoning (kind=hl)   -> reasoning + subtask only (flow AND FAST masked).
+            # Leave hl_replay_pools empty (or hl_online_weight=1.0) to disable and train online-only.
+            hl_replay_root="/scratch/current/cglossop/steervla_hl_pools",
+            hl_online_weight=0.7,
+            # Within the online cast_relabel share of each HL batch, bias the draw toward corrective
+            # chunks: 0.8 -> 80% of the online slots come from the BAD / BAD(precursor) bucket
+            # (label == "BAD", either credit_source) and 20% from the GOOD / null bucket (label GOOD or
+            # absent). Whichever bucket is thin is topped up from the other so the batch still fills.
+            # Set < 0 to disable (uniform draw over the whole online pool). Only the online pool is
+            # bucketed; the replay pools keep their own weighted share.
+            hl_online_bad_fraction=0.8,
+            hl_replay_pools=[
+                dict(name="simlingo_dataset_all_img512_1116", weight=0.3),
+                dict(name="simplified_reasoning_dataset", weight=0.1),
+            ],
             # Local OpenPI inference (ignored when actor_url is set):
-            actor_config="pi05_steervla_cot_simplified_reasoning",
-            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",
+            # actor_config="pi05_steervla_cot_simplified_reasoning",
+            actor_config="pi05_steervla_cot_simplified_reasoning_no_ego_history",
+            # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",
+            # checkpoint="/scratch/current/cglossop/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning_ego_history/pi05_steervla_cot_simplified_reasoning_ego_history_v1/pi05_steervla_simplified_reasoning_ego_history_v1_20260717_183503/4000",
+            # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_ego_history/pi05_steervla_simplified_reasoning_ego_history_v1/pi05_steervla_simplified_reasoning_ego_history_v1_20260717_183503/10000",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_ego_history/pi05_steervla_simplified_reasoning_no_ego_history_v1/pi05_steervla_simplified_reasoning_no_ego_history_v1_20260718_201640/6000",
             routing_command="Follow the route and stay in lane.",
             # Per-step CoT sampling temperature for the rollout actor. Best-of-N samples
             # ``best_of_n`` CoTs via ``sample_candidates`` at ``vla_cot_temperature`` (set above),
