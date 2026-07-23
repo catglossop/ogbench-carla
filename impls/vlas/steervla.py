@@ -701,6 +701,9 @@ class SteerVLAActor:
         self._last_prefix_mask: jax.Array | None = None
         self._last_prefix_n_fast: int = 0
         self._prefix_cache_row: int = 0
+        # Black-image sanity check: when set, the prefix encoders ignore the cache and run a fresh
+        # prefix forward from the (blacked) obs they are handed, so the feature reflects that image.
+        self._recompute_prefix_from_obs: bool = False
 
         self.train_cfg = None
         self.model = None
@@ -1282,6 +1285,43 @@ class SteerVLAActor:
         denom = jnp.maximum(m.sum(axis=1, keepdims=True), 1.0)
         return jax.lax.stop_gradient(jnp.sum(prefix_out * m[..., None], axis=1) / denom)
 
+    def _prefix_from_obs(self, raw: Dict[str, Any], *, include_fast: bool) -> tuple[jax.Array, jax.Array]:
+        """Fresh CoT + prefix from ``raw`` alone: sample a new CoT from this image + prompt and run the
+        prefix on it, as if the base VLM had seen only ``raw``. Bypasses the cache and the real rollout's
+        sampled CoT, so no real-image info (not even via CoT text) leaks in, and does not mutate the
+        rollout's CoT/prefix state. Black-image sanity check only.
+
+        Runs the same jitted path as a normal base step (``_sample_cot`` + ``_sample_actions_with_prefix``,
+        which preprocesses internally), so it is as fast as the normal pass; the sampled action is dropped.
+        """
+        if self._remote is not None or self.model is None or self._jax_device is None:
+            raise RuntimeError("Prefix recompute requires a local SteerVLA model.")
+        if not self._prefix_reuse:
+            raise RuntimeError("Black-image recompute needs openpi with sample_actions_with_prefix.")
+        obs_jax = jax.tree.map(
+            lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
+            self.build_observation_batch_numpy(1, raw=raw),
+        )
+        cot_out = self._sample_cot(
+            jax.random.PRNGKey(0),
+            obs_jax,
+            temperature=float(self.cot_temperature),
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+        obs_full = _merge_cot_output_into_observation(obs_jax, cot_out)
+        noise = jnp.zeros((1, int(self.model.action_horizon), int(self.model.action_dim)), dtype=jnp.float32)
+        _traj, prefix_out, prefix_mask = self._sample_actions_with_prefix(
+            jax.random.PRNGKey(0),
+            obs_full,
+            noise=noise,
+            num_steps=int(self.sample_actions_num_steps),
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+        if not include_fast and _model_uses_fast_tokens(self.model_cfg):
+            keep = prefix_mask.shape[1] - int(self.model_cfg.max_fast_len)
+            prefix_out, prefix_mask = prefix_out[:, :keep], prefix_mask[:, :keep]
+        return prefix_out, prefix_mask
+
     def encode_prefix_features(
         self,
         raw: Dict[str, Any],
@@ -1292,6 +1332,8 @@ class SteerVLAActor:
         trailing FAST columns dropped), so call only after the base chunk for ``raw`` has been
         sampled -- an empty cache raises.
         """
+        if self._recompute_prefix_from_obs:
+            return self._mean_pool_prefix(*self._prefix_from_obs(raw, include_fast=False))
         self._require_prefix_cache("pi prefix features")
         row = int(self._prefix_cache_row)
         keep = self._last_prefix_mask.shape[1] - int(self._last_prefix_n_fast)
@@ -1329,6 +1371,8 @@ class SteerVLAActor:
         subtask]`` -> f32[1, 4*D]. Same CoT / cache semantics as :meth:`encode_prefix_features`, but keeps
         the four groups separate so a trained (ideally nonlinear) state head can weight them.
         """
+        if self._recompute_prefix_from_obs:
+            return self._group_pool(*self._prefix_from_obs(raw, include_fast=False))
         self._require_prefix_cache("pi prefix features")
         row = int(self._prefix_cache_row)
         keep = self._last_prefix_mask.shape[1] - int(self._last_prefix_n_fast)
@@ -1354,6 +1398,11 @@ class SteerVLAActor:
 
         Returns ``(prefix_out f32[1, M, D], prefix_mask bool[1, M])``.
         """
+        if self._recompute_prefix_from_obs:
+            prefix_out, prefix_mask = self._prefix_from_obs(raw, include_fast=True)
+            out = np.asarray(jax.device_get(prefix_out), dtype=np.float32)
+            mask = np.asarray(jax.device_get(prefix_mask), dtype=bool)
+            return out, mask
         self._require_prefix_cache("pi prefix tokens")
         row = int(self._prefix_cache_row)
         out = np.asarray(jax.device_get(self._last_prefix_out[row : row + 1]), dtype=np.float32)

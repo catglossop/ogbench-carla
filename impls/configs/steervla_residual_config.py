@@ -58,14 +58,19 @@ def get_config():
     # All require local SteerVLA (remote HTTP mode does not expose Pi features).
     config.state_encoder = "pi_prefix"
 
+    # Sanity check: feed the state encoders a black (zeroed) image while the base policy still sees the
+    # real one, to verify the encoded state actually depends on the image. VLM encoders (pi_prefix /
+    # pi_prefix_groups / rl_token) run a second, cache-bypassing prefix forward on the black image;
+    # siglip_pool just re-embeds it. Test-only (extra VLM pass); leave False for real runs.
+    config.sanity_black_image = False
+
     # ----- rl_token encoder (used only when state_encoder == "rl_token") ------ #
     # The autoencoder is trained separately by train_rl_token_ae.py on prefix
     # embeddings dumped (dump_rl_token_embeddings.py) from the *same* frozen
     # SteerVLA checkpoint below; its config (d_model, layers, max_seq_len) is read
     # from the checkpoint, so only the path is needed here. device="cuda" runs the
     # small Torch AE on-GPU (~1-2ms vs seconds on CPU); it shares the JAX GPU, fitting
-    # in the headroom JAX leaves unallocated. Fall back to "cpu" only if that GPU is
-    # memory-starved (then also lower XLA_PYTHON_CLIENT_MEM_FRACTION to free room).
+    # in the headroom JAX leaves unallocated.
     config.rl_token = ml_collections.ConfigDict(
         dict(
             checkpoint_path="",

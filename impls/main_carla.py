@@ -1656,7 +1656,16 @@ def run_online_residual(
     # (rl_token: vlm/ae/total, pi_prefix: vlm/total, siglip_pool: vision/text/total).
     enc_time_acc: dict[str, float] = {}
 
+    # Black-image sanity check: encoders see a zeroed image (the base policy still gets the real one),
+    # to confirm the encoded state actually depends on the image. VLM encoders then need a fresh prefix
+    # forward, so flag the actor to bypass its real-image cache (a second VLM pass, test-only).
+    sanity_black_image = bool(config.get("sanity_black_image", False))
+    if sanity_black_image and steervla_actor is not None:
+        steervla_actor._recompute_prefix_from_obs = True
+
     def _encode_one(o: dict) -> np.ndarray:
+        if sanity_black_image:
+            o = {**o, "image": np.zeros_like(o["image"])}
         vec, breakdown = state_encoder.encode_timed(o)
         for k, v in breakdown.items():
             enc_time_acc[k] = enc_time_acc.get(k, 0.0) + float(v)
