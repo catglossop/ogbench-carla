@@ -49,6 +49,7 @@ class RLTokenEncoder(StateEncoder):
         self._actor = steervla_actor
         self._device = device
         self._model, self._cfg = load_autoencoder(checkpoint_path, device)
+        print(f"[rl_token] AE on {next(self._model.parameters()).device}", flush=True)
 
     def encode(self, obs: dict) -> np.ndarray:
         return self.encode_timed(obs)[0]
