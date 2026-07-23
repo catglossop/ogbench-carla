@@ -2087,8 +2087,23 @@ def _run_residual_entry(config):
                 action_dim = 2
             else:
                 action_dim = int(steervla_cfg["action_horizon"]) * int(steervla_cfg["action_dim"])
+            # Prefix (VLM) encoders read the cache the base sampler populates, so warm it with one base
+            # sample before probing the encoded-state width; reset after so the loop starts clean.
+            if getattr(state_encoder, "cot_dependent", False) and getattr(steervla_actor, "model", None) is not None:
+                raw_holder["obs"] = obs
+                _bm = steervla_actor.model
+                vla_sample_fn(
+                    jnp.zeros((1, 1), dtype=jnp.float32),
+                    jax.random.normal(
+                        jax.random.PRNGKey(FLAGS.seed),
+                        (1, int(_bm.action_horizon) * int(_bm.action_dim)),
+                        dtype=jnp.float32,
+                    ),
+                )
             # Probe the encoded-state width once so the agent's MLPs are sized correctly.
             x_dim = int(state_encoder.encode(obs).shape[-1])
+            if getattr(steervla_actor, "reset_action_cache", None) is not None:
+                steervla_actor.reset_action_cache()
             ex_obs = np.zeros((1, x_dim), dtype=np.float32)
             ex_base = np.zeros((1, action_dim), dtype=np.float32)
             print(
