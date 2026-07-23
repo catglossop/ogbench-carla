@@ -43,7 +43,7 @@ def build_state_encoder(config, steervla_actor) -> StateEncoder:
         return RLTokenEncoder(
             steervla_actor,
             checkpoint_path=str(rlt_cfg.get("checkpoint_path", "")),
-            device=str(rlt_cfg.get("device", "cpu")),
+            device=str(rlt_cfg.get("device", "cuda")),
         )
 
     raise ValueError(

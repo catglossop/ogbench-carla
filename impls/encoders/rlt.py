@@ -43,7 +43,7 @@ class RLTokenEncoder(StateEncoder):
 
     name = "rl_token"
 
-    def __init__(self, steervla_actor, checkpoint_path: str, *, device: str = "cpu"):
+    def __init__(self, steervla_actor, checkpoint_path: str, *, device: str = "cuda"):
         if not checkpoint_path:
             raise ValueError("rl_token encoder requires config.rl_token.checkpoint_path.")
         self._actor = steervla_actor
@@ -81,9 +81,9 @@ class RLTokenEncoder(StateEncoder):
                 f"RLT prefix length {m} exceeds autoencoder max_seq_len {self._cfg.max_seq_len}; "
                 "the inference token layout does not match the offline dump."
             )
-        z = torch.from_numpy(prefix_out).to(self._device).float()
-        mask = torch.from_numpy(prefix_mask).to(self._device).bool()
-        with torch.no_grad():
+        z = torch.from_numpy(prefix_out).to(self._device, non_blocking=True).float()
+        mask = torch.from_numpy(prefix_mask).to(self._device, non_blocking=True).bool()
+        with torch.inference_mode():
             z_rl = self._model.encode(z, mask)
         out = z_rl[0].cpu().numpy().astype(np.float32, copy=False)
         t2 = time.perf_counter()

@@ -62,12 +62,14 @@ def get_config():
     # The autoencoder is trained separately by train_rl_token_ae.py on prefix
     # embeddings dumped (dump_rl_token_embeddings.py) from the *same* frozen
     # SteerVLA checkpoint below; its config (d_model, layers, max_seq_len) is read
-    # from the checkpoint, so only the path is needed here. device="cpu" keeps the
-    # small Torch AE off the JAX GPU; set "cuda" to run it on-GPU.
+    # from the checkpoint, so only the path is needed here. device="cuda" runs the
+    # small Torch AE on-GPU (~1-2ms vs seconds on CPU); it shares the JAX GPU, fitting
+    # in the headroom JAX leaves unallocated. Fall back to "cpu" only if that GPU is
+    # memory-starved (then also lower XLA_PYTHON_CLIENT_MEM_FRACTION to free room).
     config.rl_token = ml_collections.ConfigDict(
         dict(
             checkpoint_path="",
-            device="cpu",
+            device="cuda",
         )
     )
 
