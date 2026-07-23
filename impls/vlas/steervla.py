@@ -48,7 +48,6 @@ import optax
 import os
 
 from openpi.models import model as _openpi_model
-from openpi.models import pi0 as _openpi_pi0
 from openpi.models.pi0_config import Pi0CoTConfig
 from openpi.models.tokenizer import CoTPaligemmaTokenizer
 from openpi.policies import steervla_policy as sv_policy
@@ -70,10 +69,6 @@ from impls.vlas.utils import RemoteActor
 
 # Only the front camera for OpenPI preprocess + SigLIP (skip zero-padded wrist streams).
 CARLA_STEERVLA_IMAGE_KEYS: tuple[str, ...] = ("base_0_rgb",)
-
-# STEERVLA_PREFIX_CACHE_CHECK=1: encoders recompute the prefix and assert it matches the cache
-# reused from sample_actions_with_prefix. Debug only (doubles VLM work); validates the cache path.
-_PREFIX_CACHE_CHECK: bool = bool(int(os.environ.get("STEERVLA_PREFIX_CACHE_CHECK", "0") or "0"))
 
 
 def restore_openpi_params_on_single_gpu(
@@ -1280,64 +1275,6 @@ class SteerVLAActor:
             None, obs_jax, train=False, image_keys=CARLA_STEERVLA_IMAGE_KEYS,
         )
 
-    def _prefix_llm_forward(
-        self,
-        obs_proc: _openpi_model.Observation,
-        *,
-        include_fast: bool,
-    ) -> tuple[jax.Array, jax.Array]:
-        """Run the frozen PaliGemma prefix LLM; return un-pooled ``(prefix_out, prefix_mask)``.
-
-        Embeds image + prompt + reasoning + subtask tokens (token order
-        ``[vision, prompt, reasoning, subtask, (fast)]``) and runs the full LLM.
-        When ``include_fast`` and the model uses FAST tokens, the FAST action
-        tokens are appended and the FAST->reasoning knowledge-insulation mask is
-        applied, matching the offline RL-Token dump. With ``include_fast=False``
-        this is the image+prompt+CoT prefix consumed by the mean-pooled feature.
-        Shared by :meth:`encode_prefix_features` and :meth:`encode_prefix_tokens`.
-        """
-        model = self.model
-        img_tokens, img_masks, img_ar = model._embed_images(obs_proc)
-        n_img = sum(t.shape[1] for t in img_tokens)
-
-        prompt = model._embed_text_tokens(obs_proc.tokenized_prompt)
-        reasoning = model._embed_text_tokens(obs_proc.tokenized_reasoning)
-        subtask = model._embed_text_tokens(obs_proc.tokenized_subtask)
-        n_prompt, n_reasoning, n_subtask = prompt.shape[1], reasoning.shape[1], subtask.shape[1]
-
-        parts = list(img_tokens) + [prompt, reasoning, subtask]
-        masks = list(img_masks) + [
-            obs_proc.tokenized_prompt_mask,
-            obs_proc.tokenized_reasoning_mask,
-            obs_proc.tokenized_subtask_mask,
-        ]
-        ar = list(img_ar) + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask
-
-        n_fast = 0
-        if include_fast and _model_uses_fast_tokens(self.model_cfg) and obs_proc.tokenized_fast is not None:
-            fast = model._embed_text_tokens(obs_proc.tokenized_fast)
-            n_fast = fast.shape[1]
-            parts.append(fast)
-            masks.append(obs_proc.tokenized_fast_mask)
-            ar += [True] * n_fast
-
-        tokens = jnp.concatenate(parts, axis=1)
-        prefix_mask = jnp.concatenate(masks, axis=1)
-        attn_mask = _openpi_pi0.make_attn_mask(prefix_mask, jnp.array(ar))
-        if n_fast > 0:
-            # FAST rows must not attend to reasoning cols (knowledge insulation), so
-            # z_rl is not graded on copying the action it conditions on.
-            total = prefix_mask.shape[1]
-            rstart, rend = n_img + n_prompt, n_img + n_prompt + n_reasoning
-            fstart = rend + n_subtask
-            idx = jnp.arange(total)
-            col_r = (idx >= rstart) & (idx < rend)
-            row_f = (idx >= fstart) & (idx < fstart + n_fast)
-            attn_mask = attn_mask & (~(row_f[:, None] & col_r[None, :]))[None]
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        (prefix_out, _), _ = model.PaliGemma.llm([tokens, None], mask=attn_mask, positions=positions)
-        return prefix_out, prefix_mask
-
     @staticmethod
     def _mean_pool_prefix(prefix_out: jax.Array, prefix_mask: jax.Array) -> jax.Array:
         """Mask-weighted mean over the token axis -> one frozen feature per batch row."""
@@ -1345,39 +1282,23 @@ class SteerVLAActor:
         denom = jnp.maximum(m.sum(axis=1, keepdims=True), 1.0)
         return jax.lax.stop_gradient(jnp.sum(prefix_out * m[..., None], axis=1) / denom)
 
-    def _prefix_features_recompute(self, raw: Dict[str, Any]) -> jax.Array:
-        """Fresh PaliGemma prefix forward for pi_prefix (no FAST), mean-pooled. Cache fallback."""
-        obs_proc = self._preprocess_observation_on_device(self.build_observation_batch_numpy(1, raw=raw))
-        prefix_out, prefix_mask = self._prefix_llm_forward(obs_proc, include_fast=False)
-        return self._mean_pool_prefix(prefix_out, prefix_mask)
-
     def encode_prefix_features(
         self,
         raw: Dict[str, Any],
     ) -> jax.Array:
         """Frozen, mean-pooled prefix feature over ``[image, prompt, reasoning, subtask]``.
 
-        Includes the CoT the base policy sampled (``_last_cot_out``), so call only after the base
-        chunk for ``raw``. Reuses the cached prefix (row ``_prefix_cache_row``) when available,
-        dropping trailing FAST columns (their absence doesn't change the earlier hidden states);
-        else recomputes.
+        Reuses the prefix cached by ``sample_actions_with_prefix`` (row ``_prefix_cache_row``,
+        trailing FAST columns dropped), so call only after the base chunk for ``raw`` has been
+        sampled -- an empty cache raises.
         """
-        if self._remote is not None:
-            raise RuntimeError("Pi prefix features are not available in remote SteerVLAActor mode.")
-        if self.model is None or self._jax_device is None:
-            raise RuntimeError("Local SteerVLA model is not initialized.")
-
-        if self._prefix_reuse and self._last_prefix_out is not None:
-            row = int(self._prefix_cache_row)
-            keep = self._last_prefix_mask.shape[1] - int(self._last_prefix_n_fast)
-            pooled = self._mean_pool_prefix(
-                self._last_prefix_out[row : row + 1, :keep],
-                self._last_prefix_mask[row : row + 1, :keep],
-            )
-            if _PREFIX_CACHE_CHECK:
-                self._check_prefix_cache(pooled, self._prefix_features_recompute(raw), "pi_prefix")
-            return pooled
-        return self._prefix_features_recompute(raw)
+        self._require_prefix_cache("pi prefix features")
+        row = int(self._prefix_cache_row)
+        keep = self._last_prefix_mask.shape[1] - int(self._last_prefix_n_fast)
+        return self._mean_pool_prefix(
+            self._last_prefix_out[row : row + 1, :keep],
+            self._last_prefix_mask[row : row + 1, :keep],
+        )
 
     def _group_pool(self, prefix_out: jax.Array, prefix_mask: jax.Array) -> jax.Array:
         """Masked-mean each of ``[image, prompt, reasoning, subtask]`` separately; concat -> [B, 4D].
@@ -1403,42 +1324,18 @@ class SteerVLAActor:
             pools.append(jnp.sum(seg * msk[..., None], axis=1) / denom)
         return jax.lax.stop_gradient(jnp.concatenate(pools, axis=-1))
 
-    def _prefix_group_recompute(self, raw: Dict[str, Any]) -> jax.Array:
-        """Fresh PaliGemma prefix forward (no FAST), per-group mean-pooled. Cache fallback."""
-        obs_proc = self._preprocess_observation_on_device(self.build_observation_batch_numpy(1, raw=raw))
-        prefix_out, prefix_mask = self._prefix_llm_forward(obs_proc, include_fast=False)
-        return self._group_pool(prefix_out, prefix_mask)
-
     def encode_prefix_group_features(self, raw: Dict[str, Any]) -> jax.Array:
         """Per-group mean-pooled prefix feature: concat of masked-mean over ``[image, prompt, reasoning,
         subtask]`` -> f32[1, 4*D]. Same CoT / cache semantics as :meth:`encode_prefix_features`, but keeps
         the four groups separate so a trained (ideally nonlinear) state head can weight them.
         """
-        if self._remote is not None:
-            raise RuntimeError("Pi prefix features are not available in remote SteerVLAActor mode.")
-        if self.model is None or self._jax_device is None:
-            raise RuntimeError("Local SteerVLA model is not initialized.")
-
-        if self._prefix_reuse and self._last_prefix_out is not None:
-            row = int(self._prefix_cache_row)
-            keep = self._last_prefix_mask.shape[1] - int(self._last_prefix_n_fast)
-            pooled = self._group_pool(
-                self._last_prefix_out[row : row + 1, :keep],
-                self._last_prefix_mask[row : row + 1, :keep],
-            )
-            if _PREFIX_CACHE_CHECK:
-                self._check_prefix_cache(pooled, self._prefix_group_recompute(raw), "pi_prefix_groups")
-            return pooled
-        return self._prefix_group_recompute(raw)
-
-    def _prefix_tokens_recompute(self, raw: Dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
-        """Fresh PaliGemma prefix forward for RLT (incl. FAST), un-pooled. Cache fallback."""
-        obs_proc = self._preprocess_observation_on_device(self.build_observation_batch_numpy(1, raw=raw))
-        prefix_out, prefix_mask = self._prefix_llm_forward(obs_proc, include_fast=True)
-        prefix_out = jax.lax.stop_gradient(prefix_out)
-        out = np.asarray(jax.device_get(prefix_out), dtype=np.float32)
-        mask = np.asarray(jax.device_get(prefix_mask), dtype=bool)
-        return out, mask
+        self._require_prefix_cache("pi prefix features")
+        row = int(self._prefix_cache_row)
+        keep = self._last_prefix_mask.shape[1] - int(self._last_prefix_n_fast)
+        return self._group_pool(
+            self._last_prefix_out[row : row + 1, :keep],
+            self._last_prefix_mask[row : row + 1, :keep],
+        )
 
     def encode_prefix_tokens(
         self,
@@ -1446,35 +1343,22 @@ class SteerVLAActor:
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return the *un-pooled* SteerVLA prefix tokens for the RLT state encoder.
 
-        Mirrors the offline RL-Token embedding dump (``dump_rl_token_embeddings.py``)
-        exactly so a separately trained autoencoder sees the same token layout it was
-        trained on: image + prompt + reasoning + subtask + FAST tokens run through the
-        full PaliGemma LLM (including the FAST->reasoning knowledge-insulation mask),
-        *without* the mean-pool that :meth:`encode_prefix_features` applies.
+        Mirrors the offline RL-Token embedding dump (``dump_rl_token_embeddings.py``) exactly so a
+        separately trained autoencoder sees the same token layout it was trained on: image + prompt +
+        reasoning + subtask + FAST tokens (order ``[base-cam vision, prompt, reasoning, subtask, fast]``;
+        CARLA has a single camera so there are no wrist-cam tokens to drop), *without* the mean-pool that
+        :meth:`encode_prefix_features` applies.
 
-        The reasoning/subtask/FAST tokens come from the CoT the base policy actually
-        sampled for this observation (``self._last_cot_out``), so call this only
-        *after* the base action chunk has been produced for ``raw``. Token order is
-        ``[base-cam vision, prompt, reasoning, subtask, fast]``; CARLA uses a single
-        camera so there are no wrist-cam tokens to drop (the offline dump drops them).
-        Reuses the cached prefix (row ``_prefix_cache_row``) when available, else recomputes.
+        Reuses the prefix cached by ``sample_actions_with_prefix`` (row ``_prefix_cache_row``), so call
+        only after the base chunk for ``raw`` has been sampled -- an empty cache raises.
 
         Returns ``(prefix_out f32[1, M, D], prefix_mask bool[1, M])``.
         """
-        if self._remote is not None:
-            raise RuntimeError("Pi prefix tokens are not available in remote SteerVLAActor mode.")
-        if self.model is None or self._jax_device is None:
-            raise RuntimeError("Local SteerVLA model is not initialized.")
-
-        if self._prefix_reuse and self._last_prefix_out is not None:
-            row = int(self._prefix_cache_row)
-            out = np.asarray(jax.device_get(self._last_prefix_out[row : row + 1]), dtype=np.float32)
-            mask = np.asarray(jax.device_get(self._last_prefix_mask[row : row + 1]), dtype=bool)
-            if _PREFIX_CACHE_CHECK:
-                r_out, _r_mask = self._prefix_tokens_recompute(raw)
-                self._check_prefix_cache(out, r_out, "rl_token")
-            return out, mask
-        return self._prefix_tokens_recompute(raw)
+        self._require_prefix_cache("pi prefix tokens")
+        row = int(self._prefix_cache_row)
+        out = np.asarray(jax.device_get(self._last_prefix_out[row : row + 1]), dtype=np.float32)
+        mask = np.asarray(jax.device_get(self._last_prefix_mask[row : row + 1]), dtype=bool)
+        return out, mask
 
     def _sample_or_reuse_cot(
         self,
@@ -1562,14 +1446,16 @@ class SteerVLAActor:
             image_keys=image_keys,
         )
 
-    def _check_prefix_cache(self, cached: Any, recomputed: Any, what: str) -> None:
-        """Assert a cache-derived tensor matches its recompute (STEERVLA_PREFIX_CACHE_CHECK=1 only)."""
-        a = np.asarray(jax.device_get(cached), dtype=np.float32)
-        b = np.asarray(jax.device_get(recomputed), dtype=np.float32)
-        if a.shape != b.shape or not np.allclose(a, b, rtol=1e-3, atol=1e-3):
-            delta = float(np.abs(a - b).max()) if a.shape == b.shape else float("nan")
+    def _require_prefix_cache(self, what: str) -> None:
+        """Guard the prefix encoders: local model up, and the base prefix already cached this step."""
+        if self._remote is not None:
+            raise RuntimeError(f"{what} are not available in remote SteerVLAActor mode.")
+        if self.model is None or self._jax_device is None:
+            raise RuntimeError("Local SteerVLA model is not initialized.")
+        if self._last_prefix_out is None:
             raise RuntimeError(
-                f"[steervla] prefix-cache mismatch ({what}): shapes {a.shape} vs {b.shape}, max|Δ|={delta:.4g}"
+                f"{what} require the cached prefix; sample the base chunk before encoding "
+                "(needs openpi with sample_actions_with_prefix)."
             )
 
     def _forward_pi0(
