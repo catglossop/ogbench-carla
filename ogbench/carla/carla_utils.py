@@ -866,6 +866,14 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._raw_collision_active: bool = False
         self._collision_recently_active: bool = False
         self._last_route_completion = 0.0
+        # Set by checkpoint() the first time it's called in an episode: once the world has
+        # been rolled back once, the leaderboard's RouteCompletionTest criterion (a monotonic
+        # "furthest ever reached" value) can no longer be trusted for reward -- it doesn't
+        # reset on teleport, so a candidate's own scoring trial silently inflates the baseline
+        # the real committed run is then measured against, undercounting its progress reward
+        # (see restore()). Once True, _route_completion_percent always uses the geometric
+        # fallback (recomputed fresh from ego position each call) instead of the criterion.
+        self._geometric_route_completion_only = False
         self._route_progress_xyz: Optional[np.ndarray] = None
         self._route_progress_s: Optional[np.ndarray] = None
         self._route_total_distance_m = 0.0
@@ -920,7 +928,11 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             try:
                 from ogbench.carla.steervla_simlingo_control import SimlingoStyleWaypointDecoder
 
-                self._steervla_decoder = SimlingoStyleWaypointDecoder()
+                _decoder_kwargs = {}
+                for _k in ("brake_speed", "brake_ratio", "stuck_threshold", "creep_throttle", "creep_duration"):
+                    if _k in exec_raw:
+                        _decoder_kwargs[_k] = exec_raw[_k]
+                self._steervla_decoder = SimlingoStyleWaypointDecoder(**_decoder_kwargs)
             except ImportError as e:
                 raise ImportError(
                     "SteerVLA waypoint decoding failed to load dependencies "
@@ -1204,6 +1216,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._raw_collision_active = False
         self._collision_recently_active = False
         self._last_route_completion = 0.0
+        self._geometric_route_completion_only = False
         self._init_route_progress_cache()
         self._spawn_raw_collision_sensor()
 
@@ -1213,6 +1226,235 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             return None
         ego_list = getattr(ev.manager, "ego_vehicles", None) or []
         return ego_list[0] if ego_list else None
+
+    def traffic_actor_states(self) -> list[dict[str, Any]]:
+        """Ground-truth state (id/type/speed/location) of every non-ego vehicle/walker
+        actor, read via the same live client/world reference the ego uses (so this
+        doesn't hit the actor-visibility issues a freshly-opened separate client
+        connection can run into). Debug-only -- see --debug_log_traffic."""
+        if self._evaluator is None:
+            return []
+        world = self._evaluator.world
+        ego = self._ego_actor()
+        ego_id = ego.id if ego is not None else None
+        out: list[dict[str, Any]] = []
+        for actor in world.get_actors():
+            if not actor.type_id.startswith(("vehicle.", "walker.pedestrian.")):
+                continue
+            if actor.id == ego_id:
+                continue
+            v = actor.get_velocity()
+            speed = float((v.x**2 + v.y**2 + v.z**2) ** 0.5)
+            loc = actor.get_location()
+            out.append({
+                "id": actor.id,
+                "type": actor.type_id,
+                "speed": speed,
+                "loc": (float(loc.x), float(loc.y), float(loc.z)),
+            })
+        return out
+
+    # Keyword match on actor type_id for scenario obstacle props (e.g. Fail2Drive's
+    # "brickwall" roadblock asset pack -- see run_simlingo_fail2drive.sh's doc comment).
+    _OBSTACLE_PROP_KEYWORDS = ("wall", "brick", "barrier", "roadblock")
+
+    def nearest_obstacle_distance_m(self) -> Optional[float]:
+        """Ground-truth XY distance from ego to the nearest scenario obstacle prop.
+
+        Ground truth (queries the actual CARLA actor list + transform), not a proxy
+        like speed -- more reliable for e.g. main_carla_teleop.py's auto_then_manual
+        mode deciding when to hand off from autonomous rollout to a human. Returns
+        None if the ego or no matching prop is currently in the world.
+
+        XY-only (ignores Z): Bench2Drive/Fail2Drive scenario obstacle props (e.g. the
+        brickwall roadblock) are staged at a large, unrelated Z offset from the road
+        surface until the leaderboard's own route-progress trigger fires and moves
+        them into place -- a naive 3D distance is dominated by that staging offset
+        (observed: ~200m of pure Z mismatch, well before the wall is anywhere near
+        the ego) and would never cross a close-range threshold like
+        --obstacle_trigger_distance_m.
+        """
+        ego = self._ego_actor()
+        if ego is None:
+            return None
+        world = self.evaluator.world
+        ego_loc = ego.get_transform().location
+        best: Optional[float] = None
+        for actor in world.get_actors():
+            if actor.type_id.startswith(("vehicle.", "walker.", "sensor.", "traffic.", "controller.")):
+                continue
+            tid = actor.type_id.lower()
+            if not any(kw in tid for kw in self._OBSTACLE_PROP_KEYWORDS):
+                continue
+            actor_loc = actor.get_transform().location
+            d = ((ego_loc.x - actor_loc.x) ** 2 + (ego_loc.y - actor_loc.y) ** 2) ** 0.5
+            if best is None or d < best:
+                best = d
+        return best
+
+    def teleport_ego_to_obstacle(self, offset_m: float = 1.0) -> bool:
+        """Teleport the ego to sit ``offset_m`` in front of the nearest obstacle prop.
+
+        Debug-only helper (main_carla_teleop.py's wall_snapshot mode) for visually
+        inspecting candidate-action diversity right at a scenario obstacle without
+        driving the whole route there first. "Front" is measured surface-to-surface
+        (wall face to ego front bumper) using both actors' bounding-box extents, and
+        the ego is placed along the line from its current position to the obstacle so
+        it naturally faces the obstacle. Returns False if no obstacle prop or ego is
+        currently in the world.
+
+        CAVEAT: the obstacle prop itself (e.g. Fail2Drive's brickwall) is not
+        necessarily *visible* after this call. Bench2Drive stages some scenario props
+        at an unrelated Z offset until the leaderboard's own route-progress trigger
+        fires and moves them onto the road; a raw teleport places the ego at the
+        correct on-road XY next to the prop's (possibly still-staged) transform, but
+        doesn't itself fire that trigger. Only useful for the ego's own position/
+        candidate-diversity inspection, not for guaranteeing the obstacle renders.
+        """
+        ego = self._ego_actor()
+        if ego is None:
+            return False
+        world = self.evaluator.world
+        ego_loc = ego.get_transform().location
+        best_actor = None
+        best_dist = None
+        for actor in world.get_actors():
+            if actor.type_id.startswith(("vehicle.", "walker.", "sensor.", "traffic.", "controller.")):
+                continue
+            tid = actor.type_id.lower()
+            if not any(kw in tid for kw in self._OBSTACLE_PROP_KEYWORDS):
+                continue
+            actor_loc = actor.get_transform().location
+            # XY-only: obstacle props may be staged at an unrelated Z until the
+            # leaderboard's own route-progress trigger moves them onto the road.
+            d = ((ego_loc.x - actor_loc.x) ** 2 + (ego_loc.y - actor_loc.y) ** 2) ** 0.5
+            if best_dist is None or d < best_dist:
+                best_dist = d
+                best_actor = actor
+        if best_actor is None:
+            return False
+        wall_loc = best_actor.get_transform().location
+        dx, dy = wall_loc.x - ego_loc.x, wall_loc.y - ego_loc.y
+        dist_xy = max((dx**2 + dy**2) ** 0.5, 1e-3)
+        ux, uy = dx / dist_xy, dy / dist_xy
+        ego_half_length = 2.3
+        try:
+            ego_half_length = float(ego.bounding_box.extent.x)
+        except Exception:
+            pass
+        wall_half_depth = 0.5
+        try:
+            wall_half_depth = float(max(best_actor.bounding_box.extent.x, best_actor.bounding_box.extent.y))
+        except Exception:
+            pass
+        gap = offset_m + ego_half_length + wall_half_depth
+        new_loc = carla.Location(x=wall_loc.x - ux * gap, y=wall_loc.y - uy * gap, z=ego_loc.z)
+        yaw = math.degrees(math.atan2(uy, ux))
+        ego.set_transform(carla.Transform(new_loc, carla.Rotation(pitch=0.0, roll=0.0, yaw=yaw)))
+        ego.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+        ego.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+        world.tick()
+        return True
+
+    def drive_straight_until_close(
+        self,
+        *,
+        target_distance_m: float = 10.0,
+        slowdown_distance_m: float = 30.0,
+        max_ticks: int = 2000,
+        throttle: float = 0.4,
+        slow_throttle: float = 0.12,
+    ) -> bool:
+        """Debug-only: drive straight (holding the ego's initial heading, bypassing
+        the policy) until within ``target_distance_m`` (XY) of the nearest scenario
+        obstacle prop, then brake to a stop right there -- or stop immediately if a
+        collision happens first. For main_carla_teleop.py's wall_snapshot mode:
+        driving via the policy is cautious around traffic/junctions and can take
+        hundreds of decisions (or get stuck entirely) before reaching a distant
+        obstacle; a raw straight-line drive is much faster when the obstacle sits
+        ahead on a straight stretch of the route.
+
+        Ticks via ``self.evaluator.manager.step_once()`` (the same path env.step()
+        uses), not a bare ``world.tick()`` -- this matters because some scenario
+        obstacle props (e.g. Fail2Drive's brickwall) are only moved onto the road /
+        made collidable once the leaderboard's own scenario tree registers real
+        route progress; a bare world tick never fires that trigger no matter how
+        close the ego's raw position gets (verified empirically: zero collisions
+        driving all the way to point-blank range via bare ticks).
+
+        A small proportional steer correction holds the ego's spawn-time heading
+        (assumes the stretch toward the obstacle is straight, per the caller) --
+        zero steer alone measurably drifted off the road over ~200+m in testing.
+
+        Throttle drops to ``slow_throttle`` once within ``slowdown_distance_m``, so
+        a single tick's movement doesn't overshoot straight through the
+        ``target_distance_m`` stop window into a collision (observed at full
+        throttle: distance can jump from "far" to "collided" in one tick). Distance
+        is checked *before* each tick's movement, and braked to a stop the moment
+        it's within range, rather than after -- the intent is to end up close but
+        not touching. Still stops immediately (without braking room) on the first
+        tick a collision is registered regardless of distance, as a fallback: some
+        obstacle props only become queryable in essentially the same tick the ego
+        reaches them, so a collision can in principle still occur before the
+        distance check ever sees a close reading. Some props are also removed from
+        the world shortly after a collision resolves, so stopping immediately and
+        letting the caller read the observation right away (no further ticks)
+        maximizes the chance the obstacle is still actually visible/present.
+
+        Returns whether the obstacle was reached, either by distance or by collision
+        (False if max_ticks elapsed first, e.g. blocked by traffic, stuck against
+        something off-route, or the episode ended).
+        """
+        ego = self._ego_actor()
+        if ego is None:
+            return False
+        manager = self.evaluator.manager
+        initial_yaw = ego.get_transform().rotation.yaw
+        prev_collision_count = self._collision_count()
+        for _ in range(max(1, int(max_ticks))):
+            current_yaw = ego.get_transform().rotation.yaw
+            yaw_error = ((current_yaw - initial_yaw + 180.0) % 360.0) - 180.0
+            steer = float(np.clip(-0.02 * yaw_error, -0.3, 0.3))
+            d = self.nearest_obstacle_distance_m()
+            if d is not None and d <= target_distance_m:
+                manager.pending_control = carla.VehicleControl(throttle=0.0, steer=steer, brake=1.0)
+                try:
+                    manager.step_once()
+                except Exception:
+                    pass
+                return True
+            cur_throttle = slow_throttle if (d is not None and d <= slowdown_distance_m) else throttle
+            manager.pending_control = carla.VehicleControl(
+                throttle=float(cur_throttle), steer=steer, brake=0.0
+            )
+            try:
+                running, _tree_status = manager.step_once()
+            except Exception:
+                return False
+            if not running:
+                return False
+            if self._collision_count() > prev_collision_count:
+                return True
+        return False
+
+    def step_raw_control(self, throttle: float, steer: float, brake: float = 0.0) -> bool:
+        """One ``manager.step_once()`` tick with a raw ``VehicleControl``, bypassing
+        the policy/action-format decoding entirely. Debug-only (main_carla_teleop.py
+        wall_snapshot video recording) -- lets the caller interleave driving ticks
+        with its own policy queries (the policy itself lives client-side, not in
+        this env subprocess), unlike drive_straight_until_close()'s single blocking
+        call. Returns whether the episode is still running (False if it just
+        terminated this tick).
+        """
+        manager = self.evaluator.manager
+        manager.pending_control = carla.VehicleControl(
+            throttle=float(throttle), steer=float(steer), brake=float(brake)
+        )
+        try:
+            running, _tree_status = manager.step_once()
+        except Exception:
+            return False
+        return bool(running)
 
     def _update_routing_command(self) -> None:
         """Advance the route planner by one step and cache the current routing command."""
@@ -1682,7 +1924,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             sensors = self._get_expert_input_data()
             try:
                 control = self._expert_agent.run_step(sensors, GameTime.get_time())
-                return self._step_with_control(control)
+                return self._step_with_control(control, skip_expert_tick=True)
             except Exception as _ee:
                 print(f"[step_expert] SimLingo autopilot failed: {_ee}", flush=True)
         expert_action = (obs_raw or {}).get("expert_action")
@@ -1770,6 +2012,8 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         terminal_bonus = 0.0
         info["collision_count"] = collision_count
         info["route_progress_pct"] = self._route_completion_pct()
+        _wall_dist = self.nearest_obstacle_distance_m()
+        info["nearest_obstacle_distance_m"] = -1.0 if _wall_dist is None else float(_wall_dist)
         info["crash_stuck_ticks"] = self._crash_stuck_ticks
         info["collision_penalty_active"] = bool(collision_penalty_active)
         info["collision_contact_active"] = bool(collision_contact_active)
@@ -1827,8 +2071,16 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         info["reward_total"] = float(reward)
         return float(reward), bool(terminated), info
 
-    def _step_with_control(self, control):
-        """Apply a pre-computed VehicleControl and run one leaderboard tick."""
+    def _step_with_control(self, control, *, skip_expert_tick: bool = False):
+        """Apply a pre-computed VehicleControl and run one leaderboard tick.
+
+        ``skip_expert_tick``: set by step_expert(), whose caller already ran
+        self._expert_agent.run_step() this tick to produce ``control`` -- ticking it
+        again here would be a second, wasted (result-discarded) full planning pass.
+        The background tick_expert() call otherwise keeps the expert's route/planner
+        state warm while some other action source (the policy) is actually driving,
+        for later expert takeover (e.g. auto_then_manual, expert_recover_debug).
+        """
         self._last_control = control
         self.evaluator.manager.pending_control = control
         self._raw_collision_active = False
@@ -1842,7 +2094,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             tree_status=tree_status,
             terminated=terminated,
         )
-        if self._expert_agent is not None:
+        if self._expert_agent is not None and not skip_expert_tick:
             self.tick_expert()
         return self._obs_dict(), float(reward), terminated, False, info
 
@@ -1983,12 +2235,13 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         return value
 
     def _route_completion_percent(self, criteria: list[dict[str, Any]]) -> float:
-        criterion_value = self._criterion_value(
-            criteria,
-            (("route", "completion"), ("route", "completed")),
-        )
-        if criterion_value > 0.0:
-            return float(np.clip(criterion_value, 0.0, 100.0))
+        if not self._geometric_route_completion_only:
+            criterion_value = self._criterion_value(
+                criteria,
+                (("route", "completion"), ("route", "completed")),
+            )
+            if criterion_value > 0.0:
+                return float(np.clip(criterion_value, 0.0, 100.0))
 
         ego = self._ego_actor()
         if ego is None or not self._route_transforms or not self._route_completion_accum_perc:
@@ -2225,6 +2478,80 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         if self._expert_agent is not None:
             self.tick_expert()
         return self._obs_dict(), float(reward), terminated, False, info
+
+    def checkpoint(self) -> Dict[str, Any]:
+        """Snapshot every actor's kinematic state + reward bookkeeping for a cheap rollback point.
+
+        Unlike ``reset()``, this does not touch the leaderboard's scenario tree /
+        statistics manager -- it only records what's needed to teleport the physical
+        world back and re-baseline reward deltas via :meth:`restore`. Cost is
+        O(num actors), independent of how far into the episode this is called.
+
+        Permanently switches this episode's route-completion reward to the geometric
+        fallback (see ``_geometric_route_completion_only``) -- once any rollback happens,
+        the leaderboard's monotonic completion criterion is no longer a trustworthy
+        reward source for the rest of the episode.
+        """
+        self._geometric_route_completion_only = True
+        world = self.evaluator.world
+        actors: Dict[int, Tuple[Any, Any, Any]] = {}
+        for actor in world.get_actors():
+            if actor.type_id.startswith(("vehicle.", "walker.pedestrian.")):
+                actors[actor.id] = (
+                    actor.get_transform(), actor.get_velocity(), actor.get_angular_velocity(),
+                )
+        return {
+            "actors": actors,
+            "last_control": self._last_control,
+            "route_completion_index": self._route_completion_index,
+            # True snapshot (not re-baselined on restore, unlike the reward-delta
+            # trackers below) -- crash_stuck termination needs to see genuine elapsed
+            # stuck time across decision boundaries, or it can never reach
+            # _crash_stuck_steps and the episode never ends. See restore().
+            "crash_stuck_ticks": self._crash_stuck_ticks,
+            "collision_recently_active": self._collision_recently_active,
+        }
+
+    def restore(self, ckpt: Dict[str, Any]) -> None:
+        """Teleport actors back to a checkpoint and re-baseline reward deltas.
+
+        Infraction/route-completion CRITERIA state inside the leaderboard's scenario
+        tree is not (and can't cheaply be) rolled back -- only the physical world is.
+        Delta-tracking attributes (collision/violation/route-completion counters used
+        for the *reward*) are re-baselined to *current* criterion readings (taken
+        immediately after the teleport) instead of restored to their pre-checkpoint
+        values, so a candidate is only ever scored on what changes during its own
+        trial, never charged for a sibling candidate's rollout.
+
+        ``crash_stuck_ticks``/``collision_recently_active`` are the one exception:
+        they drive *termination*, not reward, and restoring them to "fresh" (0/False)
+        every call -- instead of back to the checkpoint's true saved values -- would
+        mean a genuinely stuck episode can never accumulate enough consecutive stuck
+        ticks to actually terminate, since every decision's checkpoint()/restore()
+        would wipe its progress before it reaches ``_crash_stuck_steps``. Restoring
+        them exactly still avoids cross-candidate contamination (every candidate at
+        this decision point restores from the same saved snapshot), while correctly
+        carrying real elapsed stuck-time forward across decisions.
+        """
+        world = self.evaluator.world
+        for actor in world.get_actors():
+            state = ckpt["actors"].get(actor.id)
+            if state is None:
+                continue
+            transform, velocity, angular_velocity = state
+            actor.set_transform(transform)
+            actor.set_target_velocity(velocity)
+            actor.set_target_angular_velocity(angular_velocity)
+        world.tick()
+        self._last_control = ckpt["last_control"]
+        self._route_completion_index = ckpt["route_completion_index"]
+        self._raw_collision_active = False
+        self._collision_recently_active = ckpt["collision_recently_active"]
+        self._crash_stuck_ticks = ckpt["crash_stuck_ticks"]
+        self._prev_collision_count = self._collision_count()
+        self._prev_outside_route_value, _ = self._route_infraction_values()
+        self._prev_traffic_violation_count = self._traffic_violation_count()
+        self._last_route_completion = self._route_completion_percent(self._criteria_snapshot())
 
     def _finalize_route(self, entry_status: str, crash_message: str) -> None:
         if not self._scenario_active:

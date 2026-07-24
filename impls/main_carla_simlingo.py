@@ -535,6 +535,14 @@ class CarlaEnvProxy:
         if expert_raw is not None:
             obs["expert_action"] = np.array(expert_raw, dtype=np.float32)
         obs["scene_context"] = wire.get("scene_context") or {}
+        # rgb_front-derived policy image (impls/carla_env_server.py's _obs_to_wire always
+        # sends this) -- unused by this file's own SimLingo control loop, but exposed here
+        # for callers (e.g. collect_checkpoint_rollout_data.py) that want the same camera
+        # view as the rest of the pi0/critic-pretraining pipeline rather than the
+        # SimLingo-specific camera.
+        if "image_b64" in wire:
+            img_bytes2 = base64.b64decode(wire["image_b64"])
+            obs["image"] = np.frombuffer(img_bytes2, dtype=np.uint8).reshape(wire["image_shape"])
         return obs
 
     def close(self):

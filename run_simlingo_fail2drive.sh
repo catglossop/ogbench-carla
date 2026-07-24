@@ -54,7 +54,7 @@ HIERARCHICAL_SOURCE_ROOT=""
 HIGH_LEVEL_SOURCE_ROOT="/scratch/current/celinet/simlingo-steervla"
 LOW_LEVEL_SOURCE_ROOT="/scratch/current/celinet/simlingo-tian"
 ROUTE="generalization-wall-1095"   # default Fail2Drive route (f2d:85)
-STEPS="3000"
+STEPS="30000"
 WARMUP="500"
 LEARNING_STARTS="200"  # normalizer collects stats for 200 steps before freezing and before SAC updates begin
 CHUNK_SIZE="1"
@@ -95,14 +95,18 @@ OBS_MODE="encoder"
 ACTOR_L2_REG="0"
 TERMINATE_ON_INFRACTION="false"
 EVAL_ONLY="false"
-INCLUDE_EGO_STATE="true"
+INCLUDE_EGO_STATE="false"
 DEBUG_NEG_SPEED="false"
 DEBUG_TARGET_SPEED=""
 EXPERT_DEBUG="false"
 EXPERT_RECOVER_DEBUG="false"
+EXPERT_CHECKPOINT=""
 SAVE_VIDEO="true"
 DRY_RUN="false"
+DEBUG_OBS_HIST="false"
+DEBUG_OBS_HIST_STEPS="2000"
 USE_GEMINI_COACH="false"
+LOG_Q_EXPERT_DIFF="false"
 CRITIC_MODE="none"
 GEMINI_MODEL="gemini-3.5-flash"
 GEMINI_API_KEY=""
@@ -148,7 +152,8 @@ Mode:
   --terminate-on-infraction Terminate episode on collision, traffic violation, or off-route
   --training-mode MODE      sac_residual|dagger_residual. Default: sac_residual
   --policy-mode MODE        single|hierarchical. Default: single
-  --no-ego-state            Disable ego state vector input to actor/critic (on by default)
+  --ego-state               Enable ego state vector input to actor/critic (off by default)
+  --no-ego-state            Disable ego state vector input to actor/critic
   --debug-neg-speed         Replace reward with -speed (m/s) — SAC should brake
   --debug-target-speed F    Replace reward with -|speed - F| (m/s)
   --expert-debug            Drive with CARLA expert action instead of base+residual (dagger_residual only)
@@ -237,13 +242,19 @@ Logging:
   --video-log-interval N    Upload video every N episodes. Default: 1
   --save-interval N         Save SAC checkpoint every N steps. Default: 2000
   --no-video                Disable local mp4 saving
+  --debug-obs-hist          Collect obs samples then plot per-component histograms and exit
+  --debug-obs-hist-steps N  Steps to collect before plotting (default: 2000)
   --dry-run                 Print resolved config/command without launching
 
-Critic mode (expert planner as critic input):
-  --critic-mode MODE        none|expert. Default: none
-                              none   -> standard SAC critic (no extra input)
-                              expert -> feed expert planner (accel, steer) as
-                                        additional critic input each step
+Critic mode (expert feedback as critic input):
+  --critic-mode MODE        none|expert|language_bow|noise. Default: none
+                              none         -> standard SAC critic (no extra input)
+                              expert       -> feed expert planner (accel, steer, valid) as
+                                             additional critic input each step
+                              language_bow -> feed scene-grounded language BoW (SCENE_DELTA_VOCAB,
+                                             26 words + validity) from expert-vs-agent action delta
+                              noise        -> feed i.i.d. Gaussian noise (same 27-dim as language_bow)
+                                             as ablation baseline to isolate capacity vs language signal
 
 Gemini VLM coach:
   --use-gemini-coach
@@ -281,11 +292,13 @@ while [[ $# -gt 0 ]]; do
     --actor-l2-reg|--actor_l2_reg) ACTOR_L2_REG="$2"; shift 2 ;;
     --terminate-on-infraction|--terminate_on_infraction) TERMINATE_ON_INFRACTION="true"; shift ;;
     --policy-mode)         POLICY_MODE="$2"; shift 2 ;;
+    --ego-state)           INCLUDE_EGO_STATE="true"; shift ;;
     --no-ego-state)        INCLUDE_EGO_STATE="false"; shift ;;
     --debug-neg-speed)     DEBUG_NEG_SPEED="true"; shift ;;
     --debug-target-speed)  DEBUG_TARGET_SPEED="$2"; shift 2 ;;
     --expert-debug)        EXPERT_DEBUG="true"; shift ;;
     --expert-recover-debug) EXPERT_RECOVER_DEBUG="true"; shift ;;
+    --expert-checkpoint)   EXPERT_CHECKPOINT="$2"; shift 2 ;;
     --route)               ROUTE="$2"; shift 2 ;;
     --carla-config)        CARLA_CFG="$2"; shift 2 ;;
     --fail2drive-root)       _F2D_ROOT="$2"; FAIL2DRIVE_ROUTES_DIR="${FAIL2DRIVE_ROUTES_DIR:-${_F2D_ROOT}/fail2drive_split}"; FAIL2DRIVE_SCENARIOS_DIR="${FAIL2DRIVE_SCENARIOS_DIR:-${_F2D_ROOT}/scenario_runner/srunner/scenarios}"; FAIL2DRIVE_CARLA_ROOT="${FAIL2DRIVE_CARLA_ROOT:-${_F2D_ROOT}/f2d_carla}"; shift 2 ;;
@@ -339,6 +352,7 @@ while [[ $# -gt 0 ]]; do
     --seed)                SEED="$2"; shift 2 ;;
     --no-video)            SAVE_VIDEO="false"; shift ;;
     --critic-mode)         CRITIC_MODE="$2"; shift 2 ;;
+    --log-q-expert-diff)   LOG_Q_EXPERT_DIFF="true"; shift ;;
     --use-gemini-coach)    USE_GEMINI_COACH="true"; shift ;;
     --gemini-model)        GEMINI_MODEL="$2"; shift 2 ;;
     --gemini-api-key)      GEMINI_API_KEY="$2"; shift 2 ;;
@@ -346,6 +360,8 @@ while [[ $# -gt 0 ]]; do
     --coach-query-freq)         COACH_QUERY_FREQ="$2"; shift 2 ;;
     --coach-label-mode)         COACH_LABEL_MODE="$2"; shift 2 ;;
     --coach-embed-plot)         COACH_EMBED_PLOT="true"; shift ;;
+    --debug-obs-hist)      DEBUG_OBS_HIST="true"; shift ;;
+    --debug-obs-hist-steps) DEBUG_OBS_HIST_STEPS="$2"; shift 2 ;;
     --dry-run)             DRY_RUN="true"; shift ;;
     --instance)            INSTANCE="$2"; shift 2 ;;
     --gpu)                 TRAIN_GPU="$2"; GPU_RANK="$2"; shift 2 ;;
@@ -370,15 +386,27 @@ done
 
 # ── Critic mode validation ────────────────────────────────────────────────────
 case "$CRITIC_MODE" in
-  none|expert) ;;
+  none|expert|language_bow|noise) ;;
   *)
     echo "Invalid --critic-mode: $CRITIC_MODE" >&2
-    echo "Expected one of: none, expert" >&2
+    echo "Expected one of: none, expert, language_bow, noise" >&2
     exit 2
     ;;
 esac
 USE_EXPERT_IN_CRITIC="false"
+USE_LANGUAGE_BOW_CRITIC="false"
+USE_NOISE_CRITIC="false"
 [[ "$CRITIC_MODE" == "expert" ]] && USE_EXPERT_IN_CRITIC="true"
+[[ "$CRITIC_MODE" == "language_bow" ]] && USE_LANGUAGE_BOW_CRITIC="true"
+[[ "$CRITIC_MODE" == "noise" ]] && USE_NOISE_CRITIC="true"
+
+# ── Auto-suffix W&B run name with train mode and critic mode ──────────────────
+_effective_mode="$( [[ "$EVAL_ONLY" == "true" ]] && echo "eval" || echo "$TRAINING_MODE" )"
+if [[ -z "$WANDB_RUN_NAME" ]]; then
+  WANDB_RUN_NAME="${ROUTE}_${_effective_mode}_${CRITIC_MODE}"
+else
+  WANDB_RUN_NAME="${WANDB_RUN_NAME}_${_effective_mode}_${CRITIC_MODE}"
+fi
 
 # ── Environment check ─────────────────────────────────────────────────────────
 REQUIRED_PKGS=(ml_collections)
@@ -530,6 +558,20 @@ for key, value in reward_overrides.items():
 Path(out_path).write_text(yaml.safe_dump(cfg, sort_keys=False))
 PY
 
+  # Expert debug: enable the SimLingo autopilot so _compute_expert_action() uses
+  # the live PDM-Lite planner instead of the route-based approximation (which can
+  # return zeros and fall back to random residual → collision).
+  if [[ "$EXPERT_DEBUG" == "true" || "$EXPERT_RECOVER_DEBUG" == "true" ]]; then
+    "$SIMLINGO_PYTHON" - "$TMP_CFG" <<'PY'
+import sys, yaml
+from pathlib import Path
+p = Path(sys.argv[1])
+cfg = yaml.safe_load(p.read_text())
+cfg["expert_controller"] = "simlingo_autopilot"
+p.write_text(yaml.safe_dump(cfg, sort_keys=False))
+PY
+  fi
+
   CARLA_CFG="$TMP_CFG"
 fi
 
@@ -562,6 +604,9 @@ ARGS=(
   --actor_l2_reg="$ACTOR_L2_REG"
   --include_ego_state="$INCLUDE_EGO_STATE"
   --use_expert_in_critic="$USE_EXPERT_IN_CRITIC"
+  --use_language_bow_critic="$USE_LANGUAGE_BOW_CRITIC"
+  --use_noise_critic="$USE_NOISE_CRITIC"
+  --log_q_expert_diff="$LOG_Q_EXPERT_DIFF"
   --terminate_on_infraction="$TERMINATE_ON_INFRACTION"
   --seed="$SEED"
   --run_group="$RUN_GROUP"
@@ -629,6 +674,10 @@ if [[ "$EXPERT_RECOVER_DEBUG" == "true" ]]; then
   ARGS+=(--expert_recover_debug)
 fi
 
+if [[ -n "$EXPERT_CHECKPOINT" ]]; then
+  ARGS+=(--expert_checkpoint="$EXPERT_CHECKPOINT")
+fi
+
 if [[ "$USE_GEMINI_COACH" == "true" ]]; then
   ARGS+=(--use_gemini_coach)
   ARGS+=(--gemini_model="$GEMINI_MODEL")
@@ -644,7 +693,7 @@ fi
 
 ARGS+=("${EXTRA_ARGS[@]}")
 
-echo "[run_simlingo_fail2drive.sh] route=$ROUTE  eval_only=$EVAL_ONLY  training_mode=$TRAINING_MODE  policy_mode=$POLICY_MODE  debug_neg_speed=$DEBUG_NEG_SPEED  debug_target_speed=${DEBUG_TARGET_SPEED:-off}  expert_debug=$EXPERT_DEBUG  expert_recover_debug=$EXPERT_RECOVER_DEBUG"
+echo "[run_simlingo_fail2drive.sh] route=$ROUTE  eval_only=$EVAL_ONLY  training_mode=$TRAINING_MODE  policy_mode=$POLICY_MODE  debug_neg_speed=$DEBUG_NEG_SPEED  debug_target_speed=${DEBUG_TARGET_SPEED:-off}  expert_debug=$EXPERT_DEBUG  expert_recover_debug=$EXPERT_RECOVER_DEBUG  expert_checkpoint=${EXPERT_CHECKPOINT:-none}"
 echo "[run_simlingo_fail2drive.sh] steps=$STEPS  warmup=$WARMUP  chunk_size=$CHUNK_SIZE  res_scale_accel=$RES_SCALE_ACCEL  res_scale_steer=$RES_SCALE_STEER  obs_mode=$OBS_MODE  actor_l2_reg=$ACTOR_L2_REG  critic_mode=$CRITIC_MODE"
 echo "[run_simlingo_fail2drive.sh] wandb_mode=$WANDB_MODE  run_group=$RUN_GROUP  wandb_project=$WANDB_PROJECT"
 echo "[run_simlingo_fail2drive.sh] checkpoint=$SIMLINGO_CKPT"
@@ -671,6 +720,10 @@ if [[ -n "$COLLISION_EVENT_PENALTY$COLLISION_CONTACT_PENALTY$OUTSIDE_ROUTE_EVENT
   echo "[run_simlingo_fail2drive.sh] reward_overrides collision_event=$COLLISION_EVENT_PENALTY collision_contact=$COLLISION_CONTACT_PENALTY outside_route=$OUTSIDE_ROUTE_EVENT_PENALTY traffic_violation=$TRAFFIC_VIOLATION_PENALTY crash_stuck=$CRASH_STUCK_PENALTY progress=$PROGRESS_REWARD_WEIGHT success=$SUCCESS_BONUS failure=$FAILURE_BONUS"
 fi
 echo ""
+
+if [[ "$DEBUG_OBS_HIST" == "true" ]]; then
+  ARGS+=(--debug_obs_hist --debug_obs_hist_steps="$DEBUG_OBS_HIST_STEPS")
+fi
 
 if [[ "$DRY_RUN" == "true" ]]; then
   printf '[run_simlingo_fail2drive.sh] command: '

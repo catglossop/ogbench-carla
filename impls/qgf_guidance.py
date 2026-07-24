@@ -84,6 +84,22 @@ def make_q_fn(critic_def, critic_params: dict) -> Callable:
     return q_fn
 
 
+def make_q_fn_batched(critic_def, critic_params: dict) -> Callable:
+    """Return jitted f(obs_enc_1152, action_model_flat) -> per-row min-ensemble Q, shape (B,).
+
+    Unlike :func:`make_q_fn` (which reduces to a scalar mean, for use as a gradient
+    target), this keeps the batch dimension so callers can rank/argmax candidates
+    against each other (e.g. best-of-N action selection).
+    """
+
+    @jax.jit
+    def q_fn_batched(obs_enc: jnp.ndarray, action_model_flat: jnp.ndarray) -> jnp.ndarray:
+        qs = critic_def.apply({"params": critic_params}, obs_enc, action_model_flat)  # (2, B)
+        return jnp.min(qs, axis=0)  # (B,)
+
+    return q_fn_batched
+
+
 def make_q_grad_fn(critic_def, critic_params: dict) -> Callable:
     """Return jitted f(obs_enc_1152, action_flat_40) → qgrad_flat_40.
 

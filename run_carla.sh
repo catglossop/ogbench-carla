@@ -10,7 +10,7 @@ if [[ ! -d "$CARLA_ROOT" ]]; then
   CARLA_ROOT="/home/celinet/carla-0-9-16"
 fi
 
-ROUTE="3936"
+ROUTE="merger-into-slow-traffic-v2-005"
 ONLINE_STEPS="50000"
 SEED="0"
 RUN_GROUP="Debug"
@@ -19,8 +19,8 @@ EXPERT_DEBUG="false"
 EXPERT_RECOVER_DEBUG="false"
 WANDB_MODE="${WANDB_MODE:-online}"
 
-TRAIN_GPU_RANK="1"
-SIM_GPU_RANK="1"
+TRAIN_GPU_RANK="0"
+SIM_GPU_RANK=""  # defaults to TRAIN_GPU_RANK below
 RENDER_ADAPTER=""
 CARLA_HOST="localhost"
 CARLA_PORT=""
@@ -30,6 +30,36 @@ X_DISPLAY_NUM=""
 
 CRITIC_MODE="none"
 TRAIN_MODE="sac_residual"
+INCLUDE_PROPRIO="false"
+DISCOUNT="0.97"
+PRETRAINED_CRITIC=""
+QGF_CRITIC_CKPT=""
+QGF_GUIDANCE_WEIGHT="0.0"
+EVAL_ONLY="false"
+BON_CRITIC_CKPT=""
+BON_NUM_CANDIDATES="8"
+BON_ONLINE_CRITIC="false"
+BON_CANDIDATES_LOG_EVERY="20"
+BON_MAX_SAMPLE_ATTEMPTS="6"
+# 0.0 (the base config's default) makes subtask decoding greedy/deterministic, so every
+# candidate would decode to the identical subtask text and the diversity search in
+# _sample_diverse_candidates could never find a different one. run_carla_teleop.sh's
+# manual candidate picker overrides this to 1.0 for the same reason; match it here
+# whenever best-of-N is active (see the get_config() injection below).
+BON_COT_TEMPERATURE="1.0"
+BON_SHADOW_ONLY="false"
+BON_CRITIC_ROLLOUT_CHUNK="false"
+PID_BRAKE_SPEED=""
+PID_STUCK_THRESHOLD=""
+PID_CREEP_DURATION=""
+PID_CREEP_THROTTLE=""
+BON_GEMINI_SELECT="false"
+GEMINI_MODEL=""
+BON_GEMINI_ROLLOUT_CHUNK="false"
+MAX_EPISODES=""
+TERMINATE_ON_COLLISION="false"
+EXPERT_CONTROLLER=""
+SAVE_VIDEO_LOCAL="true"
 
 BASE_AGENT_CFG="impls/configs/pi0_residual_sac_config.py"
 BASE_CARLA_CFG="impls/configs/carla_config.yaml"
@@ -52,7 +82,7 @@ Options:
   --wandb-mode MODE         online|offline|disabled. Default: WANDB_MODE or offline
 
   --train-gpu N             JAX / learner GPU rank. Default: 2
-  --sim-gpu N               Alias for --render-adapter. Default: 3
+  --sim-gpu N               Alias for --render-adapter. Default: same as --train-gpu
   --render-adapter N        CARLA -graphicsadapter value. Default: 3
 
   --carla-host HOST         CARLA host. Default: localhost
@@ -63,15 +93,68 @@ Options:
 
   --critic-mode MODE        one of:
                               none         -> no extra critic info
-                              delta        -> numeric action delta
+                              expert       -> expert action (+validity flag) as critic
+                                              input; state-only, Bellman-consistent.
+                                              PID-decoded [accel, steer] in
+                                              accel_steer residual mode.
+                              delta        -> numeric action delta (expert - agent;
+                                              depends on the logged action)
                               delta-lang   -> language on expert-agent delta
                               expert-lang  -> language on expert action
                             Default: delta
 
   --train-mode MODE         rl|dagger|sac_residual|dagger_residual. Default: sac_residual
 
+  --include-proprio BOOL    true|false. Include ego-state vector as explicit input to residual
+                            actor and critic (residual_append_state). Default: false
+
+  --discount FLOAT          RL discount factor (gamma). Default: 0.99
+
   --agent-config PATH       Base agent config. Default: impls/configs/pi0_residual_sac_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
+
+  --pretrained-critic PATH  Path to a pretrained critic .pkl from pretrain_critic.py.
+                            Injects obs_encoder + critic params before online training begins.
+                            Must match the online config (same encoder, hidden dims, action_mode,
+                            critic_feedback_mode=none).
+
+  --qgf-critic-ckpt PATH    Pretrained critic .pkl for QGF Q-gradient guidance at each pi0
+                            denoising step (test-time only, no training).
+  --qgf-guidance-weight F   Scale for QGF Q-gradient guidance. Default: 0.0 (disabled).
+
+  --bon-critic-ckpt PATH    Pretrained critic .pkl (pretrain_critic.py, action_mode=waypoints)
+                            used to score N candidate action chunks sampled straight from the
+                            frozen pi0 base policy (no residual actor); the highest-Q candidate
+                            is executed each step. Requires --train-mode=rl.
+  --bon-num-candidates N    Number of candidates to sample/score per step. Default: 8.
+  --bon-online-critic BOOL  true|false. Best-of-N scored with the live online critic instead
+                            of a frozen --bon-critic-ckpt; keeps training via update_with_vla()
+                            on collected transitions. Warm-start with --pretrained-critic.
+                            Requires --eval-only=false. Default: false.
+  --bon-candidates-log-every N
+                            Log an overlay frame every N env steps showing every best-of-N
+                            candidate's subtask + Q value, selected one marked. 0 disables.
+                            Default: 20.
+  --bon-max-sample-attempts N
+                            Best-of-N diverse-subtask search: max resample attempts per
+                            candidate slot (beyond the first). Each attempt is a full VLA
+                            forward pass; lower this to trade diversity for speed. Default: 6.
+  --bon-cot-temperature F   CoT/subtask sampling temperature when best-of-N is active. The
+                            base config defaults to 0.0 (greedy -- every candidate would
+                            decode to the same subtask), so this defaults to 1.0 here,
+                            matching run_carla_teleop.sh's manual candidate picker.
+  --bon-critic-rollout-chunk BOOL
+                            true|false. When --bon-critic-ckpt or --bon-online-critic is
+                            active, execute the FULL selected action chunk (all
+                            vla_action_horizon steps, shifted one step at a time) across
+                            consecutive env steps instead of re-sampling N candidates and
+                            re-scoring with the critic every single step. Only re-scores
+                            once the chunk is exhausted (or on episode reset). Mirrors
+                            --bon-gemini-rollout-chunk. Default: false (re-score every step).
+
+  --save-video-local BOOL   true|false. Write each episode's rollout video to
+                            <save_dir>/videos/epNNNN.mp4 locally (in addition to W&B). Default: true.
+
   -h, --help                Show this help
 
 Examples:
@@ -85,6 +168,10 @@ Examples:
   bash run_carla.sh --expert-debug true --save-buffer false
   # Second instance on different ports:
   bash run_carla.sh --carla-port 2002 --carla-streaming-port 2003 --tm-port 8002 --x-display-num 12
+  # Best-of-N action selection from the frozen pi0 policy (no residual), scored by a
+  # pretrained critic, eval-only:
+  bash run_carla.sh --route 3936 --eval-only true --train-mode rl \
+      --bon-critic-ckpt /path/to/critic.pkl --bon-num-candidates 8
 EOF
 }
 
@@ -108,8 +195,33 @@ while [[ $# -gt 0 ]]; do
     --x-display-num) X_DISPLAY_NUM="$2"; shift 2 ;;
     --critic-mode) CRITIC_MODE="$2"; shift 2 ;;
     --train-mode) TRAIN_MODE="$2"; shift 2 ;;
+    --include-proprio) INCLUDE_PROPRIO="$2"; shift 2 ;;
+    --discount) DISCOUNT="$2"; shift 2 ;;
     --agent-config) BASE_AGENT_CFG="$2"; shift 2 ;;
     --carla-config) BASE_CARLA_CFG="$2"; shift 2 ;;
+    --pretrained-critic|--pretrained_critic) PRETRAINED_CRITIC="$2"; shift 2 ;;
+    --qgf-critic-ckpt|--qgf_critic_ckpt) QGF_CRITIC_CKPT="$2"; shift 2 ;;
+    --qgf-guidance-weight|--qgf_guidance_weight) QGF_GUIDANCE_WEIGHT="$2"; shift 2 ;;
+    --bon-critic-ckpt|--bon_critic_ckpt) BON_CRITIC_CKPT="$2"; shift 2 ;;
+    --bon-num-candidates|--bon_num_candidates) BON_NUM_CANDIDATES="$2"; shift 2 ;;
+    --bon-online-critic|--bon_online_critic) BON_ONLINE_CRITIC="$2"; shift 2 ;;
+    --bon-candidates-log-every|--bon_candidates_log_every) BON_CANDIDATES_LOG_EVERY="$2"; shift 2 ;;
+    --bon-max-sample-attempts|--bon_max_sample_attempts) BON_MAX_SAMPLE_ATTEMPTS="$2"; shift 2 ;;
+    --bon-cot-temperature|--bon_cot_temperature) BON_COT_TEMPERATURE="$2"; shift 2 ;;
+    --bon-shadow-only|--bon_shadow_only) BON_SHADOW_ONLY="$2"; shift 2 ;;
+    --bon-critic-rollout-chunk|--bon_critic_rollout_chunk) BON_CRITIC_ROLLOUT_CHUNK="$2"; shift 2 ;;
+    --pid-brake-speed|--pid_brake_speed) PID_BRAKE_SPEED="$2"; shift 2 ;;
+    --pid-stuck-threshold|--pid_stuck_threshold) PID_STUCK_THRESHOLD="$2"; shift 2 ;;
+    --pid-creep-duration|--pid_creep_duration) PID_CREEP_DURATION="$2"; shift 2 ;;
+    --pid-creep-throttle|--pid_creep_throttle) PID_CREEP_THROTTLE="$2"; shift 2 ;;
+    --bon-gemini-select|--bon_gemini_select) BON_GEMINI_SELECT="$2"; shift 2 ;;
+    --gemini-model|--gemini_model) GEMINI_MODEL="$2"; shift 2 ;;
+    --bon-gemini-rollout-chunk|--bon_gemini_rollout_chunk) BON_GEMINI_ROLLOUT_CHUNK="$2"; shift 2 ;;
+    --max-episodes|--max_episodes) MAX_EPISODES="$2"; shift 2 ;;
+    --terminate-on-collision|--terminate_on_collision) TERMINATE_ON_COLLISION="$2"; shift 2 ;;
+    --expert-controller|--expert_controller) EXPERT_CONTROLLER="$2"; shift 2 ;;
+    --save-video-local|--save_video_local) SAVE_VIDEO_LOCAL="$2"; shift 2 ;;
+    --eval-only|--eval_only) EVAL_ONLY="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; EXTRA_ARGS+=("$@"); break ;;
     *)
@@ -120,14 +232,20 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# SIM_GPU_RANK defaults to TRAIN_GPU_RANK so training and rendering share a GPU.
+if [[ -z "$SIM_GPU_RANK" ]]; then
+  SIM_GPU_RANK="$TRAIN_GPU_RANK"
+fi
+
 case "$CRITIC_MODE" in
   none) CRITIC_FEEDBACK_MODE="none" ;;
+  expert) CRITIC_FEEDBACK_MODE="expert_action" ;;
   delta) CRITIC_FEEDBACK_MODE="action_delta" ;;
   delta-lang) CRITIC_FEEDBACK_MODE="delta_commentary_bow" ;;
   expert-lang) CRITIC_FEEDBACK_MODE="commentary_bow" ;;
   *)
     echo "Invalid --critic-mode: $CRITIC_MODE" >&2
-    echo "Expected one of: none, delta, delta-lang, expert-lang" >&2
+    echo "Expected one of: none, expert, delta, delta-lang, expert-lang" >&2
     exit 2
     ;;
 esac
@@ -161,6 +279,12 @@ else
   exit 1
 fi
 
+if [[ "$INCLUDE_PROPRIO" == "true" ]]; then
+  _INCLUDE_PROPRIO_PY="True"
+else
+  _INCLUDE_PROPRIO_PY="False"
+fi
+
 TMP_ROOT="$ROOT_DIR/.run_carla"
 mkdir -p "$TMP_ROOT"
 TMP_DIR="$(mktemp -d "$TMP_ROOT/run.XXXXXX")"
@@ -179,7 +303,7 @@ fi
 # Derive ports from SIM_GPU_RANK when not explicitly set (offset = gpu * 20)
 _GPU_OFFSET=$((SIM_GPU_RANK * 20))
 CARLA_PORT="${CARLA_PORT:-$((2000 + _GPU_OFFSET))}"
-TM_PORT="${TM_PORT:-$((8000 + _GPU_OFFSET))}"
+TM_PORT="${TM_PORT:-$((CARLA_PORT + 6000))}"
 CARLA_STREAMING_PORT="${CARLA_STREAMING_PORT:-0}"
 
 # Derive X display from CARLA_PORT (must be after port derivation)
@@ -198,10 +322,17 @@ _BASE_GET_CONFIG = runpy.run_path(str(_BASE_PATH))["get_config"]
 def get_config():
     config = _BASE_GET_CONFIG()
     config.training_gpu_rank = ${TRAIN_GPU_RANK}
+    config.siglip_device = "cuda:${TRAIN_GPU_RANK}"
     config.critic_feedback_mode = "${CRITIC_FEEDBACK_MODE}"
     config.online_training_mode = "${TRAIN_MODE}"
     if config.critic_feedback_mode == "none":
         config.language_label_dim = 0
+    elif config.critic_feedback_mode == "expert_action":
+        config.language_label_dim = 2  # accel_steer 2D; no validity flag (matches pretrained critic)
+    config.residual_append_state = ${_INCLUDE_PROPRIO_PY}
+    config.discount = ${DISCOUNT}
+$( [[ -n "$BON_CRITIC_CKPT" || "$BON_ONLINE_CRITIC" == "true" || "$BON_GEMINI_SELECT" == "true" ]] && \
+   echo "    config.steervla.cot_temperature = ${BON_COT_TEMPERATURE}" )
     return config
 EOF
 
@@ -218,6 +349,8 @@ cfg["traffic_manager_port"] = int("${TM_PORT}")
 cfg["gpu_rank"] = int("${SIM_GPU_RANK}")
 cfg["x_display_num"] = int("${X_DISPLAY_NUM}")
 cfg["use_cuda_visible_devices"] = False
+if r"${EXPERT_CONTROLLER}":
+    cfg["expert_controller"] = r"${EXPERT_CONTROLLER}"
 Path(r"${CARLA_CFG_TMP}").write_text(yaml.safe_dump(cfg, sort_keys=False))
 EOF
 
@@ -226,9 +359,13 @@ echo "[run_carla.sh] train_mode=${TRAIN_MODE}"
 echo "[run_carla.sh] critic_mode=${CRITIC_FEEDBACK_MODE}"
 echo "[run_carla.sh] train_gpu_rank=${TRAIN_GPU_RANK} render_adapter=${SIM_GPU_RANK}"
 echo "[run_carla.sh] carla_host=${CARLA_HOST} carla_port=${CARLA_PORT} streaming_port=${CARLA_STREAMING_PORT} tm_port=${TM_PORT} x_display=:${X_DISPLAY_NUM}"
-echo "[run_carla.sh] expert_debug=${EXPERT_DEBUG} expert_recover_debug=${EXPERT_RECOVER_DEBUG} save_buffer=${SAVE_BUFFER} online_steps=${ONLINE_STEPS}"
+echo "[run_carla.sh] expert_debug=${EXPERT_DEBUG} expert_recover_debug=${EXPERT_RECOVER_DEBUG} save_buffer=${SAVE_BUFFER} online_steps=${ONLINE_STEPS} include_proprio=${INCLUDE_PROPRIO}"
 echo "[run_carla.sh] temp agent config: ${AGENT_CFG_TMP}"
 echo "[run_carla.sh] temp carla config: ${CARLA_CFG_TMP}"
+if [[ -n "$BON_CRITIC_CKPT" ]]; then
+  echo "[run_carla.sh] best-of-N: ckpt=${BON_CRITIC_CKPT} num_candidates=${BON_NUM_CANDIDATES}"
+fi
+echo "[run_carla.sh] save_video_local=${SAVE_VIDEO_LOCAL}"
 
 PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla:${ROOT_DIR}/simlingo-rebuttal${PYTHONPATH:+:$PYTHONPATH}" \
 WANDB_MODE="${WANDB_MODE}" uv run python impls/main_carla.py \
@@ -241,4 +378,25 @@ WANDB_MODE="${WANDB_MODE}" uv run python impls/main_carla.py \
   --run_group="${RUN_GROUP}" \
   --expert_debug="${EXPERT_DEBUG}" \
   --expert_recover_debug="${EXPERT_RECOVER_DEBUG}" \
+  ${PRETRAINED_CRITIC:+--pretrained_critic="${PRETRAINED_CRITIC}"} \
+  ${QGF_CRITIC_CKPT:+--qgf_critic_ckpt="${QGF_CRITIC_CKPT}"} \
+  ${QGF_GUIDANCE_WEIGHT:+--qgf_guidance_weight="${QGF_GUIDANCE_WEIGHT}"} \
+  ${BON_CRITIC_CKPT:+--bon_critic_ckpt="${BON_CRITIC_CKPT}"} \
+  --bon_num_candidates="${BON_NUM_CANDIDATES}" \
+  --bon_online_critic="${BON_ONLINE_CRITIC}" \
+  --bon_candidates_log_every="${BON_CANDIDATES_LOG_EVERY}" \
+  --bon_max_sample_attempts="${BON_MAX_SAMPLE_ATTEMPTS}" \
+  --bon_shadow_only="${BON_SHADOW_ONLY}" \
+  --bon_critic_rollout_chunk="${BON_CRITIC_ROLLOUT_CHUNK}" \
+  ${PID_BRAKE_SPEED:+--pid_brake_speed="${PID_BRAKE_SPEED}"} \
+  ${PID_STUCK_THRESHOLD:+--pid_stuck_threshold="${PID_STUCK_THRESHOLD}"} \
+  ${PID_CREEP_DURATION:+--pid_creep_duration="${PID_CREEP_DURATION}"} \
+  ${PID_CREEP_THROTTLE:+--pid_creep_throttle="${PID_CREEP_THROTTLE}"} \
+  --bon_gemini_select="${BON_GEMINI_SELECT}" \
+  ${GEMINI_MODEL:+--gemini_model="${GEMINI_MODEL}"} \
+  --bon_gemini_rollout_chunk="${BON_GEMINI_ROLLOUT_CHUNK}" \
+  ${MAX_EPISODES:+--max_episodes="${MAX_EPISODES}"} \
+  --terminate_on_collision="${TERMINATE_ON_COLLISION}" \
+  --save_video_local="${SAVE_VIDEO_LOCAL}" \
+  --eval_only="${EVAL_ONLY}" \
   "${EXTRA_ARGS[@]}"

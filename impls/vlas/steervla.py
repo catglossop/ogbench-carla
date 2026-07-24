@@ -775,6 +775,8 @@ class SteerVLAActor:
         self._jax_device = None
         self._local_ready = False
         self._qgf_config: dict | None = None  # set by setup_qgf()
+        self._last_batch_subtask: tuple[np.ndarray, np.ndarray] | None = None
+        self._last_batch_reasoning: tuple[np.ndarray, np.ndarray] | None = None
         self.checkpoint_dir: Path | None = None
         self._mesh: jax.sharding.Mesh | None = None
         self._train_rng: jax.Array | None = None
@@ -1555,6 +1557,16 @@ class SteerVLAActor:
         subtask_valid = subtask_tokens[subtask_mask.astype(bool)]
         subtask_text = self.tokenizer._tokenizer.decode(subtask_valid.tolist())
         print(f"[DEBUG - steervla] Subtask text: {subtask_text}")
+
+        # Per-row (batch) subtask/reasoning tokens, for callers that need each
+        # candidate's own text separately (e.g. best-of-N candidate overlays) --
+        # the debug print above flattens the whole batch into one decode.
+        self._last_batch_subtask = (
+            np.asarray(jax.device_get(subtask_tokens)), np.asarray(jax.device_get(subtask_mask))
+        )
+        self._last_batch_reasoning = (
+            np.asarray(jax.device_get(reason_tokens)), np.asarray(jax.device_get(reason_mask))
+        )
         if "tokenized_fast" in cot_out and self.tokenizer.use_fast_tokens:
             fast_tokens = cot_out["tokenized_fast"]
             fast_mask = cot_out["tokenized_fast_mask"]
@@ -1727,6 +1739,34 @@ class SteerVLAActor:
             return np.asarray(jax.device_get(x))
 
         return jax.tree.map(_to_numpy, dict(cot_out))
+
+    def decode_last_batch_subtasks(self) -> list[str]:
+        """Per-row subtask text from the most recent batched forward pass.
+
+        Unlike the ``[DEBUG - steervla] Subtask text:`` print (which flattens the
+        whole batch into a single decode), this decodes each row separately --
+        for best-of-N candidate overlays where each row is a different candidate.
+        """
+        if self._last_batch_subtask is None or self.tokenizer is None:
+            return []
+        tokens, mask = self._last_batch_subtask
+        texts = []
+        for i in range(tokens.shape[0]):
+            row_valid = tokens[i][mask[i].astype(bool)]
+            texts.append(self.tokenizer._tokenizer.decode(row_valid.tolist()))
+        return texts
+
+    def decode_last_batch_reasoning(self) -> list[str]:
+        """Per-row reasoning text from the most recent batched forward pass (see
+        :meth:`decode_last_batch_subtasks`)."""
+        if self._last_batch_reasoning is None or self.tokenizer is None:
+            return []
+        tokens, mask = self._last_batch_reasoning
+        texts = []
+        for i in range(tokens.shape[0]):
+            row_valid = tokens[i][mask[i].astype(bool)]
+            texts.append(self.tokenizer._tokenizer.decode(row_valid.tolist()))
+        return texts
 
 
 def create_steervla_pi0_cot_sample_fn(

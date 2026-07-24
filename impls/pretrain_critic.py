@@ -254,10 +254,12 @@ def _rewards_noisy(measurements: list[dict]) -> np.ndarray:
     """Compute per-step rewards for a noisy-dataset route.
 
     Uses stored reward_component_* fields for the continuous terms (progress,
-    speed-limit, crash-stuck) and rising-edge detection on boolean flags for
-    event-based penalties (outside_road, traffic violations) to mirror the
-    criteria-delta logic in ~/ogbench-carla carla_utils.py.
+    speed-limit, crash-stuck, steer, brake) and rising-edge detection on boolean flags
+    for event-based penalties (outside_road, traffic violations) to mirror
+    ~/ogbench-carla carla_utils.py's _compute_reward_and_info exactly.
     Collision is kept as a per-step contact penalty (matches legacy mode).
+    The terminal success/failure bonus, if present, is applied on the last step only
+    (in place of the results.json.gz score-threshold guess used elsewhere in this file).
     """
     rewards = np.zeros(len(measurements), dtype=np.float32)
     prev_outside = False
@@ -268,6 +270,9 @@ def _rewards_noisy(measurements: list[dict]) -> np.ndarray:
             float(m.get("reward_component_progress", 0.0))
             + float(m.get("reward_component_speed_limit_pen", 0.0))  # already negative
             + float(m.get("reward_component_crash_stuck_pen", 0.0))  # already negative
+            + float(m.get("reward_component_steer_pen", 0.0))  # already negative
+            + float(m.get("reward_component_brake_pen", 0.0))  # already negative
+            + float(m.get("reward_component_terminal", 0.0))  # 0 except last step
         )
         # Collision: per-step contact penalty (legacy mode in carla_utils)
         r += COLLISION_PEN * float(m.get("reward_collision_active", False))

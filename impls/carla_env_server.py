@@ -5,9 +5,10 @@ Run with: uv run python impls/carla_env_server.py [--route=...] [--gpu_rank=...]
 Protocol (newline-delimited JSON):
   Startup:  server writes {"ready": true, "obs_space": {...}}
   Step:     controller writes {"action": [accel, steer]}
-            server writes {"obs": {...}, "reward": float, "terminated": bool, "truncated": bool, "info": {...}}
+            server writes {"obs": {...}, "reward": float, "terminated": bool, "truncated": bool,
+                            "info": {..., "ego_matrix": [[...4x4...]] | null, "speed": float}}
   Reset:    controller writes {"reset": true}
-            server writes {"obs": {...}, "info": {...}}
+            server writes {"obs": {...}, "info": {"ego_matrix": [[...4x4...]] | null, "speed": float}}
   Shutdown: controller closes stdin; server exits cleanly
 
 Observation dict keys sent over wire:
@@ -130,6 +131,25 @@ def _obs_to_wire(obs: Dict[str, Any], include_simlingo: bool) -> Dict[str, Any]:
     return out
 
 
+def _add_ego_pose_to_info(env, info: Dict[str, Any]) -> None:
+    """Add 4x4 ego transform matrix + raw speed (m/s) directly into an already-built
+    `info` dict, for offline critic-pretraining data collection (pretrain_critic.py's
+    _waypoints_action needs ego_matrix per frame). These aren't scalar, so they must be
+    added *after* the safe_info scalar-only filter runs, not before -- CarlaEnvProxy's
+    step()/reset()/step_expert() (main_carla_simlingo.py) pass `info` through to the
+    client verbatim with no additional filtering, so anything placed here survives the
+    wire round-trip without needing any client-side changes.
+    """
+    ego = env._ego_actor() if hasattr(env, "_ego_actor") else None
+    if ego is None:
+        info["ego_matrix"] = None
+        info["speed"] = 0.0
+        return
+    v = ego.get_velocity()
+    info["ego_matrix"] = ego.get_transform().get_matrix()
+    info["speed"] = float((v.x ** 2 + v.y ** 2 + v.z ** 2) ** 0.5)
+
+
 def _load_carla_config(path):
     import yaml
     cfg_path = path or str(_IMPLS_ROOT / "configs" / "carla_config.yaml")
@@ -181,6 +201,12 @@ def main(_argv):
     _wire_out.write(json.dumps(startup) + "\n")
     _wire_out.flush()
 
+    # Single-slot checkpoint for main_carla_teleop.py's literal-rollback best-of-N mode:
+    # env.checkpoint()/env.restore() live entirely in this process (carla.Transform /
+    # carla.Vector3D objects aren't JSON-serializable), so the wire protocol just carries
+    # an opaque "did it work" ack -- see CarlaEnvSubprocess.checkpoint()/restore().
+    _current_checkpoint = None
+
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -193,7 +219,9 @@ def main(_argv):
 
         if msg.get("reset"):
             obs, info = env.reset()
-            resp = {"obs": _obs_to_wire(obs, include_simlingo), "info": {}}
+            reset_info: Dict[str, Any] = {}
+            _add_ego_pose_to_info(env, reset_info)
+            resp = {"obs": _obs_to_wire(obs, include_simlingo), "info": reset_info}
             _wire_out.write(json.dumps(resp) + "\n")
             _wire_out.flush()
 
@@ -201,6 +229,78 @@ def main(_argv):
             if hasattr(env, "reinit_expert"):
                 env.reinit_expert()
             _wire_out.write(json.dumps({"ack": True}) + "\n")
+            _wire_out.flush()
+
+        elif msg.get("checkpoint"):
+            _current_checkpoint = env.checkpoint()
+            _wire_out.write(json.dumps({"ack": True}) + "\n")
+            _wire_out.flush()
+
+        elif msg.get("restore"):
+            if _current_checkpoint is None:
+                _wire_out.write(json.dumps({"ack": False, "error": "no checkpoint taken yet"}) + "\n")
+            else:
+                env.restore(_current_checkpoint)
+                _wire_out.write(json.dumps({"ack": True}) + "\n")
+            _wire_out.flush()
+
+        elif msg.get("traffic_states"):
+            states = env.traffic_actor_states() if hasattr(env, "traffic_actor_states") else []
+            _wire_out.write(json.dumps({"ack": True, "states": states}) + "\n")
+            _wire_out.flush()
+
+        elif msg.get("teleport_to_obstacle"):
+            offset_m = float(msg.get("offset_m", 1.0))
+            ok = env.teleport_ego_to_obstacle(offset_m) if hasattr(env, "teleport_ego_to_obstacle") else False
+            _wire_out.write(json.dumps({"ack": bool(ok)}) + "\n")
+            _wire_out.flush()
+
+        elif msg.get("drive_straight_until_close"):
+            target_distance_m = float(msg.get("target_distance_m", 10.0))
+            slowdown_distance_m = float(msg.get("slowdown_distance_m", 30.0))
+            max_ticks = int(msg.get("max_ticks", 2000))
+            throttle = float(msg.get("throttle", 0.4))
+            slow_throttle = float(msg.get("slow_throttle", 0.12))
+            ok = (
+                env.drive_straight_until_close(
+                    target_distance_m=target_distance_m,
+                    slowdown_distance_m=slowdown_distance_m,
+                    max_ticks=max_ticks,
+                    throttle=throttle,
+                    slow_throttle=slow_throttle,
+                )
+                if hasattr(env, "drive_straight_until_close") else False
+            )
+            resp: Dict[str, Any] = {"ack": bool(ok)}
+            if ok:
+                # Read the observation directly (no extra tick) -- some obstacle props
+                # get removed from the world shortly after a collision resolves, so an
+                # extra env.step() here (another tick) risks missing the window where
+                # it's still actually present/visible.
+                resp["obs"] = _obs_to_wire(env._obs_dict(), include_simlingo)
+                dist = env.nearest_obstacle_distance_m() if hasattr(env, "nearest_obstacle_distance_m") else None
+                resp["nearest_obstacle_distance_m"] = -1.0 if dist is None else float(dist)
+                resp["collision_count"] = int(env._collision_count()) if hasattr(env, "_collision_count") else -1
+            _wire_out.write(json.dumps(resp) + "\n")
+            _wire_out.flush()
+
+        elif msg.get("step_raw_control"):
+            throttle = float(msg.get("throttle", 0.0))
+            steer = float(msg.get("steer", 0.0))
+            brake = float(msg.get("brake", 0.0))
+            running = (
+                env.step_raw_control(throttle, steer, brake)
+                if hasattr(env, "step_raw_control") else False
+            )
+            resp = {
+                "ack": True,
+                "running": bool(running),
+                "obs": _obs_to_wire(env._obs_dict(), include_simlingo),
+            }
+            dist = env.nearest_obstacle_distance_m() if hasattr(env, "nearest_obstacle_distance_m") else None
+            resp["nearest_obstacle_distance_m"] = -1.0 if dist is None else float(dist)
+            resp["collision_count"] = int(env._collision_count()) if hasattr(env, "_collision_count") else -1
+            _wire_out.write(json.dumps(resp) + "\n")
             _wire_out.flush()
 
         elif msg.get("expert_step"):
@@ -215,6 +315,7 @@ def main(_argv):
                 for k, v in info.items()
                 if isinstance(v, (np.floating, np.integer, np.bool_, float, int, bool, str))
             }
+            _add_ego_pose_to_info(env, safe_info)
             resp = {
                 "obs": _obs_to_wire(next_obs, include_simlingo),
                 "reward": float(reward),
@@ -237,6 +338,7 @@ def main(_argv):
                 for k, v in info.items()
                 if isinstance(v, (np.floating, np.integer, np.bool_, float, int, bool, str))
             }
+            _add_ego_pose_to_info(env, safe_info)
 
             resp = {
                 "obs": _obs_to_wire(next_obs, include_simlingo),
