@@ -596,8 +596,16 @@ def _episode_summary_log(info: dict) -> dict[str, Any]:
         out["rollout/final_route_progress_pct"] = float(info["route_progress_pct"])
     if "collision_count" in info:
         out["rollout/episode_collision_count"] = float(info["collision_count"])
-    if "termination_reason" in info:
-        out["rollout/termination_reason"] = str(info["termination_reason"])
+    # termination_reason is a string (not chartable); emit it plus a one-hot over the
+    # reasons the env can end on so W&B can plot per-reason frequency. The env only sets
+    # termination_reason for crash_stuck / episode_max_steps; a scenario-tree end (success
+    # or collision/route failure) leaves it unset but populates ``success``.
+    reason = str(info.get("termination_reason") or "").strip()
+    if not reason:
+        reason = "scenario_end" if "success" in info else "unknown"
+    out["rollout/termination_reason"] = reason
+    for r in ("crash_stuck", "episode_max_steps", "scenario_end", "unknown"):
+        out[f"rollout/term_{r}"] = 1.0 if reason == r else 0.0
     return out
 
 
@@ -699,11 +707,14 @@ def _annotate_waypoints_frame(frame: np.ndarray, action_flat, exec_cfg) -> np.nd
         return frame
 
 
-def _annotate_text_panel(frame, raw, *, reward: float, critic_text: str = "", steervla_actor=None) -> np.ndarray:
+def _annotate_text_panel(
+    frame, raw, *, reward: float, critic_text: str = "", steervla_actor=None, hud: dict | None = None
+) -> np.ndarray:
     """Bottom text panel: reward corner + prompt/reasoning/subtask (+ optional expert/critic lines).
 
     ``critic_text`` / ``expert_action`` lines are omitted when unavailable, so residual videos stay
-    clean while the DSRL loop (which always supplies critic text) keeps its full panel.
+    clean while the DSRL loop (which always supplies critic text) keeps its full panel. ``hud`` (when
+    given) adds a residual-RL header line: base/residual/final actions + progress%/step/return/scale.
     """
     base = np.array(frame, copy=True)
     try:
@@ -747,6 +758,15 @@ def _annotate_text_panel(frame, raw, *, reward: float, critic_text: str = "", st
             return txt if len(txt) <= n else (txt[: n - 3] + "...")
 
         lines = []
+        if hud:
+            lines.append(
+                f"Action base={hud.get('base', '-')} residual={hud.get('residual', '-')} "
+                f"final={hud.get('final', '-')} scale={hud.get('scale', '-')}"
+            )
+            lines.append(
+                f"progress={float(hud.get('progress', 0.0)):.1f}% step={int(hud.get('ep_step', 0))} "
+                f"return={float(hud.get('ep_return', 0.0)):+.1f}"
+            )
         if critic_text:
             lines.append(f"Expert: {_clip(critic_text)}")
         if expert_action_str:
@@ -772,6 +792,7 @@ def _annotate_text_panel(frame, raw, *, reward: float, critic_text: str = "", st
 def _annotate_full_frame(
     frame, raw, *, reward: float, action_flat=None, exec_cfg=None,
     critic_text: str = "", collision=None, steervla_actor=None, expert_debug: bool = False,
+    hud: dict | None = None,
 ) -> np.ndarray:
     """Unified rollout-video frame: waypoint overlay + text panel + optional collision badge."""
     out = np.asarray(frame)
@@ -779,7 +800,9 @@ def _annotate_full_frame(
         out = np.clip(out, 0, 255).astype(np.uint8)
     if not expert_debug:
         out = _annotate_waypoints_frame(out, action_flat, exec_cfg)
-    out = _annotate_text_panel(out, raw, reward=reward, critic_text=critic_text, steervla_actor=steervla_actor)
+    out = _annotate_text_panel(
+        out, raw, reward=reward, critic_text=critic_text, steervla_actor=steervla_actor, hud=hud
+    )
     if collision is not None:
         out = _draw_corner_badge(out, f"COLL c={int(collision[0])} e={int(collision[1])}", corner="tr", bg=(255, 0, 0))
     return out
@@ -798,7 +821,7 @@ def _episode_video(frames: list[np.ndarray], fps: float):
 def _maybe_capture_frame(
     frames: list[np.ndarray], obs: dict, reward: float, *, episode_steps: int, done: bool,
     log_video: bool, video_every: int, action_flat=None, exec_cfg=None,
-    collision=None, steervla_actor=None,
+    collision=None, steervla_actor=None, hud: dict | None = None,
 ) -> Optional[np.ndarray]:
     """Append an annotated frame on capture steps (every Nth step + the terminal one).
 
@@ -811,7 +834,7 @@ def _maybe_capture_frame(
         if frame is not None:
             annotated = _annotate_full_frame(
                 frame, obs, reward=float(reward), action_flat=action_flat, exec_cfg=exec_cfg,
-                collision=collision, steervla_actor=steervla_actor,
+                collision=collision, steervla_actor=steervla_actor, hud=hud,
             )
             frames.append(annotated)
             return annotated
@@ -1546,15 +1569,22 @@ def run_online_residual(
     # ``residual_scale`` over ``residual_ramp_steps`` env steps, avoiding a magnitude jump at
     # handover and keeping the critic in-distribution as the executed policy drifts off base.
     ramp_steps = max(0, int(config.get("residual_ramp_steps", 0)))
-    target_scale = float(config["residual_scale"])
+    _accel_steer_space = str(config.get("residual_action_space", "waypoint_chunk")).strip().lower() == "accel_steer"
+    _accel_scale = float(config["residual_scale"])
+    _steer_scale = float(config.get("residual_steer_scale", -1.0))
+    # Per-dim [accel, steer] authority in accel_steer mode (steer<0 -> reuse accel); scalar otherwise.
+    target_scale = (
+        np.array([_accel_scale, _steer_scale if _steer_scale >= 0.0 else _accel_scale], dtype=np.float32)
+        if _accel_steer_space else np.float32(_accel_scale)
+    )
 
-    def _residual_scale(step: int) -> float:
-        """Annealed residual authority at ``step`` (0 during warmup, linear ramp, then target)."""
+    def _residual_scale(step: int):
+        """Annealed residual authority at ``step`` (0 in warmup, linear ramp, then target); per-dim in accel_steer."""
         if step <= warmup:
-            return 0.0
+            return target_scale * 0.0
         if ramp_steps <= 0 or step >= warmup + ramp_steps:
             return target_scale
-        return target_scale * float(step - warmup) / float(ramp_steps)
+        return target_scale * (float(step - warmup) / float(ramp_steps))
 
     batch_size = int(config["batch_size"])
     updates_per_step = int(config["updates_per_step"])
@@ -1814,13 +1844,31 @@ def run_online_residual(
             # In accel_steer mode ``final`` is a 2-D control (no waypoint projection), so draw the
             # (smooth) base chunk plan; in chunk mode draw the executed (perturbed) chunk.
             viz_action = base_chunk if accel_steer else final
+            # accel_steer HUD: show base/residual/final controls + progress/step/return on the frame
+            # (the waypoint overlay can't convey the residual once it acts post-PID).
+            hud = None
+            if accel_steer:
+                def _fmt2(v) -> str:
+                    a = np.asarray(v, dtype=np.float32).reshape(-1)
+                    return f"({a[0]:+.2f},{a[1]:+.2f})" if a.size >= 2 else f"({a[0]:+.2f})"
+
+                show_resid = residual_active and last_residual is not None
+                hud = {
+                    "base": _fmt2(winner_base),
+                    "residual": _fmt2(last_residual) if show_resid else "(--)",
+                    "final": _fmt2(final),
+                    "scale": _fmt2(scale_now),
+                    "progress": float(info.get("route_progress_pct", 0.0)),
+                    "ep_step": episode_steps,
+                    "ep_return": episode_return,
+                }
             _maybe_capture_frame(
                 episode_frames, next_obs, debug_step_reward if debug_task else reward,
                 episode_steps=episode_steps, done=done,
                 log_video=log_video, video_every=video_every,
                 action_flat=viz_action, exec_cfg=exec_cfg,
                 collision=(collision_count, episode_collision_events) if collision_delta > 0 else None,
-                steervla_actor=steervla_actor,
+                steervla_actor=steervla_actor, hud=hud,
             )
             if live_viewer is not None and episode_frames:
                 live_viewer.publish_frames(episode_frames, step)
@@ -1853,7 +1901,12 @@ def run_online_residual(
                 if agent is not None:
                     log["env/buffer_size"] = int(buffer.size) if buffer is not None else 0
                     log["env/residual_active"] = int(residual_active)
-                    log["env/residual_scale"] = float(scale_now)
+                    _sn = np.asarray(scale_now, dtype=np.float32).reshape(-1)
+                    if _sn.size >= 2:
+                        log["env/residual_scale_accel"] = float(_sn[0])
+                        log["env/residual_scale_steer"] = float(_sn[1])
+                    else:
+                        log["env/residual_scale"] = float(_sn[0])
                 log["training/in_warmup"] = float(step <= warmup)
                 log["training/in_ramp"] = float(ramp_steps > 0 and warmup < step < warmup + ramp_steps)
                 log["training/enable_updates"] = float(enable_updates)

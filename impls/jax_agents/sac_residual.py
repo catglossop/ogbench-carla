@@ -200,7 +200,7 @@ class SACResidualAgent(flax.struct.PyTreeNode):
             "alpha_loss": alpha_loss,
             "alpha": alpha,
             "entropy": -log_probs.mean(),
-            "residual_scale": scale,
+            "residual_scale": jnp.mean(scale),
             "residual_abs_mean": jnp.abs(scale * residual).mean(),
         }
 
@@ -361,6 +361,8 @@ def get_config():
             discount=0.99,
             tau=0.005,
             residual_scale=0.1,
+            # accel_steer only: steer-dim residual authority. <0 -> reuse residual_scale for both dims.
+            residual_steer_scale=-1.0,
             # Consumed by main_carla.py (the SAC agent itself is space-agnostic):
             #   "accel_steer" (default) -> base chunk is PID-decoded to a 2-D [accel, steer] before residual is applied.
             #   "waypoint_chunk" -> residual acts on the flattened normalized 40-D chunk

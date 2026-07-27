@@ -56,8 +56,10 @@ crash_stuck_speed_threshold: 0.1
 crash_stuck_steps: 20
 crash_stuck_penalty: -1.0
 
-# Force a new episode after this many env steps (0 = no limit).
-max_episode_steps: 1000
+# Force a new episode after this many env steps (0 = no limit). 1 step = 0.05s, so
+# 2400 = 120s; clears the ~90s generalization-wall despawn. Ceiling: tick_count>4000 (200s).
+max_episode_steps: 2400
 
-# Per-step reward shaping (defaults in carla_utils.py). Example:
-# speed_limit_penalty_weight: 0.1  # penalty = weight * max(0, speed/limit - 1)
+# Per-step reward shaping (defaults in carla_utils.py).
+# Dense progress = weight * Δroute% / 100; whole-route reward = weight.
+progress_reward_weight: 20.0
