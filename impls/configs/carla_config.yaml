@@ -55,7 +55,7 @@ checkpoint: ./simulation_results.json
 debug_checkpoint: ./live_results.txt
 # CARLA UE / rendering adapter index (leaderboard subprocess). JAX RL GPU is separate:
 # set ``training_gpu_rank`` in the agent config (e.g. steervla_dsrl_config.py).
-gpu_rank: 0 # Carla for some reason swaps the order of the GPUs, so we need to set the rank to 0 for GPU1 in nvtop and vice versa 
+gpu_rank: 0 # Carla swaps GPU order: gpu_rank=1 -> nvtop GPU0, gpu_rank=0 -> nvtop GPU1. We render on nvtop GPU0 (shared with JAX inference+RL) so nvtop GPU1 stays dedicated to the HL update.
 repetitions: 1
 repetition_index: 0
 
@@ -65,7 +65,7 @@ crash_stuck_steps: 20
 crash_stuck_penalty: -5.0
 
 # Force a new episode after this many env steps (0 = no limit).
-max_episode_steps: 2000
+max_episode_steps: 4000
 
 # Per-step reward shaping (defaults in carla_utils.py). Example:
 # speed_limit_penalty_weight: 0.1  # penalty = weight * max(0, speed/limit - 1)

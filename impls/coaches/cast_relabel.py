@@ -504,7 +504,9 @@ def build_credit_relabel_prompt(
           event. For GOOD chunks, keep the original subtask. If a chunk is BAD because the
           vehicle stopped or crawled prematurely while the route is unfinished and the way
           ahead is clear (no red light, stop sign, close leading vehicle, or pedestrian/yield),
-          suggest a subtask that has it accelerate and make forward progress along the route.
+          suggest a subtask that has it accelerate and make forward progress along the route.  
+          DO NOT USE "reverse" or "back up" or "backwards" OR ANYTHING LIKE THIS IN THE SUBTASK. 
+          This will not be understood by the model and will destroy the training signal.
         - suggested_reasoning: for BAD chunks whose subtask you are changing (direct AND
           precursor), write a fresh, concise chain-of-thought (1-3 sentences, present tense)
           that a driver would think BEFORE arriving at the corrected subtask — describe what is

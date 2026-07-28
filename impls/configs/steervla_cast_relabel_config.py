@@ -36,7 +36,7 @@ def get_config():
     config.training_gpu_rank = 0
     config.siglip_device = "cuda:0"
     config.batch_size = 32
-    config.warmup_steps = 200
+    config.warmup_steps = 50
     
     config.enable_updates = True
     # Per-kind switches, each ANDed with ``enable_updates``:
@@ -45,7 +45,7 @@ def get_config():
     #   bc_hl -> high-level VLM backbone update: DSRLAgent.update_with_vla(run_hl=True) calls
     #            SteerVLAActor.update_hl, which fine-tunes the CoT/VLM backbone on the
     #            cast_relabel HL samples (subtask + reasoning targets, action loss masked out).
-    config.enable_updates_rl = False
+    config.enable_updates_rl = True
     config.enable_updates_bc = False
     config.enable_updates_bc_hl = True
 
@@ -57,7 +57,7 @@ def get_config():
             debug_task=False,
             # Review one window every N env steps (rounded down to whole action chunks).
             # A window can be as small as one chunk or as large as a whole episode.
-            query_every_n_episode_steps=200,
+            query_every_n_episode_steps=150,
             query_on_episode_end=True,
             provider="gemini",
             gemini_model="gemini-3.5-flash",
@@ -94,18 +94,30 @@ def get_config():
             # instead of an inference-only param restore. Needed for the cast_relabel
             # fine-tuning step. Set False for a frozen inference-only actor.
             load_trainable_params=True,
+            # Put the high-level (VLM-backbone) gradient step on its OWN GPU, separate from the
+            # inference model + DSRL RL updates (which sit on training_gpu_rank above). This is a JAX
+            # device index into jax.devices("gpu") (same convention as training_gpu_rank), NOT CARLA's
+            # -graphicsadapter rank. The HL train state (params + Adam mu/nu + backward activations) is
+            # the memory hog, so isolating it frees the whole HL GPU for a much larger
+            # hl_update_batch_size; the inference GPU only keeps a forward-only copy of the params.
+            # After each HL update the refreshed weights are copied back to the inference GPU. Set to
+            # -1 (or the same rank as training_gpu_rank) to disable the split and keep everything on
+            # one GPU, exactly as before. Make sure this rank is NOT the CARLA renderer's GPU.
+            hl_training_gpu_rank=1,
             # High-level (VLM-backbone) update knobs, consumed by SteerVLAActor.update_hl.
             # This is the gradient step that supervises the CoT/VLM backbone on the cast_relabel
             # subtask + reasoning targets (action loss masked out). Only active when
             # load_trainable_params=True and enable_updates_bc_hl=True.
             #   hl_update_batch_size -> HL samples per gradient step (default 2, too small).
-            #     NOTE: this is a full Pi0-CoT forward+backward per sample; 256 may OOM the
-            #     training GPU, so start at 128 and bump to 256 if memory allows.
+            #     NOTE: this is a full Pi0-CoT forward+backward per sample. With hl_training_gpu_rank
+            #     isolating the HL step on its own GPU the whole card is available, so you can push
+            #     this much higher (start at 128 and bump toward 256 if memory allows); when the HL
+            #     step shares the inference GPU (hl_training_gpu_rank<0) keep it modest to avoid OOM.
             #   hl_update_every      -> run update_hl once every N update_with_vla calls (1 = every).
             #   hl_update_num_steps  -> gradient steps taken per update_hl call.
-            hl_update_batch_size=32,
-            hl_update_every=10,
-            hl_update_num_steps=1,
+            hl_update_batch_size=64,
+            hl_update_every=5,
+            hl_update_num_steps=2,
             # Freeze the memory-heavy pretrained subtrees for the HL (VLM-backbone) update so its
             # grad + Adam(mu/nu) buffers fit. The HL step supervises only the CoT/subtask targets
             # (action loss masked), so the SigLIP vision tower (``.*img.*``) and the tied Gemma token
@@ -129,7 +141,7 @@ def get_config():
             #   simlingo (kind=regular)          -> flow + FAST + reasoning + subtask (everything).
             #   simplified_reasoning (kind=hl)   -> reasoning + subtask only (flow AND FAST masked).
             # Leave hl_replay_pools empty (or hl_online_weight=1.0) to disable and train online-only.
-            hl_replay_root="/scratch/current/cglossop/steervla_hl_pools",
+            hl_replay_root="/raid/users/cglossop/steervla_hl_pools",
             hl_online_weight=0.7,
             # Within the online cast_relabel share of each HL batch, bias the draw toward corrective
             # chunks: 0.8 -> 80% of the online slots come from the BAD / BAD(precursor) bucket
@@ -138,8 +150,21 @@ def get_config():
             # Set < 0 to disable (uniform draw over the whole online pool). Only the online pool is
             # bucketed; the replay pools keep their own weighted share.
             hl_online_bad_fraction=0.8,
+            # Within that corrective (BAD) share, balance BAD(precursor) vs direct BAD chunks:
+            # 0.5 -> half of the corrective slots are BAD(precursor) (credit_source == "precursor")
+            # and half direct BAD, again topping up from whichever sub-bucket is thin. Set < 0 to
+            # disable the sub-split (corrective slots drawn uniformly over BAD/precursor). Only takes
+            # effect when hl_online_bad_fraction >= 0.
+            hl_online_precursor_fraction=0.5,
+            # How many online cast_relabel samples must exist before the first HL update fires. The
+            # update never waits for the online pool to fill its full hl_online_weight share of
+            # hl_update_batch_size: at/above this count it takes every online sample it has and fills
+            # the rest of the batch from the offline replay pools (repeating rows only if those are
+            # empty too). 1 = start updating as soon as the first relabeled window lands; 0 = allow
+            # replay-only updates before any online sample exists.
+            hl_min_online_samples=20,
             hl_replay_pools=[
-                dict(name="simlingo_dataset_all_img512_1116", weight=0.3),
+                dict(name="simlingo_dataset_all_img512_1116", weight=0.2),
                 dict(name="simplified_reasoning_dataset", weight=0.1),
             ],
             # Local OpenPI inference (ignored when actor_url is set):

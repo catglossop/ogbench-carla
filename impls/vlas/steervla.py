@@ -78,7 +78,7 @@ CARLA_STEERVLA_IMAGE_KEYS: tuple[str, ...] = ("base_0_rgb",)
 # ``<OPENPI_DATA_HOME>/<netloc>/<path>``. Point the cache at NFS so large GCS
 # checkpoints are shared across hosts/users instead of filling each box's home dir;
 # the on-disk layout under it is unchanged.
-STEERVLA_CACHE_DIR = "/scratch/current/cglossop/openpi"
+STEERVLA_CACHE_DIR = "/raid/users/cglossop/openpi"
 
 
 def _ensure_openpi_cache_dir() -> None:
@@ -886,6 +886,7 @@ class SteerVLAActor:
         sample_actions_num_steps: int = 10,
         action_decode_batch_size: int = 2,
         training_gpu_rank: int = -1,
+        hl_training_gpu_rank: int = -1,
         load_trainable_params: bool = False,
         hl_dataset_dir: str | Path | None = None,
         hl_update_every: int = 1,
@@ -896,6 +897,8 @@ class SteerVLAActor:
         hl_replay_pools: list[dict] | None = None,
         hl_online_weight: float = 1.0,
         hl_online_bad_fraction: float = -1.0,
+        hl_online_precursor_fraction: float = -1.0,
+        hl_min_online_samples: int = 1,
         return_normalized_action_chunk: bool = False,
         fixed_subtask_text: Optional[str] = None,
         fixed_reasoning_text: Optional[str] = None,
@@ -948,6 +951,19 @@ class SteerVLAActor:
         # full batch is still produced. ``< 0`` disables the split (uniform draw over the online pool).
         # Only the online pool is bucketed; replay pools keep their weighted share untouched.
         self.hl_online_bad_fraction = float(hl_online_bad_fraction)
+        # Within the corrective (BAD) bucket, further balance BAD(precursor) chunks
+        # (``credit_source == "precursor"``) against direct BAD chunks: ``hl_online_precursor_fraction``
+        # of the corrective slots are filled from the precursor sub-bucket and the remainder from the
+        # direct sub-bucket, again topping up from whichever sub-bucket has spares. ``< 0`` disables the
+        # sub-split (corrective slots drawn uniformly over BAD/precursor). Only meaningful when
+        # ``hl_online_bad_fraction >= 0`` (the corrective bucket must exist to be sub-split).
+        self.hl_online_precursor_fraction = float(hl_online_precursor_fraction)
+        # How many online cast_relabel samples must exist before the FIRST HL update runs. The batch
+        # does NOT wait for the online pool to fill its whole weighted share: as soon as this many
+        # online samples are on disk, the update takes whatever the online pool has and fills the rest
+        # of the batch from the offline replay pools (and, if those can't cover it either, by resampling
+        # what's available). Set to 0 to allow replay-only updates before any online sample lands.
+        self.hl_min_online_samples = max(0, int(hl_min_online_samples))
         self._hl_replay_root: Path | None = Path(hl_replay_root) if hl_replay_root is not None else None
         self._hl_replay_pool_specs: list[dict[str, Any]] = self._resolve_replay_pool_specs(hl_replay_pools)
         self._hl_replay_logged_once = False
@@ -958,6 +974,7 @@ class SteerVLAActor:
         # ``{}``), which makes an absent ``vla_hl/batch_text`` table impossible to explain.
         self._hl_pool_size = 0
         self._last_hl_skip_reason: str | None = None
+        self._last_hl_note: str | None = None
         self._hl_logged_batch_once = False
         self._hl_logged_json_once = False
         # Rows accumulated for the wandb step currently being logged. ``updates_per_step`` sends
@@ -1028,6 +1045,15 @@ class SteerVLAActor:
         self.tokenizer = None
         self.model_cfg = None
         self._jax_device = None
+        # Optional dedicated device for the high-level (VLM-backbone) update. When
+        # ``hl_training_gpu_rank`` selects a GPU different from ``training_gpu_rank``, the trainable
+        # ``_train_state`` (params + optimizer + backward activations — the memory hog) lives here,
+        # isolated from the inference model + DSRL RL updates on ``_jax_device``. This frees the whole
+        # HL GPU for a larger ``hl_update_batch_size``. When they match (or the split is disabled),
+        # ``_hl_jax_device`` is just ``_jax_device`` and behavior is unchanged. Set in :meth:`setup`.
+        self._hl_jax_device = None
+        # Requested HL device rank (``< 0`` or equal-to-inference => no split).
+        self.hl_training_gpu_rank = int(hl_training_gpu_rank)
         self._local_ready = False
         self.checkpoint_dir: Path | None = None
         self._mesh: jax.sharding.Mesh | None = None
@@ -1102,14 +1128,34 @@ class SteerVLAActor:
             # GPU. Matches ``scripts/train.py :: init_train_state`` so the actor's weights can be
             # gradient-updated. ``self.model`` is reconstructed from the live (non-EMA) params.
             print("Loading SteerVLA as a trainable model (full train state).", flush=True)
+            # Inference (+ DSRL RL) device. The HL train state can optionally live on a *different*
+            # GPU (``hl_training_gpu_rank``) so its optimizer/backward memory doesn't compete with the
+            # inference model, leaving that GPU free for a bigger HL batch.
+            infer_device = _pick_single_gpu_device(training_gpu_rank)
+            hl_rank = self.hl_training_gpu_rank
+            hl_device = _pick_single_gpu_device(hl_rank) if hl_rank >= 0 else infer_device
+            split_hl = hl_device != infer_device
             train_state, mesh, device = init_openpi_train_state_single_gpu(
                 self.train_cfg,
-                training_gpu_rank=training_gpu_rank,
+                training_gpu_rank=(hl_rank if split_hl else training_gpu_rank),
             )
             self._train_state = train_state
             self._mesh = mesh
-            self.model = nnx.merge(train_state.model_def, train_state.params)
-            self._jax_device = device
+            self._jax_device = infer_device
+            self._hl_jax_device = device  # where the train state / HL gradient step live.
+            if split_hl:
+                # Keep the inference model on ``infer_device``; the train state (and its params) stay
+                # on ``hl_device``. Copy the params across once for the initial inference model; each
+                # HL update later re-syncs via :meth:`_refresh_inference_weights`.
+                print(
+                    f"[steervla] HL update isolated on {hl_device} (rank {hl_rank}); "
+                    f"inference + RL on {infer_device} (rank {training_gpu_rank}).",
+                    flush=True,
+                )
+                infer_params = jax.device_put(train_state.params, infer_device)
+                self.model = nnx.merge(train_state.model_def, infer_params)
+            else:
+                self.model = nnx.merge(train_state.model_def, train_state.params)
 
             # Confirm the freeze actually matched: a regex that matches nothing would silently keep
             # the whole model trainable and OOM again. Report trainable vs total param counts and the
@@ -1136,6 +1182,7 @@ class SteerVLAActor:
             )
             self.model = self.train_cfg.model.load(params)
             self._jax_device = device
+            self._hl_jax_device = device  # no HL update in inference-only mode; keep them aligned.
 
         self.tokenizer = CoTPaligemmaTokenizer(
             max_prompt_len=model_cfg.max_token_len,
@@ -1268,7 +1315,13 @@ class SteerVLAActor:
         """
         if not self._weights_dirty or self._train_state is None:
             return
-        self.model = nnx.merge(self._train_state.model_def, self._train_state.params)
+        params = self._train_state.params
+        # When the HL update runs on a separate GPU, the freshly-updated params live on
+        # ``_hl_jax_device``; copy them back to the inference device before rebuilding the model so
+        # inference stays on ``_jax_device`` (with the DSRL RL updates).
+        if self._hl_jax_device is not None and self._hl_jax_device != self._jax_device:
+            params = jax.device_put(params, self._jax_device)
+        self.model = nnx.merge(self._train_state.model_def, params)
         self._build_sample_wrappers()
         self._weights_dirty = False
 
@@ -1374,16 +1427,48 @@ class SteerVLAActor:
         """True for a cast_relabel BAD / BAD(precursor) chunk (either ``credit_source``)."""
         return str(e.get("label") or "").strip().upper() == "BAD"
 
+    @staticmethod
+    def _is_precursor_entry(e: dict[str, Any]) -> bool:
+        """True for a cast_relabel BAD(precursor) chunk (``credit_source == "precursor"``)."""
+        return str(e.get("credit_source") or "").strip().lower() == "precursor"
+
+    @staticmethod
+    def _balance_buckets(
+        primary: list[dict[str, Any]],
+        secondary: list[dict[str, Any]],
+        cnt: int,
+        primary_fraction: float,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Pick up to ``cnt`` entries — ~``primary_fraction`` from ``primary``, the rest from
+        ``secondary`` — topping up from whichever bucket has spares when the other underfills.
+        Both inputs are assumed pre-shuffled. Returns ``(selected, leftovers)``.
+        """
+        n_primary = min(len(primary), int(round(cnt * float(primary_fraction))))
+        n_secondary = cnt - n_primary
+        if n_secondary > len(secondary):  # secondary bucket short -> pull more primary to reach cnt.
+            n_secondary = len(secondary)
+            n_primary = min(len(primary), cnt - n_secondary)
+        selected = primary[:n_primary] + secondary[:n_secondary]
+        leftovers = primary[n_primary:] + secondary[n_secondary:]
+        return selected, leftovers
+
     def _order_online_entries(
-        self, entries: list[dict[str, Any]], cnt: int, bad_fraction: float
+        self,
+        entries: list[dict[str, Any]],
+        cnt: int,
+        bad_fraction: float,
+        precursor_fraction: float = -1.0,
     ) -> list[dict[str, Any]]:
         """Order online-pool entries so the first ``cnt`` are ~``bad_fraction`` BAD, the rest GOOD/null.
 
         BAD and BAD(precursor) chunks form the corrective bucket; GOOD and unlabeled/null chunks the
         reinforce bucket. Selects ``round(cnt * bad_fraction)`` corrective + the remainder reinforce,
         topping up from whichever bucket has spares when the other underfills so ``cnt`` is met when
-        possible. Remaining entries are appended (shuffled) as leftover top-up candidates for the
-        caller. The returned list is a full permutation of ``entries``.
+        possible. When ``precursor_fraction >= 0``, the corrective slots are themselves balanced
+        between BAD(precursor) and direct BAD chunks (``round(n_bad * precursor_fraction)`` precursor,
+        the rest direct), with the same underfill top-up. Remaining entries are appended (shuffled) as
+        leftover top-up candidates for the caller. The returned list is a full permutation of
+        ``entries``.
         """
         bad = [e for e in entries if self._is_bad_entry(e)]
         good = [e for e in entries if not self._is_bad_entry(e)]
@@ -1394,8 +1479,16 @@ class SteerVLAActor:
         if n_good > len(good):  # reinforce bucket short -> pull more corrective to reach cnt.
             n_good = len(good)
             n_bad = min(len(bad), cnt - n_good)
-        selected = bad[:n_bad] + good[:n_good]
-        leftovers = bad[n_bad:] + good[n_good:]
+        if precursor_fraction >= 0.0:
+            # Sub-split the corrective bucket by BAD(precursor) vs direct BAD. ``bad`` is already
+            # shuffled, so the comprehensions inherit that shuffle.
+            precursor = [e for e in bad if self._is_precursor_entry(e)]
+            direct = [e for e in bad if not self._is_precursor_entry(e)]
+            bad_selected, bad_leftover = self._balance_buckets(precursor, direct, n_bad, precursor_fraction)
+        else:
+            bad_selected, bad_leftover = bad[:n_bad], bad[n_bad:]
+        selected = bad_selected + good[:n_good]
+        leftovers = bad_leftover + good[n_good:]
         np.random.shuffle(selected)
         np.random.shuffle(leftovers)
         return selected + leftovers
@@ -1451,14 +1544,18 @@ class SteerVLAActor:
             "state_format": str(e.get("state_format", "carla_raw")),
             "pool": e.get("pool", "online"),
             "label": e.get("label"),
+            "credit_source": e.get("credit_source", ""),
         }
 
     def _load_hl_batch(self, batch_size: int):
         """Draw a weighted mixed batch of HL records across the online + replay pools.
 
         Counts are split across active pools by their (normalized) weights, mirroring steervla-pi's
-        dataset mixture. Returns ``None`` (skip/wait) until the online cast_relabel pool can supply
-        its full share, so every update includes fresh relabel data rather than only replay.
+        dataset mixture. The online cast_relabel pool does NOT have to fill its whole weighted share:
+        as soon as it holds ``hl_min_online_samples`` samples the update runs, taking every online
+        sample available (up to its share) and topping the batch up from the offline replay pools.
+        Returns ``None`` only when the online pool is still below ``hl_min_online_samples`` (or no
+        pool has any readable sample at all).
         """
         bs = int(batch_size)
         pools = self._hl_pools()
@@ -1484,19 +1581,17 @@ class SteerVLAActor:
         self._hl_pool_size = (
             len(online["entries"]) if online is not None else sum(len(s["entries"]) for s in scanned)
         )
+        # Gate only on *starting* the online stream, not on it filling its share: below
+        # ``hl_min_online_samples`` we'd be training on replay alone, which is not the point of the
+        # online HL update. At or above it, whatever is on disk goes in and replay covers the rest.
+        if online is not None and len(online["entries"]) < self.hl_min_online_samples:
+            return None
+
         active = [s for s in scanned if s["entries"]]
         if not active:
             return None
         wsum = sum(float(s["pool"]["weight"]) for s in active)
         counts = self._largest_remainder(bs, [float(s["pool"]["weight"]) / wsum for s in active])
-
-        # Gate on the online share so we never train on replay alone.
-        if online is not None:
-            if online not in active:
-                return None
-            need_online = counts[active.index(online)]
-            if len(online["entries"]) < need_online:
-                return None
 
         records: list[dict[str, Any]] = []
         leftovers: list[dict[str, Any]] = []
@@ -1504,7 +1599,9 @@ class SteerVLAActor:
             # The online pool is bucketed 80/20 (BAD/precursor vs GOOD/null) when enabled; replay
             # pools (and disabled split) draw uniformly at random.
             if s["pool"].get("kind") == "online" and self.hl_online_bad_fraction >= 0.0:
-                ordered = self._order_online_entries(s["entries"], cnt, self.hl_online_bad_fraction)
+                ordered = self._order_online_entries(
+                    s["entries"], cnt, self.hl_online_bad_fraction, self.hl_online_precursor_fraction
+                )
             else:
                 ordered = [s["entries"][int(j)] for j in np.random.permutation(len(s["entries"]))]
             taken = 0
@@ -1525,13 +1622,17 @@ class SteerVLAActor:
                 rec = self._read_hl_record(e)
                 if rec is not None:
                     records.append(rec)
-        if len(records) < bs:
-            return self._hl_short_batch(len(records), bs)
+        if not records:
+            return self._hl_short_batch(0, bs)
         records = records[:bs]
         # Records are assembled pool-by-pool (online block, then each replay pool), so without this
         # shuffle the batch — and the logged HL panel, which shows the leading rows — would be all
         # online. Interleave the pools so the batch (and its inspection panel) is a random mix.
         np.random.shuffle(records)
+        if len(records) < bs:
+            records = self._pad_hl_batch(records, bs)
+        else:
+            self._last_hl_note = None  # Cleared: a later partial batch should re-announce itself.
         if not self._hl_replay_logged_once and (
             self._hl_replay_pool_specs or self.hl_online_bad_fraction >= 0.0
         ):
@@ -1544,16 +1645,53 @@ class SteerVLAActor:
                 n_bad = sum(1 for r in records if r.get("pool") == "online" and self._is_bad_entry(r))
                 n_online = sum(1 for r in records if r.get("pool") == "online")
                 msg += f"; online label split (BAD/precursor -> {n_bad}, GOOD/null -> {n_online - n_bad})"
+                if self.hl_online_precursor_fraction >= 0.0:
+                    n_precursor = sum(
+                        1
+                        for r in records
+                        if r.get("pool") == "online" and self._is_bad_entry(r) and self._is_precursor_entry(r)
+                    )
+                    msg += f"; corrective split (precursor -> {n_precursor}, direct BAD -> {n_bad - n_precursor})"
             print(msg, flush=True)
         return records
 
     def _hl_short_batch(self, got: int, bs: int):
-        """Report an under-filled batch once, then skip the update rather than train on a partial one."""
+        """Report a batch with nothing readable in it and skip the update."""
         self._hl_skip(
             f"HL pool has {self._hl_pool_size} samples but only {got}/{bs} were readable "
             f"(missing or half-written .npz under {self.hl_dataset_dir}); skipping this update"
         )
         return None
+
+    def _pad_hl_batch(self, records: list[dict[str, Any]], bs: int) -> list[dict[str, Any]]:
+        """Repeat-sample ``records`` up to ``bs`` rows so the batch shape stays fixed.
+
+        Only reached when the online pool has started but neither it nor the replay pools can cover a
+        full batch yet (typically the first few updates of a run, or replay pools not extracted). The
+        alternative — training on a genuinely smaller batch — retraces/recompiles ``_hl_train_step``
+        for every new size and re-allocates its backward buffers, so instead the available rows are
+        cycled (in shuffled passes) to fill ``bs``. Gradient-wise this is the mean over the distinct
+        rows; it just costs the extra compute of the duplicated rows.
+        """
+        n = len(records)
+        if n >= bs or n == 0:
+            return records[:bs]
+        padded = list(records)
+        while len(padded) < bs:
+            extra = list(records)
+            np.random.shuffle(extra)
+            padded.extend(extra[: bs - len(padded)])
+        self._hl_note(
+            f"partial HL batch: {n}/{bs} distinct samples available "
+            f"(online pool {self._hl_pool_size}); repeating them to fill the batch"
+        )
+        return padded
+
+    def _hl_note(self, msg: str) -> None:
+        """Print an HL-update note once per distinct message (same de-dup idea as :meth:`_hl_skip`)."""
+        if msg != getattr(self, "_last_hl_note", None):
+            print(f"[steervla.update_hl] {msg}", flush=True)
+            self._last_hl_note = msg
 
     def _build_hl_observation_batch(self, records: list[dict[str, Any]]):
         """Build ``(Observation, actions)`` for :meth:`update_hl` from mixed HL records.
@@ -1683,7 +1821,9 @@ class SteerVLAActor:
         observation = _openpi_model.Observation.from_dict(data)
         actions = np.stack(act_rows, axis=0).astype(np.float32)
 
-        device = self._jax_device
+        # The HL gradient step runs on ``_hl_jax_device`` (== ``_jax_device`` unless the HL update is
+        # isolated on its own GPU), so colocate the batch with the train state.
+        device = self._hl_jax_device or self._jax_device
         observation = jax.tree.map(lambda x: jax.device_put(jnp.asarray(x), device), observation)
         actions = jax.device_put(jnp.asarray(actions), device)
         return observation, actions
@@ -1954,9 +2094,12 @@ class SteerVLAActor:
         """Run high-level (VLM-backbone) gradient steps on the stored cast_relabel HL dataset.
 
         No-op (returns ``{}``) unless the actor was loaded trainable (``load_trainable_params``) and the
-        HL dataset holds at least ``batch_size`` samples (so the first update waits for a full,
-        randomly-sampled batch). Throttled by ``hl_update_every`` calls. Updates ``self._train_state``
-        in place and marks the inference weights dirty so the next rollout uses the updated backbone.
+        online cast_relabel pool holds at least ``hl_min_online_samples`` samples. It does *not* wait
+        for ``batch_size`` online samples: the batch takes whatever the online pool has (up to its
+        weighted share) and fills the rest from the offline replay pools, repeating rows only if even
+        those can't cover ``batch_size``. Throttled by ``hl_update_every`` calls. Updates
+        ``self._train_state`` in place and marks the inference weights dirty so the next rollout uses
+        the updated backbone.
         """
         if self._remote is not None:
             return self._hl_skip(
@@ -1981,9 +2124,10 @@ class SteerVLAActor:
         loaded = self._load_hl_batch(bs)
         if loaded is None:
             return self._hl_skip(
-                f"waiting for a full HL batch: {self._hl_pool_size}/{bs} samples under "
-                f"{self.hl_dataset_dir} (lower steervla.hl_update_batch_size, or let more "
-                f"cast_relabel windows finish)"
+                f"waiting for the online HL pool to start: {self._hl_pool_size}/"
+                f"{self.hl_min_online_samples} samples under {self.hl_dataset_dir} "
+                f"(lower steervla.hl_min_online_samples, or let more cast_relabel windows finish). "
+                f"Once it starts, the batch fills from replay rather than waiting for {bs} online samples"
             )
         records = loaded
         self._last_hl_skip_reason = None  # Cleared: a later skip should re-announce itself.
@@ -2023,7 +2167,7 @@ class SteerVLAActor:
         # sample ``peak_bytes_in_use`` (async dispatch would otherwise read a stale peak).
         try:
             jax.block_until_ready(self._train_state.params)
-            dev = self._jax_device or jax.local_devices()[0]
+            dev = self._hl_jax_device or self._jax_device or jax.local_devices()[0]
             stats = dev.memory_stats() or {}
             live = stats.get("bytes_in_use")
             peak = stats.get("peak_bytes_in_use")
@@ -3165,6 +3309,7 @@ def create_steervla_pi0_cot_sample_fn(
         sample_actions_num_steps=int(steervla_cfg.get("sample_actions_num_steps", 10)),
         action_decode_batch_size=int(steervla_cfg.get("action_decode_batch_size", 2)),
         training_gpu_rank=int(srank),
+        hl_training_gpu_rank=int(steervla_cfg.get("hl_training_gpu_rank", -1)),
         load_trainable_params=bool(steervla_cfg.get("load_trainable_params", False)),
         hl_dataset_dir=steervla_cfg.get("hl_dataset_dir"),
         hl_update_every=int(steervla_cfg.get("hl_update_every", 1)),
@@ -3176,6 +3321,8 @@ def create_steervla_pi0_cot_sample_fn(
         hl_replay_pools=steervla_cfg.get("hl_replay_pools"),
         hl_online_weight=float(steervla_cfg.get("hl_online_weight", 1.0)),
         hl_online_bad_fraction=float(steervla_cfg.get("hl_online_bad_fraction", -1.0)),
+        hl_online_precursor_fraction=float(steervla_cfg.get("hl_online_precursor_fraction", -1.0)),
+        hl_min_online_samples=int(steervla_cfg.get("hl_min_online_samples", 1)),
         return_normalized_action_chunk=bool(steervla_cfg.get("use_pi_action_chunk_for_env", True)),
         fixed_subtask_text=steervla_cfg.get("fixed_subtask_text"),
         fixed_reasoning_text=steervla_cfg.get("fixed_reasoning_text"),
