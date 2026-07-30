@@ -62,4 +62,4 @@ max_episode_steps: 2400
 
 # Per-step reward shaping (defaults in carla_utils.py).
 # Dense progress = weight * Δroute% / 100; whole-route reward = weight.
-progress_reward_weight: 20.0
+progress_reward_weight: 5.0
