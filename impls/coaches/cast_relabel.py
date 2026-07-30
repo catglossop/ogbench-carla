@@ -307,6 +307,46 @@ def _extract_json_payload(text: str) -> dict[str, Any]:
         raise ValueError("CAST relabel response must be a JSON object.")
     return payload
 
+def build_chunks_payload(
+    chunk_specs: list[ActionChunkSpec],
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Chunk timing table for the credit prompt, with the env reward earned over each chunk.
+
+    The credit-assignment call gets neither the video nor the per-step trajectory data — only the
+    prose event list from the window review. Folding the per-step ``reward_total`` into each chunk
+    gives it the one hard, per-chunk signal it can otherwise not see: which chunks the environment
+    itself paid for and which it penalized. Reward keys are omitted for chunks whose steps carry no
+    reward (older trajectories), so the prompt never shows misleading zeros.
+    """
+    step_rewards: dict[int, float] = {}
+    for s in metadata.get("steps", []) or []:
+        if not isinstance(s, dict) or s.get("reward_total") is None or s.get("episode_step") is None:
+            continue
+        step_rewards[int(s["episode_step"])] = float(s["reward_total"])
+
+    payload: list[dict[str, Any]] = []
+    for spec in chunk_specs:
+        entry: dict[str, Any] = {
+            "chunk_index": spec.chunk_index,
+            "episode_step_start": spec.episode_step_start,
+            "episode_step_end": spec.episode_step_end,
+            "video_time_start_sec": round(spec.video_time_start_sec, 3),
+            "video_time_end_sec": round(spec.video_time_end_sec, 3),
+        }
+        span = [
+            step_rewards[st]
+            for st in range(int(spec.episode_step_start), int(spec.episode_step_end) + 1)
+            if st in step_rewards
+        ]
+        if span:
+            entry["reward_total_sum"] = round(sum(span), 4)
+            entry["reward_total_mean"] = round(sum(span) / len(span), 4)
+            entry["reward_total_min"] = round(min(span), 4)
+        payload.append(entry)
+    return payload
+
+
 def build_debug_task_prompt(
     *,
     events: list[CoachEvent],
@@ -327,16 +367,7 @@ def build_debug_task_prompt(
         }
         for e in events
     ]
-    chunks_payload = [
-        {
-            "chunk_index": s.chunk_index,
-            "episode_step_start": s.episode_step_start,
-            "episode_step_end": s.episode_step_end,
-            "video_time_start_sec": round(s.video_time_start_sec, 3),
-            "video_time_end_sec": round(s.video_time_end_sec, 3),
-        }
-        for s in chunk_specs
-    ]
+    chunks_payload = build_chunks_payload(chunk_specs, metadata)
     # Present a bounded sample of seed subtasks to keep the prompt small.
     seeds_subtasks = list(seed_subtasks)[:max_seed_examples]
     seed_subtask_block = "\n".join(f"- {s}" for s in seeds_subtasks)
@@ -419,16 +450,7 @@ def build_credit_relabel_prompt(
         }
         for e in events
     ]
-    chunks_payload = [
-        {
-            "chunk_index": s.chunk_index,
-            "episode_step_start": s.episode_step_start,
-            "episode_step_end": s.episode_step_end,
-            "video_time_start_sec": round(s.video_time_start_sec, 3),
-            "video_time_end_sec": round(s.video_time_end_sec, 3),
-        }
-        for s in chunk_specs
-    ]
+    chunks_payload = build_chunks_payload(chunk_specs, metadata)
     # Present a bounded sample of seed subtasks to keep the prompt small.
     seeds_subtasks = list(seed_subtasks)[:max_seed_examples]
     seed_subtask_block = "\n".join(f"- {s}" for s in seeds_subtasks)
@@ -453,9 +475,10 @@ def build_credit_relabel_prompt(
         video seconds as the events) is given below.
 
         Window summary (``route_progress_end_pct`` < 100 means the route is unfinished — making
-        forward progress toward completion is a primary objective):
+        forward progress toward completion is a primary objective; ``window_reward_total`` is the
+        environment reward summed over the window):
         ```json
-        {json.dumps({k: metadata.get(k) for k in ("episode", "route", "episode_steps", "window_index", "success", "route_progress_start_pct", "route_progress_end_pct", "route_completed", "mean_end_speed_mps")}, indent=2)}
+        {json.dumps({k: metadata.get(k) for k in ("episode", "route", "episode_steps", "window_index", "success", "route_progress_start_pct", "route_progress_end_pct", "route_completed", "mean_end_speed_mps", "window_reward_total", "window_reward_mean")}, indent=2)}
         ```
 
         GOOD/BAD events from the window review (timestamps are video seconds):
@@ -463,7 +486,16 @@ def build_credit_relabel_prompt(
         {json.dumps(events_payload, indent=2)}
         ```
 
-        Action chunks in this window:
+        Action chunks in this window. ``reward_total_sum`` / ``reward_total_mean`` /
+        ``reward_total_min`` are the environment reward earned over each chunk's steps — the
+        objective the policy is trained on. It rises with route progress and falls with collisions,
+        route/traffic infractions, and harsh steering or braking. Treat a chunk with a low or
+        negative reward as corroborating evidence for BAD, and a precursor chunk that still looks
+        well-paid as a reason to check whether the blame really belongs there. Reward is NOT the
+        verdict on its own: it is per-step and myopic, so a chunk can be well-paid and still be the
+        precursor that made a later failure unavoidable (e.g. carrying speed toward an occlusion
+        earns progress reward right up to the near-miss). The event list remains the primary
+        evidence:
         ```json
         {json.dumps(chunks_payload, indent=2)}
         ```
@@ -1302,6 +1334,14 @@ class OnlineCastRelabelSession:
             if s.get("ego_speed_mps") is not None
         ]
         mean_end_speed_mps = round(sum(end_speeds) / len(end_speeds), 3) if end_speeds else None
+        # Env reward over the window. The per-step values go into the review prompt's
+        # per-timestamp block; these summaries let the credit pass (which sees no per-step data)
+        # reason about the window as a whole.
+        rewards = [
+            float(s["reward_total"]) for s in traj_window if s.get("reward_total") is not None
+        ]
+        window_reward_total = round(sum(rewards), 4) if rewards else None
+        window_reward_mean = round(sum(rewards) / len(rewards), 4) if rewards else None
         return {
             "episode": self.episode_count,
             "route": self.route_name,
@@ -1320,6 +1360,8 @@ class OnlineCastRelabelSession:
             "route_progress_delta_pct": route_progress_delta_pct,
             "route_completed": route_completed,
             "mean_end_speed_mps": mean_end_speed_mps,
+            "window_reward_total": window_reward_total,
+            "window_reward_mean": window_reward_mean,
             "collision_events": collision_events,
             "chunk_original_subtask": chunk_original_subtask,
             "steps": traj_window,

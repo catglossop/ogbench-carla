@@ -369,6 +369,31 @@ def format_steervla_cot_prompt(
     return f"Prompt:{cleaned};State:{state_str};"
 
 
+_COT_PROMPT_WRAPPER_RE = re.compile(r"^Prompt:(.*?);State:[-\d\s]*;$", re.DOTALL)
+
+
+def unformat_steervla_cot_prompt(text: str) -> str:
+    """Strip a ``Prompt:<instruction>;State:<digits>;`` wrapper, returning the bare instruction.
+
+    Defensive inverse of :func:`format_steervla_cot_prompt`. Anything that re-tokenizes a *stored*
+    prompt must pass ``tokenize_prompt`` the bare instruction, because that method applies the
+    wrapper itself — handing it an already-wrapped string yields
+    ``Prompt:Prompt:<instr>;State:<s>;;State:<s>;``, a prefix format the model never sees at
+    inference. Producers should store the raw instruction (``openpi_prompt_raw_text``); this exists
+    so datasets already written with the wrapped form still train on the correct prefix.
+
+    Returns ``text`` unchanged when it is not wrapped. Applied to a fixed point, so a prompt that
+    was already double-wrapped on disk unwraps all the way back to the bare instruction.
+    """
+    stripped = str(text or "").strip()
+    for _ in range(4):  # Bounded: real prompts are wrapped at most once or twice.
+        match = _COT_PROMPT_WRAPPER_RE.match(stripped)
+        if match is None:
+            break
+        stripped = match.group(1).strip()
+    return stripped
+
+
 def carla_state_vec_to_steervla_state(
     carla_vec: np.ndarray,
     *,
@@ -839,6 +864,91 @@ def _resize_hl_image(image: Any, hw: tuple[int, int] = _HL_IMAGE_HW) -> np.ndarr
     return resize_stretch_np(image, hw[0], hw[1])
 
 
+def cot_special_token_map(tokenizer: CoTPaligemmaTokenizer) -> dict[int, str]:
+    """Map the reserved CoT / sentencepiece control ids to readable tags, for token decoding.
+
+    The CoT delimiters live at the top of the PaliGemma vocab (``vocab_size - 1 - skip - slot``) and
+    sentencepiece ``decode`` renders them as empty strings, so a plain decode silently swallows exactly
+    the tokens that say where the reasoning and subtask segments begin and end. Tagging them keeps a
+    decoded segment structurally legible (e.g. ``<sor>...<eor>``).
+    """
+    sp = tokenizer._tokenizer  # openpi exposes no public accessor for the sentencepiece processor.
+    out: dict[int, str] = {}
+    for name, fn in (
+        ("<start_of_subtask>", tokenizer._start_of_subtask),
+        ("<end_of_subtask>", tokenizer._end_of_subtask),
+        ("<start_of_reasoning>", tokenizer._start_of_reasoning),
+        ("<end_of_reasoning>", tokenizer._end_of_reasoning),
+    ):
+        try:
+            out[int(fn())] = name
+        except Exception:  # noqa: BLE001 - a missing delimiter must not break decoding.
+            continue
+    for name, fn in (("<bos>", sp.bos_id), ("<eos>", sp.eos_id), ("<pad>", sp.pad_id)):
+        try:
+            tid = int(fn())
+        except Exception:  # noqa: BLE001
+            continue
+        if tid >= 0:
+            out.setdefault(tid, name)
+    return out
+
+
+def decode_cot_token_ids(
+    tokenizer: CoTPaligemmaTokenizer,
+    ids: Any,
+    mask: Any = None,
+    *,
+    keep_padding: bool = False,
+) -> str:
+    """Decode one tokenized segment (prompt / reasoning / subtask / fast) back to text.
+
+    This is the inverse of ``CoTPaligemmaTokenizer.tokenize_*`` and is meant for *inspection of the
+    exact tensors a training step consumes*, not for generation. Reserved delimiter ids are rendered
+    as tags (see :func:`cot_special_token_map`) and the remaining runs are decoded with sentencepiece.
+
+    ``mask`` (the segment's ``tokenized_*_mask``) selects the real tokens; the padding tail is dropped
+    unless ``keep_padding``. Never raises — decode failures degrade to raw piece concatenation.
+    """
+    arr = np.asarray(jax.device_get(ids)).reshape(-1).astype(np.int64)
+    if mask is not None and not keep_padding:
+        m = np.asarray(jax.device_get(mask)).reshape(-1).astype(bool)
+        n = min(arr.shape[0], m.shape[0])
+        arr = arr[:n][m[:n]]
+    specials = cot_special_token_map(tokenizer)
+    sp = tokenizer._tokenizer
+    pieces: list[str] = []
+    buf: list[int] = []
+
+    def _flush() -> None:
+        if not buf:
+            return
+        try:
+            pieces.append(sp.decode(list(buf)))
+        except Exception:  # noqa: BLE001 - out-of-range ids (e.g. FAST codes) can trip decode.
+            pieces.append(
+                "".join(_piece_or_id(sp, t) for t in buf).replace("▁", " ")
+            )
+        buf.clear()
+
+    for tid in arr.tolist():
+        if tid in specials:
+            _flush()
+            pieces.append(specials[tid])
+        else:
+            buf.append(int(tid))
+    _flush()
+    return "".join(pieces)
+
+
+def _piece_or_id(sp: Any, token_id: int) -> str:
+    """``id_to_piece`` with an ``<id:N>`` fallback for ids outside the sentencepiece vocab."""
+    try:
+        return str(sp.id_to_piece(int(token_id)))
+    except Exception:  # noqa: BLE001
+        return f"<id:{int(token_id)}>"
+
+
 def _fit_chunk_to_horizon(chunk: np.ndarray, horizon: int, dim: int) -> np.ndarray:
     """Coerce a ``(H, D)`` chunk to exactly ``(horizon, dim)`` (pad-last-row / truncate as needed)."""
     arr = np.asarray(chunk, dtype=np.float32)
@@ -899,6 +1009,7 @@ class SteerVLAActor:
         hl_online_bad_fraction: float = -1.0,
         hl_online_precursor_fraction: float = -1.0,
         hl_min_online_samples: int = 1,
+        hl_log_batch_tokens: bool = True,
         return_normalized_action_chunk: bool = False,
         fixed_subtask_text: Optional[str] = None,
         fixed_reasoning_text: Optional[str] = None,
@@ -964,6 +1075,11 @@ class SteerVLAActor:
         # of the batch from the offline replay pools (and, if those can't cover it either, by resampling
         # what's available). Set to 0 to allow replay-only updates before any online sample lands.
         self.hl_min_online_samples = max(0, int(hl_min_online_samples))
+        # Decode every HL batch's tokens back to text right before the gradient step consumes them
+        # (:meth:`_dump_hl_batch_tokens`). Cheap (one host transfer + sentencepiece decode per update)
+        # and the only place tokenization damage — truncated reasoning, empty segments, masked
+        # padding — is observable, so it defaults on; set steervla.hl_log_batch_tokens=False to skip.
+        self.hl_log_batch_tokens = bool(hl_log_batch_tokens)
         self._hl_replay_root: Path | None = Path(hl_replay_root) if hl_replay_root is not None else None
         self._hl_replay_pool_specs: list[dict[str, Any]] = self._resolve_replay_pool_specs(hl_replay_pools)
         self._hl_replay_logged_once = False
@@ -983,6 +1099,12 @@ class SteerVLAActor:
         # table instead of overwriting each other.
         self._hl_table_step: int | None = None
         self._hl_table_rows: list[list[Any]] = []
+        # Same accumulate-per-env-step bookkeeping for the decoded-token table.
+        self._hl_token_table_step: int | None = None
+        self._hl_token_table_rows: list[list[Any]] = []
+        self._hl_logged_tokens_once = False
+        # (segment, pool) pairs already warned about for tokenizer truncation — warn once each.
+        self._hl_truncation_warned: set[tuple[str, str]] = set()
         self._weights_dirty = False
         self.raw_obs_holder = raw_obs_holder
         self.routing_command = routing_command
@@ -1735,7 +1857,10 @@ class SteerVLAActor:
                     include_ego_history=self.include_ego_history,
                     proprio_norm=self.proprio_norm,
                 )
-            prompt_text = (str(rec.get("prompt", "")).strip() or self.routing_command)
+            # ``tokenize_prompt`` applies the ``Prompt:...;State:...;`` wrapper itself, so unwrap
+            # any stored prompt that already carries it (datasets written before the producer was
+            # fixed) rather than double-wrapping into a prefix format the model never sees.
+            prompt_text = unformat_steervla_cot_prompt(rec.get("prompt", "")) or self.routing_command
             tok_ids, tok_mask = self.tokenizer.tokenize_prompt(
                 prompt_text, state_pad, state_dim=self.prompt_state_dim
             )
@@ -2083,6 +2208,221 @@ class SteerVLAActor:
         except Exception as exc:  # noqa: BLE001 - local logging must never break the update.
             print(f"[steervla.update_hl] local HL batch JSON dump failed (non-fatal): {exc}", flush=True)
 
+    def _decode_hl_batch_tokens(
+        self,
+        observation: Any,
+        actions: Any,
+        records: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Decode the *tokenized* HL batch back to text, sample by sample.
+
+        Everything else logged around the HL update (``_log_hl_batch_to_wandb``,
+        ``_dump_hl_batch_json``, the figure) reads the manifest strings — i.e. the supervision as it
+        was *written by cast_relabel*. This reads the tensors that :meth:`update_hl` is about to hand
+        to ``_hl_train_step``, so anything the tokenizer did in between (truncation of a long
+        reasoning trace, an empty segment falling back to ``"Follow the route."``, a mask that
+        supervises padding, a subtask/reasoning swap) shows up here and nowhere else.
+
+        Per sample it reports the decoded prompt / reasoning / subtask (and FAST segment when
+        supervised), the token counts against each segment's max length, a ``truncated`` flag, and
+        whether the decode round-trips to the source string.
+        """
+        assert self.tokenizer is not None
+        max_prompt = int(getattr(self.tokenizer, "_max_prompt_len", 0))
+        max_reason = int(getattr(self.tokenizer, "_max_reasoning_len", 0))
+        max_subtask = int(getattr(self.tokenizer, "_max_subtask_len", 0))
+        segments = (
+            ("prompt", observation.tokenized_prompt, observation.tokenized_prompt_mask, max_prompt),
+            ("reasoning", observation.tokenized_reasoning, observation.tokenized_reasoning_mask, max_reason),
+            ("subtask", observation.tokenized_subtask, observation.tokenized_subtask_mask, max_subtask),
+            ("fast", observation.tokenized_fast, observation.tokenized_fast_mask, int(self.tokenizer.max_fast_len)),
+        )
+        # One host transfer per array rather than one per (sample, segment).
+        seg_np: dict[str, tuple[np.ndarray | None, np.ndarray | None, int]] = {}
+        for name, ids, mask, max_len in segments:
+            seg_np[name] = (
+                None if ids is None else np.asarray(jax.device_get(ids)),
+                None if mask is None else np.asarray(jax.device_get(mask)),
+                max_len,
+            )
+        loss_mask = (
+            None
+            if observation.action_loss_mask is None
+            else np.asarray(jax.device_get(observation.action_loss_mask))
+        )
+        act_np = np.asarray(jax.device_get(actions), dtype=np.float32)
+
+        out: list[dict[str, Any]] = []
+        for i, rec in enumerate(records):
+            row: dict[str, Any] = {
+                "sample": i,
+                "pool": str(rec.get("pool", "online")),
+                "label": rec.get("label"),
+                "credit_source": rec.get("credit_source"),
+                "supervise_fast": bool(rec.get("supervise_fast", False)),
+                "action_supervision": bool(rec.get("action_supervision", False)),
+            }
+            for name, (ids, mask, max_len) in seg_np.items():
+                if ids is None or i >= ids.shape[0]:
+                    row[f"decoded_{name}"] = None
+                    continue
+                mrow = None if mask is None else mask[i].astype(bool)
+                n_tok = int(mrow.sum()) if mrow is not None else int(ids.shape[-1])
+                row[f"decoded_{name}"] = decode_cot_token_ids(self.tokenizer, ids[i], mrow)
+                row[f"n_{name}_tokens"] = n_tok
+                row[f"max_{name}_tokens"] = int(max_len)
+                # The tokenizer truncates silently (it only logs a warning): a segment whose mask runs
+                # to the very last slot almost certainly lost its tail.
+                row[f"{name}_truncated"] = bool(max_len and n_tok >= int(max_len))
+                row[f"{name}_token_ids"] = [int(t) for t in np.asarray(ids[i]).reshape(-1).tolist()][:max_len or None]
+            # Round-trip check against the manifest string the tokenizer was handed.
+            for name in ("prompt", "reasoning", "subtask"):
+                src = str(rec.get(name, "") or "").strip()
+                dec = str(row.get(f"decoded_{name}") or "")
+                row[f"source_{name}"] = src
+                row[f"{name}_roundtrip_ok"] = bool(src) and src.replace("_", " ").replace("\n", " ") in dec
+            if loss_mask is not None and i < loss_mask.shape[0]:
+                row["action_loss_mask_true"] = int(loss_mask[i].astype(bool).sum())
+                row["action_loss_mask_len"] = int(loss_mask[i].shape[0])
+            if i < act_np.shape[0]:
+                row["action_chunk_absmax"] = float(np.abs(act_np[i]).max())
+            out.append(row)
+        return out
+
+    def _dump_hl_batch_tokens(
+        self,
+        observation: Any,
+        actions: Any,
+        records: list[dict[str, Any]],
+        *,
+        global_step: int | None,
+    ) -> None:
+        """Write / log the decoded token batch produced by :meth:`_decode_hl_batch_tokens`.
+
+        Local JSON is the primary channel (``<hl_dataset_dir>/hl_update_batches/hl_tokens_*.json``
+        plus an appended ``hl_update_batch_tokens.jsonl`` without the raw ids); the wandb table
+        ``vla_hl/batch_tokens`` mirrors it when a run is active. Never raises — diagnostics must not
+        be able to break the update.
+        """
+        if not self.hl_log_batch_tokens:
+            return
+        try:
+            rows = self._decode_hl_batch_tokens(observation, actions, records)
+        except Exception as exc:  # noqa: BLE001 - decoding must never break the update.
+            print(f"[steervla.update_hl] HL token decode failed (non-fatal): {exc}", flush=True)
+            return
+
+        n_trunc = sum(1 for r in rows if r.get("reasoning_truncated"))
+        n_bad_rt = sum(1 for r in rows if not r.get("reasoning_roundtrip_ok", True))
+        # The tokenizer truncates silently (``_pad_or_truncate`` only emits a logging.warning that
+        # is easily lost in the CARLA log), and a reasoning trace that loses its tail — and its
+        # <end_of_reasoning> delimiter — is exactly the kind of damage this dump exists to catch.
+        # Announce it per (segment, pool) once so it can't pass unnoticed.
+        for seg in ("prompt", "reasoning", "subtask", "fast"):
+            hits = [r for r in rows if r.get(f"{seg}_truncated")]
+            if not hits:
+                continue
+            for pool in sorted({str(r["pool"]) for r in hits}):
+                key = (seg, pool)
+                if key in self._hl_truncation_warned:
+                    continue
+                self._hl_truncation_warned.add(key)
+                n = sum(1 for r in hits if str(r["pool"]) == pool)
+                max_len = next(r.get(f"max_{seg}_tokens") for r in hits)
+                print(
+                    f"[steervla.update_hl] WARNING: {n} sample(s) from pool '{pool}' have a "
+                    f"TRUNCATED {seg} segment ({max_len}/{max_len} tokens used). The tail — "
+                    f"including the closing CoT delimiter — was dropped before training. Raise the "
+                    f"tokenizer's max_{seg}_len or shorten the source text.",
+                    flush=True,
+                )
+        record = {
+            "hl_update_call": int(self._hl_update_calls),
+            "global_step": None if global_step is None else int(global_step),
+            "num_samples": len(rows),
+            "num_reasoning_truncated": n_trunc,
+            "num_reasoning_roundtrip_failed": n_bad_rt,
+            "samples": rows,
+        }
+        try:
+            root = self.hl_dataset_dir if self.hl_dataset_dir is not None else Path(".")
+            out_dir = Path(root) / "hl_update_batches"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            fname = f"hl_tokens_call{int(self._hl_update_calls):06d}"
+            if global_step is not None:
+                fname += f"_step{int(global_step):09d}"
+            (out_dir / f"{fname}.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+            slim = dict(record)
+            slim["samples"] = [
+                {k: v for k, v in r.items() if not k.endswith("_token_ids")} for r in rows
+            ]
+            with (out_dir / "hl_update_batch_tokens.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps(slim) + "\n")
+            if not getattr(self, "_hl_logged_tokens_once", False):
+                self._hl_logged_tokens_once = True
+                print(
+                    f"[steervla.update_hl] writing DECODED HL batch tokens to {out_dir} "
+                    f"(hl_tokens_*.json + hl_update_batch_tokens.jsonl): the prompt/reasoning/subtask "
+                    f"decoded from the exact tensors each update consumes.",
+                    flush=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[steervla.update_hl] HL token JSON dump failed (non-fatal): {exc}", flush=True)
+
+        try:
+            import wandb  # type: ignore
+
+            if wandb.run is None:
+                return
+            columns = [
+                "hl_update_call",
+                "sample",
+                "pool",
+                "decoded_prompt",
+                "decoded_reasoning",
+                "decoded_subtask",
+                "decoded_fast",
+                "source_reasoning",
+                "source_subtask",
+                "n_reasoning_tokens",
+                "n_subtask_tokens",
+                "reasoning_truncated",
+                "reasoning_roundtrip_ok",
+                "subtask_roundtrip_ok",
+            ]
+            new_rows = [
+                [int(self._hl_update_calls)] + [r.get(c) for c in columns[1:]] for r in rows
+            ]
+            # Same merge-by-global_step rule as ``_log_hl_batch_to_wandb``: several update_with_vla
+            # calls share one env step and wandb keeps only the last value per (step, key).
+            if global_step is not None and global_step == self._hl_token_table_step:
+                self._hl_token_table_rows.extend(new_rows)
+            else:
+                self._hl_token_table_step = global_step
+                self._hl_token_table_rows = new_rows
+            table = wandb.Table(columns=columns)
+            for row in self._hl_token_table_rows:
+                table.add_data(*row)
+            step = None if global_step is None else max(int(global_step), int(getattr(wandb.run, "step", 0) or 0))
+            payload: dict[str, Any] = {
+                "vla_hl/batch_tokens": table,
+                "vla_hl/tokens_reasoning_roundtrip_failed": float(n_bad_rt),
+            }
+            for seg in ("prompt", "reasoning", "subtask", "fast"):
+                lens = [r[f"n_{seg}_tokens"] for r in rows if f"n_{seg}_tokens" in r]
+                if not lens:
+                    continue
+                payload[f"vla_hl/tokens_{seg}_truncated"] = float(
+                    sum(1 for r in rows if r.get(f"{seg}_truncated"))
+                )
+                payload[f"vla_hl/tokens_mean_{seg}_len"] = float(np.mean(lens))
+                payload[f"vla_hl/tokens_max_{seg}_len"] = float(np.max(lens))
+            wandb.log(payload, step=step)
+        except ImportError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            print(f"[steervla.update_hl] HL token wandb logging failed (non-fatal): {exc}", flush=True)
+
     def update_hl(
         self,
         *,
@@ -2143,6 +2483,11 @@ class SteerVLAActor:
         self._log_hl_batch_to_wandb(records, figure=figure, global_step=global_step)
         self._dump_hl_batch_json(records, figure=figure, global_step=global_step)
         observation, actions = self._build_hl_observation_batch(records)
+        # Decode the *tokenized* batch (prompt / reasoning / subtask / FAST) immediately before the
+        # gradient step consumes it. This is the only view of the supervision after tokenization —
+        # truncated or empty reasoning, mis-tokenized subtasks, and masks over padding are invisible
+        # in the manifest-text logs above.
+        self._dump_hl_batch_tokens(observation, actions, records, global_step=global_step)
 
         info: dict[str, Any] = {}
         for _ in range(max(1, ns)):
@@ -2387,6 +2732,11 @@ class SteerVLAActor:
         )
         if isinstance(raw, dict):
             raw["openpi_prompt_text"] = formatted_prompt
+            # The *raw* routing instruction, i.e. what ``tokenize_prompt`` is actually given.
+            # ``openpi_prompt_text`` above is the already-wrapped ``Prompt:...;State:...;`` display
+            # form; anything that re-tokenizes a stored prompt (the CAST-relabel HL dataset) must
+            # use this one, or the wrapper gets applied twice.
+            raw["openpi_prompt_raw_text"] = prompt_text
 
         assert self.tokenizer is not None
         tok_ids, tok_mask = self.tokenizer.tokenize_prompt(
@@ -3323,6 +3673,7 @@ def create_steervla_pi0_cot_sample_fn(
         hl_online_bad_fraction=float(steervla_cfg.get("hl_online_bad_fraction", -1.0)),
         hl_online_precursor_fraction=float(steervla_cfg.get("hl_online_precursor_fraction", -1.0)),
         hl_min_online_samples=int(steervla_cfg.get("hl_min_online_samples", 1)),
+        hl_log_batch_tokens=bool(steervla_cfg.get("hl_log_batch_tokens", True)),
         return_normalized_action_chunk=bool(steervla_cfg.get("use_pi_action_chunk_for_env", True)),
         fixed_subtask_text=steervla_cfg.get("fixed_subtask_text"),
         fixed_reasoning_text=steervla_cfg.get("fixed_reasoning_text"),

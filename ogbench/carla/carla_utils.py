@@ -2373,6 +2373,9 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             info["reward_terminal"] = 0.0
             info["reward_total"] = float(reward)
             self._finalize_route("Finished", "Episode max steps")
+            # _finalize_route computes the leaderboard statistics; surface the composed driving
+            # score here too so a step-capped episode reports it like any other termination.
+            info["driving_score"] = self._last_driving_score
             terminated = True
         return float(reward), bool(terminated), info
 

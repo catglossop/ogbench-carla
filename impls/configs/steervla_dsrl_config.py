@@ -132,13 +132,14 @@ def get_config():
             # Must be the _csp variant to match the CSP checkpoint below: it is the only config
             # whose model carries context_smoothing (and hence the ctx_time_mlp_* params that the
             # checkpoint contains and that t_context needs).
-            actor_config="pi05_steervla_cot_simplified_reasoning_csp",
+            actor_config="pi05_steervla_cot_simplified_reasoning_no_ego_history",
             # actor_config="pi05_steervla_cot_simplified_reasoning",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260525_202139/8000",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260526_175924/4000",
             # checkpoint="/home/carla/.cache/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",
-            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_csp/pi05_steervla_cot_simplified_reasoning_csp/pi05_steervla_cot_simplified_reasoning_csp_20260713_095815/10000",
+            # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_csp/pi05_steervla_cot_simplified_reasoning_csp/pi05_steervla_cot_simplified_reasoning_csp_20260713_095815/10000",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_ego_history/pi05_steervla_simplified_reasoning_no_ego_history_v1/pi05_steervla_simplified_reasoning_no_ego_history_v1_20260718_201640/6000",
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,
             include_ego_history=False,
@@ -166,9 +167,9 @@ def get_config():
             #   sample_t_context=True  -> fresh t_context ~ U[t_context_min, t_context_max] per
             #                             model query (independent per best-of-N candidate).
             #   t_context=<float>      -> pin a fixed level (0 = clean, 1 = uninformative context).
-            sample_t_context=True,
-            t_context_min=0.0,
-            t_context_max=1.0,
+            # sample_t_context=True,
+            # t_context_min=0.0,
+            # t_context_max=1.0,
             # Remote HTTP actor (leave unset or falsy for local checkpoint load):
             # actor_url="http://35.186.30.251:8000",
         )

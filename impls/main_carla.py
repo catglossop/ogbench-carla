@@ -1120,6 +1120,10 @@ def run_online_carla(
             "control_brake": float(drive["control_brake"]),
             "collision": bool(collision_occurred),
             "route_progress_pct": float(step_info.get("route_progress_pct", 0.0)),
+            # Env reward for this step (``_compute_reward_and_info``). Recorded so the VLM coaches
+            # (window review + CAST credit assignment) can see the actual objective the RL side is
+            # optimizing, instead of inferring it from speed / progress / collisions.
+            "reward_total": float(step_info.get("reward_total", 0.0)),
             "in_video": bool(in_video),
         }
         if in_video and video_frame_index is not None:
@@ -1388,7 +1392,14 @@ def run_online_carla(
                 _format_text_field(cot_obs_raw, "reasoning_text")
                 or _format_text_field(cot_obs_raw, "reasoning")
             )
-            _cast_step_record["prompt"] = _format_text_field(cot_obs_raw, "openpi_prompt_text")
+            # Raw routing instruction, NOT the wrapped ``Prompt:...;State:...;`` display string:
+            # this value is re-tokenized by ``SteerVLAActor._build_hl_observation_batch``, which
+            # applies the wrapper itself. Storing the wrapped form double-wraps every online HL
+            # sample ("Prompt:Prompt:...;State:..;;State:..;") — a prefix the model never sees at
+            # inference. ``openpi_prompt_text`` is kept as the fallback for older raw dicts.
+            _cast_step_record["prompt"] = _format_text_field(
+                cot_obs_raw, "openpi_prompt_raw_text"
+            ) or _format_text_field(cot_obs_raw, "openpi_prompt_text")
             _cast_relabel.record_trajectory_step(_cast_step_record)
             # Stash the raw SteerVLA model input (pre-step obs the action was taken from) so the
             # window review can persist BAD/relabeled chunks as high-level dataset samples. The
@@ -1425,6 +1436,16 @@ def run_online_carla(
         step_wb = {f"rollout/{k}": v for k, v in drive_metrics.items()}
         step_wb["rollout/collision_count"] = float(collision_count)
         step_wb["rollout/collision_events"] = float(collision_delta)
+        # Bench2Drive route completion, per step. The dominant positive reward term and the
+        # clearest read on whether the policy is actually advancing rather than stalling.
+        if "route_progress_pct" in info:
+            step_wb["rollout/route_progress_pct"] = float(info["route_progress_pct"])
+            step_wb["rollout/route_progress_delta"] = float(info.get("route_progress_delta", 0.0))
+        # Leaderboard infraction counters (only meaningful as running totals).
+        if "traffic_violation_count" in info:
+            step_wb["rollout/traffic_violation_count"] = float(info["traffic_violation_count"])
+        if "outside_route_value" in info:
+            step_wb["rollout/outside_route_value"] = float(info["outside_route_value"])
         # Best-of-N candidate action entropy (per-dim + mean), stashed by the agent at sample time.
         _bon_actor = getattr(agent, "steervla_actor", None)
         _bon_metrics = getattr(_bon_actor, "last_bon_metrics", None) if _bon_actor is not None else None
@@ -1540,6 +1561,26 @@ def run_online_carla(
                     done_info.get("penalty_crash_stuck", 0.0)
                 )
                 rollout_log["rollout/final_step_success"] = float(bool(done_info.get("success", False)))
+            # Bench2Drive end-of-route statistics. ``driving_score`` is the leaderboard's composed
+            # score (route completion x infraction multiplier), computed by
+            # ``statistics_manager.compute_route_statistics`` when the wrapper finalizes the route,
+            # so it exists only on the terminal step — log it per episode, not per step.
+            if "driving_score" in done_info:
+                rollout_log["rollout/driving_score"] = float(done_info["driving_score"])
+            if "route_progress_pct" in done_info:
+                rollout_log["rollout/episode_route_progress_pct"] = float(
+                    done_info["route_progress_pct"]
+                )
+                rollout_log["rollout/episode_route_completed"] = float(
+                    float(done_info["route_progress_pct"]) >= 99.5
+                )
+            if "traffic_violation_count" in done_info:
+                rollout_log["rollout/episode_traffic_violations"] = float(
+                    done_info["traffic_violation_count"]
+                )
+            rollout_log["rollout/episode_termination_reason"] = str(
+                done_info.get("termination_reason", "?")
+            )
             if FLAGS.expert_recover_debug:
                 rollout_log["rollout/vla_steps_budget"] = float(_vla_steps_budget)
             traj_path = _save_episode_trajectory_json(

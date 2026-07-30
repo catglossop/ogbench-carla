@@ -99,16 +99,17 @@ WANDB_MODE=online uv run python impls/main_carla.py \
 If desired, increase the allowed mem allocation for JAX
 
 ```
+CUDA_VISIBLE_DEVICES=0 \
 XLA_PYTHON_CLIENT_PREALLOCATE="true" \
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 \
 WANDB_MODE=online \
 uv run python impls/main_carla.py \
-  --agent=impls/configs/steervla_cast_relabel_config.py \
-  --route=generalization-wall-1095 \
+  --agent=impls/configs/steervla_dsrl_config.py \
+  --route=enter-actor-flow-004 \
   --online_steps=50000 \
   --save_buffer=true \
   --seed=0 \
-  --live_policy_view=true
+  --save_dir=\home\cglossop\exps
 ```
 
 There are a couple levers to pull to optimize the speed a bit: 

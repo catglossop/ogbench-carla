@@ -55,7 +55,7 @@ checkpoint: ./simulation_results.json
 debug_checkpoint: ./live_results.txt
 # CARLA UE / rendering adapter index (leaderboard subprocess). JAX RL GPU is separate:
 # set ``training_gpu_rank`` in the agent config (e.g. steervla_dsrl_config.py).
-gpu_rank: 0 # Carla swaps GPU order: gpu_rank=1 -> nvtop GPU0, gpu_rank=0 -> nvtop GPU1. We render on nvtop GPU0 (shared with JAX inference+RL) so nvtop GPU1 stays dedicated to the HL update.
+gpu_rank: 1 
 repetitions: 1
 repetition_index: 0
 

@@ -153,10 +153,10 @@ def _build_per_timestamp_block(metadata: dict[str, Any]) -> str:
     """Render a timestamp-keyed JSON block of per-step trajectory data for the prompt.
 
     Top-level keys are video seconds (as strings); each value bundles the vehicle state and
-    controls already recorded per step with the executed subtask, chain-of-thought
-    reasoning, and the prompt the policy received at that moment. Steps that were not
-    captured in the video (``video_timestamp_sec is None``) are skipped, since the VLM can
-    only cross-reference moments it can actually see.
+    controls already recorded per step with the env reward earned at that step, the executed
+    subtask, chain-of-thought reasoning, and the prompt the policy received at that moment. Steps
+    that were not captured in the video (``video_timestamp_sec is None``) are skipped, since the
+    VLM can only cross-reference moments it can actually see.
     """
     steps = metadata.get("steps", []) or []
     per_timestamp: dict[str, Any] = {}
@@ -175,6 +175,8 @@ def _build_per_timestamp_block(metadata: dict[str, Any]) -> str:
             "control_brake": s.get("control_brake"),
             "collision": s.get("collision"),
             "route_progress_pct": s.get("route_progress_pct"),
+            # Env reward actually earned at this step — the objective the RL side optimizes.
+            "reward_total": s.get("reward_total"),
             "subtask": s.get("subtask", ""),
             "reasoning": s.get("reasoning", ""),
             "prompt": s.get("prompt", ""),
@@ -184,7 +186,13 @@ def _build_per_timestamp_block(metadata: dict[str, Any]) -> str:
     return (
         "\nPer-timestamp trajectory data (keys are video seconds; each value is the vehicle "
         "state/controls plus the executed subtask, chain-of-thought reasoning, and the prompt "
-        "the policy received at that moment):\n"
+        "the policy received at that moment). ``reward_total`` is the environment reward earned "
+        "at that step — the objective the policy is being trained on. It is dominated by route "
+        "progress and is reduced by collisions, route/traffic infractions, and harsh steering or "
+        "braking; a sustained near-zero or negative stretch marks behavior the environment itself "
+        "scores as bad. Use it as corroborating evidence, not as the verdict: it cannot see "
+        "everything you can in the video, so flag behavior that looks wrong even where the reward "
+        "does not, and say so when the two disagree:\n"
         f"```json\n{json.dumps(per_timestamp, indent=2)}\n```\n"
     )
 
@@ -199,7 +207,9 @@ def build_coaching_prompt(
     summary_keys = ("episode", "route", "episode_steps", "success",
                     "termination_reason", "route_progress_start_pct",
                     "route_progress_end_pct", "route_progress_delta_pct",
-                    "route_completed", "collision_events")
+                    "route_completed", "collision_events",
+                    # Env reward over the window (absent for producers that don't record it).
+                    "window_reward_total", "window_reward_mean")
     summary = {k: metadata[k] for k in summary_keys if k in metadata}
     metadata_block = json.dumps(summary, indent=2) if summary else "{}"
 
