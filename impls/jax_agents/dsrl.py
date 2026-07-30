@@ -198,7 +198,13 @@ def _noise_actor_loss_vla_pure_math(
     )
     obs_e = network.select("obs_encoder")(batch["observations"], params=grad_params)
     dist = network.select("noise_actor")(obs_e, params=grad_params)
-    log_prob = dist.log_prob(noise_actions / noise_scale)
+    # tanh() saturates to exactly +/-1.0 in float32 for moderately large pre-squash
+    # values; evaluating log_prob() there hits log(1 - tanh(z)^2) = log(0) = -inf in
+    # the Tanh bijector's Jacobian term, which NaNs the whole combined total_loss_vla
+    # gradient (see NoiseActor's mean-clip comment). Keep the evaluated point strictly
+    # inside (-1, 1) regardless of how noise_actions was produced.
+    noise_action_value = jnp.clip(noise_actions / noise_scale, -1.0 + 1e-6, 1.0 - 1e-6)
+    log_prob = dist.log_prob(noise_action_value)
     qs = network.select("noise_critic")(
         _critic_obs_e(obs_e, batch, "language_label"), noise_actions,
     )
@@ -315,6 +321,15 @@ class NoiseActor(nn.Module):
     def __call__(self, observations, temperature: float = 1.0):
         x = MLP(self.hidden_dims, activate_final=True)(observations)
         mean = nn.Dense(self.action_dim, kernel_init=default_init(0.01))(x)
+        # Unlike log_std, `mean` is otherwise unconstrained: it can drift arbitrarily
+        # large during online training, and tanh() saturates to *exactly* +/-1.0 in
+        # float32 well before the underlying value is actually infinite. Evaluating
+        # log_prob() at (or a sample near) that saturated point later hits log(1 -
+        # tanh(z)^2) = log(0) = -inf in the Tanh bijector's Jacobian correction, which
+        # then NaNs the whole combined total_loss_vla gradient (all heads share one
+        # optax state) permanently for the rest of the run. Bounding mean keeps samples
+        # away from the saturation boundary in the first place.
+        mean = jnp.clip(mean, -8.0, 8.0)
         log_std = nn.Dense(self.action_dim, kernel_init=default_init(0.01))(x)
         log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
         base = distrax.MultivariateNormalDiag(
@@ -679,19 +694,32 @@ class DSRLAgent(flax.struct.PyTreeNode):
         noise_scale = jnp.asarray(self.config["noise_scale"], dtype=jnp.float32)
         critic_actions = self._clip_actions_to_env(batch["actions"])
 
+        # Best-of-N (--bon_critic_ckpt / --bon_online_critic) executes raw-random-noise
+        # candidates scored by modules_critic; noise_actor/noise_critic never influence
+        # behavior there. Skipping their loss here decouples the critic's gradient from
+        # a numerically unstable head it doesn't depend on (see NoiseActor's mean-clip
+        # comment) instead of just clipping around occasional blowups.
+        _skip_noise_actor = bool(self.config.get("skip_noise_actor_training", False))
+        _zero = jnp.zeros((), dtype=jnp.float32)
+
         noise_total_loss_vla_time = time.time()
         if vla_cache is not None:
             noise_critic_loss_vla_time = time.time()
-            nc_loss, nc_info = _noise_critic_loss_vla_pure_math(
-                self.network,
-                batch,
-                vla_cache["vla_actions_nc"],
-                vla_cache["noise_actions"],
-                grad_params,
-            )
-            na_loss, na_info = _noise_actor_loss_vla_pure_math(
-                self.network, batch, grad_params, na_rng, alpha, noise_scale,
-            )
+            if _skip_noise_actor:
+                nc_loss, na_loss = _zero, _zero
+                nc_info = {"noise_critic_loss": _zero, "noise_q_values": _zero, "q_values": _zero}
+                na_info = {"noise_actor_loss": _zero, "noise_log_prob": _zero, "q_for_noise_actor": _zero}
+            else:
+                nc_loss, nc_info = _noise_critic_loss_vla_pure_math(
+                    self.network,
+                    batch,
+                    vla_cache["vla_actions_nc"],
+                    vla_cache["noise_actions"],
+                    grad_params,
+                )
+                na_loss, na_info = _noise_actor_loss_vla_pure_math(
+                    self.network, batch, grad_params, na_rng, alpha, noise_scale,
+                )
             c_loss, c_info = _critic_loss_vla_pure_math(
                 self.network,
                 batch,
@@ -704,8 +732,13 @@ class DSRLAgent(flax.struct.PyTreeNode):
             print(f"[DEBUG - dsrl] Noise critic loss vla time: {noise_critic_loss_vla_time} seconds")
         else:
             noise_critic_loss_vla_time = time.time()
-            nc_loss, nc_info = self.noise_critic_loss_vla(batch, grad_params, nc_rng)
-            na_loss, na_info = self.noise_actor_loss_vla(batch, grad_params, na_rng)
+            if _skip_noise_actor:
+                nc_loss, na_loss = _zero, _zero
+                nc_info = {"noise_critic_loss": _zero, "noise_q_values": _zero, "q_values": _zero}
+                na_info = {"noise_actor_loss": _zero, "noise_log_prob": _zero, "q_for_noise_actor": _zero}
+            else:
+                nc_loss, nc_info = self.noise_critic_loss_vla(batch, grad_params, nc_rng)
+                na_loss, na_info = self.noise_actor_loss_vla(batch, grad_params, na_rng)
             c_loss, c_info = self.critic_loss_vla(batch, grad_params, c_rng)
             noise_critic_loss_vla_time = time.time() - noise_critic_loss_vla_time
             print(f"[DEBUG - dsrl] Noise critic loss vla time: {noise_critic_loss_vla_time} seconds")
@@ -1361,7 +1394,17 @@ class DSRLAgent(flax.struct.PyTreeNode):
         args = {k: v[1] for k, v in networks.items()}
 
         network_def = ModuleDict(defs)
-        network_tx = optax.adam(learning_rate=config["lr"])
+        # Gradient clipping: update_with_vla() backprops through noise_actor_loss_vla's
+        # log_prob term, whose Gaussian std can collapse toward zero during online
+        # training, spiking that head's gradient norm into the thousands. All modules
+        # share one optax.adam state, so once a spike pushes Adam's internal moment
+        # accumulators to NaN, every subsequent step (including modules_critic, used
+        # for best-of-N Q-scoring) is permanently NaN for the rest of the run -- clipping
+        # bounds the update before it reaches Adam's state, rather than after.
+        network_tx = optax.chain(
+            optax.clip_by_global_norm(float(config.get("grad_clip_norm", 10.0))),
+            optax.adam(learning_rate=config["lr"]),
+        )
         network_params = network_def.init(init_rng, **args)["params"]
         network = TrainState.create(network_def, network_params, tx=network_tx)
         network.params["modules_target_critic"] = network.params["modules_critic"]

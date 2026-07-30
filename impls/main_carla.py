@@ -212,11 +212,19 @@ flags.DEFINE_bool(
     "driving.",
 )
 
+flags.DEFINE_bool(
+    "bon_include_brake_candidate", False,
+    "When best-of-N is active (--bon_critic_ckpt or --bon_online_critic), append one "
+    "extra synthetic all-zero (full-stop) action chunk to the N sampled candidates each "
+    "step, so the critic always has the option to brake regardless of what the pi0 base "
+    "policy actually sampled. Shown in candidate logging as '[synthetic] full brake'.",
+)
+
 flags.DEFINE_float(
     "pid_brake_speed", None,
     "Override SimlingoStyleWaypointDecoder.brake_speed (m/s) -- the controller brakes "
     "outright whenever the predicted desired_speed falls below this. Default (unset) "
-    "keeps the class's own default of 0.4.",
+    "keeps the class's own default of 0.1.",
 )
 flags.DEFINE_integer(
     "pid_stuck_threshold", None,
@@ -1664,6 +1672,20 @@ def run_online_carla(
             tree,
         )
 
+    def _append_brake_candidate(
+        chunks_np: np.ndarray, candidate_subtasks: list[str]
+    ) -> tuple[np.ndarray, list[str]]:
+        """Append a synthetic all-zero (full-stop) action chunk as an extra best-of-N
+        candidate. Zero deltas in DELTA_XY_T_DELTA_XY_SPACE decode to zero desired_speed
+        (see pretrain_critic.py's _waypoints_action / SimlingoStyleWaypointDecoder.
+        control_pid), i.e. a genuine brake -- this just guarantees the critic always has
+        that option on the table, regardless of what the pi0 base policy sampled.
+        """
+        brake_chunk = np.zeros((1,) + chunks_np.shape[1:], dtype=chunks_np.dtype)
+        chunks_np = np.concatenate([chunks_np, brake_chunk], axis=0)
+        candidate_subtasks = candidate_subtasks + ["[synthetic] full brake"]
+        return chunks_np, candidate_subtasks
+
     def _sample_diverse_candidates(subkey, n: int) -> tuple[np.ndarray, list[str]]:
         """Sample ``n`` candidate action chunks from the frozen pi0 base policy for
         best-of-N, one at a time (not batched), so each draw gets a fresh CoT.
@@ -1731,6 +1753,8 @@ def run_online_carla(
         ``--bon_shadow_only``).
         """
         chunks_np, candidate_subtasks = _sample_diverse_candidates(rng_key, _bon_n)
+        if FLAGS.bon_include_brake_candidate:
+            chunks_np, candidate_subtasks = _append_brake_candidate(chunks_np, candidate_subtasks)
         chunks = jax.numpy.asarray(chunks_np)  # (N, vla_action_horizon * vla_action_dim), e.g. (N, 40)
         img = obs_raw.get("image") if isinstance(obs_raw, dict) else None
         if img is None:
@@ -1945,6 +1969,8 @@ def run_online_carla(
                 _last_vla_chunk_holder[0] = shifted
                 return best_chunk, None
             chunks_np, candidate_subtasks = _sample_diverse_candidates(subkey, _bon_n)
+            if FLAGS.bon_include_brake_candidate:
+                chunks_np, candidate_subtasks = _append_brake_candidate(chunks_np, candidate_subtasks)
             chunks = jax.numpy.asarray(chunks_np)  # (N, 40)
             # Live agent critic: re-reads agent.network.params every call, so this tracks
             # whatever update_with_vla() has trained modules_critic to as of this step.
@@ -2858,6 +2884,15 @@ def build_carla_session(config, env, exec_cfg: Optional[dict] = None) -> CarlaSe
         ex_obs = np.expand_dims(agent_obs, 0)
         ex_actions = np.zeros((1,) + tuple(env.action_space.shape), dtype=np.float32)
 
+        # Best-of-N (frozen or online) selects the executed action from raw random
+        # noise + critic scoring (see _sample_diverse_candidates) -- the learned
+        # noise_actor/noise_critic never influence behavior in this mode. Tell the
+        # agent to skip training them: it's wasted compute, and (found 2026-07-30)
+        # the noise_actor's tanh-Gaussian log_prob is numerically unstable and can
+        # NaN the *shared* combined gradient (see total_loss_vla), corrupting the
+        # critic that best-of-N actually depends on. Decoupling removes that risk
+        # entirely rather than just clipping around it.
+        config.skip_noise_actor_training = bool(FLAGS.bon_critic_ckpt) or bool(FLAGS.bon_online_critic)
         agent = agent_class.create(FLAGS.seed, ex_obs, ex_actions, config, **create_kwargs)
 
         if online_training_mode in {"sac_residual", "dagger_residual"}:

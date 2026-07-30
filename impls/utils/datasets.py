@@ -138,6 +138,16 @@ class ReplayBuffer(Dataset):
             buffer[self.pointer] = new_element
 
         written_idx = int(self.pointer)
+        # The buffer's schema is fixed from whatever example transition built it
+        # (see create()/create_from_initial_dataset()). Some VLA checkpoints emit extra
+        # incidental observation fields (e.g. a "fast"-tokenizer action encoding some
+        # OpenPI configs compute alongside the ones this codebase actually uses) that
+        # weren't present in that example -- drop anything the buffer doesn't already
+        # have a slot for rather than hard-failing the whole rollout on a structural
+        # mismatch.
+        extra_keys = transition.keys() - self._dict.keys()
+        if extra_keys:
+            transition = {k: v for k, v in transition.items() if k not in extra_keys}
         jax.tree_util.tree_map(set_idx, self._dict, transition)
         self.pointer = (self.pointer + 1) % self.max_size
         self.size = max(self.pointer, self.size)
