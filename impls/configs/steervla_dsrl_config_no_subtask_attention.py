@@ -36,7 +36,7 @@ def get_config():
     config.batch_size = 32
     # Denoise steps for frozen VLA forwards during RL updates (rollout uses steervla.sample_actions_num_steps).
     config.vla_update_flow_steps = 5
-    config.noise_scale = 5.0
+    config.noise_scale = 1.0
     config.alpha = 0.1
     # Collect transitions with the rollout policy (SteerVLA / DSRL) but skip RL updates.
     config.warmup_steps = 200
@@ -86,17 +86,17 @@ def get_config():
     config.online_training_mode = "rl"
     # language_label_dim is auto-set from language_feedback / critic_feedback_mode in main_carla.py.
 
-    config.language_feedback = ml_collections.ConfigDict(
-        dict(
-            # Where DSRL critic language labels come from:
-            #   "expert" — SimLingo-style expert commentary / action-delta coaches
-            #   "vlm"    — Gemini/Perceptron VLM chunk feedback (see ``vlm_coach``)
-            source="vlm",
-            # Used when source="expert". One of commentary_bow | action_delta |
-            # delta_commentary_bow | none
-            expert_mode="commentary_bow",
-        )
-    )
+    # config.language_feedback = ml_collections.ConfigDict(
+    #     dict(
+    #         # Where DSRL critic language labels come from:
+    #         #   "expert" — SimLingo-style expert commentary / action-delta coaches
+    #         #   "vlm"    — Gemini/Perceptron VLM chunk feedback (see ``vlm_coach``)
+    #         source="expert",
+    #         # Used when source="expert". One of commentary_bow | action_delta |
+    #         # delta_commentary_bow | none
+    #         expert_mode="commentary_bow",
+    #     )
+    # )
     # Enable VLM chunk coaching for the DSRL critic:
     config.language_feedback.source = "vlm"
 
@@ -125,8 +125,8 @@ def get_config():
             actor_config="pi05_steervla_cot_simplified_reasoning",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260525_202139/8000",
-            # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260526_175924/4000",
-            checkpoint="/home/carla/.cache/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260526_175924/4000",
+            # checkpoint="/home/carla/.cache/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,
             include_ego_history=False,

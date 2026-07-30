@@ -1,7 +1,7 @@
 """VLM coaches that review driving rollout videos and annotate good/bad moments.
 
 Supports:
-  - Google Gemini (``gemini-3.5-flash`` by default)
+  - Google Gemini (``gemini-2.0-flash`` by default)
   - Perceptron video QA API
 
 Run from ``impls/``::
@@ -39,34 +39,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-import tyro
-
-from impls.coaches.action_chunk_feedback import (
-    DEFAULT_ACTION_CHUNK_STEPS,
-    DEFAULT_BAD_EVENT_RADIUS_CHUNKS,
-    DEFAULT_CHUNK_DURATION_SEC,
-    active_chunk_at_time,
-    affected_chunks_from_bad_events,
-    assemble_chunk_feedback_json,
-    build_action_chunk_specs,
-    build_chunk_feedback_prompt,
-    format_chunk_feedback_lines,
-    parse_chunk_feedback_response,
-)
-from impls.coaches.trajectory_plots import (
-    TRAJECTORY_JSON_DESCRIPTION,
-    compact_metadata_for_prompt,
-    generate_trajectory_plots,
-    is_trajectory_metadata,
-    load_trajectory_metadata,
-)
-
 ProviderName = Literal["gemini", "perceptron"]
 
 # Placeholders — override via environment variables in real runs.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
 PERCEPTRON_API_KEY = os.environ.get("PERCEPTRON_API_KEY", "YOUR_PERCEPTRON_API_KEY_HERE")
-DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
+
+DEFAULT_ACTION_CHUNK_STEPS = 10
+DEFAULT_CHUNK_DURATION_SEC = 0.5
+DEFAULT_BAD_EVENT_RADIUS_CHUNKS = 2
 
 # How long each GOOD/BAD label stays on screen after its timestamp (seconds).
 ANNOTATION_DISPLAY_SEC = 1.0
@@ -105,36 +87,40 @@ def build_coaching_prompt(
     include_plots: bool = False,
 ) -> str:
     """Prompt shared by Gemini and Perceptron coaches."""
-    if is_trajectory_metadata(metadata):
-        prompt_metadata = compact_metadata_for_prompt(metadata)
-        metadata_block = json.dumps(prompt_metadata, indent=2)
-        metadata_intro = TRAJECTORY_JSON_DESCRIPTION
-        if include_plots:
-            metadata_intro += (
-                "\n\nA combined trajectory plot image is attached (speed, controls, collisions, "
-                "route progress vs video time in seconds). Use it together with the video and JSON."
-            )
-        else:
-            metadata_intro += (
-                "\n\nUse the JSON below as structured context; timestamps in ``video_timestamp_sec`` "
-                "align with the rollout video."
-            )
+    # Summarise metadata compactly: top-level fields + collision events only.
+    # The full steps array is omitted from the prompt to stay within token budgets.
+    summary_keys = ("episode", "route", "episode_steps", "success",
+                    "termination_reason", "collision_events")
+    summary = {k: metadata[k] for k in summary_keys if k in metadata}
+    metadata_block = json.dumps(summary, indent=2) if summary else "{}"
+
+    collision_events = metadata.get("collision_events", [])
+    if collision_events:
+        collision_lines = "\n".join(
+            f"  t={e.get('video_timestamp_sec', '?'):.2f}s  "
+            f"new_event={e.get('new_event')}  contact_active={e.get('contact_active')}"
+            for e in collision_events
+        )
+        collision_section = (
+            f"\nCollision log (from on-board sensors — cross-reference with the video):\n"
+            f"{collision_lines}\n"
+        )
     else:
-        metadata_block = json.dumps(metadata, indent=2) if metadata else "{}"
-        metadata_intro = "Optional metadata (may be empty):"
+        collision_section = "\nNo collisions were recorded by the on-board sensors.\n"
 
     return textwrap.dedent(
         f"""
         You are reviewing a driving rollout video for an autonomous vehicle policy.
 
-        {metadata_intro}
+        Episode summary:
         ```json
         {metadata_block}
         ```
-
+        {collision_section}
         Watch the full video and identify moments where driving behavior was clearly
         good or clearly bad (lane keeping, speed, turns, collisions/near-misses,
-        stopping, yielding, etc.).
+        stopping, yielding, etc.). The collision log above shows ground-truth sensor
+        data — use it to anchor your feedback to the correct timestamps.
 
         Return ONLY valid JSON with this schema (no markdown fences):
         {{
@@ -207,9 +193,122 @@ class VLMCOach(ABC):
     ) -> list[CoachEvent]:
         """Return timestamped GOOD/BAD events for a rollout video."""
 
+    def complete_text(self, prompt: str) -> str:
+        """Text-only completion (used for per-chunk feedback refinement)."""
+        raise NotImplementedError(f"{type(self).__name__} does not support text-only completion.")
+
+
+# ── Gemini REST API helpers (Python-3.8-compatible; no google-genai package needed) ──
+
+_GEMINI_UPLOAD_BASE = "https://generativelanguage.googleapis.com/upload/v1beta"
+_GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+
+def _gemini_upload_file(path: Path, api_key: str) -> dict[str, Any]:
+    """Upload *path* to the Gemini Files API via the resumable-upload protocol.
+
+    Returns the file metadata dict (keys: ``name``, ``uri``, ``state``, …).
+    """
+    import mimetypes
+
+    import requests
+
+    mime_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+    file_size = path.stat().st_size
+
+    # Step 1 — initiate resumable upload session.
+    start_resp = requests.post(
+        f"{_GEMINI_UPLOAD_BASE}/files",
+        params={"uploadType": "resumable", "key": api_key},
+        headers={
+            "X-Goog-Upload-Protocol": "resumable",
+            "X-Goog-Upload-Command": "start",
+            "X-Goog-Upload-Header-Content-Length": str(file_size),
+            "X-Goog-Upload-Header-Content-Type": mime_type,
+            "Content-Type": "application/json",
+        },
+        json={"file": {"display_name": path.name}},
+        timeout=30,
+    )
+    start_resp.raise_for_status()
+    upload_url = start_resp.headers.get("X-Goog-Upload-URL")
+    if not upload_url:
+        raise RuntimeError("Gemini upload: missing X-Goog-Upload-URL in response headers.")
+
+    # Step 2 — stream the file content (SDK uses POST, not PUT).
+    with path.open("rb") as fh:
+        data = fh.read()
+    upload_resp = requests.post(
+        upload_url,
+        headers={
+            "Content-Length": str(file_size),
+            "X-Goog-Upload-Offset": "0",
+            "X-Goog-Upload-Command": "upload, finalize",
+            "Content-Type": mime_type,
+        },
+        data=data,
+        timeout=120,
+    )
+    upload_resp.raise_for_status()
+    body = upload_resp.json()
+    # The Files API wraps the metadata under a "file" key on upload.
+    return body.get("file", body)
+
+
+def _gemini_get_file(name: str, api_key: str) -> dict[str, Any]:
+    """Fetch current metadata for a Gemini-uploaded file by its resource name."""
+    import requests
+
+    resp = requests.get(
+        f"{_GEMINI_API_BASE}/{name}",
+        params={"key": api_key},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+_GEMINI_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def _gemini_generate_content(model: str, contents: list[Any], api_key: str, max_retries: int = 5) -> str:
+    """Call ``models.generateContent`` and return the response text.
+
+    Retries up to *max_retries* times on transient errors (429/5xx) with
+    exponential backoff.
+    """
+    import requests
+
+    delay = 5.0
+    for attempt in range(max_retries + 1):
+        resp = requests.post(
+            f"{_GEMINI_API_BASE}/models/{model}:generateContent",
+            params={"key": api_key},
+            json={"contents": contents},
+            timeout=120,
+        )
+        if resp.status_code not in _GEMINI_RETRYABLE_STATUS:
+            break
+        if attempt == max_retries:
+            break
+        print(
+            f"[vlm_feedback] Gemini {resp.status_code} on attempt {attempt + 1}/{max_retries};"
+            f" retrying in {delay:.0f}s…",
+            flush=True,
+        )
+        time.sleep(delay)
+        delay = min(delay * 2, 60.0)
+
+    resp.raise_for_status()
+    data = resp.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError) as exc:
+        raise RuntimeError(f"Unexpected Gemini response structure: {data}") from exc
+
 
 class GeminiVLMCOach(VLMCOach):
-    """Coach backed by the Google Gemini API."""
+    """Coach backed by the Google Gemini REST API (no google-genai package required)."""
 
     def __init__(
         self,
@@ -228,58 +327,66 @@ class GeminiVLMCOach(VLMCOach):
         plot_paths: list[Path] | None = None,
         include_plots_in_prompt: bool = False,
     ) -> list[CoachEvent]:
-        try:
-            from google import genai
-        except ImportError as exc:
-            raise ImportError(
-                "Gemini coach requires the google-genai package. Install with: pip install google-genai"
-            ) from exc
-
         path = Path(video_path)
         if not path.is_file():
             raise FileNotFoundError(f"Video not found: {path}")
 
-        client = genai.Client(api_key=self.api_key)
-        uploaded = client.files.upload(file=str(path))
-        while uploaded.state.name == "PROCESSING":
+        # Upload video and wait for it to become ACTIVE.
+        # The upload response may omit "state" when the file is already ready;
+        # in that case do a GET to get the authoritative status.
+        uploaded = _gemini_upload_file(path, self.api_key)
+        if uploaded.get("state") is None:
+            uploaded = _gemini_get_file(uploaded["name"], self.api_key)
+        while uploaded.get("state") == "PROCESSING":
             time.sleep(1.0)
-            uploaded = client.files.get(name=uploaded.name)
-        if uploaded.state.name != "ACTIVE":
-            raise RuntimeError(f"Gemini file upload failed with state={uploaded.state.name!r}.")
+            uploaded = _gemini_get_file(uploaded["name"], self.api_key)
+        if uploaded.get("state") != "ACTIVE":
+            raise RuntimeError(f"Gemini file upload failed with state={uploaded.get('state')!r}.")
 
-        contents: list[Any] = [uploaded]
+        parts: list[Any] = [
+            {
+                "file_data": {
+                    "mime_type": uploaded.get("mimeType", "video/mp4"),
+                    "file_uri": uploaded["uri"],
+                }
+            }
+        ]
+
         if include_plots_in_prompt and plot_paths:
             for plot_path in plot_paths:
-                plot_upload = client.files.upload(file=str(plot_path))
-                while plot_upload.state.name == "PROCESSING":
+                plot_uploaded = _gemini_upload_file(Path(plot_path), self.api_key)
+                if plot_uploaded.get("state") is None:
+                    plot_uploaded = _gemini_get_file(plot_uploaded["name"], self.api_key)
+                while plot_uploaded.get("state") == "PROCESSING":
                     time.sleep(0.5)
-                    plot_upload = client.files.get(name=plot_upload.name)
-                if plot_upload.state.name != "ACTIVE":
+                    plot_uploaded = _gemini_get_file(plot_uploaded["name"], self.api_key)
+                if plot_uploaded.get("state") != "ACTIVE":
                     raise RuntimeError(
                         f"Gemini plot upload failed for {plot_path} "
-                        f"with state={plot_upload.state.name!r}."
+                        f"with state={plot_uploaded.get('state')!r}."
                     )
-                contents.append(plot_upload)
+                parts.append(
+                    {
+                        "file_data": {
+                            "mime_type": plot_uploaded.get("mimeType", "image/png"),
+                            "file_uri": plot_uploaded["uri"],
+                        }
+                    }
+                )
 
-        prompt = build_coaching_prompt(metadata, include_plots=include_plots_in_prompt)
-        contents.append(prompt)
-        response = client.models.generate_content(
-            model=self.model,
-            contents=contents,
-        )
-        text = getattr(response, "text", None) or str(response)
+        prompt = build_coaching_prompt(metadata)
+        parts.append({"text": prompt})
+
+        text = _gemini_generate_content(self.model, [{"parts": parts}], self.api_key)
         return parse_coach_response(text)
 
     def complete_text(self, prompt: str) -> str:
         """Text-only completion (used for per-chunk feedback refinement)."""
-        from google import genai
-
-        client = genai.Client(api_key=self.api_key)
-        response = client.models.generate_content(
-            model=self.model,
-            contents=prompt,
+        return _gemini_generate_content(
+            self.model,
+            [{"parts": [{"text": prompt}]}],
+            self.api_key,
         )
-        return getattr(response, "text", None) or str(response)
 
 
 class PerceptronVLMCOach(VLMCOach):
@@ -404,6 +511,82 @@ def create_coach(provider: ProviderName, **kwargs: Any) -> VLMCOach:
     if provider == "perceptron":
         return PerceptronVLMCOach(**kwargs)
     raise ValueError(f"Unknown provider {provider!r}; expected 'gemini' or 'perceptron'.")
+
+
+def generate_action_chunk_feedback(
+    coach: VLMCOach,
+    metadata: dict[str, Any],
+    events: list[CoachEvent],
+    *,
+    steps_per_chunk: int = 10,
+    chunk_duration_sec: float = 0.5,
+    bad_event_radius_chunks: int = 2,
+) -> dict[str, Any]:
+    """Map episode BAD events → per-action-chunk lateral/longitudinal feedback BoW labels.
+
+    Returns the assembled chunk-feedback JSON dict (see coaches/action_chunk_feedback.py).
+    Bad events near a GOOD/BAD boundary are expanded by ``bad_event_radius_chunks`` chunks
+    on each side; all other chunks receive ``null`` feedback.
+    """
+    from coaches.action_chunk_feedback import (
+        affected_chunks_from_bad_events,
+        assemble_chunk_feedback_json,
+        build_action_chunk_specs,
+        build_chunk_feedback_prompt,
+        parse_chunk_feedback_response,
+    )
+
+    chunk_specs = build_action_chunk_specs(
+        metadata,
+        steps_per_chunk=steps_per_chunk,
+        chunk_duration_sec=chunk_duration_sec,
+    )
+    num_chunks = len(chunk_specs)
+    bad_timestamps = [e.timestamp_sec for e in events if e.label == "BAD"]
+    affected = affected_chunks_from_bad_events(
+        bad_timestamps,
+        num_chunks=num_chunks,
+        radius_chunks=bad_event_radius_chunks,
+        chunk_duration_sec=chunk_duration_sec,
+    )
+
+    chunk_feedback: list[dict[str, Any] | None] = [None] * num_chunks
+    if affected and bad_timestamps:
+        bad_payload = [
+            {
+                "timestamp_sec": e.timestamp_sec,
+                "description": e.description,
+                "correction": e.correction,
+            }
+            for e in events
+            if e.label == "BAD"
+        ]
+        prompt = build_chunk_feedback_prompt(
+            bad_events=bad_payload,
+            chunk_specs=chunk_specs,
+            affected_chunk_indices=affected,
+            metadata=metadata,
+            steps_per_chunk=steps_per_chunk,
+            chunk_duration_sec=chunk_duration_sec,
+            bad_event_radius_chunks=bad_event_radius_chunks,
+        )
+        response_text = coach.complete_text(prompt)
+        chunk_feedback = parse_chunk_feedback_response(
+            response_text,
+            num_chunks=num_chunks,
+            affected_chunk_indices=affected,
+        )
+
+    return assemble_chunk_feedback_json(
+        metadata,
+        events=events,
+        chunk_feedback=chunk_feedback,
+        chunk_specs=chunk_specs,
+        affected_chunk_indices=affected,
+        steps_per_chunk=steps_per_chunk,
+        chunk_duration_sec=chunk_duration_sec,
+        bad_event_radius_chunks=bad_event_radius_chunks,
+    )
 
 
 def _wrap_text(text: str, *, width: int = 48) -> list[str]:
@@ -679,4 +862,6 @@ def main(
 
 
 if __name__ == "__main__":
+    import tyro
+
     tyro.cli(main)

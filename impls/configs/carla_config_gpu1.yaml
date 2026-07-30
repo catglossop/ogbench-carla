@@ -1,0 +1,40 @@
+# CARLA / Bench2Drive runtime configuration.
+#
+# Routes are NOT specified here. Pick a route on the command line:
+#   --route=parking-cut-in-001        (scenario-style name)
+#   --route=bench2drive_007           (file basename)
+#   --route=1711                      (XML <route id="...">)
+# See `python impls/main_carla.py --list_routes=true` for the full list.
+#
+# CARLA Python API + navigation agents live under PythonAPI/carla. Export before Python starts:
+#   export CARLA_PYTHON_API_ROOT=/home/carla/carla-0-9-16/PythonAPI/carla
+# or:
+#   export CARLA_ROOT=/home/carla/carla-0-9-16
+
+host: localhost
+port: 2003
+traffic_manager_port: 8003
+traffic_manager_seed: 0
+debug: 0
+record: ''
+timeout: 7200  # 2 hours wall-clock — needed because SimLingo inference runs at ~0.020x realtime via IPC
+
+# Leaderboard agent module: defaults to ogbench.carla.leaderboard_agents.observation_only
+# (registers a small sensor suite and never produces controls; the gym wrapper drives).
+track: SENSORS
+resume: False
+checkpoint: ./simulation_results.json
+debug_checkpoint: ./live_results.txt
+# CARLA UE / rendering adapter index (leaderboard subprocess). JAX RL GPU is separate:
+# set ``training_gpu_rank`` in the agent config (e.g. steervla_dsrl_config.py).
+gpu_rank: 1 # Carla for some reason swaps the order of the GPUs, so we need to set the rank to 0 for GPU1 in nvtop and vice versa 
+repetitions: 1
+repetition_index: 0
+
+# Terminate early when a counted collision is followed by sustained low speed.
+crash_stuck_speed_threshold: 0.1
+crash_stuck_steps: 20
+crash_stuck_penalty: -1.0
+
+# Per-step reward shaping (defaults in carla_utils.py). Example:
+# speed_limit_penalty_weight: 0.1  # penalty = weight * max(0, speed/limit - 1)

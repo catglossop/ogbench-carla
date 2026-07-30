@@ -37,7 +37,7 @@ traffic_manager_port: 8001
 traffic_manager_seed: 0
 debug: 0
 record: ''
-timeout: 600
+timeout: 7200  # 2 hours wall-clock — needed because SimLingo inference runs at ~0.020x realtime via IPC
 
 # Leaderboard agent module: defaults to ogbench.carla.leaderboard_agents.observation_only
 # (registers a small sensor suite and never produces controls; the gym wrapper drives).
@@ -54,11 +54,10 @@ repetition_index: 0
 # Terminate early when a counted collision is followed by sustained low speed.
 crash_stuck_speed_threshold: 0.1
 crash_stuck_steps: 20
-crash_stuck_penalty: -1.0
+crash_stuck_penalty: -5.0
 
-# Force a new episode after this many env steps (0 = no limit). 1 step = 0.05s, so
-# 2400 = 120s; clears the ~90s generalization-wall despawn. Ceiling: tick_count>4000 (200s).
-max_episode_steps: 2400
+# Force a new episode after this many env steps (0 = no limit).
+max_episode_steps: 2000
 
 # Per-step reward shaping (defaults in carla_utils.py).
 # Dense progress = weight * Δroute% / 100; whole-route reward = weight.

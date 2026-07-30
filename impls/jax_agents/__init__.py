@@ -7,6 +7,7 @@ from .hiql import HIQLAgent
 from .qrl import QRLAgent
 from .sac import SACAgent
 from .sac_residual import SACResidualAgent
+from .best_of_n import BestOfNAgent
 
 agents = dict(
     crl=CRLAgent,
@@ -18,4 +19,5 @@ agents = dict(
     qrl=QRLAgent,
     sac=SACAgent,
     sac_residual=SACResidualAgent,
+    best_of_n=BestOfNAgent,
 )

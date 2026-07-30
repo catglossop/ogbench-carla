@@ -39,6 +39,7 @@ this module walks both source directories once.
 
 from __future__ import annotations
 
+import os
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -51,7 +52,21 @@ _DEFAULT_BENCH2DRIVE_DIR = Path(__file__).resolve().parents[2] / "data" / "bench
 
 
 def _fail2drive_routes_dir() -> Optional[Path]:
-    """Return the Fail2Drive routes directory if the package is installed."""
+    """Return the Fail2Drive routes directory.
+
+    Resolution order:
+    1. ``FAIL2DRIVE_ROUTES_DIR`` env var  (e.g. ~/fail2drive/fail2drive_split)
+    2. ``fail2drive`` Python package's ``ROUTES_DIR`` attribute (if the package
+       is pip-installed, e.g. catglossop/fail2drive)
+    """
+    # 1. Explicit env var — works with a cloned repo, no pip install needed.
+    env_dir = os.environ.get("FAIL2DRIVE_ROUTES_DIR", "")
+    if env_dir:
+        p = Path(env_dir).expanduser().resolve()
+        if p.is_dir():
+            return p
+
+    # 2. Installed package fallback.
     try:
         import fail2drive  # type: ignore
     except ImportError:

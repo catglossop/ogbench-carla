@@ -106,24 +106,25 @@ def generate_trajectory_plots(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    times = [step_time_sec(s, metadata) for s in steps]
+    times_raw = [step_time_sec(s, metadata) for s in steps]
     speed = [float(s["ego_speed_mps"]) for s in steps]
     throttle = [float(s["control_throttle"]) for s in steps]
     steer = [float(s["control_steer"]) for s in steps]
     brake = [float(s["control_brake"]) for s in steps]
     progress = [float(s["route_progress_pct"]) for s in steps]
-    collision_times = [t for t, s in zip(times, steps, strict=True) if s.get("collision")]
+    collision_times = [t for t, s in zip(times_raw, steps) if s.get("collision")]  # strict= requires Python 3.10+
 
     episode = metadata.get("episode", "?")
     route = metadata.get("route", "?")
     title = f"Episode {episode} — {route}"
 
+    # Use a uniform time axis so the plot spacing is consistent even when
+    # trajectory records don't have exact video timestamps.
+    times = np.arange(len(speed)) * float(metadata.get("video_frame_stride", 1)) / float(metadata.get("video_fps", 20.0))
+
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
     fig.suptitle(title, fontsize=12)
 
-    times = np.arange(len(speed)) * 0.05
-    
-    breakpoint()
     ax_speed = axes[0, 0]
     ax_speed.plot(times, speed, color="#4C9AFF", linewidth=1.5)
     ax_speed.set_ylabel("Speed (m/s)")

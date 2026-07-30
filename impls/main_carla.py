@@ -46,6 +46,7 @@ remains free for CARLA's ``PythonAPI/carla/agents`` (navigation, etc.).
 
 from __future__ import annotations
 
+import faulthandler
 import json
 import os
 import random
@@ -54,6 +55,16 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
+
+# CARLA's C++ rpclib I/O thread calls std::terminate() -> SIGABRT when concurrent RPC
+# from multiple threads corrupts the msgpack socket framing (surfaces as a bogus
+# "Actor could not be found in the registry ... set_actor_simulate_physics" + "Fatal
+# Python error: Aborted"). See ogbench/carla/carla_utils._patch_speedometer_no_rpc.
+# faulthandler.enable() installs an all-threads handler for SIGABRT (among SIGSEGV/
+# SIGFPE/SIGBUS/SIGILL) by default, so every thread's Python stack is dumped on abort,
+# revealing which background thread was mid-CARLA-RPC. (SIGABRT cannot be passed to
+# faulthandler.register(); enable() is the supported path.)
+faulthandler.enable()
 
 import numpy as np
 import jax
@@ -246,6 +257,18 @@ def _ego_speed_mps_from_raw(raw: dict) -> np.float32:
     return np.float32(state[_EGO_STATE_IDX_SPEED])
 
 
+def _coerce_language_label(value, dim: int, fallback: np.ndarray) -> np.ndarray:
+    """Return ``value`` as a length-``dim`` float32 vector, or ``fallback`` if mismatched."""
+    if dim <= 0:
+        return np.zeros(0, dtype=np.float32)
+    if value is None:
+        return fallback
+    arr = np.asarray(value, dtype=np.float32).reshape(-1)
+    if arr.size != int(dim):
+        return fallback
+    return arr
+
+
 def _steervla_prompt_subtask_strings(raw: dict, steervla_actor=None) -> tuple[str, str]:
     """Extract SteerVLA prompt and subtask strings from a CARLA raw obs dict."""
     prompt = str(raw.get("openpi_prompt_text") or "").strip()
@@ -400,6 +423,7 @@ def _build_vla_sample_fn(
     raw_carla_obs_holder: dict | None,
     *,
     training_gpu_rank: int = -1,
+    noise_scale: float = 1.0,
 ):
     """Construct ``(obs, noise) -> action`` using OpenPI Pi0-CoT SteerVLA (:mod:`vlas.steervla`)."""
     if not steervla_cfg.get("enabled", False):
@@ -421,6 +445,7 @@ def _build_vla_sample_fn(
             steervla_cfg,
             raw_carla_obs_holder,
             training_gpu_rank=training_gpu_rank,
+            noise_scale=noise_scale,
         )
 
     if not steervla_cfg.get("checkpoint"):
@@ -435,6 +460,7 @@ def _build_vla_sample_fn(
         steervla_cfg,
         raw_carla_obs_holder,
         training_gpu_rank=training_gpu_rank,
+        noise_scale=noise_scale,
     )
 
 
@@ -898,6 +924,9 @@ def run_online_carla(
     warmup = int(agent_config.get("warmup_steps", 1000))
     warmup_expo = int(agent_config.get("warmup_expo_steps", 0))
     updates_per_step = int(agent_config.get("updates_per_step", 1))
+    update_interval = int(agent_config.get("update_interval", 1))
+    if update_interval < 1:
+        raise ValueError(f"update_interval must be >= 1, got {update_interval}")
     batch_size = int(agent_config.get("batch_size", 256))
     enable_updates = bool(agent_config.get("enable_updates", True))
     if FLAGS.enable_updates is not None:
@@ -908,6 +937,8 @@ def run_online_carla(
         print("[main_carla] enable_updates=False: rollout-only (no RL gradient updates)", flush=True)
     if warmup > 0 and agent is not None and not FLAGS.expert_debug:
         print(f"[main_carla] warmup: no RL updates while step < {warmup}", flush=True)
+    if update_interval > 1 and agent is not None and enable_updates:
+        print(f"[main_carla] RL updates every {update_interval} env steps", flush=True)
     if warmup_expo > 0:
         if warmup_expo <= warmup:
             raise ValueError(
@@ -1196,11 +1227,24 @@ def run_online_carla(
 
     def _sample_agent_action(subkey):
         """Rollout policy (SteerVLA VLA path, DAgger, or DSRL flow); used in warmup and RL phases."""
-        if getattr(agent, "vla_sample_fn", None) is not None:
-            return agent.sample_actions_with_vla(obs[None], seed=subkey)
-        if _online_training_mode == "dagger" and hasattr(agent, "sample_actions_dagger"):
-            return agent.sample_actions_dagger(obs[None])
-        return agent.sample_actions(obs[None], seed=subkey)
+        uses_vla = getattr(agent, "vla_sample_fn", None) is not None
+        pause_env = uses_vla and hasattr(env, "pause_for_vla_inference")
+        if pause_env:
+            env.pause_for_vla_inference()
+        t0 = time.time()
+        try:
+            if uses_vla:
+                return agent.sample_actions_with_vla(obs[None], seed=subkey)
+            if _online_training_mode == "dagger" and hasattr(agent, "sample_actions_dagger"):
+                return agent.sample_actions_dagger(obs[None])
+            return agent.sample_actions(obs[None], seed=subkey)
+        finally:
+            if uses_vla:
+                elapsed = time.time() - t0
+                if elapsed > 5.0:
+                    print(f"[main_carla] VLA sample took {elapsed:.1f}s", flush=True)
+            if pause_env:
+                env.resume_after_vla_inference()
 
     _vla_steps_budget = int(np.random.randint(70, 201)) if FLAGS.expert_recover_debug else 0
     if FLAGS.expert_recover_debug:
@@ -1296,9 +1340,17 @@ def run_online_carla(
                 else ("", _zero_label)
             )
             _next_lang = _zero_label
+        elif _critic_feedback_mode == "subtask_siglip":
+            # Best-of-N stashes a SigLIP subtask embedding on ``obs_raw`` after sampling.
+            # ``env._obs_dict()`` also puts a 119-dim expert commentary BoW in the same
+            # key — ignore mismatched sizes and never copy env labels into ``next_*``.
+            _lang = _coerce_language_label(obs_raw.get("language_label"), _lang_dim, _zero_label)
+            _next_lang = _zero_label
         else:
-            _lang = np.asarray(obs_raw.get("language_label", _zero_label), dtype=np.float32)
-            _next_lang = np.asarray(next_obs_raw.get("language_label", _zero_label), dtype=np.float32)
+            _lang = _coerce_language_label(obs_raw.get("language_label"), _lang_dim, _zero_label)
+            _next_lang = _coerce_language_label(
+                next_obs_raw.get("language_label"), _lang_dim, _zero_label
+            )
         _critic_text_for_video = _critic_input_text(_critic_feedback_mode, _lang, _lang_text, obs_raw)
 
         replay_action = action.astype(np.float32)
@@ -1412,6 +1464,8 @@ def run_online_carla(
         step_wb["training/in_warmup"] = float(in_warmup)
         step_wb["training/in_expo_warmup"] = float(in_expo_warmup)
         step_wb["training/enable_updates"] = float(enable_updates)
+        if "episode_step_count" in info:
+            step_wb["rollout/episode_step"] = float(info["episode_step_count"])
 
         wandb.log(step_wb, step=step)
 
@@ -1458,11 +1512,7 @@ def run_online_carla(
             )
             if traj_path is not None:
                 rollout_log["rollout/trajectory_json"] = traj_path
-            if _vlm_coach is not None:
-                _vlm_coach.maybe_query(
-                    episode_step=done_episode_steps, done_info=done_info, force=True
-                )
-                _vlm_coach.backfill_buffer(buffer)
+            n_video_frames = len(episode_video_frames) + (1 if end_img is not None else 0)
             _maybe_log_episode_video(
                 rollout_log,
                 end_img if log_images else None,
@@ -1473,6 +1523,27 @@ def run_online_carla(
             if live_viewer is not None and episode_video_frames:
                 live_viewer.publish_frames(episode_video_frames, step, force=True)
             wandb.log(rollout_log, step=step)
+            train_logger.log(
+                {
+                    k: v
+                    for k, v in rollout_log.items()
+                    if k.startswith("rollout/") and k != "rollout/route"
+                },
+                step=step,
+            )
+            print(
+                f"[main_carla] episode {episode_count} done: "
+                f"return={done_episode_return:.3f} steps={done_episode_steps} "
+                f"route={done_route!r} "
+                f"video={'yes' if 'rollout/episode_video' in rollout_log else 'no'} "
+                f"({n_video_frames} frames)",
+                flush=True,
+            )
+            if _vlm_coach is not None:
+                _vlm_coach.maybe_query(
+                    episode_step=done_episode_steps, done_info=done_info, force=True
+                )
+                _vlm_coach.backfill_buffer(buffer)
             episode_video_frames = []
             episode_trajectory = []
             episode_video_frame_index = 0
@@ -1501,8 +1572,8 @@ def run_online_carla(
             and agent is not None
             and not in_warmup
             and buffer.size >= batch_size
+            and step % update_interval == 0
         ):
-            
             for _ in range(updates_per_step):
                 t_update_start = time.time()
                 use_vla_update = getattr(agent, "vla_sample_fn", None) is not None
@@ -2271,6 +2342,9 @@ def _run_dsrl_entry(config):
         config.language_label_dim = NUM_COMMENTARY_WORDS
     elif critic_feedback_mode == "action_delta":
         config.language_label_dim = int(config.get("critic_action_dim", 4))
+    elif critic_feedback_mode == "subtask_siglip":
+        # Subtask text embedded with SigLIP; agent.create syncs siglip_embed_dim to the encoder.
+        config.language_label_dim = int(config.get("siglip_embed_dim", 1152))
     extra_carla: dict[str, Any] = {}
     exec_cfg = _steervla_action_execution_cfg(steervla_cfg)
     if exec_cfg is not None:
@@ -2326,7 +2400,10 @@ def _run_dsrl_entry(config):
             tr_rank = int(config.get("training_gpu_rank", -1))
             if use_steervla_rollout:
                 vla_bundle = _build_vla_sample_fn(
-                    steervla_cfg, raw_carla_holder, training_gpu_rank=tr_rank
+                    steervla_cfg,
+                    raw_carla_holder,
+                    training_gpu_rank=tr_rank,
+                    noise_scale=float(config.get("noise_scale", 1.0)),
                 )
                 if vla_bundle is None:
                     raise ValueError("SteerVLA rollout enabled but vla_sample_fn could not be built.")
@@ -2337,6 +2414,7 @@ def _run_dsrl_entry(config):
                 steervla_actor.debug_noise_log_every_n_steps = int(
                     config.get("debug_noise_log_every_n_steps", 5)
                 )
+                steervla_actor.noise_scale = float(config.get("noise_scale", 1.0))
                 if steervla_actor.debug_noise:
                     print(
                         f"[main_carla] debug_noise enabled: "
@@ -2362,13 +2440,17 @@ def _run_dsrl_entry(config):
 
             agent_class = agents[config["agent_name"]]
             create_kwargs = {}
-            if config["agent_name"] == "dsrl" and vla_sample_fn is not None:
+            if config["agent_name"] in ("dsrl", "best_of_n") and vla_sample_fn is not None:
                 create_kwargs["vla_sample_fn"] = vla_sample_fn
                 url = steervla_cfg.get("actor_url") if steervla_cfg else None
                 if not (url and str(url).strip()):
                     create_kwargs["openpi_train_config"] = steervla_actor.train_cfg
                     create_kwargs["steervla_actor"] = steervla_actor
-                
+
+            if config["agent_name"] == "best_of_n":
+                # Subtask -> critic language label uses SigLIP text features (shared encoder if present).
+                create_kwargs["siglip_encoder"] = siglip_encoder
+
             if config["agent_name"] == "expo" and vla_sample_fn is not None:
                 create_kwargs["vla_sample_fn"] = vla_sample_fn
                 url = steervla_cfg.get("actor_url") if steervla_cfg else None
