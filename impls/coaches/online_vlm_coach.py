@@ -380,12 +380,15 @@ class OnlineVLMSession:
             return _label_memo[step]
 
         for buf_idx, ep_step in zip(new_indices, new_steps):
+            # DSRL ReplayBuffer (main_carla.py) stores critic language as ``language_label`` /
+            # ``next_language_label`` -- NOT ``coach_label``, which is the SimLingo/torch stack's
+            # field name (see coaches/test_action_chunk_feedback_integration.py).
             # The next-state label (ep_step + 1) keeps the TD bootstrap conditioned
             # on the label the critic sees at s_{t+1}, not a stale/zero one.
             buffer.update_at(
                 int(buf_idx),
-                coach_label=_label(ep_step),
-                next_coach_label=_label(ep_step + 1),
+                language_label=_label(ep_step),
+                next_language_label=_label(ep_step + 1),
             )
         self._backfill_cursor += len(new_indices)
         n_labeled = sum(1 for ep_step in new_steps if _label(ep_step).any())

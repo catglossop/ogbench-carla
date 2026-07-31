@@ -24,6 +24,9 @@ def critic_language_dim(agent_config: Any) -> int:
         return int(agent_config.get("critic_action_dim", 4)) + 1
     if mode == "action_delta":
         return int(agent_config.get("critic_action_dim", 4))
+    if mode == "subtask_siglip":
+        # SigLIP text embedding of the executed candidate's subtask (best-of-N critic label).
+        return int(agent_config.get("siglip_embed_dim", 1152))
     if mode in ("delta_commentary_bow", "vlm_chunk_bow"):
         return NUM_DELTA_COMMENTARY_WORDS
     return NUM_COMMENTARY_WORDS

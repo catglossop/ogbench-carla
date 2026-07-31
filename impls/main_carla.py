@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import faulthandler
 import json
 import os
 import random
@@ -47,6 +48,16 @@ import time
 import traceback
 from pathlib import Path
 from typing import Any, Optional
+
+# CARLA's C++ rpclib I/O thread calls std::terminate() -> SIGABRT when concurrent RPC
+# from multiple threads corrupts the msgpack socket framing (surfaces as a bogus
+# "Actor could not be found in the registry ... set_actor_simulate_physics" + "Fatal
+# Python error: Aborted"). See ogbench/carla/carla_utils._patch_speedometer_no_rpc.
+# faulthandler.enable() installs an all-threads handler for SIGABRT (among SIGSEGV/
+# SIGFPE/SIGBUS/SIGILL) by default, so every thread's Python stack is dumped on abort,
+# revealing which background thread was mid-CARLA-RPC. (SIGABRT cannot be passed to
+# faulthandler.register(); enable() is the supported path.)
+faulthandler.enable()
 
 import numpy as np
 import jax
@@ -75,6 +86,9 @@ import tqdm
 
 from ogbench.carla.carla_utils import ego_drive_metrics_from_state_vec
 
+from impls.coaches.online_vlm_coach import OnlineVLMSession
+from utils.live_policy_viewer import LivePolicyViewer
+
 from utils.datasets import ReplayBuffer
 from utils.flax_utils import save_agent
 
@@ -82,6 +96,12 @@ from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
 
 FLAGS = flags.FLAGS
 
+flags.DEFINE_bool(
+    "enable_updates",
+    None,
+    "If false, skip RL gradient updates (rollout/buffer logging only). "
+    "Default: agent config ``enable_updates`` (true).",
+)
 flags.DEFINE_string("run_group", "Debug", "Run group.")
 flags.DEFINE_integer("seed", 0, "Random seed.")
 flags.DEFINE_string(
@@ -92,8 +112,10 @@ flags.DEFINE_string(
 flags.DEFINE_string(
     "route",
     None,
-    "Bench2Drive route: scenario-name (parking-cut-in-001), file basename "
-    "(bench2drive_007), or route id (1711). See --list_routes=true.",
+    "Bench2Drive or Fail2Drive route. Accepts scenario-name "
+    "(parking-cut-in-001, base-pedestrians-on-road-0085), file basename "
+    "(bench2drive_007, Base_PedestriansOnRoad_0085), or route id "
+    "(1711 for bench2drive; f2d:85 for fail2drive). See --list_routes=true.",
 )
 flags.DEFINE_bool("list_routes", False, "Print all known routes and exit.")
 flags.DEFINE_bool(
@@ -431,7 +453,27 @@ def _configure_jax_training_device(training_gpu_rank: int) -> None:
     )
 
 
+# Must match :data:`ogbench.carla.carla_utils.EGO_STATE_IDX_SPEED`.
 _EGO_STATE_IDX_SPEED = 15
+
+
+def _ego_speed_mps_from_raw(raw: dict) -> np.float32:
+    state = np.asarray(raw["state"], dtype=np.float32).reshape(-1)
+    if state.size <= _EGO_STATE_IDX_SPEED:
+        return np.float32(0.0)
+    return np.float32(state[_EGO_STATE_IDX_SPEED])
+
+
+def _coerce_language_label(value, dim: int, fallback: np.ndarray) -> np.ndarray:
+    """Return ``value`` as a length-``dim`` float32 vector, or ``fallback`` if mismatched."""
+    if dim <= 0:
+        return np.zeros(0, dtype=np.float32)
+    if value is None:
+        return fallback
+    arr = np.asarray(value, dtype=np.float32).reshape(-1)
+    if arr.size != int(dim):
+        return fallback
+    return arr
 
 
 def _steervla_prompt_subtask_strings(raw: dict, steervla_actor=None) -> tuple[str, str]:
@@ -485,7 +527,7 @@ def _extract_agent_obs(
     The language label (BOW or delta) is stored separately in the replay buffer
     and concatenated to the encoded observation ONLY inside the critic (dsrl.py).
     When ``image_encoder='siglip'`` and ``siglip_include_prompt_subtask=True``,
-    returns ``[image_embed, prompt_embed, subtask_embed]`` for actor and critic.
+    returns ``[image_embed, prompt_embed, subtask_embed]`` for actor and critics.
     """
     if mode == "state":
         return np.asarray(env_obs["state"], dtype=np.float32)
@@ -527,15 +569,24 @@ def _resolve_wandb_mode() -> str:
         return FLAGS.wandb_mode
     return os.environ.get("WANDB_MODE", "online")
 
-# List routes and exit  
+# List routes and exit
 def _list_routes_and_exit() -> None:
     from ogbench.carla.route_registry import list_routes
 
     entries = list_routes()
-    print(f"# {len(entries)} Bench2Drive routes")
-    print(f"{'scenario_name':<48} {'file_name':<24} {'route_id':<8} {'town':<10} {'scenario_type'}")
+    b2d_count = sum(1 for e in entries if e.source == "bench2drive")
+    f2d_count = sum(1 for e in entries if e.source == "fail2drive")
+    print(f"# {len(entries)} routes ({b2d_count} bench2drive, {f2d_count} fail2drive)")
+    header = (
+        f"{'source':<12} {'scenario_name':<48} {'file_name':<32} "
+        f"{'route_id':<10} {'town':<10} {'scenario_type'}"
+    )
+    print(header)
     for e in entries:
-        print(f"{e.scenario_name:<48} {e.file_name:<24} {e.route_id:<8} {e.town:<10} {e.scenario_type}")
+        print(
+            f"{e.source:<12} {e.scenario_name:<48} {e.file_name:<32} "
+            f"{e.route_id:<10} {e.town:<10} {e.scenario_type}"
+        )
 
 
 def _steervla_action_execution_cfg(steervla_cfg) -> dict[str, Any] | None:
@@ -860,6 +911,7 @@ def _build_vla_sample_fn(
     raw_carla_obs_holder: dict | None,
     *,
     training_gpu_rank: int = -1,
+    noise_scale: float = 1.0,
 ):
     """Construct ``(obs, noise) -> action`` using OpenPI Pi0-CoT SteerVLA (:mod:`vlas.steervla`)."""
     if not steervla_cfg.get("enabled", False):
@@ -881,6 +933,7 @@ def _build_vla_sample_fn(
             steervla_cfg,
             raw_carla_obs_holder,
             training_gpu_rank=training_gpu_rank,
+            noise_scale=noise_scale,
         )
 
     if not steervla_cfg.get("checkpoint"):
@@ -895,6 +948,7 @@ def _build_vla_sample_fn(
         steervla_cfg,
         raw_carla_obs_holder,
         training_gpu_rank=training_gpu_rank,
+        noise_scale=noise_scale,
     )
 
 
@@ -926,8 +980,15 @@ def run_online_carla(
 
     capacity = int(agent_config.get("buffer_capacity", 5_000))
     warmup = int(agent_config.get("warmup_steps", 1000))
+    warmup_expo = int(agent_config.get("warmup_expo_steps", 0))
     updates_per_step = int(agent_config.get("updates_per_step", 1))
+    update_interval = int(agent_config.get("update_interval", 1))
+    if update_interval < 1:
+        raise ValueError(f"update_interval must be >= 1, got {update_interval}")
     batch_size = int(agent_config.get("batch_size", 256))
+    enable_updates = bool(agent_config.get("enable_updates", True))
+    if FLAGS.enable_updates is not None:
+        enable_updates = bool(FLAGS.enable_updates)
     _online_training_mode = str(agent_config.get("online_training_mode", "rl")).strip().lower()
     _residual_warmup = int(agent_config.get("residual_warmup_steps", 0))
     # Rollout flow-latent scale for the frozen Pi0 base policy (see _sample_agent_action).
@@ -1037,9 +1098,23 @@ def run_online_carla(
     _res_norm_M2 = np.zeros(_residual_obs_dim, dtype=np.float64)
 
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, "train.csv"))
+    if not enable_updates:
+        print("[main_carla] enable_updates=False: rollout-only (no RL gradient updates)", flush=True)
     if warmup > 0 and agent is not None and not FLAGS.expert_debug:
-        policy_src = "rollout policy (no RL updates)"
-        print(f"[main_carla] warmup: {warmup} steps using {policy_src}", flush=True)
+        print(f"[main_carla] warmup: no RL updates while step < {warmup}", flush=True)
+    if update_interval > 1 and agent is not None and enable_updates:
+        print(f"[main_carla] RL updates every {update_interval} env steps", flush=True)
+    if warmup_expo > 0:
+        if warmup_expo <= warmup:
+            raise ValueError(
+                f"warmup_expo_steps ({warmup_expo}) must be greater than warmup_steps ({warmup})."
+            )
+        if agent is not None and hasattr(agent, "set_edit_actor_rollout_enabled"):
+            print(
+                f"[main_carla] EXPO warmup: RL updates from step {warmup}, "
+                f"VLA-only rollout until step > {warmup_expo}",
+                flush=True,
+            )
     
     # Get openpi fields from raw observation
     def _openpi_fields_from_raw(raw: dict | None) -> dict[str, np.ndarray]:
@@ -1052,7 +1127,10 @@ def run_online_carla(
             return {}
 
         obs_struct = steervla_actor.build_observation_batch_numpy(batch_size=1, raw=raw)
-        from vlas.steervla import openpi_replay_fields_from_observation
+        from vlas.steervla import (
+            openpi_replay_fields_from_observation,
+            openpi_replay_fields_with_fast_placeholders,
+        )
 
         out = openpi_replay_fields_from_observation(obs_struct)
         # ``build_observation_batch_numpy`` leaves CoT/FAST empty; overlay tokens stashed by VLA.
@@ -1077,13 +1155,15 @@ def run_online_carla(
         if "fast" in raw or "openpi_tokenized_fast" in raw:
             fk = raw.get("openpi_tokenized_fast", raw.get("fast"))
             fmk = raw.get("openpi_tokenized_fast_mask", raw.get("fast_mask"))
-            if fk is not None:
+            if fk is not None and fmk is not None:
                 out["openpi_tokenized_fast"] = np.asarray(fk, dtype=np.int32)
-                out["fast"] = out["openpi_tokenized_fast"]
-            if fmk is not None:
                 out["openpi_tokenized_fast_mask"] = np.asarray(fmk, dtype=bool)
+                out["fast"] = out["openpi_tokenized_fast"]
                 out["fast_mask"] = out["openpi_tokenized_fast_mask"]
-        return out
+        return openpi_replay_fields_with_fast_placeholders(
+            out,
+            model_cfg=getattr(steervla_actor, "model_cfg", None),
+        )
     
     raw_obs_holder = raw_carla_obs_holder
 
@@ -1100,10 +1180,34 @@ def run_online_carla(
             "[main_carla] SigLIP observations = [image_embed, prompt_embed, subtask_embed]",
             flush=True,
         )
-    log_images = True
+    log_images = obs_mode == "image"
+    capture_rollout_video = log_images or bool(FLAGS.live_policy_view)
+
+    live_viewer: LivePolicyViewer | None = None
+    if FLAGS.live_policy_view:
+        live_viewer = LivePolicyViewer(
+            os.path.join(FLAGS.save_dir, "live_policy.mp4"),
+            port=int(FLAGS.live_policy_port),
+            fps=10.0,
+            publish_every_n_steps=int(FLAGS.live_policy_interval),
+        )
+        live_viewer.start()
 
     _critic_feedback_mode = resolve_critic_feedback_mode(agent_config)
     _lang_dim = critic_language_dim(agent_config)
+
+    _vlm_coach: OnlineVLMSession | None = None
+    if _critic_feedback_mode == "vlm_chunk_bow":
+        vlm_cfg = agent_config.get("vlm_coach")
+        if vlm_cfg is None:
+            raise ValueError(
+                "language_feedback.source='vlm' requires agent config block 'vlm_coach'."
+            )
+        _vlm_coach = OnlineVLMSession(
+            vlm_cfg,
+            save_dir=FLAGS.save_dir,
+            action_chunk_steps=int(agent_config.get("action_horizon", 10)),
+        )
 
     steervla_cfg = agent_config.get("steervla") or {}
     _steervla_exec_cfg = _steervla_action_execution_cfg(steervla_cfg)
@@ -1189,6 +1293,8 @@ def run_online_carla(
     if _residual_append_state and _online_training_mode in {"sac_residual", "dagger_residual"}:
         example_transition["residual_obs"] = np.zeros((_residual_obs_dim,), dtype=np.float32)
         example_transition["next_residual_obs"] = np.zeros((_residual_obs_dim,), dtype=np.float32)
+    if agent_config.get("debug_task", False):
+        example_transition["ego_speed"] = _ego_speed_mps_from_raw(obs_raw)
     if steervla_actor is not None:
         openpi0 = _openpi_fields_from_raw(obs_raw)
         example_transition.update(openpi0)
@@ -1217,8 +1323,31 @@ def run_online_carla(
         return np.asarray(steervla_actor.encode_prefix_features(openpi_obs)[0], dtype=np.float32)
 
     _pi_prefix_e: np.ndarray | None = _compute_pi_prefix_e(obs_raw) if _uses_pi_prefix else None
+    _buffer_keys = frozenset(example_transition.keys())
+
+    def _buffer_transition(raw_obs: dict, next_raw_obs: dict, **core) -> dict[str, np.ndarray]:
+        """Build a transition dict whose keys match the replay buffer schema exactly."""
+        transition = dict(core)
+        if steervla_actor is not None:
+            transition.update(_openpi_fields_from_raw(raw_obs))
+            transition.update(
+                {f"next_{k}": np.array(v) for k, v in _openpi_fields_from_raw(next_raw_obs).items()}
+            )
+        extra = set(transition.keys()) - _buffer_keys
+        if extra:
+            raise KeyError(
+                f"Transition has keys not in replay buffer schema: {sorted(extra)}. "
+                f"Recreate the buffer or extend example_transition."
+            )
+        missing = _buffer_keys - set(transition.keys())
+        if missing:
+            raise KeyError(f"Transition missing replay buffer keys: {sorted(missing)}")
+        return transition
     
     rng = jax.random.PRNGKey(FLAGS.seed + 1)
+    # Index of the transition added last step, so the next step can backfill its
+    # next-state CoT fields (master 63e19f7). Reset to None on episode boundaries.
+    _last_buf_idx: int | None = None
     episode_return, episode_steps, episode_count = 0.0, 0, 0
     episode_collision_count = 0
     episode_collision_events = 0
@@ -1244,6 +1373,27 @@ def run_online_carla(
     # for the critic-scored best-of-N paths (--bon_critic_ckpt / --bon_online_critic).
     _bon_rollout_chunk: list = [None]  # flat np.ndarray (ah*ad,) selected by the last critic score
     _bon_rollout_step: list = [0]  # steps of _bon_rollout_chunk already executed
+    trajectory_dir = os.path.join(FLAGS.save_dir, "trajectories")
+    os.makedirs(trajectory_dir, exist_ok=True)
+
+    def _sync_steervla_debug_noise_context(route_name: str) -> None:
+        if steervla_actor is None or not steervla_actor.debug_noise:
+            return
+        steervla_actor.set_debug_noise_context(
+            run_name=exp_name,
+            save_root=FLAGS.save_dir,
+            route_name=route_name,
+            episode=max(0, episode_count),
+        )
+
+    _sync_steervla_debug_noise_context(
+        str(FLAGS.route or obs_raw.get("routing_command", "?") if isinstance(obs_raw, dict) else "?")
+    )
+    if _vlm_coach is not None:
+        _vlm_coach.begin_episode(
+            episode_count=max(1, episode_count),
+            route_name=str(obs_raw.get("routing_command", "?") if isinstance(obs_raw, dict) else "?"),
+        )
 
     def _as_video_frame(image: np.ndarray) -> np.ndarray:
         frame = np.asarray(image)
@@ -1892,154 +2042,169 @@ def run_online_carla(
     last_update_info = None
     def _sample_agent_action(subkey):
         """Rollout policy; returns ``(action, base_action_or_None)``."""
-        if (
-            _bon_q_fn is not None
-            and FLAGS.bon_shadow_only
-            and getattr(agent, "vla_sample_fn", None) is not None
-        ):
-            # Diagnostic-only best-of-N: score candidates (populates the usual bon/*
-            # logging) but fall through to the plain greedy branch below to pick the
-            # actually-executed action, so we can see what best-of-N *would* have
-            # selected without it actually driving.
-            subkey, shadow_key = jax.random.split(subkey)
-            _score_candidates_with_critic(shadow_key)
-        if (
-            _bon_q_fn is not None
-            and not FLAGS.bon_shadow_only
-            and getattr(agent, "vla_sample_fn", None) is not None
-        ):
-            _ah = int(_steervla_exec_cfg["action_horizon"]) if _steervla_exec_cfg is not None else 1
+        # master 63e19f7: pause the CARLA sim across the (slow) VLA forward so sim time
+        # does not advance during inference, and warn on unusually slow samples.
+        uses_vla = getattr(agent, "vla_sample_fn", None) is not None
+        pause_env = uses_vla and hasattr(env, "pause_for_vla_inference")
+        if pause_env:
+            env.pause_for_vla_inference()
+        t0 = time.time()
+        try:
             if (
-                FLAGS.bon_critic_rollout_chunk
-                and _bon_rollout_chunk[0] is not None
-                and _bon_rollout_step[0] < _ah
+                _bon_q_fn is not None
+                and FLAGS.bon_shadow_only
+                and getattr(agent, "vla_sample_fn", None) is not None
             ):
-                # Chunk still in flight: execute the next shifted step of the last
-                # critic-selected chunk instead of re-sampling candidates / re-scoring.
-                shifted = _shift_flat_chunk(_bon_rollout_chunk[0], _bon_rollout_step[0])
-                _bon_rollout_step[0] += 1
-                best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
-                _last_vla_chunk_holder[0] = shifted
-                return best_chunk, None
-            chunks, q_vals, best_idx = _score_candidates_with_critic(subkey)
-            best_chunk = chunks[best_idx][None]  # (1, 40)
-            _last_vla_chunk_holder[0] = np.asarray(best_chunk[0], dtype=np.float32)
-            if FLAGS.bon_critic_rollout_chunk:
-                _bon_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
-                _bon_rollout_step[0] = 1  # step 0 was just returned by the fresh score
-            return best_chunk, None
-        if _gemini_selector is not None and getattr(agent, "vla_sample_fn", None) is not None:
-            _ah = int(_steervla_exec_cfg["action_horizon"]) if _steervla_exec_cfg is not None else 1
+                # Diagnostic-only best-of-N: score candidates (populates the usual bon/*
+                # logging) but fall through to the plain greedy branch below to pick the
+                # actually-executed action, so we can see what best-of-N *would* have
+                # selected without it actually driving.
+                subkey, shadow_key = jax.random.split(subkey)
+                _score_candidates_with_critic(shadow_key)
             if (
-                FLAGS.bon_gemini_rollout_chunk
-                and _gemini_rollout_chunk[0] is not None
-                and _gemini_rollout_step[0] < _ah
+                _bon_q_fn is not None
+                and not FLAGS.bon_shadow_only
+                and getattr(agent, "vla_sample_fn", None) is not None
             ):
-                # Chunk still in flight: execute the next shifted step of the last
-                # Gemini-selected chunk instead of re-sampling candidates / re-querying
-                # Gemini. Mirrors actions_per_model_query caching in steervla.py, but
-                # applied at the best-of-N selection level.
-                shifted = _shift_flat_chunk(_gemini_rollout_chunk[0], _gemini_rollout_step[0])
-                _gemini_rollout_step[0] += 1
-                best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
-                _last_vla_chunk_holder[0] = shifted
+                _ah = int(_steervla_exec_cfg["action_horizon"]) if _steervla_exec_cfg is not None else 1
+                if (
+                    FLAGS.bon_critic_rollout_chunk
+                    and _bon_rollout_chunk[0] is not None
+                    and _bon_rollout_step[0] < _ah
+                ):
+                    # Chunk still in flight: execute the next shifted step of the last
+                    # critic-selected chunk instead of re-sampling candidates / re-scoring.
+                    shifted = _shift_flat_chunk(_bon_rollout_chunk[0], _bon_rollout_step[0])
+                    _bon_rollout_step[0] += 1
+                    best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
+                    _last_vla_chunk_holder[0] = shifted
+                    return best_chunk, None
+                chunks, q_vals, best_idx = _score_candidates_with_critic(subkey)
+                best_chunk = chunks[best_idx][None]  # (1, 40)
+                _last_vla_chunk_holder[0] = np.asarray(best_chunk[0], dtype=np.float32)
+                if FLAGS.bon_critic_rollout_chunk:
+                    _bon_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
+                    _bon_rollout_step[0] = 1  # step 0 was just returned by the fresh score
                 return best_chunk, None
-            chunks, scores, best_idx = _score_candidates_with_gemini(subkey)
-            best_chunk = chunks[best_idx][None]  # (1, 40)
-            _last_vla_chunk_holder[0] = np.asarray(best_chunk[0], dtype=np.float32)
-            if FLAGS.bon_gemini_rollout_chunk:
-                _gemini_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
-                _gemini_rollout_step[0] = 1  # step 0 was just returned by the fresh query
-            return best_chunk, None
-        if _bon_online and getattr(agent, "vla_sample_fn", None) is not None:
-            _ah = int(_steervla_exec_cfg["action_horizon"]) if _steervla_exec_cfg is not None else 1
-            if (
-                FLAGS.bon_critic_rollout_chunk
-                and _bon_rollout_chunk[0] is not None
-                and _bon_rollout_step[0] < _ah
-            ):
-                # Chunk still in flight: execute the next shifted step of the last
-                # live-critic-selected chunk instead of re-sampling candidates / re-scoring.
-                # Note the online critic keeps training on collected transitions regardless
-                # (see update_with_vla() below) -- this only affects action *selection*
-                # cadence, not the Bellman backup.
-                shifted = _shift_flat_chunk(_bon_rollout_chunk[0], _bon_rollout_step[0])
-                _bon_rollout_step[0] += 1
-                best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
-                _last_vla_chunk_holder[0] = shifted
+            if _gemini_selector is not None and getattr(agent, "vla_sample_fn", None) is not None:
+                _ah = int(_steervla_exec_cfg["action_horizon"]) if _steervla_exec_cfg is not None else 1
+                if (
+                    FLAGS.bon_gemini_rollout_chunk
+                    and _gemini_rollout_chunk[0] is not None
+                    and _gemini_rollout_step[0] < _ah
+                ):
+                    # Chunk still in flight: execute the next shifted step of the last
+                    # Gemini-selected chunk instead of re-sampling candidates / re-querying
+                    # Gemini. Mirrors actions_per_model_query caching in steervla.py, but
+                    # applied at the best-of-N selection level.
+                    shifted = _shift_flat_chunk(_gemini_rollout_chunk[0], _gemini_rollout_step[0])
+                    _gemini_rollout_step[0] += 1
+                    best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
+                    _last_vla_chunk_holder[0] = shifted
+                    return best_chunk, None
+                chunks, scores, best_idx = _score_candidates_with_gemini(subkey)
+                best_chunk = chunks[best_idx][None]  # (1, 40)
+                _last_vla_chunk_holder[0] = np.asarray(best_chunk[0], dtype=np.float32)
+                if FLAGS.bon_gemini_rollout_chunk:
+                    _gemini_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
+                    _gemini_rollout_step[0] = 1  # step 0 was just returned by the fresh query
                 return best_chunk, None
-            chunks_np, candidate_subtasks = _sample_diverse_candidates(subkey, _bon_n)
-            if FLAGS.bon_include_brake_candidate:
-                chunks_np, candidate_subtasks = _append_brake_candidate(chunks_np, candidate_subtasks)
-            chunks = jax.numpy.asarray(chunks_np)  # (N, 40)
-            # Live agent critic: re-reads agent.network.params every call, so this tracks
-            # whatever update_with_vla() has trained modules_critic to as of this step.
-            obs_e = agent._encode_obs(agent.network.params, obs[None])  # (1, obs_enc_dim)
-            obs_e = jax.numpy.broadcast_to(obs_e, (chunks.shape[0], obs_e.shape[-1]))
-            qs = agent.network.select("critic")(obs_e, chunks, params=agent.network.params)  # (ensemble, N)
-            q_vals = np.asarray(jax.numpy.min(qs, axis=0))  # (N,)
-            best_idx = int(np.argmax(q_vals))
-            best_chunk = chunks[best_idx][None]  # (1, 40)
-            _last_vla_chunk_holder[0] = np.asarray(best_chunk[0], dtype=np.float32)
-            _bon_last_q_best[0] = float(q_vals[best_idx])
-            _bon_last_q_mean[0] = float(q_vals.mean())
-            _bon_last_candidates[0] = {
-                "q_vals": q_vals.tolist(),
-                "best_idx": best_idx,
-                "subtasks": candidate_subtasks,
-                "chunks": chunks_np,
-            }
-            if FLAGS.bon_critic_rollout_chunk:
-                _bon_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
-                _bon_rollout_step[0] = 1  # step 0 was just returned by the fresh score
-            return best_chunk, None
-        if _online_training_mode in {"sac_residual", "dagger_residual"} and hasattr(agent, "sample_actions_sac_residual"):
-            noise = jax.random.normal(subkey, (1, agent._flat_noise_dim()))
-            # Match master's rollout noise (bounded tanh noise-actor output, not raw
-            # unit Gaussian): the pi05 checkpoint barely creeps from standstill, and only
-            # the variance of a *bounded* flow latent stochastically kicks the car out of
-            # the brake-ratio stall (verified on generalization-wall-1095: raw unit-Gaussian
-            # noise = permanent 0 m/s forever; tanh-squashed noise = takeoff and cruising).
-            # Must run unconditionally -- gating this behind `!= 1.0` means the default
-            # vla_noise_scale=1.0 silently falls back to the broken raw-Gaussian case.
-            noise = jax.numpy.tanh(noise) * _vla_noise_scale
-            if _residual_2d:
-                chunk = agent._clip_actions_to_env(
-                    jax.numpy.asarray(agent.vla_sample_fn(obs[None], noise))
-                )
-                _last_vla_chunk_holder[0] = np.asarray(chunk[0], dtype=np.float32)
-                base2d = _decode_chunk_to_accel_steer(
-                    _accel_steer_decoder, np.asarray(chunk)[0], obs_raw["state"]
-                )[None]
+            if _bon_online and getattr(agent, "vla_sample_fn", None) is not None:
+                _ah = int(_steervla_exec_cfg["action_horizon"]) if _steervla_exec_cfg is not None else 1
+                if (
+                    FLAGS.bon_critic_rollout_chunk
+                    and _bon_rollout_chunk[0] is not None
+                    and _bon_rollout_step[0] < _ah
+                ):
+                    # Chunk still in flight: execute the next shifted step of the last
+                    # live-critic-selected chunk instead of re-sampling candidates / re-scoring.
+                    # Note the online critic keeps training on collected transitions regardless
+                    # (see update_with_vla() below) -- this only affects action *selection*
+                    # cadence, not the Bellman backup.
+                    shifted = _shift_flat_chunk(_bon_rollout_chunk[0], _bon_rollout_step[0])
+                    _bon_rollout_step[0] += 1
+                    best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
+                    _last_vla_chunk_holder[0] = shifted
+                    return best_chunk, None
+                chunks_np, candidate_subtasks = _sample_diverse_candidates(subkey, _bon_n)
+                if FLAGS.bon_include_brake_candidate:
+                    chunks_np, candidate_subtasks = _append_brake_candidate(chunks_np, candidate_subtasks)
+                chunks = jax.numpy.asarray(chunks_np)  # (N, 40)
+                # Live agent critic: re-reads agent.network.params every call, so this tracks
+                # whatever update_with_vla() has trained modules_critic to as of this step.
+                obs_e = agent._encode_obs(agent.network.params, obs[None])  # (1, obs_enc_dim)
+                obs_e = jax.numpy.broadcast_to(obs_e, (chunks.shape[0], obs_e.shape[-1]))
+                qs = agent.network.select("critic")(obs_e, chunks, params=agent.network.params)  # (ensemble, N)
+                q_vals = np.asarray(jax.numpy.min(qs, axis=0))  # (N,)
+                best_idx = int(np.argmax(q_vals))
+                best_chunk = chunks[best_idx][None]  # (1, 40)
+                _last_vla_chunk_holder[0] = np.asarray(best_chunk[0], dtype=np.float32)
+                _bon_last_q_best[0] = float(q_vals[best_idx])
+                _bon_last_q_mean[0] = float(q_vals.mean())
+                _bon_last_candidates[0] = {
+                    "q_vals": q_vals.tolist(),
+                    "best_idx": best_idx,
+                    "subtasks": candidate_subtasks,
+                    "chunks": chunks_np,
+                }
+                if FLAGS.bon_critic_rollout_chunk:
+                    _bon_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
+                    _bon_rollout_step[0] = 1  # step 0 was just returned by the fresh score
+                return best_chunk, None
+            if _online_training_mode in {"sac_residual", "dagger_residual"} and hasattr(agent, "sample_actions_sac_residual"):
+                noise = jax.random.normal(subkey, (1, agent._flat_noise_dim()))
+                # Match master's rollout noise (bounded tanh noise-actor output, not raw
+                # unit Gaussian): the pi05 checkpoint barely creeps from standstill, and only
+                # the variance of a *bounded* flow latent stochastically kicks the car out of
+                # the brake-ratio stall (verified on generalization-wall-1095: raw unit-Gaussian
+                # noise = permanent 0 m/s forever; tanh-squashed noise = takeoff and cruising).
+                # Must run unconditionally -- gating this behind `!= 1.0` means the default
+                # vla_noise_scale=1.0 silently falls back to the broken raw-Gaussian case.
+                noise = jax.numpy.tanh(noise) * _vla_noise_scale
+                if _residual_2d:
+                    chunk = agent._clip_actions_to_env(
+                        jax.numpy.asarray(agent.vla_sample_fn(obs[None], noise))
+                    )
+                    _last_vla_chunk_holder[0] = np.asarray(chunk[0], dtype=np.float32)
+                    base2d = _decode_chunk_to_accel_steer(
+                        _accel_steer_decoder, np.asarray(chunk)[0], obs_raw["state"]
+                    )[None]
+                    if step <= _residual_warmup:
+                        base = jax.numpy.asarray(base2d)
+                        return base, base
+                    temperature = 0.0 if _online_training_mode == "dagger_residual" else 1.0
+                    return agent.sample_actions_sac_residual(
+                        obs[None], seed=subkey, temperature=temperature, base_action=base2d
+                    )
                 if step <= _residual_warmup:
-                    base = jax.numpy.asarray(base2d)
+                    # During warmup execute pure Pi0 with zero residual.
+                    base = jax.numpy.asarray(agent.vla_sample_fn(obs[None], noise))
+                    base = agent._clip_actions_to_env(base)
                     return base, base
                 temperature = 0.0 if _online_training_mode == "dagger_residual" else 1.0
-                return agent.sample_actions_sac_residual(
-                    obs[None], seed=subkey, temperature=temperature, base_action=base2d
-                )
-            if step <= _residual_warmup:
-                # During warmup execute pure Pi0 with zero residual.
+                return agent.sample_actions_sac_residual(obs[None], seed=subkey, temperature=temperature)
+            if getattr(agent, "vla_sample_fn", None) is not None:
+                # Bounded tanh-squashed noise (not sample_actions_with_vla's learned
+                # noise_actor distribution, which is uncalibrated/near-zero-variance on a
+                # freshly-initialized eval-only agent): the pi0 checkpoint tends to stall
+                # at standstill, and only a *bounded* flow-latent's variance reliably
+                # kicks it back out (see the sac_residual branch above / brake-ratio-stall
+                # note). Matches that branch's rollout-noise convention exactly.
+                noise = jax.random.normal(subkey, (1, agent._flat_noise_dim()))
+                noise = jax.numpy.tanh(noise) * _vla_noise_scale
                 base = jax.numpy.asarray(agent.vla_sample_fn(obs[None], noise))
                 base = agent._clip_actions_to_env(base)
-                return base, base
-            temperature = 0.0 if _online_training_mode == "dagger_residual" else 1.0
-            return agent.sample_actions_sac_residual(obs[None], seed=subkey, temperature=temperature)
-        if getattr(agent, "vla_sample_fn", None) is not None:
-            # Bounded tanh-squashed noise (not sample_actions_with_vla's learned
-            # noise_actor distribution, which is uncalibrated/near-zero-variance on a
-            # freshly-initialized eval-only agent): the pi0 checkpoint tends to stall
-            # at standstill, and only a *bounded* flow-latent's variance reliably
-            # kicks it back out (see the sac_residual branch above / brake-ratio-stall
-            # note). Matches that branch's rollout-noise convention exactly.
-            noise = jax.random.normal(subkey, (1, agent._flat_noise_dim()))
-            noise = jax.numpy.tanh(noise) * _vla_noise_scale
-            base = jax.numpy.asarray(agent.vla_sample_fn(obs[None], noise))
-            base = agent._clip_actions_to_env(base)
-            return base, None
-        if _online_training_mode == "dagger" and hasattr(agent, "sample_actions_dagger"):
-            return agent.sample_actions_dagger(obs[None]), None
-        return agent.sample_actions(obs[None], seed=subkey), None
+                return base, None
+            if _online_training_mode == "dagger" and hasattr(agent, "sample_actions_dagger"):
+                return agent.sample_actions_dagger(obs[None]), None
+            return agent.sample_actions(obs[None], seed=subkey), None
+        finally:
+            if uses_vla:
+                elapsed = time.time() - t0
+                if elapsed > 5.0:
+                    print(f"[main_carla] VLA sample took {elapsed:.1f}s", flush=True)
+            if pause_env:
+                env.resume_after_vla_inference()
 
     _vla_steps_budget = int(np.random.randint(70, 201)) if FLAGS.expert_recover_debug else 0
     if FLAGS.expert_recover_debug:
@@ -2063,9 +2228,24 @@ def run_online_carla(
         _in_expert_recovery = FLAGS.expert_recover_debug and (episode_steps >= _vla_steps_budget)
         if FLAGS.expert_recover_debug and (episode_steps == _vla_steps_budget):
             env.reinit_expert()
-        in_warmup = warmup > 0 and step <= warmup
-        if image_encoder == "siglip" and siglip_include_prompt_subtask:
+        # master's off-by-one fix: `<` so exactly `warmup` steps are collected.
+        in_warmup = warmup > 0 and step < warmup
+        in_expo_warmup = (
+            warmup_expo > 0
+            and step <= warmup_expo
+            and agent is not None
+            and hasattr(agent, "set_edit_actor_rollout_enabled")
+        )
+        if agent is not None and hasattr(agent, "set_edit_actor_rollout_enabled"):
+            agent.set_edit_actor_rollout_enabled(step > warmup_expo)
+        if (
+            obs_mode == "image"
+            and image_encoder == "siglip"
+            and siglip_include_prompt_subtask
+        ):
             obs = _extract_agent_obs(env, obs_raw, obs_mode, **_extract_obs_kwargs)
+        if steervla_actor is not None and steervla_actor.debug_noise:
+            steervla_actor.debug_noise_episode_step = episode_steps + 1
         # Figure capture: record every env step's action + Q-value for the whole trajectory.
         # Saved to disk at episode end (or run end). The figure script picks the
         # interesting window post-hoc rather than guessing it upfront.
@@ -2083,7 +2263,9 @@ def run_online_carla(
 
         base_action_np: np.ndarray | None = None
         if FLAGS.expert_debug or _in_expert_recovery or agent is None:
+            # action_dim (not env.action_space.shape) so accel_steer residual mode gets 2-D.
             action = np.zeros((action_dim,), dtype=np.float32)
+            step_obs = obs
             if (
                 (FLAGS.expert_debug or _in_expert_recovery)
                 and _bon_q_fn is not None
@@ -2148,6 +2330,27 @@ def run_online_carla(
                 print(f"[traj-capture] flushed {len(_traj)} steps → {_traj_path}", flush=True)
                 steervla_actor._traj_capture = []
 
+            if (
+                obs_mode == "image"
+                and image_encoder == "siglip"
+                and siglip_include_prompt_subtask
+            ):
+                step_obs = _extract_agent_obs(env, obs_raw, obs_mode, **_extract_obs_kwargs)
+            else:
+                step_obs = obs
+            if steervla_actor is not None and _last_buf_idx is not None:
+                from vlas.steervla import openpi_cot_replay_fields_from_raw
+
+                _cot_for_next = openpi_cot_replay_fields_from_raw(obs_raw)
+                if _cot_for_next:
+                    buffer.update_at(
+                        _last_buf_idx,
+                        **{
+                            f"next_{k}": v
+                            for k, v in _cot_for_next.items()
+                            if f"next_{k}" in _buffer_keys
+                        },
+                    )
         t_sample_end = time.time()
 
         if FLAGS.debug_freeze_after_step > 0 and step >= FLAGS.debug_freeze_after_step and not FLAGS.expert_debug:
@@ -2214,9 +2417,17 @@ def run_online_carla(
             _lang_text, _lang = compute_action_delta_commentary(obs_raw, action, agent)
             # Placeholder: backfilled one step later (below), same reason as above.
             _next_lang = _zero_label
+        elif _critic_feedback_mode == "subtask_siglip":
+            # Best-of-N stashes a SigLIP subtask embedding on ``obs_raw`` after sampling.
+            # ``env._obs_dict()`` also puts a 119-dim expert commentary BoW in the same
+            # key — ignore mismatched sizes and never copy env labels into ``next_*``.
+            _lang = _coerce_language_label(obs_raw.get("language_label"), _lang_dim, _zero_label)
+            _next_lang = _zero_label
         else:
-            _lang = np.asarray(obs_raw.get("language_label", _zero_label), dtype=np.float32)
-            _next_lang = np.asarray(next_obs_raw.get("language_label", _zero_label), dtype=np.float32)
+            _lang = _coerce_language_label(obs_raw.get("language_label"), _lang_dim, _zero_label)
+            _next_lang = _coerce_language_label(
+                next_obs_raw.get("language_label"), _lang_dim, _zero_label
+            )
         _critic_text_for_video = _critic_input_text(_critic_feedback_mode, _lang, _lang_text, obs_raw)
 
         replay_action = action.astype(np.float32)
@@ -2290,25 +2501,31 @@ def run_online_carla(
                     flush=True,
                 )
 
-        buffer.add_transition(
-            {
-                "observations": np.asarray(obs),
-                "actions": replay_action,
-                "rewards": np.float32(reward),
-                "next_observations": np.asarray(next_obs),
-                "masks": np.float32(0.0 if terminated else 1.0),
-                "terminals": np.float32(1.0 if done else 0.0),
-                "language_label": _lang,
-                "next_language_label": _next_lang,
+        # master's _buffer_transition validates against the buffer schema (and fills the
+        # openpi / next_openpi fields); residual_fields is routing-commands' sac_residual
+        # extension. masks uses ``terminated`` (not ``done``) so a truncation would still
+        # bootstrap -- the RL-correct semantics.
+        buf_idx = buffer.add_transition(
+            _buffer_transition(
+                obs_raw,
+                next_obs_raw,
+                observations=np.asarray(step_obs),
+                actions=replay_action,
+                rewards=np.float32(reward),
+                next_observations=np.asarray(next_obs),
+                masks=np.float32(0.0 if terminated else 1.0),
+                terminals=np.float32(1.0 if done else 0.0),
+                language_label=_lang,
+                next_language_label=_next_lang,
                 **residual_fields,
-                **(_openpi_fields_from_raw(obs_raw) if steervla_actor is not None else {}),
                 **(
-                    {f"next_{k}": np.array(v) for k, v in _openpi_fields_from_raw(next_obs_raw).items()}
-                    if steervla_actor is not None
+                    {"ego_speed": _ego_speed_mps_from_raw(obs_raw)}
+                    if agent_config.get("debug_task", False)
                     else {}
                 ),
-            }
+            )
         )
+        _last_buf_idx = int(buf_idx)
         _prev_transition_done = done
         if _uses_pi_prefix and _pi_prefix_e is not None:
             _pi_prefix_e = _pi_prefix_next_e
@@ -2500,11 +2717,25 @@ def run_online_carla(
                 f"env_step={t_step_end - t_step_start:.3f}s log={t_log_end - t_log_start:.3f}s",
                 flush=True,
             )
+        step_wb["training/in_expo_warmup"] = float(in_expo_warmup)
+        step_wb["training/enable_updates"] = float(enable_updates)
+        if "episode_step_count" in info:
+            step_wb["rollout/episode_step"] = float(info["episode_step_count"])
 
         wandb.log(step_wb, step=step)
 
         if done:
             episode_count += 1
+            # Snapshot end-of-episode state for the logging block below. The env reset
+            # itself stays in the HEAD block further down (routing-commands also resets
+            # the gemini/BoN rollout chunks and the PID decoders) -- doing it here too
+            # would reset CARLA twice per episode.
+            done_info = dict(info)
+            done_episode_return = float(episode_return)
+            done_episode_steps = int(episode_steps)
+            done_collision_count = int(episode_collision_count)
+            done_collision_events = int(episode_collision_events)
+            done_route = str(done_info.get("route", "?"))
             rollout_log = {
                 "rollout/episode_return": episode_return,
                 "rollout/episode_steps": episode_steps,
@@ -2529,6 +2760,11 @@ def run_online_carla(
                 rollout_log["rollout/final_step_success"] = float(bool(info.get("success", False)))
             if FLAGS.expert_recover_debug:
                 rollout_log["rollout/vla_steps_budget"] = float(_vla_steps_budget)
+            # NOTE: master's per-episode trajectory JSON is intentionally omitted here --
+            # routing-commands has no _append_trajectory_step/episode_trajectory accumulation,
+            # so the payload would always be empty. It keeps its own richer per-step capture
+            # (steervla_actor._traj_capture -> traj_capture_*.pkl) instead.
+            n_video_frames = len(episode_video_frames) + (1 if end_img is not None else 0)
             _maybe_log_episode_video(
                 rollout_log,
                 end_img if log_images else None,
@@ -2537,6 +2773,27 @@ def run_online_carla(
                 final_critic_text=last_video_critic_text,
             )
             wandb.log(rollout_log, step=step)
+            train_logger.log(
+                {
+                    k: v
+                    for k, v in rollout_log.items()
+                    if k.startswith("rollout/") and k != "rollout/route"
+                },
+                step=step,
+            )
+            print(
+                f"[main_carla] episode {episode_count} done: "
+                f"return={done_episode_return:.3f} steps={done_episode_steps} "
+                f"route={done_route!r} "
+                f"video={'yes' if 'rollout/episode_video' in rollout_log else 'no'} "
+                f"({n_video_frames} frames)",
+                flush=True,
+            )
+            if _vlm_coach is not None:
+                _vlm_coach.maybe_query(
+                    episode_step=done_episode_steps, done_info=done_info, force=True
+                )
+                _vlm_coach.backfill_buffer(buffer)
 
             # Flush any remaining trajectory capture for this episode.
             _traj_ep = getattr(steervla_actor, "_traj_capture", None) if steervla_actor else None
@@ -2576,6 +2833,13 @@ def run_online_carla(
                 _pi_prefix_e = _compute_pi_prefix_e(obs_raw)
             episode_video_frames = []
             episode_return, episode_steps = 0.0, 0
+            if _vlm_coach is not None:
+                _vlm_coach.reset_episode()
+                _vlm_coach.begin_episode(
+                    episode_count=episode_count,
+                    route_name=done_route,
+                )
+            _sync_steervla_debug_noise_context(done_route)
             episode_collision_count = 0
             episode_collision_events = 0
             prev_collision_count = 0
@@ -2595,10 +2859,11 @@ def run_online_carla(
             and agent is not None
             and not in_warmup
             and buffer.size >= batch_size
+            and step % update_interval == 0
         ):
-            
             for _ in range(updates_per_step):
                 t_update_start = time.time()
+                use_vla_update = getattr(agent, "vla_sample_fn", None) is not None
                 batch = buffer.sample(batch_size)
                 if _online_training_mode == "sac_residual":
                     agent, update_info = agent.update_sac_residual(batch)
@@ -2606,7 +2871,7 @@ def run_online_carla(
                     agent, update_info = agent.update_dagger_residual(batch)
                 elif _online_training_mode == "dagger":
                     agent, update_info = agent.update_dagger(batch)
-                elif getattr(agent, "vla_sample_fn", None) is not None:
+                elif use_vla_update:
                     agent, update_info = agent.update_with_vla(batch)
                 else:
                     agent, update_info = agent.update(batch)
@@ -2783,6 +3048,17 @@ def build_carla_session(config, env, exec_cfg: Optional[dict] = None) -> CarlaSe
         )
     if exec_cfg is None:
         exec_cfg = _steervla_action_execution_cfg(steervla_cfg)
+    elif critic_feedback_mode == "action_delta":
+        config.language_label_dim = int(config.get("critic_action_dim", 4))
+    elif critic_feedback_mode == "subtask_siglip":
+        # Subtask text embedded with SigLIP; agent.create syncs siglip_embed_dim to the encoder.
+        config.language_label_dim = int(config.get("siglip_embed_dim", 1152))
+    extra_carla: dict[str, Any] = {}
+    exec_cfg = _steervla_action_execution_cfg(steervla_cfg)
+    if exec_cfg is not None:
+        extra_carla["steervla_action_execution"] = exec_cfg
+    if FLAGS.expert_debug or FLAGS.expert_recover_debug:
+        extra_carla["expert_controller"] = "simlingo_autopilot"
 
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
@@ -2847,20 +3123,43 @@ def build_carla_session(config, env, exec_cfg: Optional[dict] = None) -> CarlaSe
 
         agent_class = agents[config["agent_name"]]
         create_kwargs = {}
-        if config["agent_name"] == "dsrl":
+        # best_of_n takes the same frozen-VLA wiring as dsrl (master 63e19f7).
+        if config["agent_name"] in ("dsrl", "best_of_n"):
             vla_bundle = None
             if use_steervla_rollout:
                 vla_bundle = _build_vla_sample_fn(
-                    steervla_cfg, raw_carla_holder, training_gpu_rank=tr_rank
+                    steervla_cfg,
+                    raw_carla_holder,
+                    training_gpu_rank=tr_rank,
+                    noise_scale=float(config.get("noise_scale", 1.0)),
                 )
             if vla_bundle is not None:
                 vla_sample_fn, steervla_actor = vla_bundle
+                steervla_actor.debug_noise = bool(config.get("debug_noise", False))
+                steervla_actor.debug_noise_samples = int(config.get("debug_noise_samples", 15))
+                steervla_actor.use_best_noise = bool(config.get("use_best_noise", True))
+                steervla_actor.debug_noise_log_every_n_steps = int(
+                    config.get("debug_noise_log_every_n_steps", 5)
+                )
+                steervla_actor.noise_scale = float(config.get("noise_scale", 1.0))
+                if steervla_actor.debug_noise:
+                    print(
+                        f"[main_carla] debug_noise enabled: "
+                        f"{steervla_actor.debug_noise_samples} random noises per fresh VLA query, "
+                        f"log plots every {steervla_actor.debug_noise_log_every_n_steps} env steps, "
+                        f"use_best_noise={steervla_actor.use_best_noise}",
+                        flush=True,
+                    )
                 create_kwargs["vla_sample_fn"] = vla_sample_fn
                 url = steervla_cfg.get("actor_url") if steervla_cfg else None
                 if not (url and str(url).strip()):
                     # create_kwargs["vla_train_state"] = steervla_actor.train_state
                     create_kwargs["openpi_train_config"] = steervla_actor.train_cfg
                     create_kwargs["steervla_actor"] = steervla_actor
+
+            if config["agent_name"] == "best_of_n":
+                # Subtask -> critic language label uses SigLIP text features (shared encoder).
+                create_kwargs["siglip_encoder"] = siglip_encoder
 
         # "policy_embed" isn't one of _extract_agent_obs's modes (it's populated via
         # SteerVLAActor.ensure_policy_embedding, not the env's raw obs dict), so it needs

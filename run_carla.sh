@@ -64,6 +64,19 @@ SAVE_VIDEO_LOCAL="true"
 BASE_AGENT_CFG="impls/configs/pi0_residual_sac_config.py"
 BASE_CARLA_CFG="impls/configs/carla_config.yaml"
 
+# Fail2Drive's custom static props (brickwall, walkingkid, ampel, autobahn,
+# dirt, graffiti, screenshot1/2, smiley, snow, stickers, walkingkidlarge) have
+# been copied into vanilla CARLA 0.9.16 at /home/carla/carla-0-9-16/CarlaUE4/Content/
+# (six asset packs: WallAssets, ImageAssets, StopOcclusions, AnimalVarietyPack,
+# FarmAnimalsPack, AfricanAnimalsPack). The vanilla 0.9.16 server registers them
+# via the standard *.Package.json discovery, so we don't need to switch CARLA_ROOT.
+#
+# Set FAIL2DRIVE_CARLA_ROOT in the env (or pass --fail2drive-carla-root) only if
+# you want to point Fail2Drive routes at a separate CARLA install (e.g. the
+# standalone 0.9.15 f2d_carla drop). Empty by default = stay on whatever
+# CARLA_ROOT is already set for every route.
+FAIL2DRIVE_CARLA_ROOT="${FAIL2DRIVE_CARLA_ROOT:-}"
+
 EXTRA_ARGS=()
 
 usage() {
@@ -155,6 +168,9 @@ Options:
   --save-video-local BOOL   true|false. Write each episode's rollout video to
                             <save_dir>/videos/epNNNN.mp4 locally (in addition to W&B). Default: true.
 
+  --fail2drive-carla-root PATH
+                            Override CARLA install used for Fail2Drive routes.
+                            Default: \$FAIL2DRIVE_CARLA_ROOT (unset -> leave CARLA_ROOT alone)
   -h, --help                Show this help
 
 Examples:
@@ -222,6 +238,7 @@ while [[ $# -gt 0 ]]; do
     --expert-controller|--expert_controller) EXPERT_CONTROLLER="$2"; shift 2 ;;
     --save-video-local|--save_video_local) SAVE_VIDEO_LOCAL="$2"; shift 2 ;;
     --eval-only|--eval_only) EVAL_ONLY="$2"; shift 2 ;;
+    --fail2drive-carla-root) FAIL2DRIVE_CARLA_ROOT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; EXTRA_ARGS+=("$@"); break ;;
     *)
@@ -354,7 +371,24 @@ if r"${EXPERT_CONTROLLER}":
 Path(r"${CARLA_CFG_TMP}").write_text(yaml.safe_dump(cfg, sort_keys=False))
 EOF
 
-echo "[run_carla.sh] route=${ROUTE}"
+# Resolve route source (bench2drive | fail2drive) via the registry, then only
+# override CARLA_ROOT if FAIL2DRIVE_CARLA_ROOT is explicitly set (e.g. you want
+# to point Fail2Drive routes at a separate 0.9.15 install). By default the
+# vanilla 0.9.16 install ships the Fail2Drive asset packs we copied in, so we
+# leave CARLA_ROOT alone and both benchmarks talk to the same server.
+ROUTE_SOURCE="$(uv run python -c "from ogbench.carla.route_registry import find_route; print(find_route('${ROUTE}').source)" 2>/dev/null || true)"
+if [[ "$ROUTE_SOURCE" == "fail2drive" && -n "$FAIL2DRIVE_CARLA_ROOT" ]]; then
+  if [[ ! -d "$FAIL2DRIVE_CARLA_ROOT" ]]; then
+    echo "[run_carla.sh] WARNING: FAIL2DRIVE_CARLA_ROOT=${FAIL2DRIVE_CARLA_ROOT} doesn't exist; not switching CARLA_ROOT." >&2
+  else
+    export CARLA_ROOT="$FAIL2DRIVE_CARLA_ROOT"
+    export CARLA_PYTHON_API_ROOT="$FAIL2DRIVE_CARLA_ROOT/PythonAPI/carla"
+    echo "[run_carla.sh] Fail2Drive route detected: CARLA_ROOT=${CARLA_ROOT}"
+    echo "[run_carla.sh]   (relaunch the CARLA server from ${CARLA_ROOT}/CarlaUE4.sh to match)"
+  fi
+fi
+
+echo "[run_carla.sh] route=${ROUTE} (source=${ROUTE_SOURCE:-?})"
 echo "[run_carla.sh] train_mode=${TRAIN_MODE}"
 echo "[run_carla.sh] critic_mode=${CRITIC_FEEDBACK_MODE}"
 echo "[run_carla.sh] train_gpu_rank=${TRAIN_GPU_RANK} render_adapter=${SIM_GPU_RANK}"

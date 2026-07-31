@@ -7,4 +7,9 @@ exp/
 .DS_Store
 .idea/
 .ruff_cache/
+debug_noises/
+*.mp4
+impls/coaches/videos/
+impls/coaches/metadata/
+impls/coaches/episode_0001_plots/
 simulation_results*

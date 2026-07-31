@@ -112,6 +112,18 @@ def _batch_obs_embed_or_encoder(
         return jnp.asarray(batch[embed_key], dtype=jnp.float32)
     return network.select("obs_encoder")(batch[obs_key], params=params)
 
+
+def _apply_debug_stop_reward_relabel(batch: dict) -> dict:
+    """Debug task: replace env reward with ``-ego_speed`` (m/s) to encourage stopping."""
+    if "ego_speed" not in batch:
+        raise KeyError(
+            "debug_task requires replay field 'ego_speed' (store CARLA speed m/s in main_carla)."
+        )
+    out = dict(batch)
+    out["rewards"] = -jnp.asarray(out["ego_speed"], dtype=jnp.float32)
+    return out
+
+
 @jax.jit
 def _critic_loss_vla_pure_math(
     network: TrainState,
@@ -156,7 +168,6 @@ def _critic_loss_vla_pure_math(
     }
 
 
-@jax.jit
 def _noise_critic_loss_vla_pure_math(
     network: TrainState,
     batch: dict,
@@ -183,7 +194,6 @@ def _noise_critic_loss_vla_pure_math(
     }
 
 
-@jax.jit
 def _noise_actor_loss_vla_pure_math(
     network: TrainState,
     batch: dict,
@@ -272,7 +282,9 @@ class CarlaObservationEncoder(nn.Module):
 
     @nn.compact
     def __call__(self, observations):
-        if self.observation_mode in ("state", "policy_embed"):
+        if self.observation_mode == "state":
+            return observations.astype(jnp.float32)
+        if self.image_encoder == "siglip":
             return observations.astype(jnp.float32)
         if self.image_encoder == "siglip":
             # Precomputed float32 SigLIP embeddings — pass through unchanged.
@@ -518,19 +530,18 @@ class DSRLAgent(flax.struct.PyTreeNode):
         return actions
 
     def sample_actions_with_vla(self, observations, seed=None, temperature=1.0):
-        """Rollout path only: when ``vla_sample_fn`` is set, map noise through VLA instead of BC flow."""
+        """Rollout path only: when ``vla_sample_fn`` is set, map noise through VLA instead of BC flow.
+
+        With ``config.debug_noise=True``, the attached SteerVLAActor samples many random flow-matching
+        noises on each fresh VLA query. With ``use_best_noise=True`` it executes the slowest candidate;
+        with ``use_best_noise=False`` it logs noise distributions and uses the actor's sampled noise.
+        Open-loop cache hits are unchanged in both modes.
+        """
         if self.vla_sample_fn is None:
             return self.sample_actions(observations, seed=seed, temperature=temperature)
         seed = seed if seed is not None else self.rng
         seed, sub = jax.random.split(seed)
-        obs_mode = str(self.config.get("observation_mode", "state"))
-        if obs_mode == "policy_embed":
-            if self.steervla_actor is None:
-                raise RuntimeError("observation_mode='policy_embed' requires an attached SteerVLAActor.")
-            embed = self.steervla_actor.ensure_policy_embedding(int(observations.shape[0]))
-            enc = jnp.asarray(embed, dtype=jnp.float32)
-        else:
-            enc = self._encode_obs(self.network.params, observations)
+        enc = self._encode_obs(self.network.params, observations)
         dist = self.network.select("noise_actor")(enc, temperature=temperature)
         noise = dist.sample(seed=sub)
         noise = noise * self.config["noise_scale"]
@@ -687,6 +698,8 @@ class DSRLAgent(flax.struct.PyTreeNode):
 
     def total_loss_vla(self, batch, grad_params, rng=None, vla_cache=None):
         """Sum of VLA-path losses; ``update_with_vla`` passes precomputed ``vla_cache``."""
+        if bool(self.config.get("debug_task", False)):
+            batch = _apply_debug_stop_reward_relabel(batch)
         rng = rng if rng is not None else self.rng
         rng, nc_rng, na_rng, c_rng = jax.random.split(rng, 4)
         discount = jnp.asarray(self.config["discount"], dtype=jnp.float32)
@@ -1314,6 +1327,10 @@ class DSRLAgent(flax.struct.PyTreeNode):
                 f"observation_mode must be 'state', 'image', or 'policy_embed', got {obs_mode!r}"
             )
         image_encoder = str(config.get("image_encoder", "impala")).lower()
+        if image_encoder not in ("impala", "siglip"):
+            raise ValueError(f"image_encoder must be 'impala' or 'siglip', got {image_encoder!r}")
+        if obs_mode != "image" and image_encoder == "siglip":
+            raise ValueError("image_encoder='siglip' requires observation_mode='image'.")
 
         if vla_sample_fn is not None:
             env_action_dim = int(config.get("vla_action_dim", 4)) * int(
@@ -1342,7 +1359,14 @@ class DSRLAgent(flax.struct.PyTreeNode):
         if obs_mode in ("state", "policy_embed"):
             embed_dim = int(ex_observations.shape[-1])
         elif image_encoder == "siglip":
-            embed_dim = int(ex_observations.shape[-1])  # precomputed SigLIP embedding
+            # Precomputed SigLIP embedding. main_carla's _detect_siglip_include_prompt_subtask
+            # sets siglip_include_prompt_subtask when the checkpoint concatenates
+            # image+prompt+subtask embeddings (3x width).
+            single = int(config.get("siglip_embed_dim", ex_observations.shape[-1]))
+            if bool(config.get("siglip_include_prompt_subtask", False)):
+                embed_dim = single * 3
+            else:
+                embed_dim = single
         else:
             embed_dim = int(tuple(config.get("image_mlp_hidden_dims", (512,)))[-1])
         critic_feedback_mode = str(config.get("critic_feedback_mode", "commentary_bow"))
@@ -1443,14 +1467,22 @@ def get_config():
             noise_scale=1.0,
             flow_steps=5,
             observation_mode="state",
+            image_encoder="impala",
             image_impala_width=1,
             image_impala_stack_sizes=(16, 32, 32),
             image_impala_num_blocks=2,
             image_mlp_hidden_dims=(512,),
+            siglip_model_id="google/siglip2-so400m-patch14-384",
+            siglip_embed_dim=1152,
+            siglip_include_prompt_subtask=False,
+            siglip_device=None,
+            # SigLIP runs in PyTorch; default CPU avoids competing with JAX GPU memory.
             # Online-loop knobs (used by main_carla.py, not by the agent itself).
             # Env steps with policy rollouts but no RL updates (see main_carla.run_online_carla).
             warmup_steps=1000,
             updates_per_step=1,
+            # Run RL gradient updates every N env steps (1 = every step).
+            update_interval=1,
             # If false, main_carla collects rollouts but skips RL gradient updates.
             enable_updates=True,
             buffer_capacity=100_000,
@@ -1525,6 +1557,13 @@ def get_config():
             residual_log_std_min=-5.0,
             residual_log_std_max=2.0,
             residual_layer_norm=False,
+            # When true, RL updates use reward = -ego_speed (m/s) instead of env reward.
+            debug_task=False,
+            # Rollout-only: sample many random VLA flow noises and pick the slowest chunk.
+            debug_noise=True,
+            debug_noise_samples=15,
+            debug_noise_log_every_n_steps=5,
+            use_best_noise=True,
         )
     )
     return config

@@ -36,7 +36,7 @@ def get_config():
     config.batch_size = 32
     # Denoise steps for frozen VLA forwards during RL updates (rollout uses steervla.sample_actions_num_steps).
     config.vla_update_flow_steps = 5
-    config.noise_scale = 5.0
+    config.noise_scale = 1.0
     config.alpha = 0.1
     # Collect transitions with the rollout policy (SteerVLA / DSRL) but skip RL updates.
     config.warmup_steps = 200
@@ -73,36 +73,30 @@ def get_config():
     config.image_keys = ("base_0_rgb",)
     # JAX RL device: ``-1`` = unset. CARLA uses ``gpu_rank`` in carla_config.yaml.
     config.training_gpu_rank = 0
-    # Critic feedback mode — four options:
+    # Critic feedback mode — three options:
     #   "commentary_bow"      (default): expert commentary BOW from the SimLingo-style labeler.
-    #   "expert_action"                : (critic_action_dim + 1)-dim = expert first step + validity
-    #                                    flag. State-only (independent of the agent's action), so it
-    #                                    is consistent across the TD bootstrap and the actor's
-    #                                    Q-query. PID-decoded [accel, steer] in accel_steer mode.
-    #   "action_delta"                 : (critic_action_dim)-dim = expert first step minus agent
-    #                                    first step. Depends on the logged action; the next-state
-    #                                    label is backfilled one step later in main_carla.py.
+    #   "action_delta"                 : (critic_action_dim)-dim = expert first step minus agent first step.
     #   "delta_commentary_bow"        : corrective language BOW from expert-vs-agent action delta
     #                                   (e.g. "Adjust right. Decelerate more heavily.").
-    # To switch, uncomment:
-    # config.critic_feedback_mode = "expert_action"
+    # To switch to action_delta, uncomment:
+    # config.critic_feedback_mode = "action_delta"
     # Online training regime:
     #   "rl"     : standard DSRL online RL
     #   "dagger" : on-policy data aggregation with expert actions as supervision
     config.online_training_mode = "rl"
     # language_label_dim is auto-set from language_feedback / critic_feedback_mode in main_carla.py.
 
-    config.language_feedback = ml_collections.ConfigDict(
-        dict(
-            # Where DSRL critic language labels come from:
-            #   "expert" — SimLingo-style expert commentary / action-delta coaches
-            #   "vlm"    — Gemini/Perceptron VLM chunk feedback (see ``vlm_coach``)
-            source="expert",
-            # Used when source="expert". One of commentary_bow | expert_action |
-            # action_delta | delta_commentary_bow | none
-            expert_mode="commentary_bow",
-        )
-    )
+    # config.language_feedback = ml_collections.ConfigDict(
+    #     dict(
+    #         # Where DSRL critic language labels come from:
+    #         #   "expert" — SimLingo-style expert commentary / action-delta coaches
+    #         #   "vlm"    — Gemini/Perceptron VLM chunk feedback (see ``vlm_coach``)
+    #         source="expert",
+    #         # Used when source="expert". One of commentary_bow | action_delta |
+    #         # delta_commentary_bow | none
+    #         expert_mode="commentary_bow",
+    #     )
+    # )
     # Enable VLM chunk coaching for the DSRL critic:
     config.language_feedback.source = "vlm"
 
@@ -130,11 +124,9 @@ def get_config():
             # Local OpenPI inference (ignored when actor_url is set):
             actor_config="pi05_steervla_cot_simplified_reasoning",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
-            # Prefer the gs:// form: the /home/carla/.cache/openpi/... local mirror of this same
-            # checkpoint is machine-specific. OpenPI caches GCS downloads under ~/.cache/openpi.
-            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",
-            # checkpoint="gs://cat-logs/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning_20260512_144250/50000",
-            # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260526_175924/4000",
+            # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260525_202139/8000",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260526_175924/4000",
+            # checkpoint="/home/carla/.cache/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,
             include_ego_history=False,

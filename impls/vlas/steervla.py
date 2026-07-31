@@ -40,8 +40,6 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, MutableMapping, Optional
 
-from numpy.ma import innerproduct
-
 import flax.nnx as nnx
 import flax.traverse_util as traverse_util
 import jax
@@ -49,7 +47,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from openpi.models import gemma as _openpi_gemma
 from openpi.models import model as _openpi_model
 from openpi.models import pi0 as _openpi_pi0
 from openpi.models.pi0_config import Pi0CoTConfig
@@ -398,6 +395,38 @@ def _model_uses_fast_tokens(model_cfg: Pi0CoTConfig | None) -> bool:
     return bool(model_cfg is not None and getattr(model_cfg, "use_fast_tokens", False))
 
 
+def empty_openpi_replay_fast_fields(max_fast_len: int) -> dict[str, np.ndarray]:
+    """Zero FAST token buffers for replay schema / transitions without FAST yet."""
+    fast = np.zeros((int(max_fast_len),), dtype=np.int32)
+    fast_mask = np.zeros((int(max_fast_len),), dtype=bool)
+    return {
+        "openpi_tokenized_fast": fast,
+        "openpi_tokenized_fast_mask": fast_mask,
+        "fast": fast.copy(),
+        "fast_mask": fast_mask.copy(),
+    }
+
+
+def with_openpi_replay_fast_fields(
+    fields: dict[str, np.ndarray],
+    *,
+    max_fast_len: int | None,
+    use_fast_tokens: bool,
+) -> dict[str, np.ndarray]:
+    """Ensure replay dicts always carry FAST keys when the model uses FAST tokens."""
+    if not use_fast_tokens or max_fast_len is None:
+        return fields
+    out = dict(fields)
+    if "openpi_tokenized_fast" not in out:
+        out.update(empty_openpi_replay_fast_fields(int(max_fast_len)))
+        return out
+    if "fast" not in out:
+        out["fast"] = out["openpi_tokenized_fast"]
+    if "fast_mask" not in out:
+        out["fast_mask"] = out["openpi_tokenized_fast_mask"]
+    return out
+
+
 def _pad_action_chunk_for_fast(actions: np.ndarray, *, model_action_dim: int) -> np.ndarray:
     """Pad a single normalized action chunk ``(H, D)`` to Pi0 ``action_dim``."""
     chunk = np.asarray(actions, dtype=np.float32)
@@ -575,6 +604,20 @@ def openpi_replay_fields_from_observation(
     return out
 
 
+def openpi_replay_fields_with_fast_placeholders(
+    fields: dict[str, np.ndarray],
+    *,
+    model_cfg: Pi0CoTConfig | None,
+) -> dict[str, np.ndarray]:
+    """Add empty FAST replay keys when needed so buffer schema stays fixed."""
+    max_fast_len = int(getattr(model_cfg, "max_fast_len", 0)) if model_cfg is not None else 0
+    return with_openpi_replay_fast_fields(
+        fields,
+        max_fast_len=max_fast_len if max_fast_len > 0 else None,
+        use_fast_tokens=_model_uses_fast_tokens(model_cfg),
+    )
+
+
 def openpi_cot_replay_fields_from_raw(raw: dict[str, Any] | None) -> dict[str, np.ndarray]:
     """CoT/FAST token fields from a raw CARLA obs dict after VLA ``_stash_cot_in_raw``.
 
@@ -599,11 +642,10 @@ def openpi_cot_replay_fields_from_raw(raw: dict[str, Any] | None) -> dict[str, n
     }
     fast = raw.get("openpi_tokenized_fast", raw.get("fast"))
     fast_mask = raw.get("openpi_tokenized_fast_mask", raw.get("fast_mask"))
-    if fast is not None:
+    if fast is not None and fast_mask is not None:
         out["openpi_tokenized_fast"] = np.asarray(fast, dtype=np.int32)
-        out["fast"] = out["openpi_tokenized_fast"]
-    if fast_mask is not None:
         out["openpi_tokenized_fast_mask"] = np.asarray(fast_mask, dtype=bool)
+        out["fast"] = out["openpi_tokenized_fast"]
         out["fast_mask"] = out["openpi_tokenized_fast_mask"]
     return out
 
@@ -739,8 +781,21 @@ class SteerVLAActor:
         actions_per_model_query: int = 1,
         actions_per_cot: int = 1,
         sample_actions_num_steps: int = 10,
+        action_decode_batch_size: int = 2,
         training_gpu_rank: int = -1,
         return_normalized_action_chunk: bool = False,
+        fixed_subtask_text: Optional[str] = None,
+        fixed_reasoning_text: Optional[str] = None,
+        debug_noise: bool = False,
+        debug_noise_samples: int = 15,
+        use_best_noise: bool = True,
+        debug_noise_log_every_n_steps: int = 5,
+        debug_noise_run_name: str | None = None,
+        debug_noise_save_root: str | Path | None = None,
+        debug_noise_route_name: str = "?",
+        debug_noise_episode: int = 0,
+        debug_noise_episode_step: int = 0,
+        noise_scale: float = 1.0,
     ) -> None:
         self.actor_url = actor_url
         self._remote: Optional[RemoteActor] = None
@@ -758,15 +813,32 @@ class SteerVLAActor:
         self.actions_per_model_query = max(1, int(actions_per_model_query))
         self.actions_per_cot = max(1, int(actions_per_cot))
         self.sample_actions_num_steps = int(sample_actions_num_steps)
+        self.action_decode_batch_size = max(1, int(action_decode_batch_size))
         self.return_normalized_action_chunk = bool(return_normalized_action_chunk)
+        self.fixed_subtask_text = (
+            str(fixed_subtask_text).strip() if fixed_subtask_text else None
+        )
+        self.fixed_reasoning_text = (
+            str(fixed_reasoning_text).strip() if fixed_reasoning_text else None
+        )
+        self.debug_noise = bool(debug_noise)
+        self.debug_noise_samples = max(1, int(debug_noise_samples))
+        self.use_best_noise = bool(use_best_noise)
+        self.debug_noise_log_every_n_steps = max(1, int(debug_noise_log_every_n_steps))
+        self.debug_noise_run_name = debug_noise_run_name
+        self.debug_noise_save_root = (
+            Path(debug_noise_save_root) if debug_noise_save_root is not None else None
+        )
+        self.debug_noise_route_name = str(debug_noise_route_name)
+        self.debug_noise_episode = int(debug_noise_episode)
+        self.debug_noise_episode_step = int(debug_noise_episode_step)
+        self.noise_scale = float(noise_scale)
         self.prompt_state_dim = steervla_prompt_state_dim(include_ego_history=include_ego_history)
         self._call_counter = 0
         self._cached_action_chunk: np.ndarray | None = None
         self._cached_action_step = 0
         self._cached_cot: dict[str, Any] | None = None
         self._cached_cot_actions_used = 0
-        self._cached_policy_embed: np.ndarray | None = None
-        self._cached_policy_embed_obs_id: int | None = None
 
         self.train_cfg = None
         self.model = None
@@ -1018,48 +1090,41 @@ class SteerVLAActor:
         out = self._postprocess_action_trajectory(trajectory, observation_state=observation_state)
         return jnp.asarray(out, dtype=jnp.float32)
     
-    def flow_sample(self, rng, openpi_observation, input_noise):
-        # Always run sample_cot so reasoning/subtask/FAST tokens match the current prompt.
-        cot_out = self._sample_cot(
-            rng,
-            openpi_observation,
-            temperature=float(self.cot_temperature),
-            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-        )
-        obs_full = _merge_cot_output_into_observation(openpi_observation, cot_out)
+    # def flow_sample(self, rng, openpi_observation, input_noise):
+    #     batch_size = int(openpi_observation.state.shape[0])
+    #     cot_out = self._sample_or_reuse_cot(rng, openpi_observation, batch_size)
+    #     obs_full = _merge_cot_output_into_observation(openpi_observation, cot_out)
         
-        # Construct the noise
-        batch_size = int(openpi_observation.state.shape[0])
-        model_ah = int(self.model.action_horizon)
-        model_ad = int(self.model.action_dim)
-        cfg_ah = min(int(self.action_horizon), model_ah)
-        cfg_ad = min(int(self.action_dim), model_ad)
-        noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
-        if input_noise.ndim == 3:
-            noise_chunk = input_noise[:, :cfg_ah, :cfg_ad]
-        elif int(input_noise.shape[-1]) == int(self.action_horizon) * int(self.action_dim):
-            noise_chunk = input_noise.reshape(batch_size, int(self.action_horizon), int(self.action_dim))[:, :cfg_ah, :cfg_ad]
-        else:
-            noise_chunk = input_noise[:, None, :cfg_ad]
-            write_ah = 1
-        noise_full = noise_full.at[:, :write_ah, :cfg_ad].set(noise_chunk)
+    #     # Construct the noise
+    #     model_ah = int(self.model.action_horizon)
+    #     model_ad = int(self.model.action_dim)
+    #     cfg_ah = min(int(self.action_horizon), model_ah)
+    #     cfg_ad = min(int(self.action_dim), model_ad)
+    #     noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
+    #     if input_noise.ndim == 3:
+    #         noise_chunk = input_noise[:, :cfg_ah, :cfg_ad]
+    #     elif int(input_noise.shape[-1]) == int(self.action_horizon) * int(self.action_dim):
+    #         noise_chunk = input_noise.reshape(batch_size, int(self.action_horizon), int(self.action_dim))[:, :cfg_ah, :cfg_ad]
+    #     else:
+    #         noise_chunk = input_noise[:, None, :cfg_ad]
+    #         write_ah = 1
+    #     noise_full = noise_full.at[:, :write_ah, :cfg_ad].set(noise_chunk)
         
-        # Sample the actions
-        traj = self._sample_actions(
-            rng,
-            obs_full,
-            noise=noise_full,
-            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-            num_steps=int(self.sample_actions_num_steps),
-        )
-        traj_np = self._postprocess_action_trajectory(
-            traj,
-            observation_state=openpi_observation.state,
-        )
-        target_dim = int(self.action_dim)
-        first_step = traj_np[:, 0, :target_dim]
-        out = jnp.asarray(first_step, dtype=jnp.float32)
-        return out
+    #     traj = self._sample_actions(
+    #         rng,
+    #         obs_full,
+    #         noise=noise_full,
+    #         image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+    #         num_steps=int(self.sample_actions_num_steps),
+    #     )
+    #     traj_np = self._postprocess_action_trajectory(
+    #         traj,
+    #         observation_state=openpi_observation.state,
+    #     )
+    #     target_dim = int(self.action_dim)
+    #     first_step = traj_np[:, 0, :target_dim]
+    #     out = jnp.asarray(first_step, dtype=jnp.float32)
+    #     return out
 
     def _routing_for_raw(self, raw: Dict[str, Any]) -> str:
         rc = raw.get("routing_command")
@@ -1303,10 +1368,11 @@ class SteerVLAActor:
             if "tokenized_fast" in cot_out and "tokenized_fast_mask" in cot_out:
                 fast_tokens = np.asarray(jax.device_get(cot_out["tokenized_fast"][0]), dtype=np.int32)
                 fast_mask = np.asarray(jax.device_get(cot_out["tokenized_fast_mask"][0]), dtype=bool)
-                raw["openpi_tokenized_fast"] = fast_tokens
-                raw["openpi_tokenized_fast_mask"] = fast_mask
-                raw["fast"] = fast_tokens
-                raw["fast_mask"] = fast_mask
+                if np.any(fast_mask):
+                    raw["openpi_tokenized_fast"] = fast_tokens
+                    raw["openpi_tokenized_fast_mask"] = fast_mask
+                    raw["fast"] = fast_tokens
+                    raw["fast_mask"] = fast_mask
         except Exception:
             # Keep rollout robust if CoT payload changes shape unexpectedly.
             return
@@ -1384,12 +1450,59 @@ class SteerVLAActor:
     def _cot_cache_enabled(self, batch_size: int) -> bool:
         return self.actions_per_cot > 1 and batch_size == 1
 
+    def _uses_fixed_cot(self) -> bool:
+        return self.fixed_subtask_text is not None
+
+    def _build_fixed_cot_out(
+        self,
+        batch_size: int,
+        *,
+        ref_array: jnp.ndarray,
+    ) -> dict[str, Any]:
+        """Teacher-forced CoT matching ``inspect_outputs.ipynb`` (no ``sample_cot``)."""
+        if self.tokenizer is None or self.model_cfg is None:
+            raise RuntimeError("Fixed CoT requires a loaded local SteerVLAActor tokenizer/model.")
+        reasoning_text = self.fixed_reasoning_text or "Follow the route."
+        rea_np, rea_mask_np = self.tokenizer.tokenize_reasoning(reasoning_text)
+        sub_np, sub_mask_np = self.tokenizer.tokenize_subtask(self.fixed_subtask_text)
+        device = self._jax_device if self._jax_device is not None else ref_array.devices().pop()
+
+        def _tile(tok: np.ndarray, mask: np.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+            tokens = jnp.asarray(np.tile(tok[None, :], (batch_size, 1)), dtype=ref_array.dtype)
+            masks = jnp.asarray(np.tile(mask[None, :], (batch_size, 1)), dtype=bool)
+            return jax.device_put(tokens, device), jax.device_put(masks, device)
+
+        reasoning, reasoning_mask = _tile(rea_np, rea_mask_np)
+        subtask, subtask_mask = _tile(sub_np, sub_mask_np)
+        out: dict[str, Any] = {
+            "tokenized_reasoning": reasoning,
+            "tokenized_reasoning_mask": reasoning_mask,
+            "tokenized_subtask": subtask,
+            "tokenized_subtask_mask": subtask_mask,
+        }
+        if self.tokenizer.use_fast_tokens:
+            mf = int(self.model_cfg.max_fast_len)
+            out["tokenized_fast"] = jax.device_put(
+                jnp.zeros((batch_size, mf), dtype=ref_array.dtype),
+                device,
+            )
+            out["tokenized_fast_mask"] = jax.device_put(
+                jnp.zeros((batch_size, mf), dtype=bool),
+                device,
+            )
+        return out
+
     def _sample_or_reuse_cot(
         self,
         rng: jax.Array,
         obs_jax: _openpi_model.Observation,
         batch_size: int,
     ) -> dict[str, Any]:
+        if self._uses_fixed_cot():
+            return self._build_fixed_cot_out(
+                batch_size,
+                ref_array=obs_jax.tokenized_prompt,
+            )
         if (
             self._cot_cache_enabled(batch_size)
             and self._cached_cot is not None
@@ -1416,8 +1529,6 @@ class SteerVLAActor:
         self._cached_action_step = 0
         self._cached_cot = None
         self._cached_cot_actions_used = 0
-        self._cached_policy_embed = None
-        self._cached_policy_embed_obs_id = None
 
     def _qgf_guided_denoise(
         self,
@@ -1654,6 +1765,296 @@ class SteerVLAActor:
         first_step = traj_np[:, 0, : int(self.action_dim)]
         return jax.device_put(jnp.asarray(first_step, dtype=jnp.float32), self._jax_device)
 
+    @staticmethod
+    def _sanitize_debug_path_component(name: str) -> str:
+        s = str(name).strip() or "unknown"
+        s = re.sub(r"[^\w\-.]+", "_", s)
+        return s[:120]
+
+    def set_debug_noise_context(
+        self,
+        *,
+        run_name: str | None = None,
+        save_root: str | Path | None = None,
+        route_name: str | None = None,
+        episode: int | None = None,
+        episode_step: int | None = None,
+    ) -> None:
+        """Update where debug-noise plots and npz logs are written (per run / route / episode)."""
+        if run_name is not None:
+            self.debug_noise_run_name = str(run_name)
+        if save_root is not None:
+            self.debug_noise_save_root = Path(save_root)
+        if route_name is not None:
+            self.debug_noise_route_name = str(route_name)
+        if episode is not None:
+            self.debug_noise_episode = int(episode)
+        if episode_step is not None:
+            self.debug_noise_episode_step = int(episode_step)
+
+    def _should_log_debug_noise_plot(self) -> bool:
+        step = int(self.debug_noise_episode_step)
+        every = int(self.debug_noise_log_every_n_steps)
+        return step > 0 and step % every == 0
+
+    def _debug_noise_artifact_dir(self) -> Path:
+        run_name = self._sanitize_debug_path_component(
+            self.debug_noise_run_name or "run"
+        )
+        route = self._sanitize_debug_path_component(self.debug_noise_route_name)
+        ep = int(self.debug_noise_episode)
+        root = self.debug_noise_save_root or Path("debug_noises")
+        out_dir = root / "debug_noises" / f"{run_name}_{route}" / f"ep{ep:04d}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
+    def _debug_speed_score_from_flat(self, flat_action: Any) -> float:
+        """First-step speed delta magnitude (``delta_xy`` cols 0:2); lower means slower."""
+        ah = int(self.action_horizon)
+        ad = int(self.action_dim)
+        flat = np.asarray(jax.device_get(flat_action), dtype=np.float32).reshape(-1)
+        expected = ah * ad
+        if flat.size != expected:
+            return float("inf")
+        speed_xy = flat.reshape(ah, ad)[:, :2]
+        speed_xy_final = np.cumsum(speed_xy, axis=0)[-1, :2]
+        return float(np.linalg.norm(speed_xy_final))
+
+    def _debug_xy_cumsum_from_flat(self, flat_action: Any) -> np.ndarray:
+        """Cumulative ``delta_xy`` in meters, shape ``(action_horizon, 2)``."""
+        ah = int(self.action_horizon)
+        ad = int(self.action_dim)
+        flat = np.asarray(jax.device_get(flat_action), dtype=np.float32).reshape(-1)
+        expected = ah * ad
+        if flat.size != expected:
+            return np.full((ah, 2), np.nan, dtype=np.float64)
+        deltas = flat.reshape(ah, ad)[:, :2].astype(np.float64)
+        return np.cumsum(deltas, axis=0)
+
+    def _sample_best_of_random_noises(self, batch_size: int, noise_jax: jax.Array) -> jnp.ndarray:
+        """Debug rollout: sample random noises, log distributions, optionally pick the slowest chunk."""
+        if not self.use_best_noise and not self._should_log_debug_noise_plot():
+            return self._forward_pi0(batch_size, noise_jax, raw=None)
+
+        import matplotlib.pyplot as plt
+
+        n = int(self.debug_noise_samples)
+        self._call_counter += 1
+        rng = jax.random.PRNGKey(self._call_counter)
+        rng, samp_rng = jax.random.split(rng)
+
+        ref_noise = np.asarray(jax.device_get(noise_jax), dtype=np.float32)
+        if ref_noise.ndim == 1:
+            ref_noise = ref_noise.reshape(1, -1)
+        noise_dim = int(ref_noise.shape[-1])
+        candidate_noises = np.asarray(
+            jax.device_get(
+                jax.random.normal(samp_rng, (n, batch_size, noise_dim), dtype=jnp.float32)
+            ),
+            dtype=np.float32,
+        )
+
+        best_out: jnp.ndarray | None = None
+        best_score = float("inf")
+        best_idx = -1
+        scores: list[float] = []
+        xy_avgs: list[tuple[float, float]] = []
+        xy_cumsum_steps: list[np.ndarray] = []
+        for i in range(n):
+            noise_i = jnp.asarray(candidate_noises[i], dtype=jnp.float32)
+            out = self._forward_pi0(batch_size, noise_i * self.noise_scale, raw=None)
+            score = self._debug_speed_score_from_flat(out)
+            scores.append(score)
+            cumsum_xy = self._debug_xy_cumsum_from_flat(out)
+            xy_cumsum_steps.append(cumsum_xy)
+            final_xy = cumsum_xy[-1]
+            xy_avgs.append((float(final_xy[0]), float(final_xy[1])))
+            if self.use_best_noise and score < best_score:
+                best_score = score
+                best_out = out
+                best_idx = i
+
+        scores_arr = np.asarray(scores, dtype=np.float64)
+        xy_arr = np.asarray(xy_avgs, dtype=np.float64)
+        xy_cumsum_arr = np.stack(xy_cumsum_steps, axis=0)
+        score_mean = float(np.mean(scores_arr))
+        score_std = float(np.std(scores_arr))
+        score_max = float(np.max(scores_arr))
+        score_min = float(np.min(scores_arr))
+
+        should_log_plot = self._should_log_debug_noise_plot()
+        plot_path: Path | None = None
+        npz_path: Path | None = None
+        if should_log_plot:
+            fig, (ax_score, ax_xy) = plt.subplots(1, 2, figsize=(13, 5))
+
+            ax_score.scatter(range(n), scores_arr, alpha=0.75, label="candidates")
+            if self.use_best_noise and best_idx >= 0:
+                ax_score.scatter(
+                    [best_idx],
+                    [scores_arr[best_idx]],
+                    color="red",
+                    s=80,
+                    zorder=3,
+                    label=f"best ({best_idx})",
+                )
+            ax_score.axhline(score_mean, color="C1", linestyle="-", linewidth=1.5, label="mean")
+            ax_score.axhline(score_max, color="C2", linestyle="--", linewidth=1.2, label="max")
+            ax_score.axhline(score_min, color="C3", linestyle="--", linewidth=1.2, label="min")
+            ax_score.axhspan(
+                score_mean - score_std,
+                score_mean + score_std,
+                color="C1",
+                alpha=0.15,
+                label="±1 std",
+            )
+            stats_text = (
+                f"mean = {score_mean:.4f}\n"
+                f"std  = {score_std:.4f}\n"
+                f"max  = {score_max:.4f}\n"
+                f"min  = {score_min:.4f}"
+            )
+            ax_score.text(
+                0.02,
+                0.98,
+                stats_text,
+                transform=ax_score.transAxes,
+                va="top",
+                ha="left",
+                fontsize=9,
+                bbox={"boxstyle": "round", "facecolor": "wheat", "alpha": 0.85},
+            )
+            ax_score.set_title("Speed score (lower = slower)")
+            ax_score.set_xlabel("Candidate")
+            ax_score.set_ylabel("||cumsum delta_xy||")
+            ax_score.legend(loc="upper right", fontsize=8)
+
+            cmap = plt.get_cmap("tab20", max(n, 1))
+            valid_cumsum_mask = np.isfinite(xy_cumsum_arr).all(axis=(1, 2))
+            final_points: list[np.ndarray] = []
+            for i in range(n):
+                if not valid_cumsum_mask[i]:
+                    continue
+                cumsum_xy = xy_cumsum_arr[i]
+                color = cmap(i % cmap.N)
+                ax_xy.plot(
+                    cumsum_xy[:, 0],
+                    cumsum_xy[:, 1],
+                    color=color,
+                    alpha=0.55,
+                    linewidth=1.2,
+                    zorder=2,
+                )
+                ax_xy.scatter(
+                    cumsum_xy[:, 0],
+                    cumsum_xy[:, 1],
+                    color=[color],
+                    alpha=0.35,
+                    s=14,
+                    edgecolors="none",
+                    zorder=2,
+                )
+                final_xy = cumsum_xy[-1]
+                final_points.append(final_xy)
+                marker_edge = "red" if i == best_idx else "black"
+                marker_lw = 1.0 if i == best_idx else 0.35
+                ax_xy.scatter(
+                    final_xy[0],
+                    final_xy[1],
+                    color=color,
+                    marker="D",
+                    s=52,
+                    edgecolors=marker_edge,
+                    linewidths=marker_lw,
+                    zorder=4,
+                )
+                ax_xy.annotate(
+                    f"c{i}",
+                    (final_xy[0], final_xy[1]),
+                    xytext=(4, 4),
+                    textcoords="offset points",
+                    fontsize=7,
+                    color=color,
+                    fontweight="bold" if i == best_idx else "normal",
+                )
+
+            if final_points:
+                finals = np.stack(final_points, axis=0)
+                overall_mean = finals.mean(axis=0)
+                ax_xy.scatter(
+                    overall_mean[0],
+                    overall_mean[1],
+                    color="black",
+                    marker="X",
+                    s=90,
+                    linewidths=1.5,
+                    zorder=5,
+                )
+                ax_xy.annotate(
+                    "overall",
+                    (overall_mean[0], overall_mean[1]),
+                    xytext=(5, -10),
+                    textcoords="offset points",
+                    fontsize=8,
+                    color="black",
+                    fontweight="bold",
+                )
+
+            ax_xy.axhline(0.0, color="0.7", linewidth=0.8)
+            ax_xy.axvline(0.0, color="0.7", linewidth=0.8)
+            ax_xy.set_title("Cumulative delta_xy per candidate")
+            ax_xy.set_xlabel("x (m)")
+            ax_xy.set_ylabel("y (m)")
+            ax_xy.set_aspect("equal", adjustable="datalim")
+
+            mode_label = "best_of_n" if self.use_best_noise else "log_only"
+            fig.suptitle(
+                f"debug_noise call={self._call_counter} step={self.debug_noise_episode_step} "
+                f"mode={mode_label} route={self.debug_noise_route_name} "
+                f"ep={self.debug_noise_episode}",
+                fontsize=10,
+            )
+            fig.tight_layout()
+
+            artifact_dir = self._debug_noise_artifact_dir()
+            stem = f"debug_noise_step{self.debug_noise_episode_step:04d}_{self._call_counter:04d}"
+            plot_path = artifact_dir / f"{stem}.png"
+            npz_path = artifact_dir / f"{stem}.npz"
+            fig.savefig(plot_path)
+            plt.close(fig)
+
+            np.savez(
+                npz_path,
+                candidate_noises=candidate_noises,
+                scores=scores_arr,
+                xy_final=xy_arr,
+                xy_cumsum=xy_cumsum_arr,
+                ref_noise=ref_noise,
+                best_idx=np.int32(best_idx),
+                use_best_noise=np.bool_(self.use_best_noise),
+                call_counter=np.int32(self._call_counter),
+                episode=np.int32(self.debug_noise_episode),
+                episode_step=np.int32(self.debug_noise_episode_step),
+                route_name=np.array(self.debug_noise_route_name),
+            )
+
+        best_speed_str = f"{best_score:.4f}" if best_idx >= 0 else "n/a"
+        plot_msg = f" plot={plot_path} npz={npz_path}" if should_log_plot else " plot=skipped"
+        print(
+            f"[debug_noise] step={self.debug_noise_episode_step} candidates={n} "
+            f"use_best_noise={self.use_best_noise} "
+            f"best_idx={best_idx} best_speed_delta_xy={best_speed_str} "
+            f"mean={score_mean:.4f} std={score_std:.4f} "
+            f"min={score_min:.4f} max={score_max:.4f}{plot_msg}",
+            flush=True,
+        )
+
+        if self.use_best_noise:
+            if best_out is None:
+                raise RuntimeError("debug_noise search failed to produce any action.")
+            return jnp.asarray(best_out)
+        return self._forward_pi0(batch_size, noise_jax, raw=None)
+
     def __call__(self, observations_jax: jax.Array, noise_jax: jax.Array) -> jax.Array:
         """DSRL ``vla_sample_fn``: map encoder observations + noise to CARLA actions.
 
@@ -1666,7 +2067,7 @@ class SteerVLAActor:
             # Cache-hit path still corresponds to a real env step with a fresh `raw_obs_holder["obs"]`.
             # Re-stash the currently reused CoT so replay capture for this step remains aligned.
             if (
-                batch_size == 1
+                batch_size == 1 
                 and self._cached_cot is not None
                 and self.raw_obs_holder is not None
                 and isinstance(self.raw_obs_holder.get("obs"), dict)
@@ -1693,7 +2094,11 @@ class SteerVLAActor:
             self._mark_action_served(batch_size)
             return out
 
-        out = self._forward_pi0(batch_size, noise_jax, raw=None)
+        out = (
+            self._sample_best_of_random_noises(batch_size, noise_jax)
+            if self.debug_noise
+            else self._forward_pi0(batch_size, noise_jax, raw=None)
+        )
         self._remember_action_chunk(out, batch_size)
         self._mark_action_served(batch_size)
         return out
@@ -1709,6 +2114,7 @@ class SteerVLAActor:
         rng = jax.random.PRNGKey(self._call_counter)
         rng_noise, rng_act = jax.random.split(rng)
         noise_jax = jax.random.normal(rng_noise, (1, self.model.action_dim), dtype=jnp.float32)
+        noise_jax = noise_jax * jnp.asarray(self.noise_scale, dtype=jnp.float32)
         actions = self._forward_pi0(1, noise_jax, raw=state, rng=rng_act, force_accel_steer=True)
         self._mark_action_served(1)
         return np.asarray(jax.device_get(actions[0]), dtype=np.float32)
@@ -1727,13 +2133,7 @@ class SteerVLAActor:
             lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
             obs_np_struct,
         )
-        cot_out = self._sample_cot(
-            rng,
-            obs_jax,
-            temperature=float(self.cot_temperature),
-            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-            # replay_reasoning=self.cot_replay_reasoning,
-        )
+        cot_out = self._sample_or_reuse_cot(rng, obs_jax, 1)
 
         def _to_numpy(x: Any) -> Any:
             return np.asarray(jax.device_get(x))
@@ -1767,6 +2167,137 @@ class SteerVLAActor:
             row_valid = tokens[i][mask[i].astype(bool)]
             texts.append(self.tokenizer._tokenizer.decode(row_valid.tolist()))
         return texts
+    def sample_candidates(
+        self,
+        n: int,
+        *,
+        temperature: float,
+        noise: jax.Array | None = None,
+        raw: Optional[Dict[str, Any]] = None,
+        rng: jax.Array | None = None,
+    ) -> dict[str, Any]:
+        """Best-of-N support: sample ``n`` CoTs at ``temperature`` and decode each subtask.
+
+        One batched forward samples ``n`` diverse chains-of-thought (``temperature`` drives
+        per-row diversity), then ``sample_actions`` produces one normalized action chunk per
+        candidate. Each candidate's reasoning + subtask is printed for debugging.
+
+        Returns a dict with:
+          - ``actions``: ``(n, action_horizon * action_dim)`` float32 normalized chunks.
+          - ``subtask_texts`` / ``reasoning_texts``: decoded strings, one per candidate.
+          - ``cot_out``: the batched CoT dict; slice row ``i`` (via :meth:`stash_candidate_cot`)
+            to persist the executed candidate's tokens for replay/training.
+        """
+        assert (
+            self.model is not None
+            and self._jax_device is not None
+            and self.tokenizer is not None
+        ), "sample_candidates requires a local SteerVLAActor (checkpoint loaded)."
+        n = max(1, int(n))
+        if rng is None:
+            self._call_counter += 1
+            rng = jax.random.PRNGKey(self._call_counter)
+        else:
+            rng = jax.random.fold_in(jnp.asarray(rng), self._call_counter)
+        rng_cot, rng_act, rng_noise = jax.random.split(rng, 3)
+
+        obs_np_struct = self.build_observation_batch_numpy(n, raw=raw)
+        obs_jax = jax.tree.map(
+            lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
+            obs_np_struct,
+        )
+
+        # n diverse CoTs in one batched call (temperature gives independent per-row samples).
+        cot_out = self._sample_cot(
+            rng_cot,
+            obs_jax,
+            temperature=float(temperature),
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+
+        reason_tokens = np.asarray(jax.device_get(cot_out["tokenized_reasoning"]), dtype=np.int32)
+        reason_mask = np.asarray(jax.device_get(cot_out["tokenized_reasoning_mask"]), dtype=bool)
+        subtask_tokens = np.asarray(jax.device_get(cot_out["tokenized_subtask"]), dtype=np.int32)
+        subtask_mask = np.asarray(jax.device_get(cot_out["tokenized_subtask_mask"]), dtype=bool)
+        reasoning_texts: list[str] = []
+        subtask_texts: list[str] = []
+        for i in range(n):
+            r_txt = self.tokenizer._tokenizer.decode(reason_tokens[i][reason_mask[i]].tolist())
+            s_txt = self.tokenizer._tokenizer.decode(subtask_tokens[i][subtask_mask[i]].tolist())
+            reasoning_texts.append(r_txt)
+            subtask_texts.append(s_txt)
+            print(
+                f"[best_of_n][cand {i}] temp={float(temperature):.2f} "
+                f"subtask={s_txt!r} reasoning={r_txt!r}",
+                flush=True,
+            )
+
+        obs_full = _merge_cot_output_into_observation(obs_jax, cot_out)
+
+        # Build per-candidate noise in model space.
+        model_ah = int(self.model.action_horizon)
+        model_ad = int(self.model.action_dim)
+        cfg_ah = min(int(self.action_horizon), model_ah)
+        cfg_ad = min(int(self.action_dim), model_ad)
+        noise_scale = jnp.asarray(self.noise_scale, dtype=jnp.float32)
+        if noise is None:
+            noise_chunk = (
+                jax.random.normal(rng_noise, (n, cfg_ah, cfg_ad), dtype=jnp.float32) * noise_scale
+            )
+        else:
+            noise_arr = jnp.asarray(noise, dtype=jnp.float32)
+            if noise_arr.ndim == 2:
+                noise_arr = noise_arr.reshape(
+                    noise_arr.shape[0], int(self.action_horizon), int(self.action_dim)
+                )
+            noise_chunk = noise_arr[:, :cfg_ah, :cfg_ad]
+            if noise_chunk.shape[0] == 1 and n > 1:
+                noise_chunk = jnp.broadcast_to(noise_chunk, (n, cfg_ah, cfg_ad))
+        noise_full = jnp.zeros((n, model_ah, model_ad), dtype=jnp.float32)
+        noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(
+            jax.device_put(noise_chunk, self._jax_device)
+        )
+
+        decode_bs = min(n, int(self.action_decode_batch_size))
+        traj_parts: list[np.ndarray] = []
+        for start in range(0, n, decode_bs):
+            end = min(start + decode_bs, n)
+            chunk_rng = jax.random.fold_in(rng_act, start)
+            chunk_obs = jax.tree.map(lambda x: x[start:end], obs_full)
+            chunk_noise = noise_full[start:end]
+            traj = self._sample_actions(
+                chunk_rng,
+                chunk_obs,
+                noise=chunk_noise,
+                num_steps=int(self.sample_actions_num_steps),
+                image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+            )
+            jax.block_until_ready(traj)
+            traj_np = self._postprocess_action_trajectory(
+                traj, observation_state=jax.tree.map(lambda x: x[start:end], obs_jax.state)
+            )
+            traj_parts.append(np.asarray(traj_np, dtype=np.float32))
+        actions_flat = np.concatenate(traj_parts, axis=0).reshape(n, -1)
+
+        return {
+            "actions": actions_flat,
+            "subtask_texts": subtask_texts,
+            "reasoning_texts": reasoning_texts,
+            "cot_out": cot_out,
+        }
+
+    def stash_candidate_cot(
+        self,
+        cot_out: dict[str, Any],
+        index: int,
+        raw: Optional[Dict[str, Any]],
+    ) -> None:
+        """Persist candidate ``index`` from a batched :meth:`sample_candidates` CoT into ``raw``."""
+        if raw is None:
+            return
+        i = int(index)
+        sliced = {k: v[i : i + 1] for k, v in cot_out.items()}
+        self._stash_cot_in_raw(raw, sliced)
 
 
 def create_steervla_pi0_cot_sample_fn(
@@ -1774,6 +2305,7 @@ def create_steervla_pi0_cot_sample_fn(
     raw_obs_holder: MutableMapping[str, Any],
     *,
     training_gpu_rank: int = -1,
+    noise_scale: float = 1.0,
 ) -> Callable[[jax.Array, jax.Array], jax.Array]:
     """Build ``vla_sample_fn`` for :class:`jax_agents.dsrl.DSRLAgent`."""
     srank = steervla_cfg.get("training_gpu_rank", None)
@@ -1794,8 +2326,18 @@ def create_steervla_pi0_cot_sample_fn(
         actions_per_model_query=int(steervla_cfg.get("actions_per_model_query", 1)),
         actions_per_cot=int(steervla_cfg.get("actions_per_cot", 1)),
         sample_actions_num_steps=int(steervla_cfg.get("sample_actions_num_steps", 10)),
+        action_decode_batch_size=int(steervla_cfg.get("action_decode_batch_size", 2)),
         training_gpu_rank=int(srank),
         return_normalized_action_chunk=bool(steervla_cfg.get("use_pi_action_chunk_for_env", True)),
+        fixed_subtask_text=steervla_cfg.get("fixed_subtask_text"),
+        fixed_reasoning_text=steervla_cfg.get("fixed_reasoning_text"),
+        debug_noise=bool(steervla_cfg.get("debug_noise", False)),
+        debug_noise_samples=int(steervla_cfg.get("debug_noise_samples", 15)),
+        use_best_noise=bool(steervla_cfg.get("use_best_noise", True)),
+        debug_noise_log_every_n_steps=int(
+            steervla_cfg.get("debug_noise_log_every_n_steps", 5)
+        ),
+        noise_scale=float(steervla_cfg.get("noise_scale", noise_scale)),
     )
 
     if url_clean:

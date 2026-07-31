@@ -104,8 +104,8 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 \
 WANDB_MODE=online \
 uv run python impls/main_carla.py \
   --agent=impls/configs/steervla_dsrl_config.py \
-  --route=parking-cut-in-001 \
-  --online_steps=10000 \
+  --route=signalized-junction-left-turn-001 \
+  --online_steps=50000 \
   --save_buffer=true \
   --seed=0
 ```
@@ -116,7 +116,13 @@ There are a couple levers to pull to optimize the speed a bit:
 - `actions_per_cot`: int - how many actions to execute before getting new CoT (speed)
 
 
+## Fail2Drive routes: 
 
+To add fail2drive routes, first pull down the f2d_content_pack.zip (see our slack channel)
 
+Then run `install_f2d_content.sh`: 
+```
+./install_f2d_content.sh <CARLA_ROOT> <ZIP_PATH>
+```
 
 
