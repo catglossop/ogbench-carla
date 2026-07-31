@@ -23,7 +23,7 @@ TM_PORT="8020"
 X_DISPLAY_NUM=""
 
 ENABLE_UPDATES="true"
-BASE_ONLY=""
+BASE_ONLY="false"
 
 # Crash supervisor: relaunch main_carla (resuming from checkpoint) after a CARLA native
 # crash (SIGSEGV/SIGABRT, exit code >=128). 0 disables the retry loop.
@@ -73,7 +73,7 @@ Options:
   --x-display-num N         Xvfb display number. Default: derived from carla port
 
   --enable-updates BOOL     true|false. false = rollout/buffer only (no RL updates). Default: true
-  --base-only BOOL          true|false. true = roll out the frozen base policy only (no RL). Default: config
+  --base-only BOOL          true|false. true = roll out the frozen base policy only (no RL). Default: false
 
   --agent-config PATH       Base agent config. Default: impls/configs/steervla_residual_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
@@ -133,7 +133,7 @@ case "$ENABLE_UPDATES" in
 esac
 
 case "$BASE_ONLY" in
-  ""|true|false) ;;
+  true|false) ;;
   *)
     echo "Invalid --base-only: $BASE_ONLY (expected true|false)" >&2
     exit 2
@@ -159,11 +159,6 @@ if [[ -n "$RENDER_ADAPTER" ]]; then
   SIM_GPU_RANK="$RENDER_ADAPTER"
 fi
 
-BASE_ONLY_LINE=""
-if [[ -n "$BASE_ONLY" ]]; then
-  BASE_ONLY_LINE="config.base_only = ${BASE_ONLY^}"
-fi
-
 cat > "$AGENT_CFG_TMP" <<EOF
 from pathlib import Path
 import runpy
@@ -176,7 +171,7 @@ def get_config():
     config = _BASE_GET_CONFIG()
     config.training_gpu_rank = ${TRAIN_GPU_RANK}
     config.enable_updates = ${ENABLE_UPDATES^}
-    ${BASE_ONLY_LINE}
+    config.base_only = ${BASE_ONLY^}
     return config
 EOF
 
@@ -213,24 +208,20 @@ if [[ "$ROUTE_SOURCE" == "fail2drive" && -n "$FAIL2DRIVE_CARLA_ROOT" ]]; then
   fi
 fi
 
-# Stable run name so save_dir + the W&B run id survive restarts (the supervisor resumes, not forks).
-ROUTE_TAG="$(printf '%s' "$ROUTE" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')"
-if [[ "${BASE_ONLY,,}" == "true" ]]; then MODE_TAG="base"; else MODE_TAG="residual"; fi
-EXP_NAME="${ROUTE_TAG}-${MODE_TAG}-sd$(printf '%03d' "$SEED")_$(date +%Y%m%d_%H%M%S)"
+# Stable run name so save_dir + the W&B id survive restarts (the supervisor resumes, not forks).
+EXP_NAME="${ROUTE//[^A-Za-z0-9._-]/-}-sd${SEED}-$(date +%Y%m%d_%H%M%S)"
 
 echo "[run_carla.sh] route=${ROUTE} (source=${ROUTE_SOURCE:-?})"
-echo "[run_carla.sh] enable_updates=${ENABLE_UPDATES} base_only=${BASE_ONLY:-<config default>}"
+echo "[run_carla.sh] enable_updates=${ENABLE_UPDATES} base_only=${BASE_ONLY}"
 echo "[run_carla.sh] train_gpu_rank=${TRAIN_GPU_RANK} render_adapter=${SIM_GPU_RANK}"
 echo "[run_carla.sh] carla_host=${CARLA_HOST} carla_port=${CARLA_PORT} streaming_port=${CARLA_STREAMING_PORT} tm_port=${TM_PORT} x_display=:${X_DISPLAY_NUM}"
 echo "[run_carla.sh] expert_debug=${EXPERT_DEBUG} expert_recover_debug=${EXPERT_RECOVER_DEBUG} save_buffer=${SAVE_BUFFER} online_steps=${ONLINE_STEPS} exp_name=${EXP_NAME} max_retries=${MAX_RETRIES}"
 echo "[run_carla.sh] temp agent config: ${AGENT_CFG_TMP}"
 echo "[run_carla.sh] temp carla config: ${CARLA_CFG_TMP}"
 
-# Supervisor loop: CARLA's leaderboard runs in-process and periodically segfaults on long runs
-# (killing our python outright, so no in-process try/except can catch it). On a crash-signal exit
-# (>=128) we kill any orphaned CARLA/Xvfb on this run's ports and relaunch with --resume=true, which
-# restores the agent + replay buffer + step counter from the last checkpoint. A clean exit (0),
-# SIGINT (130), or a non-crash error (<128, e.g. a config bug) stops the loop.
+# Supervisor loop: CARLA's in-process leaderboard periodically segfaults on long runs (kills python
+# outright, uncatchable). On a crash-signal exit (>=128, excluding SIGINT) we kill orphaned
+# CARLA/Xvfb and relaunch with --resume (restores agent + buffer + step from the last checkpoint).
 attempt=0
 RESUME_FLAG="false"
 while :; do
@@ -247,30 +238,18 @@ while :; do
     --resume="${RESUME_FLAG}" \
     --expert_debug="${EXPERT_DEBUG}" \
     --expert_recover_debug="${EXPERT_RECOVER_DEBUG}" \
-    --log_interval=10 \
     --save_interval=5000 \
     "${EXTRA_ARGS[@]}"
   CODE=$?
   set -e
-
-  if [[ $CODE -eq 0 ]]; then
-    echo "[run_carla.sh] run completed (exit 0)."
-    break
-  fi
-  if [[ $CODE -eq 130 ]]; then
-    echo "[run_carla.sh] interrupted (SIGINT); not restarting."
-    exit 130
-  fi
-  if [[ $CODE -lt 128 ]]; then
-    echo "[run_carla.sh] exited with code ${CODE} (not a crash signal); not restarting."
-    exit "$CODE"
-  fi
+  [[ $CODE -eq 0 ]] && { echo "[run_carla.sh] completed (exit 0)."; break; }
+  [[ $CODE -eq 130 ]] && exit 130  # SIGINT
   attempt=$((attempt + 1))
-  if [[ "$MAX_RETRIES" -le 0 || $attempt -gt "$MAX_RETRIES" ]]; then
-    echo "[run_carla.sh] crash (exit ${CODE}); retry budget exhausted (${attempt}/${MAX_RETRIES}). Giving up."
+  if [[ $CODE -lt 128 || "$MAX_RETRIES" -le 0 || $attempt -gt "$MAX_RETRIES" ]]; then
+    echo "[run_carla.sh] exit ${CODE}; not restarting (attempt ${attempt}/${MAX_RETRIES})."
     exit "$CODE"
   fi
-  echo "[run_carla.sh] main_carla crashed (exit ${CODE}, likely CARLA native SIGSEGV/SIGABRT); cleaning up + resuming (attempt ${attempt}/${MAX_RETRIES})."
+  echo "[run_carla.sh] crash (exit ${CODE}); cleanup + resume (attempt ${attempt}/${MAX_RETRIES})."
   pkill -9 -f "CarlaUE4.*-carla-rpc-port=${CARLA_PORT}" 2>/dev/null || true
   pkill -9 -f "Xvfb :${X_DISPLAY_NUM} " 2>/dev/null || true
   sleep 8
