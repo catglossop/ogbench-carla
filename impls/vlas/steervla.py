@@ -48,6 +48,7 @@ import optax
 import os
 
 from openpi.models import model as _openpi_model
+from openpi.models import pi0 as _openpi_pi0
 from openpi.models.pi0_config import Pi0CoTConfig
 from openpi.models.tokenizer import CoTPaligemmaTokenizer
 from openpi.policies import steervla_policy as sv_policy
@@ -693,8 +694,6 @@ class SteerVLAActor:
         self._cached_action_step = 0
         self._cached_cot: dict[str, Any] | None = None
         self._cached_cot_actions_used = 0
-        # Latest CoT output (reasoning/subtask/FAST tokens) the base policy sampled.
-        self._last_cot_out: dict[str, Any] | None = None
 
         self.train_cfg = None
         self.model = None
@@ -787,7 +786,7 @@ class SteerVLAActor:
                 "image_keys",
             ),
         )
-
+        
         self._local_ready = True
 
     def _state_for_transform(self, state: np.ndarray | jax.Array) -> np.ndarray:
@@ -898,38 +897,36 @@ class SteerVLAActor:
     #     cot_out = self._sample_or_reuse_cot(rng, openpi_observation, batch_size)
     #     obs_full = _merge_cot_output_into_observation(openpi_observation, cot_out)
         
-        # Construct the noise
-        model_ah = int(self.model.action_horizon)
-        model_ad = int(self.model.action_dim)
-        cfg_ah = min(int(self.action_horizon), model_ah)
-        cfg_ad = min(int(self.action_dim), model_ad)
-        noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
-        write_ah = cfg_ah
-        if input_noise.ndim == 3:
-            noise_chunk = input_noise[:, :cfg_ah, :cfg_ad]
-        elif int(input_noise.shape[-1]) == int(self.action_horizon) * int(self.action_dim):
-            noise_chunk = input_noise.reshape(batch_size, int(self.action_horizon), int(self.action_dim))[:, :cfg_ah, :cfg_ad]
-        else:
-            noise_chunk = input_noise[:, None, :cfg_ad]
-            write_ah = 1
-        noise_full = noise_full.at[:, :write_ah, :cfg_ad].set(noise_chunk)
+    #     # Construct the noise
+    #     model_ah = int(self.model.action_horizon)
+    #     model_ad = int(self.model.action_dim)
+    #     cfg_ah = min(int(self.action_horizon), model_ah)
+    #     cfg_ad = min(int(self.action_dim), model_ad)
+    #     noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
+    #     if input_noise.ndim == 3:
+    #         noise_chunk = input_noise[:, :cfg_ah, :cfg_ad]
+    #     elif int(input_noise.shape[-1]) == int(self.action_horizon) * int(self.action_dim):
+    #         noise_chunk = input_noise.reshape(batch_size, int(self.action_horizon), int(self.action_dim))[:, :cfg_ah, :cfg_ad]
+    #     else:
+    #         noise_chunk = input_noise[:, None, :cfg_ad]
+    #         write_ah = 1
+    #     noise_full = noise_full.at[:, :write_ah, :cfg_ad].set(noise_chunk)
         
-        # Sample the actions
-        traj = self._sample_actions(
-            rng,
-            obs_full,
-            noise=noise_full,
-            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-            num_steps=int(self.sample_actions_num_steps),
-        )
-        traj_np = self._postprocess_action_trajectory(
-            traj,
-            observation_state=openpi_observation.state,
-        )
-        target_dim = int(self.action_dim)
-        first_step = traj_np[:, 0, :target_dim]
-        out = jnp.asarray(first_step, dtype=jnp.float32)
-        return out
+    #     traj = self._sample_actions(
+    #         rng,
+    #         obs_full,
+    #         noise=noise_full,
+    #         image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+    #         num_steps=int(self.sample_actions_num_steps),
+    #     )
+    #     traj_np = self._postprocess_action_trajectory(
+    #         traj,
+    #         observation_state=openpi_observation.state,
+    #     )
+    #     target_dim = int(self.action_dim)
+    #     first_step = traj_np[:, 0, :target_dim]
+    #     out = jnp.asarray(first_step, dtype=jnp.float32)
+    #     return out
 
     def _routing_for_raw(self, raw: Dict[str, Any]) -> str:
         rc = raw.get("routing_command")
@@ -1170,18 +1167,15 @@ class SteerVLAActor:
         batch_size: int,
     ) -> dict[str, Any]:
         if self._uses_fixed_cot():
-            cot_out = self._build_fixed_cot_out(
+            return self._build_fixed_cot_out(
                 batch_size,
                 ref_array=obs_jax.tokenized_prompt,
             )
-            self._last_cot_out = cot_out
-            return cot_out
         if (
             self._cot_cache_enabled(batch_size)
             and self._cached_cot is not None
             and self._cached_cot_actions_used < self.actions_per_cot
         ):
-            self._last_cot_out = self._cached_cot
             return self._cached_cot
         cot_out = self._sample_cot(
             rng,
@@ -1192,7 +1186,6 @@ class SteerVLAActor:
         if self._cot_cache_enabled(batch_size):
             self._cached_cot = dict(cot_out)
             self._cached_cot_actions_used = 0
-        self._last_cot_out = cot_out
         return cot_out
 
     def _mark_action_served(self, batch_size: int) -> None:
@@ -1204,7 +1197,6 @@ class SteerVLAActor:
         self._cached_action_step = 0
         self._cached_cot = None
         self._cached_cot_actions_used = 0
-        self._last_cot_out = None
 
     def _forward_pi0(
         self,
