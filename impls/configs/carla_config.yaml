@@ -58,6 +58,3 @@ crash_stuck_penalty: -5.0
 
 # Force a new episode after this many env steps (0 = no limit).
 max_episode_steps: 2000
-
-# Per-step reward shaping (defaults in carla_utils.py). Example:
-# speed_limit_penalty_weight: 0.1  # penalty = weight * max(0, speed/limit - 1)

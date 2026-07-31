@@ -1190,7 +1190,9 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             try:
                 from ogbench.carla.steervla_simlingo_control import SimlingoStyleWaypointDecoder
 
-                self._steervla_decoder = SimlingoStyleWaypointDecoder()
+                self._steervla_decoder = SimlingoStyleWaypointDecoder(
+                    brake_speed=float(exec_raw.get("brake_speed", 0.1)),
+                )
             except ImportError as e:
                 raise ImportError(
                     "SteerVLA waypoint decoding failed to load dependencies "
@@ -1270,7 +1272,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         # Force NVIDIA-only Vulkan ICD so -graphicsadapter=N maps to physical GPU N.
         # Without this, llvmpipe and other ICDs shift the Vulkan device indices, causing
         # UE4's render thread to select the wrong GPU or fail to initialize.
-        _NVIDIA_VK_ICD = "/usr/share/vulkan/icd.d/nvidia_icd.json"
+        _NVIDIA_VK_ICD = _resolve_nvidia_vk_icd()
         prev_vk_icd = os.environ.get("VK_ICD_FILENAMES")
         os.environ["VK_ICD_FILENAMES"] = _NVIDIA_VK_ICD
         self._evaluator = IsolatedLeaderboardEvaluator(self._args, statistics_manager)
@@ -2148,6 +2150,21 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             if getattr(criterion, "name", "") == "CollisionTest":
                 return int(getattr(criterion, "actual_value", 0))
         return 0
+
+    def _traffic_violation_count(self) -> int:
+        """Total count of RunningStopTest + RunningRedLightTest infractions so far."""
+        scenario = getattr(self.evaluator, "route_scenario", None)
+        if scenario is None:
+            return 0
+        count = 0
+        for criterion in scenario.get_criteria():
+            name = str(getattr(criterion, "name", ""))
+            if name in ("RunningStopTest", "RunningRedLightTest"):
+                try:
+                    count += int(getattr(criterion, "actual_value", 0))
+                except Exception:
+                    pass
+        return count
 
     def _route_completion_pct(self) -> float:
         """Route completion percentage from leaderboard ``RouteCompletionTest`` (0–100)."""
