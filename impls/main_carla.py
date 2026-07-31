@@ -15,6 +15,9 @@ Three calling patterns:
 
    Set ``enable_updates=false`` in the agent config (or ``--enable_updates=false``)
    to run rollout-only: collect transitions and log videos without gradient updates.
+   Individual update kinds can be toggled with ``enable_updates_rl`` (DSRL critic/actor),
+   ``enable_updates_bc`` (full DAgger imitation path), and ``enable_updates_bc_hl`` (the
+   high-level VLM backbone update on relabeled data) — each is ANDed with ``enable_updates``.
 
    Live rollout video (single overwriting MP4 + browser UI)::
 
@@ -50,6 +53,7 @@ import faulthandler
 import json
 import os
 import random
+import re
 import sys
 import time
 import traceback
@@ -79,6 +83,7 @@ from coaches.critic_feedback import (
     resolve_critic_feedback_mode,
 )
 from impls.coaches.online_vlm_coach import OnlineVLMSession
+from impls.coaches.cast_relabel import OnlineCastRelabelSession
 
 _IMPLS_ROOT = Path(__file__).resolve().parent
 if str(_IMPLS_ROOT) not in sys.path:
@@ -168,8 +173,26 @@ flags.DEFINE_string(
 flags.DEFINE_bool(
     "enable_updates",
     None,
-    "If false, skip RL gradient updates (rollout/buffer logging only). "
+    "Master switch: if false, skip ALL gradient updates (rollout/buffer logging only). "
     "Default: agent config ``enable_updates`` (true).",
+)
+flags.DEFINE_bool(
+    "enable_updates_rl",
+    None,
+    "If false, skip DSRL critic/actor (RL) gradient updates. ANDed with ``enable_updates``. "
+    "Default: agent config ``enable_updates_rl`` (true).",
+)
+flags.DEFINE_bool(
+    "enable_updates_bc",
+    None,
+    "If false, skip the full BC / DAgger imitation update (``update_dagger``). "
+    "ANDed with ``enable_updates``. Default: agent config ``enable_updates_bc`` (true).",
+)
+flags.DEFINE_bool(
+    "enable_updates_bc_hl",
+    None,
+    "If false, skip the high-level VLM backbone update (``update_hl`` on relabeled data). "
+    "ANDed with ``enable_updates``. Default: agent config ``enable_updates_bc_hl`` (true).",
 )
 flags.DEFINE_bool(
     "live_policy_view",
@@ -467,17 +490,40 @@ def run_online_carla(
     if update_interval < 1:
         raise ValueError(f"update_interval must be >= 1, got {update_interval}")
     batch_size = int(agent_config.get("batch_size", 256))
+    # Master switch (all updates) plus per-kind switches. Each per-kind flag is ANDed with the
+    # master, so ``enable_updates=False`` still disables everything (back-compat). CLI flags
+    # override the config values when provided.
     enable_updates = bool(agent_config.get("enable_updates", True))
     if FLAGS.enable_updates is not None:
         enable_updates = bool(FLAGS.enable_updates)
+    enable_updates_rl = bool(agent_config.get("enable_updates_rl", True))
+    if FLAGS.enable_updates_rl is not None:
+        enable_updates_rl = bool(FLAGS.enable_updates_rl)
+    enable_updates_bc = bool(agent_config.get("enable_updates_bc", True))
+    if FLAGS.enable_updates_bc is not None:
+        enable_updates_bc = bool(FLAGS.enable_updates_bc)
+    enable_updates_bc_hl = bool(agent_config.get("enable_updates_bc_hl", True))
+    if FLAGS.enable_updates_bc_hl is not None:
+        enable_updates_bc_hl = bool(FLAGS.enable_updates_bc_hl)
+    # Effective per-kind gates: RL = DSRL critic/actor, BC = full DAgger imitation path,
+    # HL = high-level VLM backbone update (``update_hl`` on cast_relabel data).
+    rl_updates_on = enable_updates and enable_updates_rl
+    bc_updates_on = enable_updates and enable_updates_bc
+    hl_updates_on = enable_updates and enable_updates_bc_hl
+    any_updates_on = rl_updates_on or bc_updates_on or hl_updates_on
 
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, "train.csv"))
-    if not enable_updates:
-        print("[main_carla] enable_updates=False: rollout-only (no RL gradient updates)", flush=True)
+    if not any_updates_on:
+        print("[main_carla] all updates disabled: rollout-only (no gradient updates)", flush=True)
+    else:
+        print(
+            f"[main_carla] updates enabled -> rl={rl_updates_on} bc={bc_updates_on} hl={hl_updates_on}",
+            flush=True,
+        )
     if warmup > 0 and agent is not None and not FLAGS.expert_debug:
-        print(f"[main_carla] warmup: no RL updates while step < {warmup}", flush=True)
-    if update_interval > 1 and agent is not None and enable_updates:
-        print(f"[main_carla] RL updates every {update_interval} env steps", flush=True)
+        print(f"[main_carla] warmup: no updates while step < {warmup}", flush=True)
+    if update_interval > 1 and agent is not None and any_updates_on:
+        print(f"[main_carla] updates every {update_interval} env steps", flush=True)
     if warmup_expo > 0:
         if warmup_expo <= warmup:
             raise ValueError(
@@ -587,8 +633,37 @@ def run_online_carla(
             flush=True,
         )
         capture_rollout_video = True
+
+    # CAST relabel observer: window rollout -> VLM good/bad review -> per-chunk credit
+    # assignment -> suggested subtasks. Artifacts + wandb only (no buffer backfill).
+    _cast_relabel: OnlineCastRelabelSession | None = None
+    cast_cfg = agent_config.get("cast_relabel")
+    if cast_cfg is not None and bool(cast_cfg.get("enabled", False)):
+        _cast_relabel = OnlineCastRelabelSession(
+            cast_cfg,
+            save_dir=FLAGS.save_dir,
+            action_chunk_steps=int(agent_config.get("action_horizon", 10)),
+        )
+        print(
+            f"[main_carla] CAST relabel enabled (provider={_cast_relabel.provider}, "
+            f"window={_cast_relabel.window_env_steps} env steps, debug={_cast_relabel.debug})",
+            flush=True,
+        )
+        # Point the (trainable) SteerVLA actor at the CAST-relabel HL dataset so its high-level
+        # update (run from DSRL ``update_with_vla``) trains on the stored steervla_hl_dataset_format
+        # samples as they accumulate.
+        if steervla_actor is not None and getattr(steervla_actor, "load_trainable_params", False):
+            steervla_actor.hl_dataset_dir = _cast_relabel.hl_dataset_dir
+            print(
+                f"[main_carla] SteerVLA high-level update wired to HL dataset dir "
+                f"{steervla_actor.hl_dataset_dir} (every {steervla_actor.hl_update_every} vla updates, "
+                f"batch {steervla_actor.hl_update_batch_size}).",
+                flush=True,
+            )
+        capture_rollout_video = True
     _online_training_mode = str(agent_config.get("online_training_mode", "rl")).strip().lower()
     _lang_dim = critic_language_dim(agent_config)
+    _bon_viz_interval = int(agent_config.get("bon_viz_interval", 0))
     _steervla_exec_cfg = _steervla_action_execution_cfg(agent_config.get("steervla") or {})
 
     steervla_cfg = agent_config.get("steervla") or {}
@@ -671,6 +746,14 @@ def run_online_carla(
             episode_count=max(1, episode_count),
             route_name=str(obs_raw.get("routing_command", "?") if isinstance(obs_raw, dict) else "?"),
         )
+    if _cast_relabel is not None:
+        _cast_relabel.begin_episode(
+            episode_count=max(1, episode_count),
+            route_name=str(obs_raw.get("routing_command", "?") if isinstance(obs_raw, dict) else "?"),
+            route_command_plan=(
+                obs_raw.get("route_command_plan") if isinstance(obs_raw, dict) else None
+            ),
+        )
 
     def _as_video_frame(image: np.ndarray) -> np.ndarray:
         frame = np.asarray(image)
@@ -686,6 +769,79 @@ def run_online_carla(
             if raw.get("image") is not None:
                 return np.asarray(raw["image"], dtype=np.uint8)
         return np.asarray(raw, dtype=np.uint8)
+
+    def _plot_bon_candidates(frame: np.ndarray, cand: dict, step: int):
+        """W&B image: the frame + all best-of-N candidate action trajectories.
+
+        Each candidate's first two action dims are speed-waypoint deltas; their cumsum gives a
+        planned (forward, lateral) path. The legend keys every candidate to its subtask and
+        critic Q value, with the executed (best) candidate highlighted.
+        """
+        import textwrap
+        from io import BytesIO
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        actions = np.asarray(cand["actions"], dtype=np.float32)  # (n, env_flat)
+        q = np.asarray(cand["q"], dtype=np.float32)  # (n,)
+        subtasks = list(cand.get("subtasks", []))
+        best = int(cand.get("best", int(np.argmax(q)) if q.size else 0))
+        ah, ad = int(cand["ah"]), int(cand["ad"])
+        n = actions.shape[0]
+        chunks = actions.reshape(n, ah, ad)
+
+        fig, (ax_img, ax_traj) = plt.subplots(1, 2, figsize=(16, 8))
+        ax_img.imshow(frame)
+        ax_img.set_title(f"frame @ step {step}")
+        ax_img.axis("off")
+
+        cmap = plt.get_cmap("tab10" if n <= 10 else "tab20")
+        handles = []
+        for i in range(n):
+            wps = np.cumsum(chunks[i, :, :2], axis=0)
+            wps = np.concatenate([np.zeros((1, 2), dtype=wps.dtype), wps], axis=0)
+            is_best = i == best
+            # Show the full subtask, wrapped so long strings stay readable in the legend.
+            sub = subtasks[i] if i < len(subtasks) else ""
+            sub_wrapped = "\n     ".join(textwrap.wrap(sub, width=60)) or "(none)"
+            (h,) = ax_traj.plot(
+                wps[:, 1],  # lateral on x-axis
+                wps[:, 0],  # forward on y-axis
+                marker="o",
+                markersize=3,
+                color=cmap(i % cmap.N),
+                linewidth=3.0 if is_best else 1.5,
+                alpha=1.0 if is_best else 0.6,
+                zorder=3 if is_best else 2,
+                label=f"{i}{'*' if is_best else ''}: Q={q[i]:.2f} | {sub_wrapped}",
+            )
+            handles.append(h)
+        ego = ax_traj.scatter([0], [0], c="k", marker="s", s=40, zorder=4, label="ego")
+        handles.append(ego)
+        ax_traj.set_title("best-of-N candidate action trajectories (cumsum dx, dy)")
+        ax_traj.set_xlabel("lateral (action dim 1, cumsum)")
+        ax_traj.set_ylabel("forward (action dim 0, cumsum)")
+        ax_traj.set_aspect("equal", adjustable="datalim")
+        ax_traj.grid(True, alpha=0.3)
+        # Legend below the plots so full (wrapped) subtasks have horizontal room.
+        legend = fig.legend(
+            handles=handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.0),
+            fontsize=8,
+            ncol=2,
+            title="candidate: Q | subtask  (* = executed)",
+        )
+        # Render with bbox_inches='tight' so the out-of-axes legend is never clipped.
+        buf = BytesIO()
+        fig.savefig(buf, format="png", dpi=100, bbox_inches="tight", bbox_extra_artists=(legend,))
+        plt.close(fig)
+        buf.seek(0)
+        img = wandb.Image(plt.imread(buf))
+        return img
 
     def _annotate_collision_frame(
         frame: np.ndarray,
@@ -964,6 +1120,10 @@ def run_online_carla(
             "control_brake": float(drive["control_brake"]),
             "collision": bool(collision_occurred),
             "route_progress_pct": float(step_info.get("route_progress_pct", 0.0)),
+            # Env reward for this step (``_compute_reward_and_info``). Recorded so the VLM coaches
+            # (window review + CAST credit assignment) can see the actual objective the RL side is
+            # optimizing, instead of inferring it from speed / progress / collisions.
+            "reward_total": float(step_info.get("reward_total", 0.0)),
             "in_video": bool(in_video),
         }
         if in_video and video_frame_index is not None:
@@ -1009,6 +1169,7 @@ def run_online_carla(
 
     for step in tqdm.tqdm(range(1, FLAGS.online_steps + 1), smoothing=0.1, dynamic_ncols=True):
         t_sample_start = time.time()
+        _bon_viz_img = None
         if raw_obs_holder is not None:
             raw_obs_holder["obs"] = obs_raw
         rng, sub = jax.random.split(rng)
@@ -1061,6 +1222,21 @@ def run_online_carla(
                             if f"next_{k}" in _buffer_keys
                         },
                     )
+            # Best-of-N candidate visualization (frame is still s_t here), every N env steps.
+            if (
+                _bon_viz_interval > 0
+                and step % _bon_viz_interval == 0
+                and steervla_actor is not None
+                and getattr(steervla_actor, "last_bon_candidates", None) is not None
+            ):
+                try:
+                    _bon_viz_img = _plot_bon_candidates(
+                        _viz_image_from_raw(obs_raw),
+                        steervla_actor.last_bon_candidates,
+                        step,
+                    )
+                except Exception as e:
+                    print(f"[main_carla] best-of-n viz failed: {e}", flush=True)
         t_sample_end = time.time()
 
         t_step_start = time.time()
@@ -1177,6 +1353,15 @@ def run_online_carla(
                 episode_video_frames.append(frame)
                 if _vlm_coach is not None:
                     _vlm_coach.record_frame(frame)
+                if _cast_relabel is not None:
+                    _cast_relabel.record_frame(
+                        frame,
+                        subtask_text=(
+                            _format_text_field(cot_obs_raw, "subtask_text")
+                            or _format_text_field(cot_obs_raw, "subtask")
+                        ),
+                        episode_step=episode_steps,
+                    )
                 if step_in_video:
                     episode_video_frame_index += 1
             if live_viewer is not None and episode_video_frames:
@@ -1194,6 +1379,56 @@ def run_online_carla(
             _vlm_coach.record_trajectory_step(episode_trajectory[-1])
             if _vlm_coach.maybe_query(episode_step=episode_steps, done_info=info):
                 _vlm_coach.backfill_buffer(buffer)
+        if _cast_relabel is not None and episode_trajectory:
+            # Enrich the recorded step with the executed subtask / CoT reasoning / prompt
+            # (stashed on ``cot_obs_raw`` by the VLA) so the CAST relabel window review can
+            # key them by timestamp for the VLM coach prompt.
+            _cast_step_record = dict(episode_trajectory[-1])
+            _cast_step_record["subtask"] = (
+                _format_text_field(cot_obs_raw, "subtask_text")
+                or _format_text_field(cot_obs_raw, "subtask")
+            )
+            _cast_step_record["reasoning"] = (
+                _format_text_field(cot_obs_raw, "reasoning_text")
+                or _format_text_field(cot_obs_raw, "reasoning")
+            )
+            # Raw routing instruction, NOT the wrapped ``Prompt:...;State:...;`` display string:
+            # this value is re-tokenized by ``SteerVLAActor._build_hl_observation_batch``, which
+            # applies the wrapper itself. Storing the wrapped form double-wraps every online HL
+            # sample ("Prompt:Prompt:...;State:..;;State:..;") — a prefix the model never sees at
+            # inference. ``openpi_prompt_text`` is kept as the fallback for older raw dicts.
+            _cast_step_record["prompt"] = _format_text_field(
+                cot_obs_raw, "openpi_prompt_raw_text"
+            ) or _format_text_field(cot_obs_raw, "openpi_prompt_text")
+            _cast_relabel.record_trajectory_step(_cast_step_record)
+            # Stash the raw SteerVLA model input (pre-step obs the action was taken from) so the
+            # window review can persist BAD/relabeled chunks as high-level dataset samples. The
+            # session keeps only chunk-start steps, so calling this every step is cheap.
+            _cast_relabel.record_model_input(
+                episode_step=episode_steps,
+                image=cot_obs_raw.get("image"),
+                state=cot_obs_raw.get("state"),
+                current_speed=float(_ego_speed_mps_from_raw(cot_obs_raw)),
+                prompt=_cast_step_record["prompt"],
+                subtask=_cast_step_record["subtask"],
+                reasoning=_cast_step_record["reasoning"],
+                action_chunk=replay_action,
+            )
+            # A mid-route window review makes blocking Gemini calls (video upload + two
+            # model queries) that can exceed the CARLA leaderboard watchdog timeout. Pause
+            # the watchdogs/pseudo-sensors across the query so the route isn't stopped for
+            # inactivity (same mechanism SteerVLA inference uses per step).
+            if _cast_relabel.should_query(episode_steps):
+                _pause_offtick = hasattr(env, "pause_for_vla_inference")
+                if _pause_offtick:
+                    env.pause_for_vla_inference()
+                try:
+                    _cast_relabel.maybe_query(
+                        episode_step=episode_steps, done_info=info, global_step=step
+                    )
+                finally:
+                    if _pause_offtick and hasattr(env, "resume_after_vla_inference"):
+                        env.resume_after_vla_inference()
         last_video_reward = float(reward)
         last_video_critic_text = _critic_text_for_video
         t_log_end = time.time()
@@ -1201,6 +1436,23 @@ def run_online_carla(
         step_wb = {f"rollout/{k}": v for k, v in drive_metrics.items()}
         step_wb["rollout/collision_count"] = float(collision_count)
         step_wb["rollout/collision_events"] = float(collision_delta)
+        # Bench2Drive route completion, per step. The dominant positive reward term and the
+        # clearest read on whether the policy is actually advancing rather than stalling.
+        if "route_progress_pct" in info:
+            step_wb["rollout/route_progress_pct"] = float(info["route_progress_pct"])
+            step_wb["rollout/route_progress_delta"] = float(info.get("route_progress_delta", 0.0))
+        # Leaderboard infraction counters (only meaningful as running totals).
+        if "traffic_violation_count" in info:
+            step_wb["rollout/traffic_violation_count"] = float(info["traffic_violation_count"])
+        if "outside_route_value" in info:
+            step_wb["rollout/outside_route_value"] = float(info["outside_route_value"])
+        # Best-of-N candidate action entropy (per-dim + mean), stashed by the agent at sample time.
+        _bon_actor = getattr(agent, "steervla_actor", None)
+        _bon_metrics = getattr(_bon_actor, "last_bon_metrics", None) if _bon_actor is not None else None
+        if _bon_metrics:
+            step_wb.update(_bon_metrics)
+        if _bon_viz_img is not None:
+            step_wb["rollout/bon_candidates"] = _bon_viz_img
         if "reward_total" in info:
             step_wb["reward/total"] = float(info["reward_total"])
             step_wb["reward/progress"] = float(info.get("reward_progress", 0.0))
@@ -1239,6 +1491,9 @@ def run_online_carla(
         step_wb["training/in_warmup"] = float(in_warmup)
         step_wb["training/in_expo_warmup"] = float(in_expo_warmup)
         step_wb["training/enable_updates"] = float(enable_updates)
+        step_wb["training/rl_updates_on"] = float(rl_updates_on)
+        step_wb["training/bc_updates_on"] = float(bc_updates_on)
+        step_wb["training/hl_updates_on"] = float(hl_updates_on)
         if "episode_step_count" in info:
             step_wb["rollout/episode_step"] = float(info["episode_step_count"])
 
@@ -1306,6 +1561,26 @@ def run_online_carla(
                     done_info.get("penalty_crash_stuck", 0.0)
                 )
                 rollout_log["rollout/final_step_success"] = float(bool(done_info.get("success", False)))
+            # Bench2Drive end-of-route statistics. ``driving_score`` is the leaderboard's composed
+            # score (route completion x infraction multiplier), computed by
+            # ``statistics_manager.compute_route_statistics`` when the wrapper finalizes the route,
+            # so it exists only on the terminal step — log it per episode, not per step.
+            if "driving_score" in done_info:
+                rollout_log["rollout/driving_score"] = float(done_info["driving_score"])
+            if "route_progress_pct" in done_info:
+                rollout_log["rollout/episode_route_progress_pct"] = float(
+                    done_info["route_progress_pct"]
+                )
+                rollout_log["rollout/episode_route_completed"] = float(
+                    float(done_info["route_progress_pct"]) >= 99.5
+                )
+            if "traffic_violation_count" in done_info:
+                rollout_log["rollout/episode_traffic_violations"] = float(
+                    done_info["traffic_violation_count"]
+                )
+            rollout_log["rollout/episode_termination_reason"] = str(
+                done_info.get("termination_reason", "?")
+            )
             if FLAGS.expert_recover_debug:
                 rollout_log["rollout/vla_steps_budget"] = float(_vla_steps_budget)
             traj_path = _save_episode_trajectory_json(
@@ -1348,6 +1623,10 @@ def run_online_carla(
                     episode_step=done_episode_steps, done_info=done_info, force=True
                 )
                 _vlm_coach.backfill_buffer(buffer)
+            if _cast_relabel is not None:
+                _cast_relabel.maybe_query(
+                    episode_step=done_episode_steps, done_info=done_info, force=True, global_step=step
+                )
             episode_video_frames = []
             episode_trajectory = []
             episode_video_frame_index = 0
@@ -1355,6 +1634,12 @@ def run_online_carla(
             if _vlm_coach is not None:
                 _vlm_coach.reset_episode()
                 _vlm_coach.begin_episode(
+                    episode_count=episode_count,
+                    route_name=done_route,
+                )
+            if _cast_relabel is not None:
+                _cast_relabel.reset_episode()
+                _cast_relabel.begin_episode(
                     episode_count=episode_count,
                     route_name=done_route,
                 )
@@ -1371,7 +1656,7 @@ def run_online_carla(
 
         update_times = []
         if (
-            enable_updates
+            any_updates_on
             and (not FLAGS.expert_debug)
             and agent is not None
             and not in_warmup
@@ -1382,16 +1667,26 @@ def run_online_carla(
                 t_update_start = time.time()
                 use_vla_update = getattr(agent, "vla_sample_fn", None) is not None
                 batch = buffer.sample(batch_size)
+                update_info = None
                 if _online_training_mode == "dagger":
-                    agent, update_info = agent.update_dagger(batch)
+                    # Full BC / DAgger imitation path.
+                    if bc_updates_on:
+                        agent, update_info = agent.update_dagger(batch)
                 elif use_vla_update:
-                    agent, update_info = agent.update_with_vla(batch)
+                    # ``update_with_vla`` runs the DSRL critic/actor (RL) step and the HL VLM
+                    # backbone update; each is gated independently.
+                    if rl_updates_on or hl_updates_on:
+                        agent, update_info = agent.update_with_vla(
+                            batch, run_rl=rl_updates_on, run_hl=hl_updates_on, global_step=step,
+                        )
                 else:
-                    agent, update_info = agent.update(batch)
-                _block_until_ready_tree((agent, update_info))
+                    if rl_updates_on:
+                        agent, update_info = agent.update(batch)
+                if update_info is not None:
+                    _block_until_ready_tree((agent, update_info))
+                    last_update_info = update_info
                 t_update_end = time.time()
                 update_times.append(t_update_end - t_update_start)
-            last_update_info = update_info
             
 
         if step % FLAGS.log_interval == 0:
@@ -1406,7 +1701,7 @@ def run_online_carla(
             wandb.log(metrics, step=step)
             train_logger.log(metrics, step=step)
 
-        if agent is not None and enable_updates and step % FLAGS.save_interval == 0:
+        if agent is not None and any_updates_on and step % FLAGS.save_interval == 0:
             save_agent(agent, FLAGS.save_dir, step)
 
     train_logger.close()
@@ -1431,7 +1726,16 @@ def main(_):
 
     config = FLAGS.agent
 
-    exp_name = get_exp_name(FLAGS.seed)
+    def _slug(s: str) -> str:
+        return re.sub(r"[^0-9A-Za-z._-]+", "-", str(s)).strip("-") or "na"
+
+    _agent_name = str(config.get("agent_name", "agent"))
+    _route_name = str(FLAGS.route or "all-routes")
+    _exp_name_parts = [_slug(_agent_name)]
+    if _agent_name == "best_of_n":
+        _exp_name_parts.append(f"n{int(config.get('best_of_n', 10))}")
+    _exp_name_parts.extend([_slug(_route_name), get_exp_name(FLAGS.seed)])
+    exp_name = "_".join(_exp_name_parts)
     setup_wandb(project="OGBench-CARLA", group=FLAGS.run_group, name=exp_name, mode=wandb_mode)
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)

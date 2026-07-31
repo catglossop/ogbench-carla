@@ -30,6 +30,73 @@ def _steervla():
 
     return steervla_mod
 
+def _resolve_critic_ckpt(path: str):
+    """Resolve a critic-pretrain checkpoint path to a concrete ``.pkl`` file.
+
+    Accepts a direct ``.pkl`` file, a run directory (uses ``latest.pkl`` or the
+    highest ``step_*.pkl``), or a bare step number form like ``.../run_xxx/4000``
+    (mapped to ``.../run_xxx/step_0004000.pkl``).
+    """
+    from pathlib import Path
+
+    p = Path(path)
+    if p.is_file():
+        return p
+    if p.is_dir():
+        latest = p / "latest.pkl"
+        if latest.exists():
+            return latest
+        pkls = sorted(p.glob("step_*.pkl"))
+        if pkls:
+            return pkls[-1]
+        raise FileNotFoundError(f"No 'latest.pkl' or 'step_*.pkl' in checkpoint dir {p}")
+    if p.name.isdigit() and p.parent.is_dir():
+        cand = p.parent / f"step_{int(p.name):07d}.pkl"
+        if cand.exists():
+            return cand
+    raise FileNotFoundError(f"Could not resolve critic checkpoint from {path!r}")
+
+
+def _load_pretrained_critic_params(path: str, init_critic_params):
+    """Load ``modules_critic`` params from a DSRL-style pickle, validated against init shapes.
+
+    Returns a pytree (matching ``init_critic_params``) of ``jnp`` arrays to assign into both
+    ``modules_critic`` and ``modules_target_critic``.
+    """
+    import pickle
+
+    ckpt_path = _resolve_critic_ckpt(path)
+    with open(ckpt_path, "rb") as f:
+        ckpt = pickle.load(f)
+    params = ckpt["params"] if isinstance(ckpt, dict) and "params" in ckpt else ckpt
+    if not isinstance(params, dict) or "modules_critic" not in params:
+        raise KeyError(
+            f"Checkpoint {ckpt_path} has no 'modules_critic' params (keys: "
+            f"{list(params.keys()) if isinstance(params, dict) else type(params)})."
+        )
+    loaded = params["modules_critic"]
+
+    init_shapes = jax.tree_util.tree_structure(init_critic_params)
+    loaded_shapes = jax.tree_util.tree_structure(loaded)
+    if init_shapes != loaded_shapes:
+        raise ValueError(
+            f"Pretrained critic tree from {ckpt_path} does not match the BestOfN critic tree.\n"
+            f"  checkpoint: {loaded_shapes}\n  expected:   {init_shapes}"
+        )
+    mismatches = []
+    init_leaves = jax.tree_util.tree_leaves_with_path(init_critic_params)
+    loaded_leaves = jax.tree_util.tree_leaves(loaded)
+    for (kp, a), b in zip(init_leaves, loaded_leaves):
+        if jnp.asarray(a).shape != jnp.asarray(b).shape:
+            mismatches.append(f"{jax.tree_util.keystr(kp)}: expected {jnp.asarray(a).shape}, got {jnp.asarray(b).shape}")
+    if mismatches:
+        raise ValueError(
+            f"Pretrained critic shape mismatch in {ckpt_path}:\n  " + "\n  ".join(mismatches)
+        )
+    print(f"[best_of_n] loaded pretrained critic from {ckpt_path}", flush=True)
+    return jax.tree.map(lambda x: jnp.asarray(x, dtype=jnp.float32), loaded)
+
+
 def _critic_obs_e(obs_e: jnp.ndarray, batch: dict, key: str) -> jnp.ndarray:
     """Append language label from ``batch[key]`` to encoded observation for critic-only consumption."""
     lang = batch.get(key)
@@ -315,10 +382,17 @@ class BestOfNAgent(flax.struct.PyTreeNode):
         actions_flat = jnp.asarray(cands["actions"], dtype=jnp.float32)  # (n, env_flat)
         subtask_texts = cands["subtask_texts"]
 
-        lang = self._encode_subtask_labels(subtask_texts)  # (n, language_label_dim)
+        # No-language critic (e.g. when a pretrained DSRL critic is loaded): rank candidates
+        # by Q(obs_e, action) with no subtask conditioning. Otherwise append the SigLIP
+        # subtask embedding as the critic language label.
         obs_e = self._encode_obs(self.network.params, observations)  # (1, embed)
         obs_e_n = jnp.broadcast_to(obs_e, (actions_flat.shape[0],) + obs_e.shape[1:])
-        critic_in = jnp.concatenate([obs_e_n, lang], axis=-1)
+        if self.siglip_encoder is not None:
+            lang = self._encode_subtask_labels(subtask_texts)  # (n, language_label_dim)
+            critic_in = jnp.concatenate([obs_e_n, lang], axis=-1)
+        else:
+            lang = None
+            critic_in = obs_e_n
         critic_actions = self._clip_actions_to_env(actions_flat)
         qs = self.network.select("critic")(critic_in, critic_actions)  # (ensemble, n)
         q = jnp.min(qs, axis=0)  # (n,)
@@ -326,16 +400,49 @@ class BestOfNAgent(flax.struct.PyTreeNode):
 
         import numpy as np
 
+        # Per-dimension diversity of the N candidate action chunks, as a Gaussian
+        # differential entropy estimate (0.5*log(2*pi*e*var)) over the candidates.
+        # Variance is taken across the N candidates at each (horizon, dim) position,
+        # then collapsed over the horizon to one entropy per env action dimension.
+        acts = np.asarray(jax.device_get(critic_actions), dtype=np.float64)  # (n, env_flat)
+        ah = self._env_action_horizon()
+        ad = self._env_action_dim()
+        acts_chunk = acts.reshape(acts.shape[0], ah, ad)  # (n, H, D)
+        var = acts_chunk.var(axis=0)  # (H, D)
+        entropy_hd = 0.5 * np.log(2.0 * np.pi * np.e * np.maximum(var, 1e-12))  # (H, D)
+        per_dim_entropy = entropy_hd.mean(axis=0)  # (D,)
+        mean_entropy = float(per_dim_entropy.mean())
+
         print(
             f"[best_of_n] selected candidate {best}/{n} "
             f"q={float(q[best]):.4f} subtask={subtask_texts[best]!r} "
-            f"q_all={np.asarray(jax.device_get(q)).round(3).tolist()}",
+            f"q_all={np.asarray(jax.device_get(q)).round(3).tolist()} "
+            f"action_entropy_mean={mean_entropy:.4f} "
+            f"action_entropy_per_dim={per_dim_entropy.round(4).tolist()}",
             flush=True,
         )
 
+        # Stash entropy metrics on the actor so main_carla can log them per step.
+        bon_metrics = {
+            f"rollout/action_entropy/dim_{d}": float(per_dim_entropy[d])
+            for d in range(per_dim_entropy.shape[0])
+        }
+        bon_metrics["rollout/action_entropy/mean"] = mean_entropy
+        actor.last_bon_metrics = bon_metrics
+
+        # Stash raw candidate data (actions, subtasks, critic Q) so main_carla can plot it.
+        actor.last_bon_candidates = {
+            "actions": acts.astype(np.float32),  # (n, env_flat)
+            "q": np.asarray(jax.device_get(q), dtype=np.float32),  # (n,)
+            "subtasks": list(subtask_texts),
+            "best": best,
+            "ah": ah,
+            "ad": ad,
+        }
+
         # Persist the winner's CoT + subtask label so replay capture / critic training stay aligned.
         actor.stash_candidate_cot(cands["cot_out"], best, raw)
-        if raw is not None:
+        if raw is not None and lang is not None:
             raw["language_label"] = np.asarray(jax.device_get(lang[best]), dtype=np.float32)
 
         return actions_flat[best][None]
@@ -484,9 +591,15 @@ class BestOfNAgent(flax.struct.PyTreeNode):
         )
         return {"next_actions_critic": next_actions}
 
-    def update_with_vla(self, batch):
-        """Flax update via :meth:`total_loss_vla` with eager VLA forwards and a jitted gradient core."""
+    def update_with_vla(self, batch, run_rl: bool = True, run_hl: bool = True):
+        """Flax update via :meth:`total_loss_vla` with eager VLA forwards and a jitted gradient core.
+
+        ``run_rl`` gates the critic/actor gradient step. ``run_hl`` is accepted for signature parity
+        with :class:`DSRLAgent` but is a no-op here — best-of-N has no high-level VLM backbone update.
+        """
         new_rng, rng = jax.random.split(self.rng)
+        if not run_rl:
+            return self.replace(rng=new_rng), {}
         batch = self._prepare_vla_batch(batch)
         vla_cache = self._precompute_vla_loss_cache(batch, rng)
 
@@ -553,7 +666,21 @@ class BestOfNAgent(flax.struct.PyTreeNode):
         else:
             embed_dim = int(tuple(config.get("image_mlp_hidden_dims", (512,)))[-1])
         critic_feedback_mode = str(config.get("critic_feedback_mode", "subtask_siglip"))
-        if critic_feedback_mode == "subtask_siglip":
+        # A pretrained DSRL critic was trained without a language label, so loading it forces
+        # the no-language critic setup (no subtask conditioning) for shape consistency. This
+        # mirrors ``resolve_critic_feedback_mode`` / ``critic_language_dim`` in main_carla.
+        no_language_critic = bool(config.get("critic_pretrained_weights"))
+        if no_language_critic:
+            if critic_feedback_mode != "none":
+                print(
+                    f"[best_of_n] critic_pretrained_weights set: forcing no-language critic "
+                    f"(critic_feedback_mode {critic_feedback_mode!r} -> 'none', lang_dim=0).",
+                    flush=True,
+                )
+            critic_feedback_mode = "none"
+            siglip_encoder = None
+            lang_dim = 0
+        elif critic_feedback_mode == "subtask_siglip":
             # Subtask text is embedded with SigLIP and used as the critic language label.
             if siglip_encoder is None:
                 from utils.siglip_encoder import SigLIPEncoder
@@ -598,7 +725,18 @@ class BestOfNAgent(flax.struct.PyTreeNode):
         network_tx = optax.adam(learning_rate=config["lr"])
         network_params = network_def.init(init_rng, **args)["params"]
         network = TrainState.create(network_def, network_params, tx=network_tx)
-        network.params["modules_target_critic"] = network.params["modules_critic"]
+
+        # Optionally initialize the critic from a pretrained DSRL-style checkpoint, then
+        # copy it onto the target critic so training starts from matched weights.
+        critic_ckpt = config.get("critic_pretrained_weights", None)
+        if critic_ckpt:
+            loaded_critic = _load_pretrained_critic_params(
+                critic_ckpt, network.params["modules_critic"],
+            )
+            network.params["modules_critic"] = loaded_critic
+            network.params["modules_target_critic"] = loaded_critic
+        else:
+            network.params["modules_target_critic"] = network.params["modules_critic"]
 
         return cls(
             rng=rng,
@@ -701,6 +839,15 @@ def get_config():
             debug_noise_samples=15,
             debug_noise_log_every_n_steps=5,
             use_best_noise=True,
+            # Optional path to a DSRL-style pickle checkpoint to initialize the critic from.
+            # Accepts a .pkl file, a run dir (uses latest.pkl / highest step_*.pkl), or a bare
+            # step number form (e.g. ".../run_xxx/4000" -> ".../run_xxx/step_0004000.pkl").
+            # The loaded modules_critic is also copied onto the target critic. Empty = disabled.
+            # NOTE: shapes must match (critic input = obs_embed + lang_dim + env_action_dim).
+            critic_pretrained_weights="",
+            # Every N env steps, log a W&B image of the frame + all best-of-N candidate action
+            # trajectories, keyed by subtask and critic Q value. 0 disables.
+            bon_viz_interval=50,
         )
     )
     return config

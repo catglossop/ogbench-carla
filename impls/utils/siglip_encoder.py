@@ -35,6 +35,8 @@ class SigLIPEncoder:
     def setup(self) -> None:
         if self._model is not None:
             return
+        import os
+
         import torch
         from transformers import AutoModel, AutoProcessor
 
@@ -42,6 +44,21 @@ class SigLIPEncoder:
         if device is None:
             device = "cpu"
         self._device = device
+
+        # Cap torch's intra-op thread pool. It otherwise defaults to the host core
+        # count, which on many-core (e.g. 255-core) shared machines oversubscribes the
+        # CPU and thrashes the whole box, especially when SigLIP runs on CPU. Override
+        # with SIGLIP_NUM_THREADS; falls back to OMP_NUM_THREADS, else a modest 8.
+        try:
+            n_threads = int(
+                os.environ.get("SIGLIP_NUM_THREADS")
+                or os.environ.get("OMP_NUM_THREADS")
+                or 8
+            )
+            if n_threads > 0:
+                torch.set_num_threads(n_threads)
+        except (TypeError, ValueError):
+            torch.set_num_threads(8)
 
         self._processor = AutoProcessor.from_pretrained(self.model_id)
         self._model = AutoModel.from_pretrained(self.model_id)

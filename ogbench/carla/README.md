@@ -26,7 +26,7 @@ For ease of use, you can directly add the `CARLA_ROOT` to your `.bashrc`
 ```
 vim ~/.bashrc
 export CARLA_ROOT=<your carla path>
-source ~/.bashrc
+soumainrce ~/.bashrc
 ```
 
 ## Quickstart
@@ -99,15 +99,17 @@ WANDB_MODE=online uv run python impls/main_carla.py \
 If desired, increase the allowed mem allocation for JAX
 
 ```
+CUDA_VISIBLE_DEVICES=0 \
 XLA_PYTHON_CLIENT_PREALLOCATE="true" \
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.99 \
 WANDB_MODE=online \
 uv run python impls/main_carla.py \
   --agent=impls/configs/steervla_dsrl_config.py \
-  --route=signalized-junction-left-turn-001 \
+  --route=enter-actor-flow-004 \
   --online_steps=50000 \
   --save_buffer=true \
-  --seed=0
+  --seed=0 \
+  --save_dir=\home\cglossop\exps
 ```
 
 There are a couple levers to pull to optimize the speed a bit: 

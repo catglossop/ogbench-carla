@@ -32,11 +32,11 @@ from jax_agents import dsrl as dsrl_agent
 def get_config():
     config = dsrl_agent.get_config()
 
-    config.lr = 3e-4
-    config.batch_size = 32
+    config.lr = 3e-5
+    config.batch_size = 128
     # Denoise steps for frozen VLA forwards during RL updates (rollout uses steervla.sample_actions_num_steps).
     config.vla_update_flow_steps = 5
-    config.noise_scale = 5.0
+    config.noise_scale = 1.0
     config.alpha = 0.1
     # Collect transitions with the rollout policy (SteerVLA / DSRL) but skip RL updates.
     config.warmup_steps = 200
@@ -45,11 +45,18 @@ def get_config():
     config.updates_per_step = 5
     # Run RL gradient updates every N env steps (still ``updates_per_step`` per update).
     config.update_interval = 10
-    # Set to false for rollout-only runs (no RL gradient updates).
+    # Master switch: set to false for rollout-only runs (no gradient updates of any kind).
     config.enable_updates = True
+    # Per-kind switches, each ANDed with ``enable_updates``:
+    #   rl    -> DSRL critic/actor (RL) updates
+    #   bc    -> full BC / DAgger imitation path (``update_dagger``)
+    #   bc_hl -> high-level VLM backbone update (``update_hl`` on cast_relabel data)
+    config.enable_updates_rl = True
+    config.enable_updates_bc = False
+    config.enable_updates_bc_hl = False
     config.buffer_capacity = 1_000
     # When true, RL updates use reward = -ego_speed (m/s) instead of env reward.
-    config.debug_task = False
+    config.debug_task = True
     # Rollout-only: best-of-N random VLA noises minimizing first-step speed delta_xy.
     config.debug_noise = False
     config.debug_noise_samples = 8
@@ -122,11 +129,17 @@ def get_config():
         dict(
             enabled=True,
             # Local OpenPI inference (ignored when actor_url is set):
-            actor_config="pi05_steervla_cot_simplified_reasoning",
+            # Must be the _csp variant to match the CSP checkpoint below: it is the only config
+            # whose model carries context_smoothing (and hence the ctx_time_mlp_* params that the
+            # checkpoint contains and that t_context needs).
+            actor_config="pi05_steervla_cot_simplified_reasoning_no_ego_history",
+            # actor_config="pi05_steervla_cot_simplified_reasoning",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260525_202139/8000",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260526_175924/4000",
-            checkpoint="/home/carla/.cache/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",
+            # checkpoint="/home/carla/.cache/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",
+            # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_csp/pi05_steervla_cot_simplified_reasoning_csp/pi05_steervla_cot_simplified_reasoning_csp_20260713_095815/10000",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_ego_history/pi05_steervla_simplified_reasoning_no_ego_history_v1/pi05_steervla_simplified_reasoning_no_ego_history_v1_20260718_201640/6000",
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,
             include_ego_history=False,
@@ -148,6 +161,15 @@ def get_config():
             # When set, skip sample_cot and teacher-force CoT like inspect_outputs.ipynb.
             # fixed_subtask_text="The vehicle follows the route with steady lane keeping, normally maintaining its current speed.",
             # fixed_reasoning_text="Follow the route.",
+            # Context-Smoothed Pre-training (CSP) noise level for the action expert. Only valid
+            # for a checkpoint trained with ``Pi0CoTConfig.context_smoothing`` enabled; omit both
+            # keys (the default) for the clean, precise-imitation regime.
+            #   sample_t_context=True  -> fresh t_context ~ U[t_context_min, t_context_max] per
+            #                             model query (independent per best-of-N candidate).
+            #   t_context=<float>      -> pin a fixed level (0 = clean, 1 = uninformative context).
+            # sample_t_context=True,
+            # t_context_min=0.0,
+            # t_context_max=1.0,
             # Remote HTTP actor (leave unset or falsy for local checkpoint load):
             # actor_url="http://35.186.30.251:8000",
         )
