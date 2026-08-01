@@ -2006,7 +2006,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     angle_radians = -math.atan2(-aim_y, aim_x)
 
     # Convert the angle from radians to degrees
-    angle_degrees = np.float_(math.degrees(angle_radians))
+    angle_degrees = float(math.degrees(angle_radians))
 
     return angle_degrees
 

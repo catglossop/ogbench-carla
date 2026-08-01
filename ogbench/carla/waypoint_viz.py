@@ -88,8 +88,17 @@ def annotate_waypoints_on_frame(
     exec_cfg: dict[str, Any] | None,
     target_points: np.ndarray | None = None,
     camera_fov_deg: float = 110.0,
+    route_color: tuple[int, int, int] = (255, 0, 0),
+    speed_color: tuple[int, int, int] = (0, 255, 0),
+    label: str | None = None,
 ) -> np.ndarray:
-    """Draw target (blue), route (red), and speed (green) waypoints on an RGB ``uint8`` frame."""
+    """Draw target (blue), route (``route_color``), and speed (``speed_color``) waypoints.
+
+    ``route_color``/``speed_color`` default to the original red/green so a single call
+    keeps its old look; pass distinct colors per call to overlay multiple candidates on
+    one frame. ``label`` (if given) is drawn near the route trajectory's last point --
+    useful for tagging each candidate with its index/subtask in a multi-candidate overlay.
+    """
     out = np.array(frame, copy=True)
     if out.dtype != np.uint8:
         out = np.clip(out, 0, 255).astype(np.uint8)
@@ -97,16 +106,19 @@ def annotate_waypoints_on_frame(
     h, w = out.shape[:2]
     k = get_camera_intrinsics(w, h, camera_fov_deg)
 
-    def _draw_points(points: np.ndarray | None, color_rgb: tuple[int, int, int], radius: int) -> None:
+    def _draw_points(points: np.ndarray | None, color_rgb: tuple[int, int, int], radius: int) -> list[tuple[int, int]]:
         if points is None:
-            return
+            return []
         arr = np.asarray(points, dtype=np.float64).reshape(-1, 2)
         if arr.size == 0:
-            return
+            return []
+        drawn = []
         for u, v in project_points(arr, k):
             ui, vi = int(round(u)), int(round(v))
             if 0 <= ui < w and 0 <= vi < h:
                 cv2.circle(out, (ui, vi), radius, color_rgb, thickness=-1, lineType=cv2.LINE_AA)
+                drawn.append((ui, vi))
+        return drawn
 
     if target_points is not None:
         _draw_points(np.asarray(target_points, dtype=np.float64).reshape(-1, 2), (0, 0, 255), 4)
@@ -120,8 +132,14 @@ def annotate_waypoints_on_frame(
                 output_action_format=str(exec_cfg.get("output_action_format", "DELTA_XY_T_DELTA_XY_SPACE")),
                 action_input_space=str(exec_cfg.get("action_input_space", "normalized")),  # type: ignore[arg-type]
             )
-            _draw_points(pred_route, (255, 0, 0), 3)
-            _draw_points(pred_speed, (0, 255, 0), 2)
+            route_px = _draw_points(pred_route, route_color, 3)
+            _draw_points(pred_speed, speed_color, 2)
+            if label and route_px:
+                lx, ly = route_px[-1]
+                cv2.putText(
+                    out, label, (lx + 6, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    route_color, 2, lineType=cv2.LINE_AA,
+                )
         except Exception:
             pass
 

@@ -222,11 +222,25 @@ class SimLingoBase:
         source_root: Optional[str] = None,
         model_type_override: Optional[str] = None,
         prompt_mode: Optional[str] = None,
+        pid_only: bool = False,
     ):
         self.device = torch.device(device)
-        ckpt_dir = _resolve_checkpoint_dir(checkpoint_path)
         self.prompt_mode = prompt_mode
         self.model_type = model_type_override
+
+        if pid_only:
+            # PID-only mode: skip all model/weight loading.  Used in expert_debug.
+            self.model = None
+            self._speed_controller = _SpeedPIDController(
+                k_p=_SPEED_KP, k_i=_SPEED_KI, k_d=_SPEED_KD, n=_SPEED_N
+            )
+            self._turn_controller = _LateralPIDController(inference_mode=False)
+            self._last_route_interp: Optional[np.ndarray] = None
+            self._driving_features = None
+            self._ego_history: deque = deque(maxlen=20 * 10 + 2)
+            return
+
+        ckpt_dir = _resolve_checkpoint_dir(checkpoint_path)
 
         if cache_dir is None:
             # Use simlingo's pretrained dir if it exists, else HF default cache

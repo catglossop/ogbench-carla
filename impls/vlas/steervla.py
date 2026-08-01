@@ -36,6 +36,7 @@ import dataclasses
 import functools
 import inspect
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -47,9 +48,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import os
 
 from openpi.models import model as _openpi_model
+# Used by routing-commands' QGF guidance / frozen-prefix helpers (make_attn_mask).
+from openpi.models import pi0 as _openpi_pi0
 from openpi.models.pi0_config import Pi0CoTConfig
 from openpi.models.tokenizer import CoTPaligemmaTokenizer
 from openpi.policies import steervla_policy as sv_policy
@@ -87,6 +89,132 @@ def _ensure_openpi_cache_dir() -> None:
     wins. Must run before any ``download.maybe_download`` call.
     """
     os.environ.setdefault("OPENPI_DATA_HOME", STEERVLA_CACHE_DIR)
+
+
+def _pool_prefix_hidden(prefix_out: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
+    """Mean-pool valid prefix token hiddens to a single vector per batch row."""
+    mask_f = mask.astype(prefix_out.dtype)[..., None]
+    summed = jnp.sum(prefix_out * mask_f, axis=1)
+    denom = jnp.maximum(jnp.sum(mask_f, axis=1), 1.0)
+    return summed / denom
+
+
+def _frozen_prefix_embed_forward(model, observation):
+    """Pooled frozen-prefix embedding (jit target; bound to ``model`` via ``module_jit``).
+
+    Same prefix construction as ``SteerVLAActor._build_frozen_prefix_cache`` but
+    returns only the pooled embedding — the per-step policy_embed path doesn't
+    need the KV cache, and running this eagerly costs ~5 s/step on an A100
+    versus ~tens of ms jitted.
+    """
+    observation = _openpi_model.preprocess_observation(
+        None,
+        observation,
+        train=False,
+        image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+    )
+
+    img_tokens, img_masks, img_ar = model._embed_images(observation)
+    n_img = sum(t.shape[1] for t in img_tokens)
+
+    prompt_emb = model._embed_text_tokens(observation.tokenized_prompt)
+    prompt_mask = observation.tokenized_prompt_mask
+    n_prompt = prompt_emb.shape[1]
+
+    reasoning_emb = model._embed_text_tokens(observation.tokenized_reasoning)
+    reasoning_mask = observation.tokenized_reasoning_mask
+    n_reasoning = reasoning_emb.shape[1]
+
+    subtask_emb = model._embed_text_tokens(observation.tokenized_subtask)
+    subtask_mask = observation.tokenized_subtask_mask
+    n_subtask = subtask_emb.shape[1]
+
+    prefix_parts = img_tokens + [prompt_emb, reasoning_emb, subtask_emb]
+    prefix_mask_parts = img_masks + [prompt_mask, reasoning_mask, subtask_mask]
+    prefix_ar_list = img_ar + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask
+    if getattr(model, "_use_fast_tokens", False) and observation.tokenized_fast is not None:
+        fast_emb = model._embed_text_tokens(observation.tokenized_fast)
+        prefix_parts.append(fast_emb)
+        prefix_mask_parts.append(observation.tokenized_fast_mask)
+        prefix_ar_list += [True] * int(fast_emb.shape[1])
+
+    prefix_tokens = jnp.concatenate(prefix_parts, axis=1)
+    prefix_mask = jnp.concatenate(prefix_mask_parts, axis=1)
+    prefix_ar = jnp.array(prefix_ar_list)
+
+    prefix_attn_mask = _openpi_pi0.make_attn_mask(prefix_mask, prefix_ar)
+    positions = jnp.cumsum(prefix_mask, axis=1) - 1
+    (prefix_out, _), _kv_cache = model.PaliGemma.llm(
+        [prefix_tokens, None],
+        mask=prefix_attn_mask,
+        positions=positions,
+    )
+
+    reasoning_start = n_img + n_prompt
+    reasoning_end = reasoning_start + n_reasoning
+    prefix_len = prefix_mask.shape[1]
+    col_is_reasoning = (jnp.arange(prefix_len) >= reasoning_start) & (jnp.arange(prefix_len) < reasoning_end)
+    prefix_mask_no_reasoning = prefix_mask & ~col_is_reasoning[None, :]
+    return jax.lax.stop_gradient(_pool_prefix_hidden(prefix_out, prefix_mask_no_reasoning))
+
+
+def _compute_prefix_cache_for_qgf(model, observation):
+    """Build prefix KV-cache and masks needed by QGF guided denoising.
+
+    Like _frozen_prefix_embed_forward but returns kv_cache + masks instead of
+    discarding them. Returns (preprocessed_obs, kv_cache, prefix_mask,
+    prefix_mask_no_reasoning, pooled_embed).
+    - preprocessed_obs: preprocess_observation output (needed by _denoise_flow_step)
+    - kv_cache: prefix KV cache to reuse across all N denoising steps
+    - prefix_mask / prefix_mask_no_reasoning: attention masks for suffix pass
+    - pooled_embed: pooled prefix hidden (same as _frozen_prefix_embed_forward)
+    """
+    observation = _openpi_model.preprocess_observation(
+        None, observation, train=False, image_keys=CARLA_STEERVLA_IMAGE_KEYS
+    )
+
+    img_tokens, img_masks, img_ar = model._embed_images(observation)
+    n_img = sum(t.shape[1] for t in img_tokens)
+
+    prompt_emb = model._embed_text_tokens(observation.tokenized_prompt)
+    prompt_mask = observation.tokenized_prompt_mask
+    n_prompt = prompt_emb.shape[1]
+
+    reasoning_emb = model._embed_text_tokens(observation.tokenized_reasoning)
+    reasoning_mask = observation.tokenized_reasoning_mask
+    n_reasoning = reasoning_emb.shape[1]
+
+    subtask_emb = model._embed_text_tokens(observation.tokenized_subtask)
+    subtask_mask = observation.tokenized_subtask_mask
+    n_subtask = subtask_emb.shape[1]
+
+    prefix_parts = img_tokens + [prompt_emb, reasoning_emb, subtask_emb]
+    prefix_mask_parts = img_masks + [prompt_mask, reasoning_mask, subtask_mask]
+    prefix_ar_list = img_ar + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask
+    if getattr(model, "_use_fast_tokens", False) and observation.tokenized_fast is not None:
+        fast_emb = model._embed_text_tokens(observation.tokenized_fast)
+        prefix_parts.append(fast_emb)
+        prefix_mask_parts.append(observation.tokenized_fast_mask)
+        prefix_ar_list += [True] * int(fast_emb.shape[1])
+
+    prefix_tokens = jnp.concatenate(prefix_parts, axis=1)
+    prefix_mask = jnp.concatenate(prefix_mask_parts, axis=1)
+    prefix_ar = jnp.array(prefix_ar_list)
+
+    prefix_attn_mask = _openpi_pi0.make_attn_mask(prefix_mask, prefix_ar)
+    positions = jnp.cumsum(prefix_mask, axis=1) - 1
+    (prefix_out, _), kv_cache = model.PaliGemma.llm(
+        [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+    )
+
+    prefix_len = prefix_mask.shape[1]
+    reasoning_start = n_img + n_prompt
+    reasoning_end = reasoning_start + n_reasoning
+    col_is_reasoning = (jnp.arange(prefix_len) >= reasoning_start) & (jnp.arange(prefix_len) < reasoning_end)
+    prefix_mask_no_reasoning = prefix_mask & ~col_is_reasoning[None, :]
+
+    pooled = jax.lax.stop_gradient(_pool_prefix_hidden(prefix_out, prefix_mask_no_reasoning))
+    return observation, kv_cache, prefix_mask, prefix_mask_no_reasoning, pooled
 
 
 def restore_openpi_params_on_single_gpu(
@@ -305,16 +433,35 @@ def build_openpi_policy_transforms(
     if data_config.asset_id is None:
         raise ValueError("TrainConfig data requires asset_id to load norm stats.")
     env_action_dim = int(getattr(data_factory, "action_dim", 4))
-    # norm_stats = openpi_checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+    # Checkpoint norm-stats Normalize/Unnormalize must stay DISABLED for this checkpoint
+    # (matches origin/master 8d10a05, where they are commented out): the model predicts
+    # raw RLDS-scaled actions, so the fixed *7 physical scaling alone is the correct
+    # decode (offline A/B 2026-06-11, /tmp/cmp + logs/norm_ab_f2d: with norm OFF the
+    # speed-waypoint deltas track ego speed — 1.24 m at 5 m/s = maintain; with norm ON,
+    # Unnormalize biases every prediction to the dataset-mean ~2.5 m → desired_speed
+    # ~10 m/s regardless of state, so the car cannot express a stop and runs red lights).
+    # Set STEERVLA_ENABLE_OPENPI_NORM=1 to re-enable for A/B testing.
+    disable_norm = os.environ.get("STEERVLA_ENABLE_OPENPI_NORM", "0") != "1"
+    if not disable_norm:
+        print("[steervla] STEERVLA_ENABLE_OPENPI_NORM=1: applying Normalize/Unnormalize", flush=True)
+    norm_stats = None if disable_norm else openpi_checkpoints.load_norm_stats(
+        checkpoint_dir / "assets", data_config.asset_id
+    )
     input_transform = openpi_transforms.compose(
-        [
-            # openpi_transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+        []
+        if disable_norm
+        else [
+            openpi_transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
         ]
     )
     output_transform = openpi_transforms.compose(
         [
             *data_config.model_transforms.outputs,
-            # openpi_transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *(
+                []
+                if disable_norm
+                else [openpi_transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm)]
+            ),
             _SliceActionDim(action_dim=env_action_dim),
         ]
     )
@@ -1191,6 +1338,9 @@ class SteerVLAActor:
         # Requested HL device rank (``< 0`` or equal-to-inference => no split).
         self.hl_training_gpu_rank = int(hl_training_gpu_rank)
         self._local_ready = False
+        self._qgf_config: dict | None = None  # set by setup_qgf()
+        self._last_batch_subtask: tuple[np.ndarray, np.ndarray] | None = None
+        self._last_batch_reasoning: tuple[np.ndarray, np.ndarray] | None = None
         self.checkpoint_dir: Path | None = None
         self._mesh: jax.sharding.Mesh | None = None
         self._train_rng: jax.Array | None = None
@@ -2561,6 +2711,58 @@ class SteerVLAActor:
             print(f"[steervla.update_hl] memory_stats unavailable ({exc}).", flush=True)
 
         return out
+        import types as _types
+
+        # Jitted pooled-prefix embedding for the per-step policy_embed path; the
+        # eager _build_frozen_prefix_cache costs ~5 s/step (see _frozen_prefix_embed_forward).
+        self._prefix_embed_fn = nnx_utils.module_jit(
+            _types.MethodType(_frozen_prefix_embed_forward, self.model)
+        )
+
+        # QGF: jitted prefix-cache builder and single denoising step (used when setup_qgf() is called).
+        self._prefix_cache_fn = nnx_utils.module_jit(
+            _types.MethodType(_compute_prefix_cache_for_qgf, self.model)
+        )
+        self._denoise_step_fn = nnx_utils.module_jit(self.model._denoise_flow_step)
+
+        self._local_ready = True
+
+    def setup_qgf(
+        self,
+        critic_def,
+        critic_params: dict,
+        guidance_weight: float,
+        siglip_encoder,
+    ) -> None:
+        """Configure QGF inference-time Q-gradient guidance.
+
+        Must be called after setup() (model must be loaded).
+        critic_def / critic_params: from qgf_guidance.load_pretrained_critic()
+        guidance_weight: scalar weight on the Q-gradient (tune via sweep)
+        siglip_encoder: SigLIPEncoder instance (image-only, 1152-D) for the critic
+        """
+        from qgf_guidance import make_q_grad_fn, make_q_fn
+        # model.action_dim is 32 (the full model action space) but the pretrained critic
+        # was trained on 10 × 4 = 40-D actions (DELTA_XY_T_DELTA_XY_SPACE only).
+        # critic_ah / critic_ad are the dims the critic actually understands.
+        CRITIC_AH, CRITIC_AD = 10, 4
+        self._qgf_config = {
+            "q_grad_fn": make_q_grad_fn(critic_def, critic_params),
+            "q_fn": make_q_fn(critic_def, critic_params),
+            "guidance_weight": float(guidance_weight),
+            "siglip_encoder": siglip_encoder,
+            "model_ah": int(self.model.action_horizon),
+            "model_ad": int(self.model.action_dim),
+            "critic_ah": CRITIC_AH,
+            "critic_ad": CRITIC_AD,
+            "capture_step": -1,
+            "capture_data": None,
+        }
+        print(
+            f"[SteerVLA QGF] guidance_weight={guidance_weight}  "
+            f"action_horizon={self.model.action_horizon}  action_dim={self.model.action_dim}",
+            flush=True,
+        )
 
     def _state_for_transform(self, state: np.ndarray | jax.Array) -> np.ndarray:
         """Proprio slice passed to OpenPI ``Normalize`` / ``Unnormalize`` (2 or 8 dims, not padded)."""
@@ -2876,6 +3078,140 @@ class SteerVLAActor:
             "tokenized_subtask_mask": subtask_mask,
         }
         return _openpi_model.Observation.from_dict(data)
+
+    def policy_embedding_dim(self) -> int:
+        """Hidden size of the frozen prefix (PaliGemma) representation."""
+        if self.model_cfg is None:
+            return 2048
+        variant = getattr(self.model_cfg, "paligemma_variant", "gemma_2b")
+        return int(_openpi_gemma.get_config(variant).width)
+
+    def _build_frozen_prefix_cache(
+        self,
+        model,
+        observation: _openpi_model.Observation,
+    ) -> tuple[_openpi_model.Observation, Any, jax.Array, jax.Array, jax.Array]:
+        """Precompute frozen prefix KV/cache and a pooled prefix embedding for DSRL."""
+        observation = _openpi_model.preprocess_observation(
+            None,
+            observation,
+            train=False,
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+
+        img_tokens, img_masks, img_ar = model._embed_images(observation)
+        n_img = sum(t.shape[1] for t in img_tokens)
+
+        prompt_emb = model._embed_text_tokens(observation.tokenized_prompt)
+        prompt_mask = observation.tokenized_prompt_mask
+        n_prompt = prompt_emb.shape[1]
+
+        reasoning_emb = model._embed_text_tokens(observation.tokenized_reasoning)
+        reasoning_mask = observation.tokenized_reasoning_mask
+        n_reasoning = reasoning_emb.shape[1]
+
+        subtask_emb = model._embed_text_tokens(observation.tokenized_subtask)
+        subtask_mask = observation.tokenized_subtask_mask
+        n_subtask = subtask_emb.shape[1]
+
+        prefix_parts = img_tokens + [prompt_emb, reasoning_emb, subtask_emb]
+        prefix_mask_parts = img_masks + [prompt_mask, reasoning_mask, subtask_mask]
+        prefix_ar_list = img_ar + [False] * n_prompt + [True] * n_reasoning + [True] * n_subtask
+        n_fast = 0
+        if getattr(model, "_use_fast_tokens", False) and observation.tokenized_fast is not None:
+            fast_emb = model._embed_text_tokens(observation.tokenized_fast)
+            fast_mask = observation.tokenized_fast_mask
+            n_fast = int(fast_emb.shape[1])
+            prefix_parts.append(fast_emb)
+            prefix_mask_parts.append(fast_mask)
+            prefix_ar_list += [True] * n_fast
+
+        prefix_tokens = jnp.concatenate(prefix_parts, axis=1)
+        prefix_mask = jnp.concatenate(prefix_mask_parts, axis=1)
+        prefix_ar = jnp.array(prefix_ar_list)
+
+        prefix_attn_mask = _openpi_pi0.make_attn_mask(prefix_mask, prefix_ar)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = model.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=prefix_attn_mask,
+            positions=positions,
+        )
+
+        reasoning_start = n_img + n_prompt
+        reasoning_end = reasoning_start + n_reasoning
+        prefix_len = prefix_mask.shape[1]
+        col_is_reasoning = (jnp.arange(prefix_len) >= reasoning_start) & (jnp.arange(prefix_len) < reasoning_end)
+        prefix_mask_no_reasoning = prefix_mask & ~col_is_reasoning[None, :]
+        prefix_embed = jax.lax.stop_gradient(
+            _pool_prefix_hidden(prefix_out, prefix_mask_no_reasoning)
+        )
+
+        return (
+            observation,
+            jax.tree.map(jax.lax.stop_gradient, kv_cache),
+            jax.lax.stop_gradient(prefix_mask),
+            jax.lax.stop_gradient(prefix_mask_no_reasoning),
+            prefix_embed,
+        )
+
+    def _stash_policy_embedding(self, embed: np.ndarray | jax.Array, *, raw: Optional[Dict[str, Any]] = None) -> np.ndarray:
+        embed_np = np.asarray(jax.device_get(embed), dtype=np.float32)
+        if embed_np.ndim == 1:
+            embed_np = embed_np[None, ...]
+        self._cached_policy_embed = embed_np
+        vec = embed_np[0] if embed_np.shape[0] == 1 else embed_np
+        targets: list[Dict[str, Any]] = []
+        if isinstance(raw, dict):
+            targets.append(raw)
+        if self.raw_obs_holder is not None and isinstance(self.raw_obs_holder.get("obs"), dict):
+            holder_obs = self.raw_obs_holder["obs"]
+            if holder_obs is not raw:
+                targets.append(holder_obs)
+        for tgt in targets:
+            tgt["policy_embedding"] = np.asarray(vec, dtype=np.float32)
+        return embed_np
+
+    def ensure_policy_embedding(
+        self,
+        batch_size: int = 1,
+        *,
+        raw: Optional[Dict[str, Any]] = None,
+        force: bool = False,
+    ) -> np.ndarray:
+        """Run CoT (if needed) + frozen prefix forward; cache pooled embedding for DSRL."""
+        if self._remote is not None:
+            raise RuntimeError("Policy prefix embeddings require local SteerVLAActor inference.")
+        assert self.model is not None and self._jax_device is not None
+
+        obs_id = id(raw) if raw is not None else id(self.raw_obs_holder.get("obs") if self.raw_obs_holder else None)
+        if (
+            not force
+            and self._cached_policy_embed is not None
+            and int(self._cached_policy_embed.shape[0]) == int(batch_size)
+            and self._cached_policy_embed_obs_id == obs_id
+        ):
+            return self._cached_policy_embed
+
+        self._call_counter += 1
+        rng = jax.random.PRNGKey(self._call_counter)
+        obs_np_struct = self.build_observation_batch_numpy(batch_size, raw=raw)
+        obs_jax = jax.tree.map(
+            lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
+            obs_np_struct,
+        )
+        cot_out = self._sample_or_reuse_cot(rng, obs_jax, batch_size)
+        if batch_size == 1:
+            stash_raw = raw
+            if stash_raw is None and self.raw_obs_holder is not None:
+                stash_raw = self.raw_obs_holder.get("obs")
+            if isinstance(stash_raw, dict):
+                self._stash_cot_in_raw(stash_raw, cot_out)
+        obs_full = _merge_cot_output_into_observation(obs_jax, cot_out)
+        prefix_embed = self._prefix_embed_fn(obs_full)
+        embed_np = self._stash_policy_embedding(prefix_embed, raw=raw)
+        self._cached_policy_embed_obs_id = obs_id
+        return embed_np
 
     def _stash_cot_in_raw(self, raw: Optional[Dict[str, Any]], cot_out: dict[str, Any]) -> None:
         """Persist latest CoT tokens/masks in raw obs dict for downstream training."""
@@ -3268,6 +3604,104 @@ class SteerVLAActor:
                 "(needs openpi with sample_actions_with_prefix)."
             )
 
+    def _qgf_guided_denoise(
+        self,
+        obs_full,
+        noise_full: jnp.ndarray,
+        batch_size: int,
+    ) -> jnp.ndarray:
+        """QGF-guided denoising loop.
+
+        Replaces _sample_actions when setup_qgf() has been called.
+        Runs num_steps Euler steps, injecting Q-gradient guidance at each step.
+
+        Action convention (pi0): t goes 1→0; t=1 is pure noise, t=0 is clean action.
+        QGF guidance:
+          a_approx = clip(x_t + t * v_bc, -1, 1)   one-Euler denoised estimate
+          v_guided = v_bc + guidance_weight * chain_rule(qgrad_phys)
+        """
+        from qgf_guidance import model_to_physical_flat, qgrad_physical_to_model_flat
+
+        cfg = self._qgf_config
+        q_grad_fn = cfg["q_grad_fn"]
+        guidance_weight = float(cfg["guidance_weight"])
+        siglip_encoder = cfg["siglip_encoder"]
+        model_ah = cfg["model_ah"]   # full model action horizon (e.g. 10)
+        model_ad = cfg["model_ad"]   # full model action dim (e.g. 32)
+        c_ah = cfg["critic_ah"]      # critic action horizon (10)
+        c_ad = cfg["critic_ad"]      # critic action dim (4, DELTA_XY_T_DELTA_XY_SPACE)
+        n_steps = int(self.sample_actions_num_steps)
+        dt = jnp.asarray(-1.0 / n_steps, dtype=noise_full.dtype)
+
+        # Compute prefix KV cache + preprocessed observation (one forward pass)
+        obs_preprocessed, kv_cache, prefix_mask, prefix_mask_no_reasoning, _ = (
+            self._prefix_cache_fn(obs_full)
+        )
+        jax.block_until_ready(kv_cache)
+
+        # Get SigLIP image-only embedding (1152-D) for the pretrained critic
+        raw_obs = self.raw_obs_holder.get("obs", {}) if self.raw_obs_holder else {}
+        img = raw_obs.get("image")
+        if img is None:
+            raise RuntimeError("[QGF] raw_obs_holder['obs']['image'] is None; cannot compute obs_enc for critic.")
+        obs_enc_1152 = jnp.asarray(
+            siglip_encoder.encode(img), dtype=jnp.float32
+        )[None]  # (1, 1152)
+
+        x_t = noise_full  # (B, model_ah, model_ad)
+        t = jnp.asarray(1.0, dtype=noise_full.dtype)
+
+        # Optional data capture for figure generation (set by _qgf_config["capture_step"]).
+        capture_step = cfg.get("capture_step", -1)
+        capture_data = cfg.get("capture_data")  # list; appended to when capture_step > 0
+
+        for step_i in range(n_steps):
+            # One BC denoising step
+            x_next_bc, t_next = self._denoise_step_fn(
+                obs_preprocessed, kv_cache, prefix_mask, prefix_mask_no_reasoning,
+                dt, x_t, t,
+            )
+            # Recover BC velocity: x_next_bc = x_t + dt * v_bc  →  v_bc = (x_next - x_t) / dt
+            v_bc = (x_next_bc - x_t) / dt  # (B, model_ah, model_ad)
+
+            # One-Euler denoised action approximation (in model space).
+            # Slice only the first c_ah × c_ad dims that the critic was trained on.
+            a_approx_model = jnp.clip(x_t + t * v_bc, -1.0, 1.0)  # (B, model_ah, model_ad)
+            a_approx_critic = a_approx_model[:, :c_ah, :c_ad].reshape(batch_size, c_ah * c_ad)
+
+            # Critic trained in model space; model_to_physical_flat is identity.
+            a_phys_flat = model_to_physical_flat(a_approx_critic, c_ah, c_ad)
+
+            # Q-gradient in model space (no chain-rule scaling needed).
+            qgrad_phys_flat = q_grad_fn(obs_enc_1152, a_phys_flat)  # (B, c_ah*c_ad)
+            qgrad_model_flat = qgrad_physical_to_model_flat(qgrad_phys_flat, c_ah, c_ad)
+            # Embed gradient back into the full model action shape (zeros outside critic dims)
+            qgrad_model = jnp.zeros_like(v_bc)
+            qgrad_model = qgrad_model.at[:, :c_ah, :c_ad].set(
+                qgrad_model_flat.reshape(batch_size, c_ah, c_ad)
+            )
+
+            # Capture denoising data at the requested env step (for figure generation)
+            if capture_data is not None and capture_step >= 0:
+                q_bc = float(self._qgf_config["q_fn"](obs_enc_1152, a_phys_flat))
+                x_guided = x_t + dt * (v_bc + guidance_weight * qgrad_model)
+                capture_data.append({
+                    "denoise_step": step_i,
+                    "t": float(t),
+                    "x_t_bc": np.array(a_approx_critic[0]),   # (c_ah*c_ad,) BC approx in model space
+                    "x_t_after": np.array(jnp.clip(x_guided, -1.0, 1.0)[:, :c_ah, :c_ad].reshape(batch_size, c_ah * c_ad)[0]),
+                    "x_t_phys": np.array(a_phys_flat[0]),     # (c_ah*c_ad,) in physical space
+                    "q_bc": q_bc,
+                    "qgrad_norm": float(jnp.linalg.norm(qgrad_phys_flat)),
+                    "obs_enc": np.array(obs_enc_1152[0]),      # (1152,) for Q-landscape
+                })
+
+            # Guided update — clip to keep x_t in valid model range
+            x_t = jnp.clip(x_t + dt * (v_bc + guidance_weight * qgrad_model), -1.0, 1.0)
+            t = t_next
+
+        return x_t  # (B, model_ah, model_ad) — same shape as _sample_actions output
+
     def _forward_pi0(
         self,
         batch_size: int,
@@ -3291,10 +3725,13 @@ class SteerVLAActor:
         )
         noise_jax = jax.device_put(noise_jax, self._jax_device)
         rng_cot, rng_act = jax.random.split(rng)
-        
+
         # Either sample or reuse the CoT
+        _cot_t0 = time.time()
         cot_out = self._sample_or_reuse_cot(rng_cot, obs_jax, batch_size)
-        
+        jax.block_until_ready(cot_out["tokenized_reasoning"])
+        print(f"[DEBUG - steervla] CoT time: {time.time() - _cot_t0:.3f} seconds")
+
         reason_tokens = cot_out["tokenized_reasoning"]
         reason_mask = cot_out["tokenized_reasoning_mask"]
         reason_valid = reason_tokens[reason_mask.astype(bool)]
@@ -3306,6 +3743,16 @@ class SteerVLAActor:
         subtask_valid = subtask_tokens[subtask_mask.astype(bool)]
         subtask_text = self.tokenizer._tokenizer.decode(subtask_valid.tolist())
         print(f"[DEBUG - steervla] Subtask text: {subtask_text}")
+
+        # Per-row (batch) subtask/reasoning tokens, for callers that need each
+        # candidate's own text separately (e.g. best-of-N candidate overlays) --
+        # the debug print above flattens the whole batch into one decode.
+        self._last_batch_subtask = (
+            np.asarray(jax.device_get(subtask_tokens)), np.asarray(jax.device_get(subtask_mask))
+        )
+        self._last_batch_reasoning = (
+            np.asarray(jax.device_get(reason_tokens)), np.asarray(jax.device_get(reason_mask))
+        )
         if "tokenized_fast" in cot_out and self.tokenizer.use_fast_tokens:
             fast_tokens = cot_out["tokenized_fast"]
             fast_mask = cot_out["tokenized_fast_mask"]
@@ -3321,6 +3768,15 @@ class SteerVLAActor:
                 self._stash_cot_in_raw(self.raw_obs_holder["obs"], cot_out)
 
         obs_full = _merge_cot_output_into_observation(obs_jax, cot_out)
+
+        obs_id = id(raw) if raw is not None else id(self.raw_obs_holder.get("obs") if self.raw_obs_holder else None)
+        if self._cached_policy_embed is None or self._cached_policy_embed_obs_id != obs_id:
+            _prefix_t0 = time.time()
+            prefix_embed = self._prefix_embed_fn(obs_full)
+            jax.block_until_ready(prefix_embed)
+            self._stash_policy_embedding(prefix_embed, raw=raw)
+            self._cached_policy_embed_obs_id = obs_id
+            print(f"[DEBUG - steervla] Prefix embed time: {time.time() - _prefix_t0:.3f} seconds")
 
         # Prepare noise for inference
         batch_size = obs_jax.state.shape[0]
@@ -3347,20 +3803,36 @@ class SteerVLAActor:
         if t_context is not None:
             print(f"[DEBUG - steervla] t_context: {np.asarray(self._last_t_context).round(3).tolist()}")
 
-        # Sample the actions
+        # Sample the actions (standard or QGF-guided). QGF (routing-commands) runs its own
+        # denoising loop over the prefix cache, so it bypasses _sample_actions_cached.
         sample_actions_time = time.time()
-        traj = self._sample_actions_cached(
-            rng_act,
-            obs_full,
-            noise=noise_full,
-            num_steps=int(self.sample_actions_num_steps),
-            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-            **t_context_kw,
-        )
+        if self._qgf_config is not None:
+            traj = self._qgf_guided_denoise(obs_full, noise_full, batch_size)
+        else:
+            traj = self._sample_actions_cached(
+                rng_act,
+                obs_full,
+                noise=noise_full,
+                num_steps=int(self.sample_actions_num_steps),
+                image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+                **t_context_kw,
+            )
         jax.block_until_ready(traj)
         sample_actions_time = time.time() - sample_actions_time
 
-        print(f"[DEBUG - steervla] Sample actions time: {sample_actions_time} seconds")
+        mode_label = "QGF" if self._qgf_config is not None else "standard"
+        print(f"[DEBUG - steervla] Sample actions ({mode_label}) time: {sample_actions_time} seconds")
+
+        # Baseline capture: save final unguided action + Q-value at the capture step.
+        # Stored in _baseline_capture_holder so main_carla.py can retrieve it.
+        if hasattr(self, "_baseline_capture_holder") and self._baseline_capture_holder is not None:
+            ah = int(self.model.action_horizon)
+            ad = int(self.model.action_dim)
+            a_flat = np.array(traj[0, :ah, :ad].reshape(ah * ad))
+            self._baseline_capture_holder["action_flat"] = a_flat
+            self._baseline_capture_holder["ready"] = True
+            self._baseline_capture_holder = None  # one shot
+
         traj_np = self._postprocess_action_trajectory(traj, observation_state=obs_jax.state)
 
         if self.return_normalized_action_chunk and not force_accel_steer:
@@ -3801,6 +4273,33 @@ class SteerVLAActor:
 
         return jax.tree.map(_to_numpy, dict(cot_out))
 
+    def decode_last_batch_subtasks(self) -> list[str]:
+        """Per-row subtask text from the most recent batched forward pass.
+
+        Unlike the ``[DEBUG - steervla] Subtask text:`` print (which flattens the
+        whole batch into a single decode), this decodes each row separately --
+        for best-of-N candidate overlays where each row is a different candidate.
+        """
+        if self._last_batch_subtask is None or self.tokenizer is None:
+            return []
+        tokens, mask = self._last_batch_subtask
+        texts = []
+        for i in range(tokens.shape[0]):
+            row_valid = tokens[i][mask[i].astype(bool)]
+            texts.append(self.tokenizer._tokenizer.decode(row_valid.tolist()))
+        return texts
+
+    def decode_last_batch_reasoning(self) -> list[str]:
+        """Per-row reasoning text from the most recent batched forward pass (see
+        :meth:`decode_last_batch_subtasks`)."""
+        if self._last_batch_reasoning is None or self.tokenizer is None:
+            return []
+        tokens, mask = self._last_batch_reasoning
+        texts = []
+        for i in range(tokens.shape[0]):
+            row_valid = tokens[i][mask[i].astype(bool)]
+            texts.append(self.tokenizer._tokenizer.decode(row_valid.tolist()))
+        return texts
     def sample_candidates(
         self,
         n: int,

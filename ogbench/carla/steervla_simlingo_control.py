@@ -104,6 +104,9 @@ class SimlingoStyleWaypointDecoder:
         speed_ki: float = 1.0,
         speed_kd: float = 2.0,
         speed_n: int = 20,
+        stuck_threshold: int = 800,
+        creep_duration: int = 15,
+        creep_throttle: float = 0.4,
     ) -> None:
         self.carla_fps = float(carla_fps)
         self.wp_dilation = int(wp_dilation)
@@ -112,11 +115,24 @@ class SimlingoStyleWaypointDecoder:
         self.brake_ratio = float(brake_ratio)
         self.clip_delta = float(clip_delta)
         self.clip_throttle = float(clip_throttle)
+        self.stuck_threshold = int(stuck_threshold)
+        self.creep_duration = int(creep_duration)
+        self.creep_throttle = float(creep_throttle)
 
         self.speed_controller = PIDController(
             k_p=speed_kp, k_i=speed_ki, k_d=speed_kd, n=speed_n
         )
         self.turn_controller = LateralPIDController(inference_mode=False)
+
+        # Matches simlingo-rebuttal/team_code/agent_simlingo.py's stuck-detector: if the
+        # PID has commanded the car to stay near-stopped for `stuck_threshold` consecutive
+        # calls (regardless of *why* -- brake-ratio death-spiral, a degenerate near-zero
+        # desired_speed prediction at standstill, etc.), force a `creep_throttle` burst for
+        # `creep_duration` calls to physically break static friction. Deterministic safety
+        # net underneath the stochastic flow-noise escape (see main_carla.py's
+        # `vla_noise_scale`), which is not reliable on its own.
+        self._stuck_counter = 0
+        self._force_move = 0
 
     def control_pid(
         self,
@@ -143,8 +159,8 @@ class SimlingoStyleWaypointDecoder:
         desired_speed = (
             np.linalg.norm(speed_waypoints[idx_hi] - speed_waypoints[idx_lo]) * 2.0
         )
-        print("Desired speed: ", desired_speed)
-        print("Speed: ", speed)
+        print(f"[RC-PID] Desired speed: {desired_speed:.4f}  Current speed: {speed:.4f}", flush=True)
+
         brake = (desired_speed < self.brake_speed) or (
             (speed / max(desired_speed, 1e-6)) > self.brake_ratio
         )
@@ -154,12 +170,32 @@ class SimlingoStyleWaypointDecoder:
         throttle = float(np.clip(throttle, 0.0, self.clip_throttle))
         throttle = throttle if not brake else 0.0
 
+        if speed < 0.1:
+            self._stuck_counter += 1
+        else:
+            self._stuck_counter = 0
+        if self._stuck_counter > self.stuck_threshold:
+            self._force_move = self.creep_duration
+        forcing_move = self._force_move > 0
+        if forcing_move:
+            throttle = max(self.creep_throttle, throttle)
+            brake = False
+            self._force_move -= 1
+            print(f"[RC-PID] force_move: {self._force_move}", flush=True)
+
         route_interp = interpolate_waypoints(route_waypoints.squeeze())
         steer = float(self.turn_controller.step(route_interp, speed))
         steer = float(np.clip(round(steer, 3), -1.0, 1.0))
-        print("Steer: ", steer)
-        print("Throttle: ", throttle)
-        print("Brake: ", brake)
+        if forcing_move:
+            # Best-of-N re-selects among diverse candidates every tick, even during
+            # recovery, so route_waypoints (and thus steer) can swing tick to tick --
+            # unlike impls/debug_raw_control.py's fixed steer=0, which reliably broke
+            # the post-reset stiction in ~11 ticks. A whipping steer command at
+            # near-zero speed can burn the forced throttle on lateral motion instead of
+            # building forward momentum, so clamp steer small while forcing through.
+            steer = float(np.clip(steer, -0.05, 0.05))
+        print(f"[RC-PID] Steer: {steer:.4f}  Throttle: {throttle:.4f}  Brake: {brake}", flush=True)
+
         return steer, throttle, brake
 
     def _flat_action_to_pid(
@@ -188,6 +224,19 @@ class SimlingoStyleWaypointDecoder:
             space=action_input_space,
         )
         pred_speed_wps, pred_route = _chunks_to_speed_and_route_waypoints(np.asarray(denorm, dtype=np.float64))
+        print(
+            f"[RC-PID] Model chunk raw: {np.array2string(chunks, precision=4, suppress_small=False)}",
+            flush=True,
+        )
+        print(
+            f"[RC-PID] Denorm chunk: {np.array2string(np.asarray(denorm), precision=4, suppress_small=False)}",
+            flush=True,
+        )
+        print(
+            f"[RC-PID] Speed wps: {np.array2string(np.asarray(pred_speed_wps), precision=4)}  "
+            f"Route wps: {np.array2string(np.asarray(pred_route), precision=4)}",
+            flush=True,
+        )
 
         s = np.asarray(state_vec, dtype=np.float32).reshape(-1)
         gt_velocity = float(s[EGO_STATE_IDX_SPEED]) if s.size > EGO_STATE_IDX_SPEED else 0.0

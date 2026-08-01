@@ -80,13 +80,19 @@ def get_config():
     config.image_keys = ("base_0_rgb",)
     # JAX RL device: ``-1`` = unset. CARLA uses ``gpu_rank`` in carla_config.yaml.
     config.training_gpu_rank = 0
-    # Critic feedback mode — three options:
+    # Critic feedback mode — four options:
     #   "commentary_bow"      (default): expert commentary BOW from the SimLingo-style labeler.
-    #   "action_delta"                 : (critic_action_dim)-dim = expert first step minus agent first step.
+    #   "expert_action"                : (critic_action_dim + 1)-dim = expert first step + validity
+    #                                    flag. State-only (independent of the agent's action), so it
+    #                                    is consistent across the TD bootstrap and the actor's
+    #                                    Q-query. PID-decoded [accel, steer] in accel_steer mode.
+    #   "action_delta"                 : (critic_action_dim)-dim = expert first step minus agent
+    #                                    first step. Depends on the logged action; the next-state
+    #                                    label is backfilled one step later in main_carla.py.
     #   "delta_commentary_bow"        : corrective language BOW from expert-vs-agent action delta
     #                                   (e.g. "Adjust right. Decelerate more heavily.").
-    # To switch to action_delta, uncomment:
-    # config.critic_feedback_mode = "action_delta"
+    # To switch, uncomment:
+    # config.critic_feedback_mode = "expert_action"
     # Online training regime:
     #   "rl"     : standard DSRL online RL
     #   "dagger" : on-policy data aggregation with expert actions as supervision
@@ -98,9 +104,9 @@ def get_config():
             # Where DSRL critic language labels come from:
             #   "expert" — SimLingo-style expert commentary / action-delta coaches
             #   "vlm"    — Gemini/Perceptron VLM chunk feedback (see ``vlm_coach``)
-            source="vlm",
-            # Used when source="expert". One of commentary_bow | action_delta |
-            # delta_commentary_bow | none
+            source="expert",
+            # Used when source="expert". One of commentary_bow | expert_action |
+            # action_delta | delta_commentary_bow | none
             expert_mode="commentary_bow",
         )
     )
@@ -135,10 +141,13 @@ def get_config():
             actor_config="pi05_steervla_cot_simplified_reasoning_no_ego_history",
             # actor_config="pi05_steervla_cot_simplified_reasoning",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki/pi05_steervla_cot_ki/90000",
-            # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260525_202139/8000",
+            # Prefer the gs:// form: the /home/carla/.cache/openpi/... local mirror of this same
+            # checkpoint is machine-specific. OpenPI caches GCS downloads under ~/.cache/openpi.
+            # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",
+            # checkpoint="gs://cat-logs/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning_20260512_144250/50000",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260526_175924/4000",
-            # checkpoint="/home/carla/.cache/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_csp/pi05_steervla_cot_simplified_reasoning_csp/pi05_steervla_cot_simplified_reasoning_csp_20260713_095815/10000",
+            # Active checkpoint must match actor_config above (..._no_ego_history).
             checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_ego_history/pi05_steervla_simplified_reasoning_no_ego_history_v1/pi05_steervla_simplified_reasoning_no_ego_history_v1_20260718_201640/6000",
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,
