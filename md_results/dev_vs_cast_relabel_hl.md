@@ -191,9 +191,15 @@ wall clock.
 
 ## Route note
 
-`opposite-vehicle-running-red-light` is not a route id — the registry has
-`-001` … `-005`. Used **`opposite-vehicle-running-red-light-001`**, matching the `-001`
-suffix used for `signalized-junction-left-turn-001`.
+`opposite-vehicle-running-red-light` is not a route id — the registry has `-001` … `-005`.
+Initially launched as **`-001`**; **changed to `-004` on request** (2026-08-03). Both are
+Town12 / `OppositeVehicleRunningRedLight`, so the swap is a different route instance of the
+same scenario type.
+
+The `-001` pair (dev job 12, cast job 17) had **already completed 20 000/20 000** before the
+swap, so it is kept as extra data rather than discarded; `-004` runs as jobs **20** (dev) and
+**25** (cast), queued behind the six runs currently holding the GPUs. The results table below
+lists `-004` as the requested route and `-001` as a completed extra.
 
 `generalization-wall-1095` is a **fail2drive** route (Town13, `RoadBlocked`), not
 bench2drive. Checked before launching: Town12/Town13 are installed, the `fail2drive` package
@@ -336,6 +342,341 @@ watchdog. All six GPUs are busy again.
 
 ---
 
+## Root cause — the ego stalls, traffic jams behind it, and CARLA leaks to 1.4 TB
+
+The reported "other vehicles aren't moving" and the OOM stalls above turn out to be **the same
+failure**, and the entry point is the ego.
+
+**1. The ego stops and never restarts.** Mean speed per decile of the run, from the
+`[RC-PID] Current speed` trace (dev arm; the `cast_relabel` branch has no such print):
+
+| decile | dev 10 `enter-actor-flow-004` | dev 12 `opposite-vehicle-…-001` | dev 14 `generalization-wall-1095` |
+|---|---|---|---|
+| 10 % | 2.95 m/s (57 % stopped) | 4.84 (24 %) | 4.87 (30 %) |
+| 30 % | 2.03 (65 %) | 1.89 (59 %) | 1.64 (68 %) |
+| 50 % | **0.03 (100 %)** | 3.87 (30 %) | 1.75 (65 %) |
+| 80 % | **0.00 (100 %)** | 2.01 (71 %) | 3.72 (49 %) |
+| 100 % | **0.00 (100 %)** | 1.32 (79 %) | 2.59 (57 %) |
+
+On `enter-actor-flow-004` the ego is in a permanent standstill from ~40 % of the run onward.
+Every route also shows a **monotone decay** from ~4.9 m/s at the start.
+
+**2. Traffic is not frozen — it is queued.** Probing the live `enter-actor-flow-004` world
+(cast job 15, rpc 13500) over 40 s wallclock, ego at **0.00 m/s**:
+
+```
+moving=22   frozen_at_red_light=6   frozen_within_30m_of_ego=5   frozen_far_from_ego=10
+```
+
+The 22 moving vehicles are all 38-75 m away and doing up to 8.1 m/s, so the traffic manager is
+working (`set_traffic_manager_port` *is* reached — our `IsolatedLeaderboardEvaluator` only
+overrides `_setup_simulation`, and the inherited `_load_and_wait_for_world` still sets it from
+`args.traffic_manager_port`). What the ego camera sees is the stopped queue the ego itself
+created, plus vehicles legitimately held at red lights.
+
+Also visible in the same probe: the sim advanced **22 ticks (1.10 s of sim) in 40 s of
+wallclock**, a ~36× slowdown, because the world only ticks once per env step and an env step
+costs ~1-2.7 s of VLA inference.
+
+**3. The jam causes a spawn storm.** `enter-actor-flow` continuously spawns a *flow* of
+vehicles at fixed source points. With the junction blocked, the flow never drains, the source
+points stay occupied and every subsequent spawn fails against the vehicle already parked there
+— the same handful of `Location(...)` values repeating ~14 000 times each:
+
+| run | `Cannot spawn actor` | spawn-guard give-ups |
+|---|---|---|
+| dev 10 `enter-actor-flow-004` | 71 272 | 23 813 |
+| cast 15 `enter-actor-flow-004` | 248 868 | 83 115 |
+| dev 12 `opposite-vehicle-…-001` | 193 070 | 64 729 |
+| cast 19 `generalization-wall-1095` | 13 850 | 4 714 |
+
+Every run on every route on both branches does this, so it is systemic, not a merge
+regression.
+
+**4. That retry loop leaks memory inside the CARLA server.** The watchdog caught it: RSS of a
+single `CarlaUE4-Linux-Shipping` climbing ~150 GB/h until the kernel kills it, then the next
+server starting the same climb.
+
+```
+01:17 used= 325GB  biggest proc  140GB
+02:47 used=1246GB                843GB   (CarlaUE4 rpc-port=13600)
+03:47 used=1828GB               1061GB
+04:18 used=1265GB oom_kill 4->5          <- kernel kills it, next server starts climbing
+05:48 used=1001GB oom_kill 5->6
+09:20 used=1516GB               1426GB   (CarlaUE4 rpc-port=13100)
+```
+
+So the OOM incident is not a mysterious transient — it is the simulator accumulating state
+from hundreds of thousands of failed spawns. **Python is not the leaker**; the client
+processes sit at a steady 16-22 GB.
+
+### Two things making it worse
+
+**The anti-stall creep almost never fires.** `SimlingoStyleWaypointDecoder` has exactly the
+right mechanism — after `stuck_threshold` consecutive near-stopped PID calls it forces
+`creep_throttle` for `creep_duration` calls to break static friction — but the default
+`stuck_threshold` is **800** calls. At 1-2.7 s per env step that is 15-35 minutes of wallclock
+before the first creep attempt. `run_carla.sh` already exposes `--pid-stuck-threshold`,
+`--pid-creep-duration` and `--pid-creep-throttle`; none were set.
+
+**The HL updates are being trained to stand still.** Of the 590 HL samples stored by dev 10,
+the subtask distribution is overwhelmingly stationary:
+
+```
+ 91  "The vehicle remains stopped normally due to a red traffic light."
+ 90  "The vehicle remains stopped …"
+ 62  "The vehicle remains stopped normally …"
+ 60  "The vehicle remains stopped normally."
+ 50  "The vehicle remains stopped steadily …"
+ 45  "The vehicle accelerates steadily to follow the route …"
+```
+
+With `store_good_chunks=True`, chunks that are not labelled BAD are stored with the model's
+*own* subtask — so once the ego is stuck, the HL dataset fills with "remains stopped" and the
+VLM backbone is fine-tuned to reinforce it. That is a plausible mechanism for the monotone
+speed decay in the table above, and it is self-reinforcing.
+
+**Data bug spotted alongside:** some stored subtasks carry raw location tokens through into the
+text, e.g. `"<loc1022>The vehicle remains stopped normally.;<loc1021>"` (about 1 in 12 of the
+samples inspected). Those are being used as CoT supervision targets as-is.
+
+### Action taken
+
+Stopped dev job 11, whose CARLA server had reached **1426 GB** and would have OOM'd the box
+within the hour, plus dev 10 and cast 16, both already dead-server zombies. Host RAM went
+1.5 TB → 346 GB and the three remaining servers are back to a normal 4-6 GB. The three runs
+still progressing (dev 13, cast 15, cast 18) were left alone and keep their original config.
+
+**Creep threshold set to 150, not 800 — and not 40 either.** Sizing it from the measured
+distribution of consecutive-stopped (< 0.1 m/s) streaks rather than by guess:
+
+| run | n streaks | median | p90 | p99 | max |
+|---|---|---|---|---|---|
+| dev 12 `opposite-vehicle-…-001` | 786 | 3 | 15 | 97 | 333 |
+| dev 14 `generalization-wall-1095` | 1156 | 3 | 16 | 61 | 809 |
+| dev 10 `enter-actor-flow-004` | 111 | 6 | 99 | 353 | 565 |
+
+Ordinary stops (red lights, yielding) are almost all under ~100 steps; the pathological ones
+are the 333/565/809 tails. **800 was too high to ever fire** — dev 10's longest streak was 565
+and its creep fired *0* times in 4758 steps, as did dev 12's in a full 20 000 (dev 14's fired
+23 times). But the ~40 I originally floated sits between p90 and p99, so it would fire inside
+2-5 % of *legitimate* stops and creep the ego through red lights — corrupting exactly the
+traffic-violation metric being measured. 150 clears the p99 of normal stops on every route
+while still catching the deadlock tails. Note 1 env step = 1 tick = 0.05 s sim, so 150 steps
+is 7.5 s of stationary sim time.
+
+**The fix is dev-only.** The `cast_relabel` branch has **no creep mechanism at all** — its
+`SimlingoStyleWaypointDecoder.__init__` takes no `stuck_threshold` / `creep_*` kwargs, and the
+force-move block in `ogbench/carla/carla.py:723-726` is commented out. There is no flag to
+set. So the cast arm cannot unstick itself, and cast 16 was relaunched unchanged; expect it to
+deadlock the same way. This is itself a real difference between the branches.
+
+**Guard added.** `carla_guard.sh` polls every 60 s and issues a scoped `carla_job.sh stop` on
+any job whose CarlaUE4 server passes **250 GB** RSS (~40× a healthy 4-6 GB server). The point
+is to confine the damage to the one broken run instead of letting the kernel OOM-kill
+whichever process is biggest and take healthy neighbours with it.
+
+---
+
+## Spawn-guard fix + `cot_temperature=0.5` re-run (2026-08-03)
+
+The uncommitted `ogbench/carla/carla_utils.py` change found the actual origin of the spawn
+cascade — it was **the guard itself**, not only the stalled ego:
+
+- `_carla_actor_alive` confirmed actors via `world.get_actor`, which is meaningless right after
+  a `tick=False` spawn because the client's world snapshot predates the actor. Successful
+  spawns were therefore judged stale.
+- The old guard then popped the "stale" actor from `_carla_actor_pool` but **left the vehicle
+  physically parked on the spawn point**, so every later attempt at that transform failed —
+  self-inflicted, and permanent. `_destroy_leaked_actor` now removes it from the world too.
+- `try_spawn_actor` returning `None` (occupied point) is no longer retried; retrying inside the
+  same tick cannot help because nothing has moved, and `BackgroundBehavior` calls this every
+  tick per traffic source.
+
+**Measured effect on the same route, same config:**
+
+| arm | job | steps | `Cannot spawn actor` | per env step |
+|---|---|---|---|---|
+| dev before | 10 | 3 520 | 59 326 | **16.9** |
+| dev after | 21 | 410 | **0** | **0.00** |
+| cast before | 15 | 20 000 | 299 554 | **15.0** |
+| cast after | 26 | 430 | **0** | **0.00** |
+
+The fix was applied to the `cast_relabel` worktree too (`git apply` of the same diff — the
+pre-fix code there was byte-identical), so both arms get it.
+
+`cot_temperature` dropped **1.0 → 0.5** on both arms via `--agent.steervla.cot_temperature=0.5`
+(no config edit; verified in the run's own `flags.json`, not just the command line). The dev
+arm also keeps `--pid-stuck-threshold 150`; the cast arm still cannot, having no creep.
+
+Re-run as jobs **21** (dev) and **26** (cast) rather than reusing 10/15, so the pre-fix logs
+survive for comparison. `cast 15` had already reached 20 000/20 000 before the swap and is kept.
+
+### Still open: `was not alive after tick`
+
+`Cannot spawn actor` is gone, but a second failure mode survives — and it thins out the traffic:
+
+```
+[carla spawn guard] spawned actor 6355 was not alive after tick (attempt 1/3); retrying
+[carla spawn guard] spawned actor 6356 was not alive after tick (attempt 2/3); retrying
+[carla spawn guard] spawned actor 6357 was not alive after tick (attempt 3/3); retrying
+[carla spawn guard] could not spawn a live actor after 3 attempts; returning None
+```
+
+6 210 retries / 2 070 give-ups in 410 steps, with **zero** `Cannot spawn actor` — so
+`try_spawn_actor` is succeeding every time (consecutive actor ids) and the liveness check is
+rejecting the result. Probing the live world confirms the consequence: **11 vehicles in the
+post-fix run vs 33-35 pre-fix**.
+
+Likely cause: the fix routes `tick=False` spawns to the client-side `actor.is_alive` flag
+instead of `world.get_actor` — but *both* are derived from the world snapshot, and with
+`tick=False` no snapshot containing the actor exists yet. `background_activity.py:2130,2175`
+passes `tick=False` as a keyword, and `_TICK_ARG_INDEX = 8` is correct, so `ticked` is being
+read properly; the check itself is the problem. The consistent treatment would be to skip the
+liveness check entirely when `tick=False` (trust a non-`None` return and re-validate after the
+next tick) rather than substituting one snapshot-dependent test for another.
+
+Not changed here — `carla_utils.py` is uncommitted work in progress and stomping it risked a
+conflict.
+
+### Revision 2 (14:18) — `world.get_actor` restored as authoritative
+
+The next iteration of `carla_utils.py` went the other way: it drops the `rpc_check` /
+`_TICK_ARG_INDEX` machinery and makes `world.get_actor` authoritative again, on the grounds
+that `actor.is_alive` "reads False on a perfectly live actor" for a `tick=False` spawn.
+`_destroy_leaked_actor` and the no-retry-on-`None` behaviour — the parts that actually killed
+the cascade — are kept. Ported to the cast worktree (reset + re-apply, both trees now
+byte-identical in the guard region) and relaunched as jobs **22** (dev) / **27** (cast), still
+at `cot_temperature=0.5`.
+
+**It made no measurable difference to the rejection rate:**
+
+| version | job | steps | `Cannot spawn actor` | `not alive` retries | give-ups | retries/step | give-ups/step |
+|---|---|---|---|---|---|---|---|
+| rev 1 (`is_alive`) | dev 21 | 1 240 | 0 | 18 645 | 6 215 | 15.04 | 5.01 |
+| rev 2 (`get_actor`) | dev 22 | 400 | 0 | 6 015 | 2 005 | **15.04** | **5.01** |
+| rev 1 (`is_alive`) | cast 26 | 1 415 | 0 | 18 084 | 6 028 | 12.78 | 4.26 |
+| rev 2 (`get_actor`) | cast 27 | 410 | 0 | 6 177 | 2 059 | 15.07 | 5.02 |
+
+Identical to three significant figures on the dev arm. So **both** liveness tests reject a
+`tick=False` spawn — swapping between them cannot help, because neither the client snapshot
+nor the `get_actor` lookup reflects an actor created without a tick. Probing job 22's world
+found **only the ego present**, no background vehicles.
+
+The good news is unchanged and is the part that matters for stability: `Cannot spawn actor`
+stays at **0** in both revisions, so the blocked-spawn-point cascade — and with it the >1 TB
+CarlaUE4 leak — is genuinely fixed by `_destroy_leaked_actor` plus not retrying an occupied
+point. What remains is that the guard rejects every background vehicle, so traffic never
+populates.
+
+Given both tests fail, the options are to skip the liveness check entirely when `tick=False`
+(trust a non-`None` return, re-validate after the next tick) or to let `request_new_actor`
+tick. There is no third choice that keeps a check at spawn time.
+
+### Which uncommitted change is in which run
+
+Two files were edited on 2026-08-03 and they have **different** reach, because only one of them
+ports across branches:
+
+| file | mtime | dev arm | cast arm |
+|---|---|---|---|
+| `ogbench/carla/carla_utils.py` (spawn guard, rev 2) | 14:18:56 | ✅ | ✅ ported via `git apply` |
+| `impls/vlas/steervla.py` (CoT overflow resample) | 13:48:28 | ✅ | ❌ **patch does not apply** |
+
+The guard region is byte-identical across the two trees (`md5` of
+`_carla_actor_alive` → `_spawn_guard_installed = True` is `94112e510ef7` in both), and each job
+imports its own tree (`PYTHONPATH` verified per process).
+
+The `steervla.py` change adds `_reasoning_overflowed` / `_sample_cot_checked`: when the
+reasoning segment burns its whole `max_reasoning_len` budget the chain has derailed (with
+`cot_temperature > 0` the decoder samples the full vocabulary with no top-k/top-p, so one junk
+token knocks it off-distribution and it never emits `END_OF_REASONING`), and it is resampled at
+halved temperature, finally falling back to greedy. That is almost certainly the source of the
+`"<loc1022>The vehicle remains stopped normally.;<loc1021>"` garbage found in the HL dataset.
+
+It cannot be `git apply`-ed to the cast worktree — the two branches' `steervla.py` differ by
+~915 lines. **So with `cot_temperature=0.5` on both arms, the dev arm repairs garbled CoT and
+the cast arm does not.** A hand-port is feasible: the cast branch has `_sample_or_reuse_cot`,
+`tokenized_reasoning_mask`, `max_reasoning_len`, the identical `self._sample_cot(...)` call
+site (line 2936) and the `create_steervla_pi0_cot_sample_fn` config plumbing. Not done —
+hand-editing a 915-line-divergent file is a bigger step than a clean patch application.
+
+### Revision 3 (15:31) — skip the check when `tick=False`. This one works.
+
+The next `carla_utils.py` revision does what the measurements pointed to: the liveness check
+runs **only when the caller asked `request_new_actor` to tick**. Its docstring confirms the
+diagnosis independently — checking a `tick=False` spawn "rejected ~100% of them", and since
+`BackgroundBehavior._spawn_source_actor` is the only way road traffic is replenished as the ego
+drives, that "silently disabled continuous background traffic: only the initial batch
+population (`request_new_batch_actors`, which this guard does not wrap) ever survived, and it
+thinned out to nothing as the ego moved away from it."
+
+**Guard behaviour on `enter-actor-flow-004` across all three revisions:**
+
+| revision | job | steps | `Cannot spawn actor` | `not alive` retries | give-ups |
+|---|---|---|---|---|---|
+| rev 1 (`is_alive`) | dev 21 | 1 240 | 0 | 18 645 | 6 215 |
+| rev 2 (`get_actor`) | dev 23 | 1 107 | 0 | 16 650 | 5 550 |
+| **rev 3 (skip when `tick=False`)** | dev 24 | 300 | **0** | **0** | **0** |
+| **rev 3** | cast 29 | 305 | **0** | **0** | **0** |
+
+And the traffic is back. Probing job 24's live world: **24 vehicles** — 10 moving (including
+`scenario`-role actors at ~12 m/s), 4 held at red lights, 10 stationary further out, and
+**0 frozen within 30 m of the ego**, i.e. no queue jammed against a stalled ego. Compare rev 2,
+where the same probe found only the ego.
+
+### Stale-code audit (what prompted the rev-3 relaunch)
+
+Rev 3 landed at 15:31:31, *after* every then-running job had started, so all of them were
+running superseded code. Audit and action:
+
+| job | route | started | state | action |
+|---|---|---|---|---|
+| dev 20 | opposite-vehicle-…-004 | 11:18 | 6 921 steps, pre-fix (spawn storm ~5.9/step) | relaunched → **dev 30** |
+| cast 25 | opposite-vehicle-…-004 | 11:22 | 7 820 steps, pre-fix (~6.1/step) | relaunched → **cast 35** |
+| cast 28 | enter-actor-flow-004 | 15:00 | 1 280 steps, rev 2 | relaunched → **cast 29** |
+| dev 23 | enter-actor-flow-004 | 15:00 | stopped externally ~15:36 (pidfile removed, no guard entry) | relaunched → **dev 24** |
+| dev 13 | merger-…-005 | — | **20 000/20 000 complete** | left |
+| cast 18 | merger-…-005 | — | **20 000/20 000 complete** | left |
+
+The two `opposite-vehicle-…-004` runs gave up ~7-8k steps, but they carried the *original*
+pre-fix guard and were accumulating the cascade at ~6 failures/step, so they were heading for
+the 250 GB guard regardless.
+
+All four relaunches verified: started after 15:31:31, `rl=False bc=False hl=True`,
+`cot_temperature=0.5`, dev arm also `--pid_stuck_threshold=150`. Guard region `md5` is
+`3b327f88dc33` in both trees.
+
+**Still dev-only:** the `steervla.py` CoT-overflow resample (13:48). It does not apply to the
+cast branch and has not been hand-ported, so at `cot_temperature=0.5` the dev arm repairs
+garbled CoT and the cast arm does not.
+
+### Monitoring
+
+`spawnwatch.sh` snapshots every live run every 5 min into `spawnwatch.log` — steps,
+`Cannot spawn actor` count, give-ups and the per-step rate — and flags any run that climbs back
+above 0.5/step. First snapshot after the fix:
+
+```
+dev   job 13  steps=18652  cannot_spawn=115708  per_step=6.20  <<< ALERT   (pre-fix run)
+dev   job 20  steps=4650   cannot_spawn=27472   per_step=5.91  <<< ALERT   (pre-fix run)
+dev   job 21  steps=410    cannot_spawn=0       per_step=0.00             (post-fix)
+cast  job 18  steps=18078  cannot_spawn=112572  per_step=6.23  <<< ALERT   (pre-fix run)
+cast  job 25  steps=5160   cannot_spawn=31259   per_step=6.06  <<< ALERT   (pre-fix run)
+cast  job 26  steps=430    cannot_spawn=0       per_step=0.00             (post-fix)
+```
+
+The four alerting runs started before the fix landed and carry the old code.
+
+### The 250 GB guard earned its keep
+
+`carla_guard.sh` stopped dev 11 and cast 16 when their servers hit 250 GB, and the cgroup
+`oom_kill` counter stayed at **6** — no new kernel kills, and no collateral damage to the
+healthy runs. Both had died of the spawn cascade (final log lines are `Cannot spawn actor` at a
+single repeating transform), so both are candidates for a re-run on the fixed code.
+
+---
+
 ## Results
 
 *(filled in as runs complete)*
@@ -346,8 +687,10 @@ watchdog. All six GPUs are busy again.
 | cast | enter-actor-flow-004 | | | | | | | running |
 | dev | signalized-junction-left-turn-001 | | | | | | | running |
 | cast | signalized-junction-left-turn-001 | | | | | | | running |
-| dev | opposite-vehicle-running-red-light-001 | | | | | | | queued |
-| cast | opposite-vehicle-running-red-light-001 | | | | | | | queued |
+| dev | opposite-vehicle-running-red-light-**004** | | | | | | | queued (job 20) |
+| cast | opposite-vehicle-running-red-light-**004** | | | | | | | queued (job 25) |
+| dev | opposite-vehicle-running-red-light-001 *(superseded, kept)* | 20000 | 34 | | | | | **complete** |
+| cast | opposite-vehicle-running-red-light-001 *(superseded, kept)* | 20000 | 8 | | | | | **complete** |
 | dev | merger-into-slow-traffic-v2-005 | | | | | | | queued |
 | cast | merger-into-slow-traffic-v2-005 | | | | | | | queued |
 | dev | generalization-wall-1095 | 20000 | 19 | | | | | **complete** |

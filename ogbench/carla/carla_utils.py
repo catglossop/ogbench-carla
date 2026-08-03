@@ -1234,7 +1234,17 @@ def _ego_state_vector(
 
 
 def _carla_actor_alive(actor) -> bool:
-    """True if ``actor``'s server-side counterpart still exists and is alive."""
+    """True if ``actor``'s server-side counterpart still exists and is alive.
+
+    Valid only **after a tick has run**. Measured against a live 0.9.16 server, in synchronous mode,
+    immediately after ``try_spawn_actor`` and before any ``world.tick()``: ``world.get_actor(id)``
+    returns the actor but with ``is_alive == False``, and the client-side ``actor.is_alive`` flag
+    also reads False. One ``world.tick()`` later both read True. The result was 0/4 then 4/4,
+    identical via raw ``try_spawn_actor`` and via ``CarlaDataProvider.request_new_actor(tick=False)``.
+
+    So there is no liveness signal to consult before the first tick -- which is why the caller skips
+    this check entirely for ``tick=False`` spawns rather than picking a different flag.
+    """
     try:
         if actor is None:
             return False
@@ -1245,6 +1255,23 @@ def _carla_actor_alive(actor) -> bool:
         return live is not None and live.is_alive
     except Exception:
         return False
+
+
+def _destroy_leaked_actor(actor) -> None:
+    """Drop a spawned-but-rejected actor from the pool *and* the world.
+
+    Popping it from ``_carla_actor_pool`` alone leaves the vehicle physically parked on the
+    spawn point, so every subsequent attempt at that transform fails with
+    ``WARNING: Cannot spawn actor`` -- a self-inflicted cascade.
+    """
+    try:
+        CarlaDataProvider._carla_actor_pool.pop(actor.id, None)
+    except Exception:
+        pass
+    try:
+        actor.destroy()
+    except Exception:
+        pass
 
 
 def _install_carla_actor_spawn_guard() -> None:
@@ -1262,30 +1289,56 @@ def _install_carla_actor_spawn_guard() -> None:
     spawned alive we return ``None`` so the caller raises an ordinary, catchable Python
     error (a clean episode failure) instead of aborting the process.
 
+    Only the *stale handle* case is retried. When the underlying ``try_spawn_actor`` refuses the
+    transform it returns ``None`` and srunner logs ``WARNING: Cannot spawn actor ...``; that means
+    the spawn point is occupied, and retrying inside the same tick cannot help because nothing has
+    moved. ``BackgroundBehavior`` calls this every tick for each traffic source, so retrying a
+    blocked point tripled both the log spam and the blocking RPC round-trips on the sim's critical
+    path (~112k wasted calls in a single observed episode).
+
+    The liveness check runs **only when the caller asked ``request_new_actor`` to tick**. With
+    ``tick=False`` nothing has advanced the simulation between the spawn and the check, and no
+    liveness signal is valid yet -- both ``world.get_actor(id).is_alive`` and ``actor.is_alive``
+    read False on a vehicle that is physically in the world (see :func:`_carla_actor_alive`).
+    Checking anyway rejected ~100% of them, and since ``BackgroundBehavior._spawn_source_actor`` is
+    the *only* way road traffic is replenished as the ego drives, that silently disabled continuous
+    background traffic: only the initial batch population (``request_new_batch_actors``, which this
+    guard does not wrap) ever survived, and it thinned out as the ego moved away from it.
+
     Idempotent; safe to call on every env construction. Retries via
     ``CARLA_SPAWN_GUARD_RETRIES`` (default 3); set to 0/1 to disable retrying.
     """
     if getattr(CarlaDataProvider, "_spawn_guard_installed", False):
         return
     _orig_request_new_actor = CarlaDataProvider.request_new_actor
+    # ``tick`` is the 9th positional parameter of CarlaDataProvider.request_new_actor.
+    _TICK_ARG_INDEX = 8
 
     def request_new_actor_guarded(*args, **kwargs):
         attempts = max(1, int(os.environ.get("CARLA_SPAWN_GUARD_RETRIES", "3")))
+        if "tick" in kwargs:
+            ticked = bool(kwargs["tick"])
+        elif len(args) > _TICK_ARG_INDEX:
+            ticked = bool(args[_TICK_ARG_INDEX])
+        else:
+            ticked = True
         for i in range(attempts):
-            # request_new_actor already ticks once internally before returning, so the
-            # actor is registered server-side by now. Do NOT add another tick here: the
+            # When ``tick`` is set, request_new_actor ticks once internally before returning, so
+            # the actor is registered server-side by then. Do NOT add another tick here: the
             # scenario freezes physics (set_simulate_physics(False)) right after spawn,
             # and an extra physics tick could itself collide/destroy the fresh actor.
             actor = _orig_request_new_actor(*args, **kwargs)
             if actor is None:
-                continue
+                # Occupied spawn point, not a stale handle -- let the caller deal with it.
+                return None
+            if not ticked:
+                # Un-checkable (see docstring). set_simulate_physics on a dead id is still
+                # covered later by _install_carla_physics_guard.
+                return actor
             if _carla_actor_alive(actor):
                 return actor
-            # Stale: drop the dead handle from the pool so it cannot be reused, then retry.
-            try:
-                CarlaDataProvider._carla_actor_pool.pop(actor.id, None)
-            except Exception:
-                pass
+            # Stale handle: destroy it so it cannot keep blocking the spawn point, then retry.
+            _destroy_leaked_actor(actor)
             print(
                 f"[carla spawn guard] spawned actor {getattr(actor, 'id', '?')} was not "
                 f"alive after tick (attempt {i + 1}/{attempts}); retrying",

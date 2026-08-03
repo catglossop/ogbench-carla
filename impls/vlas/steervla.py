@@ -1133,6 +1133,8 @@ class SteerVLAActor:
         raw_obs_holder: Optional[MutableMapping[str, Any]] = None,
         routing_command: str = "Follow the route.",
         cot_temperature: float = 0.0,
+        cot_resample_on_overflow: bool = True,
+        cot_overflow_max_resamples: int = 2,
         include_ego_history: bool = False,
         proprio_norm: bool = True,
         output_action_format: Optional[str] = "DELTA_XY_T_DELTA_XY_SPACE",
@@ -1256,6 +1258,10 @@ class SteerVLAActor:
         self.raw_obs_holder = raw_obs_holder
         self.routing_command = routing_command
         self.cot_temperature = float(cot_temperature)
+        self.cot_resample_on_overflow = bool(cot_resample_on_overflow)
+        self.cot_overflow_max_resamples = max(0, int(cot_overflow_max_resamples))
+        self._cot_overflow_count = 0
+        self._cot_sample_count = 0
         self.include_ego_history = include_ego_history
         self.proprio_norm = proprio_norm
         self.output_action_format = output_action_format
@@ -3526,6 +3532,64 @@ class SteerVLAActor:
         mask = np.asarray(jax.device_get(self._last_prefix_mask[row : row + 1]), dtype=bool)
         return out, mask
 
+    def _reasoning_overflowed(self, cot_out: dict[str, Any]) -> np.ndarray:
+        """Per-row: did the reasoning segment run out its whole ``max_reasoning_len`` budget?
+
+        ``Pi0CoT._sample_cot_core_impl`` decodes reasoning until it emits ``END_OF_REASONING``
+        (``<loc1019>``) or exhausts ``mr = max_reasoning_len`` tokens. On exhaustion it *force-writes*
+        the end marker into the tail slot, so an overflowed chain is indistinguishable from a normal
+        one by text alone -- but its mask is saturated to the full budget.
+
+        Overflow is the signature of a derailed sample: with ``cot_temperature > 0`` the decoder draws
+        from the full PaliGemma vocabulary with no top-k/top-p truncation, so one junk token
+        (multilingual fragments, emoji) knocks the chain off-distribution and it never emits the stop
+        token. The resulting "reasoning" is the FAST action grammar (``Action: <loc....>|...``) spilled
+        into the reasoning slot.
+        """
+        mask = np.asarray(jax.device_get(cot_out["tokenized_reasoning_mask"]))
+        mask = mask.reshape(mask.shape[0], -1) if mask.ndim > 1 else mask.reshape(1, -1)
+        budget = int(getattr(self.model_cfg, "max_reasoning_len", mask.shape[-1]))
+        return mask.astype(bool).sum(axis=-1) >= budget
+
+    def _sample_cot_checked(
+        self,
+        rng: jax.Array,
+        obs_jax: _openpi_model.Observation,
+    ) -> dict[str, Any]:
+        """``_sample_cot`` plus a bounded resample when the reasoning overflows its budget.
+
+        Only active when sampling stochastically (``cot_temperature > 0``); greedy decoding is
+        deterministic, so a resample at the same temperature would reproduce the same chain. Each
+        retry halves the temperature and the last one falls back to greedy, which always terminates
+        on-distribution. See :meth:`_reasoning_overflowed` for why overflow means "garbled".
+        """
+        temperature = float(self.cot_temperature)
+        cot_out = self._sample_cot(
+            rng, obs_jax, temperature=temperature, image_keys=CARLA_STEERVLA_IMAGE_KEYS
+        )
+        self._cot_sample_count += 1
+        if temperature <= 0.0 or not self.cot_resample_on_overflow:
+            return cot_out
+
+        for attempt in range(self.cot_overflow_max_resamples):
+            if not bool(np.any(self._reasoning_overflowed(cot_out))):
+                return cot_out
+            self._cot_overflow_count += 1
+            last = attempt == self.cot_overflow_max_resamples - 1
+            temperature = 0.0 if last else temperature / 2.0
+            print(
+                f"[DEBUG - steervla] reasoning overflowed max_reasoning_len "
+                f"(garbled CoT); resampling at temperature={temperature:.2f} "
+                f"({attempt + 1}/{self.cot_overflow_max_resamples}) "
+                f"[{self._cot_overflow_count}/{self._cot_sample_count} samples so far]",
+                flush=True,
+            )
+            rng, sub_rng = jax.random.split(rng)
+            cot_out = self._sample_cot(
+                sub_rng, obs_jax, temperature=temperature, image_keys=CARLA_STEERVLA_IMAGE_KEYS
+            )
+        return cot_out
+
     def _sample_or_reuse_cot(
         self,
         rng: jax.Array,
@@ -3546,12 +3610,7 @@ class SteerVLAActor:
         ):
             self._last_cot_out = self._cached_cot
             return self._cached_cot
-        cot_out = self._sample_cot(
-            rng,
-            obs_jax,
-            temperature=float(self.cot_temperature), 
-            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-        )
+        cot_out = self._sample_cot_checked(rng, obs_jax)
         if self._cot_cache_enabled(batch_size):
             self._cached_cot = dict(cot_out)
             self._cached_cot_actions_used = 0
@@ -4373,6 +4432,11 @@ class SteerVLAActor:
         reason_mask = np.asarray(jax.device_get(cot_out["tokenized_reasoning_mask"]), dtype=bool)
         subtask_tokens = np.asarray(jax.device_get(cot_out["tokenized_subtask"]), dtype=np.int32)
         subtask_mask = np.asarray(jax.device_get(cot_out["tokenized_subtask_mask"]), dtype=bool)
+        # Candidates are drawn in one batched forward, so a derailed row cannot be resampled
+        # individually the way _sample_cot_checked does for the batch-1 rollout path. Flag them
+        # instead: an overflowed row is garbled (see _reasoning_overflowed) and its subtask is not
+        # a usable Best-of-N candidate.
+        overflowed = self._reasoning_overflowed(cot_out)
         reasoning_texts: list[str] = []
         subtask_texts: list[str] = []
         for i in range(n):
@@ -4382,6 +4446,7 @@ class SteerVLAActor:
             subtask_texts.append(s_txt)
             print(
                 f"[best_of_n][cand {i}] temp={float(temperature):.2f} "
+                f"{'[GARBLED: reasoning overflowed budget] ' if bool(overflowed[i]) else ''}"
                 f"subtask={s_txt!r} reasoning={r_txt!r}",
                 flush=True,
             )
@@ -4486,6 +4551,8 @@ def create_steervla_pi0_cot_sample_fn(
         raw_obs_holder=raw_obs_holder,
         routing_command=str(steervla_cfg.get("routing_command", "Follow the route.")),
         cot_temperature=float(steervla_cfg.get("cot_temperature", 0.0)),
+        cot_resample_on_overflow=bool(steervla_cfg.get("cot_resample_on_overflow", True)),
+        cot_overflow_max_resamples=int(steervla_cfg.get("cot_overflow_max_resamples", 2)),
         include_ego_history=bool(steervla_cfg.get("include_ego_history", False)),
         proprio_norm=bool(steervla_cfg.get("proprio_norm", True)),
         output_action_format=steervla_cfg.get("output_action_format") or "DELTA_XY_T_DELTA_XY_SPACE",
