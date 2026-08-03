@@ -56,6 +56,15 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 \
 # Launch SteerVLA server on a TPU VM
 cd impls/vlas && ./launch_steervla.sh <tpu-vm-name> <config> <checkpoint>
 
+# Build npz "HL replay pools" from the SteerVLA RLDS pretraining data (run ONCE, offline,
+# in an env that has tensorflow/tfds/dlimp — the CARLA venv does not). Consumed at runtime
+# by SteerVLAActor.update_hl to prevent catastrophic forgetting of the VLM backbone.
+python impls/vlas/extract_hl_replay.py \
+  --data-dir <rlds-root> --out-root <pool-root> \
+  --actor-config pi05_steervla_cot_simplified_reasoning \
+  --dataset simlingo_dataset_all_img512_1116 --regular --n 2000 \
+  --dataset simplified_reasoning_dataset --hl --supervise-fast=false --n 2000
+
 # Lint (configured in pyproject.toml: ruff, line-length 120, single quotes)
 uv run ruff check .
 uv run ruff format .
@@ -100,7 +109,22 @@ This is the part that is **not** discoverable by reading any single file. Trace 
    - `none` — disable; `language_label_dim` is forced to 0.
    `main_carla.py` auto-sets `agent_config.language_label_dim` from this resolution; don't hand-set it.
 
-5. **`impls/main_carla.py`** — orchestrates: builds env → builds `SteerVLAActor` (if `steervla.enabled`) → wires `vla_sample_fn` into the DSRL agent → runs the online loop, computing critic labels per step and pushing to a `utils.datasets.ReplayBuffer`. Optionally serves a live MP4 viewer at `http://<host>:<port>/` (`utils/live_policy_viewer.py`).
+5. **`impls/coaches/cast_relabel.py` :: `OnlineCastRelabelSession`** — a *separate* feedback path from the critic coaches above (it does not touch the replay buffer or critic labels). Every `cast_relabel.query_every_n_episode_steps` env steps it: records a window video → asks a VLM what the agent did GOOD/BAD → runs a second **credit-assignment** VLM call mapping those events onto individual action chunks (`credit_source` is `direct` or `precursor`) → asks for a corrected subtask plus a fresh CoT trace per bad chunk. Output goes to artifacts/W&B, and (when `cast_relabel.store_hl_dataset`) to an on-disk **high-level dataset** in OpenPI's `steervla_hl_dataset_format` schema (image + state + prompt + corrected subtask + reasoning + action chunk with `action_loss_mask` all-False).
+
+6. **The high-level (HL) update loop** — closes the loop from (5) back into the VLA's VLM backbone, which is what makes this stack different from plain DSRL:
+   `main_carla.py` → `DSRLAgent.update_with_vla(..., run_hl=True)` → `SteerVLAActor.update_hl()` → one OpenPI gradient step on the CoT/VLM backbone using the cast_relabel HL samples (action-flow loss masked out, so only subtask + reasoning are supervised). This requires SteerVLA loaded as a **trainable** OpenPI `TrainState` (`steervla.load_trainable_params=True`, see `steervla_cast_relabel_train_config.py`), and mixes in `hl_replay_pools` from `extract_hl_replay.py` to resist catastrophic forgetting. Cadence knobs: `steervla.hl_update_every` / `hl_update_batch_size` / `hl_update_num_steps`.
+
+7. **`impls/main_carla.py`** — orchestrates: builds env → builds `SteerVLAActor` (if `steervla.enabled`) → wires `vla_sample_fn` into the DSRL agent → runs the online loop, computing critic labels per step and pushing to a `utils.datasets.ReplayBuffer`. Optionally serves a live MP4 viewer at `http://<host>:<port>/` (`utils/live_policy_viewer.py`).
+
+### Update kinds are individually gated
+
+`enable_updates` is a master switch; each kind is ANDed with it (agent-config field, overridable by the same-named `main_carla.py` flag):
+
+- `enable_updates_rl` — DSRL critic/actor gradient step.
+- `enable_updates_bc` — full BC / DAgger imitation path (`update_dagger`).
+- `enable_updates_bc_hl` — the HL VLM-backbone update in (6).
+
+So "fine-tune the VLM backbone on relabeled data while freezing RL" is `enable_updates_rl=false, enable_updates_bc_hl=true` — not a code change.
 
 ### Two-GPU split (gotcha)
 
@@ -108,14 +132,26 @@ CARLA's UE4 renderer and JAX run on **different GPUs**, and the rank conventions
 
 - `gpu_rank` in `impls/configs/carla_config.yaml` → passed as CARLA `-graphicsadapter`. CARLA's adapter ordering is **swapped** relative to `nvtop`/`nvidia-smi` — see the inline comment in `carla_config.yaml`.
 - `training_gpu_rank` in the agent config → pins JAX's default device via `jax.config.update("jax_default_device", devs[rank])`. Set to `-1` to leave alone.
+- `steervla.hl_training_gpu_rank` → optional **third** rank: when the HL (VLM-backbone) update is enabled, the trainable OpenPI train state lives on this device so its optimizer/backward memory doesn't compete with the rollout + RL learner. `-1` means "same device as `training_gpu_rank`".
 
-`run_carla.sh` exposes both as `--render-adapter` (alias `--sim-gpu`) and `--train-gpu`, generates a temp `carla_config.yaml` + temp agent config under `.run_carla/` for the run, and cleans them up on exit. When debugging multi-run setups, look at the printed `[run_carla.sh]` summary lines — they show every resolved port and GPU rank.
+`run_carla.sh` exposes all three as `--render-adapter` (alias `--sim-gpu`), `--train-gpu`, and `--hl-gpu`, generates a temp `carla_config.yaml` + temp agent config under `.run_carla/` for the run, and cleans them up on exit. When debugging multi-run setups, look at the printed `[run_carla.sh]` summary lines — they show every resolved port and GPU rank.
 
 ## Config layering for `run_carla.sh`
 
 `run_carla.sh` doesn't edit your configs in place. It writes two temp files under `.run_carla/run.XXXXXX/`:
 
-- `agent_config.py` — `runpy`-loads `impls/configs/steervla_dsrl_config.py` (the default; other experiment variants live alongside it — `steervla_best_of_n_config.py`, `steervla_cast_relabel_config.py`, `steervla_dsrl_config_no_subtask_attention.py` — selected via `--agent=`), then overrides `training_gpu_rank`, `critic_feedback_mode`, and `online_training_mode` from CLI flags. So `--critic-mode {none|delta|delta-lang|expert-lang}` and `--train-mode {rl|dagger}` are the canonical user-facing knobs; **don't edit `steervla_dsrl_config.py` to change them per-run**.
+- `agent_config.py` — `runpy`-loads the base agent config (default `impls/configs/steervla_dsrl_config.py`, chosen with **`--agent-config PATH`**; the script then passes the generated temp file to `main_carla.py` as `--agent=`), then overrides `training_gpu_rank`, `steervla.hl_training_gpu_rank`, `critic_feedback_mode`, and `online_training_mode` from CLI flags. So `--critic-mode {none|delta|delta-lang|expert-lang}` and `--train-mode {rl|dagger}` are the canonical user-facing knobs; **don't edit `steervla_dsrl_config.py` to change them per-run**.
+
+  Experiment configs form an inheritance chain — each calls the parent's `get_config()` and overrides, so read the parent for anything not mentioned in the child:
+
+  ```
+  steervla_dsrl_config.py                      # base: DSRL + SteerVLA
+   ├─ steervla_dsrl_config_no_subtask_attention.py
+   └─ steervla_cast_relabel_config.py          # + cast_relabel observer (artifacts/W&B only)
+       └─ steervla_cast_relabel_train_config.py  # + trainable SteerVLA & HL dataset writing
+  steervla_best_of_n_config.py                 # agent_name="best_of_n"
+  steervla_tmrl_config.py                      # agent_name="tmrl" (see caveat below)
+  ```
 - `carla_config.yaml` — loads the base yaml and overrides `host`/`port`/`streaming_port`/`traffic_manager_port`/`gpu_rank`/`x_display_num`. `use_cuda_visible_devices` is forced to `False` because the script is already managing GPU pinning.
 
 ## Custom Python packages
@@ -130,6 +166,7 @@ When changing things like routing-command prompt format or normalization, the so
 ## File-organization conventions worth knowing
 
 - `impls/jax_agents/` is named `jax_agents/` (not `agents/`) deliberately, because CARLA's `PythonAPI/carla/agents` (navigation agents) takes the `agents` import name. Don't rename it.
+- Adding a new JAX agent takes **two** steps: the module's `get_config()` must set `config.agent_name = "<name>"`, and the class must be added to the `agents` dict in `impls/jax_agents/__init__.py` — `main_carla.py` looks the class up by `config["agent_name"]`. Agents needing the VLA also need a branch in `main_carla.py`'s `create_kwargs` block (~line 1843) to receive `vla_sample_fn` / `steervla_actor`. As of this branch `jax_agents/tmrl.py` (DSRL + a learned context-noise-level head, requires a `*_csp` context-smoothing checkpoint) is written but **not** registered in `__init__.py`, so `steervla_tmrl_config.py` will `KeyError` until it is.
 - Coach artifacts (`metadata/`, `results/`, `videos/`) under `impls/coaches/` are run outputs — they are not source. Don't grep them for examples of "how things work."
 - `data/` holds Bench2Drive route XMLs and weather definitions; it is not training data.
 - `exp/` is the local experiment / wandb scratch dir (per `.gitignore`).
