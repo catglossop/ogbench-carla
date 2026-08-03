@@ -45,7 +45,7 @@ def get_config():
     #   bc_hl -> high-level VLM backbone update: DSRLAgent.update_with_vla(run_hl=True) calls
     #            SteerVLAActor.update_hl, which fine-tunes the CoT/VLM backbone on the
     #            cast_relabel HL samples (subtask + reasoning targets, action loss masked out).
-    config.enable_updates_rl = True
+    config.enable_updates_rl = False
     config.enable_updates_bc = False
     config.enable_updates_bc_hl = True
 

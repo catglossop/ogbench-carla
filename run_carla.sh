@@ -469,7 +469,10 @@ if [[ -n "$BON_CRITIC_CKPT" ]]; then
 fi
 echo "[run_carla.sh] save_video_local=${SAVE_VIDEO_LOCAL}"
 
-PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla:${ROOT_DIR}/simlingo-rebuttal${PYTHONPATH:+:$PYTHONPATH}" \
+# Export rather than prefixing the invocation: the run now happens inside the crash-supervisor
+# loop below, so a one-shot `VAR=... cmd` prefix here would only have applied to the next echo.
+export PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla:${ROOT_DIR}/simlingo-rebuttal${PYTHONPATH:+:$PYTHONPATH}"
+
 echo "[run_carla.sh] agent_config=${BASE_AGENT_CFG}"
 echo "[run_carla.sh] enable_updates=${ENABLE_UPDATES} base_only=${BASE_ONLY:-<config default>} state_encoder=${STATE_ENCODER:-<config default>}${RLT_CHECKPOINT:+ rlt_checkpoint=${RLT_CHECKPOINT}}"
 echo "[run_carla.sh] hl_gpu_rank=${HL_TRAIN_GPU_RANK:-<config>} max_retries=${MAX_RETRIES}"

@@ -55,8 +55,10 @@ def get_config():
     config.enable_updates_bc = False
     config.enable_updates_bc_hl = False
     config.buffer_capacity = 1_000
-    # When true, RL updates use reward = -ego_speed (m/s) instead of env reward.
-    config.debug_task = True
+    # When true, RL updates use reward = -ego_speed (m/s) instead of env reward. This is a
+    # standstill-diagnostic switch only -- it trains the policy to *minimise* speed. Left on by
+    # aaa4c7a; off by default so real runs optimise the env reward. cast_relabel inherits this.
+    config.debug_task = False
     # Rollout-only: best-of-N random VLA noises minimizing first-step speed delta_xy.
     config.debug_noise = False
     config.debug_noise_samples = 8

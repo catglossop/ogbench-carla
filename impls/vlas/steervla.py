@@ -39,6 +39,7 @@ import json
 import os
 import re
 import time
+import types as _types
 from pathlib import Path
 from typing import Any, Callable, Dict, MutableMapping, Optional
 
@@ -1307,6 +1308,11 @@ class SteerVLAActor:
         self._cached_action_step = 0
         self._cached_cot: dict[str, Any] | None = None
         self._cached_cot_actions_used = 0
+        # Pooled prefix embedding cache (DSRL / residual state encoders). Both are read
+        # before their first assignment in _forward_pi0 / ensure_policy_embedding, so they
+        # must exist from construction.
+        self._cached_policy_embed: np.ndarray | None = None
+        self._cached_policy_embed_obs_id: int | None = None
         # Latest CoT output (reasoning/subtask/FAST tokens) the base policy sampled,
         # needed by the RLT state encoder to reproduce the prefix the policy acted on.
         self._last_cot_out: dict[str, Any] | None = None
@@ -1438,10 +1444,10 @@ class SteerVLAActor:
                     f"inference + RL on {infer_device} (rank {training_gpu_rank}).",
                     flush=True,
                 )
-                infer_params = jax.device_put(train_state.params, infer_device)
+                infer_params = self._params_for_inference(train_state.params)
                 self.model = nnx.merge(train_state.model_def, infer_params)
             else:
-                self.model = nnx.merge(train_state.model_def, train_state.params)
+                self.model = nnx.merge(train_state.model_def, self._params_for_inference(train_state.params))
 
             # Confirm the freeze actually matched: a regex that matches nothing would silently keep
             # the whole model trainable and OOM again. Report trainable vs total param counts and the
@@ -1538,6 +1544,18 @@ class SteerVLAActor:
                 ),
             )
 
+        # Jitted pooled-prefix embedding for the per-step policy_embed path; the
+        # eager _build_frozen_prefix_cache costs ~5 s/step (see _frozen_prefix_embed_forward).
+        self._prefix_embed_fn = nnx_utils.module_jit(
+            _types.MethodType(_frozen_prefix_embed_forward, self.model)
+        )
+
+        # QGF: jitted prefix-cache builder and single denoising step (used when setup_qgf() is called).
+        self._prefix_cache_fn = nnx_utils.module_jit(
+            _types.MethodType(_compute_prefix_cache_for_qgf, self.model)
+        )
+        self._denoise_step_fn = nnx_utils.module_jit(self.model._denoise_flow_step)
+
     # ------------------------------------------------------------------
     # Context-Smoothed Pre-training (CSP): context noise level ``t_context``
     # ------------------------------------------------------------------
@@ -1606,6 +1624,28 @@ class SteerVLAActor:
         """Per-row ``t_context`` used by the most recent action sample (``None`` if clean)."""
         return self._last_t_context
 
+    def _params_for_inference(self, params):
+        """Return train-state params as buffers the inference model can own outright.
+
+        ``_hl_train_step`` is jitted with ``donate_argnums=(1,)``, so every HL update deletes the
+        buffers of the ``TrainState`` handed to it. Two cases:
+
+        * **Split HL GPU** (``hl_training_gpu_rank`` != ``training_gpu_rank``): the freshly-updated
+          params live on ``_hl_jax_device``; ``device_put`` to ``_jax_device`` is a real cross-device
+          copy, so inference already owns independent buffers.
+        * **Shared GPU** (``hl_training_gpu_rank`` unset, -1, or equal): ``device_put`` onto the
+          device the array is already on is a no-op that returns the *same* buffer. The inference
+          model would then alias the donated train state and the next forward dies with
+          ``INVALID_ARGUMENT: Buffer has been deleted or donated``. Copy explicitly instead.
+        """
+        if (
+            self._hl_jax_device is not None
+            and self._jax_device is not None
+            and self._hl_jax_device != self._jax_device
+        ):
+            return jax.device_put(params, self._jax_device)
+        return jax.tree.map(lambda x: x.copy() if hasattr(x, "copy") else x, params)
+
     def _refresh_inference_weights(self) -> None:
         """Rebuild the model + inference kernels from the train state after a HL update.
 
@@ -1614,12 +1654,7 @@ class SteerVLAActor:
         """
         if not self._weights_dirty or self._train_state is None:
             return
-        params = self._train_state.params
-        # When the HL update runs on a separate GPU, the freshly-updated params live on
-        # ``_hl_jax_device``; copy them back to the inference device before rebuilding the model so
-        # inference stays on ``_jax_device`` (with the DSRL RL updates).
-        if self._hl_jax_device is not None and self._hl_jax_device != self._jax_device:
-            params = jax.device_put(params, self._jax_device)
+        params = self._params_for_inference(self._train_state.params)
         self.model = nnx.merge(self._train_state.model_def, params)
         self._build_sample_wrappers()
         self._weights_dirty = False
@@ -2711,21 +2746,6 @@ class SteerVLAActor:
             print(f"[steervla.update_hl] memory_stats unavailable ({exc}).", flush=True)
 
         return out
-        import types as _types
-
-        # Jitted pooled-prefix embedding for the per-step policy_embed path; the
-        # eager _build_frozen_prefix_cache costs ~5 s/step (see _frozen_prefix_embed_forward).
-        self._prefix_embed_fn = nnx_utils.module_jit(
-            _types.MethodType(_frozen_prefix_embed_forward, self.model)
-        )
-
-        # QGF: jitted prefix-cache builder and single denoising step (used when setup_qgf() is called).
-        self._prefix_cache_fn = nnx_utils.module_jit(
-            _types.MethodType(_compute_prefix_cache_for_qgf, self.model)
-        )
-        self._denoise_step_fn = nnx_utils.module_jit(self.model._denoise_flow_step)
-
-        self._local_ready = True
 
     def setup_qgf(
         self,

@@ -114,12 +114,6 @@ from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_bool(
-    "enable_updates",
-    None,
-    "If false, skip RL gradient updates (rollout/buffer logging only). "
-    "Default: agent config ``enable_updates`` (true).",
-)
 flags.DEFINE_string("run_group", "Debug", "Run group.")
 flags.DEFINE_integer("seed", 0, "Random seed.")
 flags.DEFINE_string(
@@ -669,7 +663,7 @@ def _list_routes_and_exit() -> None:
         )
 
 
-def _steervla_action_execution_cfg(steervla_cfg, *, residual: bool = False) -> dict[str, Any] | None:
+def _steervla_action_execution_cfg(steervla_cfg) -> dict[str, Any] | None:
     """Env + replay-buffer layout for OpenPI SteerVLA chunks (simlingo-style control)."""
     if steervla_cfg is None or not steervla_cfg.get("enabled"):
         return None
@@ -680,12 +674,23 @@ def _steervla_action_execution_cfg(steervla_cfg, *, residual: bool = False) -> d
     ad = int(steervla_cfg.get("action_dim", 4))
     url = steervla_cfg.get("actor_url")
     remote = bool(url and str(url).strip())
-    if residual and not remote:
-        # Residual acts on raw model output, so only the fixed denormalize_actions applies.
-        action_input_space = "normalized"
-    else:
-        # SteerVLA actor applies OpenPI Unnormalize + fixed steervla denormalize_actions.
-        action_input_space = "policy_output"
+    # Who applies the fixed RLDS scaling (``denormalize_actions``: *7 on the speed-waypoint
+    # deltas for DELTA_XY_T_DELTA_XY_SPACE)? It has to happen exactly once.
+    #
+    # * **remote** (``steervla.actor_url`` set): steervla_server.py calls
+    #   ``steervla_physical_denormalize_actions`` before returning, so the chunk on the wire is
+    #   already physical -> ``policy_output`` (env must not scale again).
+    # * **local**: SteerVLAActor returns the raw model output. OpenPI Normalize/Unnormalize are
+    #   deliberately disabled for these checkpoints (see ``impls/vlas/steervla.py``:
+    #   ``STEERVLA_ENABLE_OPENPI_NORM``), and the rollout ``sample_actions`` path does *not*
+    #   denormalize, so the env has to -> ``normalized``.
+    #
+    # ``residual`` is NOT the discriminator: every local entrypoint gets the same raw chunk from
+    # the same ``vla_sample_fn``. Keying on it left DSRL / cast_relabel / best_of_n on
+    # ``policy_output``, silently dropping the *7 -- PID desired speed came out ~7x too low and
+    # the car crawled (<1 m/s) while the residual stack on the identical checkpoint drove at
+    # ~10 m/s. See dev_testrun.md.
+    action_input_space = "policy_output" if remote else "normalized"
     out = {
         "output_action_format": fmt,
         "action_horizon": ah,
@@ -1198,6 +1203,8 @@ def _episode_summary_log(info: dict) -> dict[str, Any]:
         out["rollout/final_route_progress_pct"] = float(info["route_progress_pct"])
     if "collision_count" in info:
         out["rollout/episode_collision_count"] = float(info["collision_count"])
+    if "traffic_violation_count" in info:
+        out["rollout/episode_traffic_violations"] = float(info["traffic_violation_count"])
     # termination_reason is a string (not chartable); emit it plus a one-hot over the
     # reasons the env can end on so W&B can plot per-reason frequency. The env only sets
     # termination_reason for crash_stuck / episode_max_steps; a scenario-tree end (success
@@ -1245,8 +1252,15 @@ def _viz_image_from_raw(raw) -> Optional[np.ndarray]:
     return None if raw is None else np.asarray(raw, dtype=np.uint8)
 
 
-def _draw_corner_badge(frame: np.ndarray, label: str, *, corner: str = "tl", bg=(0, 0, 0)) -> np.ndarray:
-    """Boxed text badge in a top corner (``'tl'``/``'tr'``); no-op if cv2 is unavailable."""
+def _draw_corner_badge(
+    frame: np.ndarray, label: str, *, corner: str = "tl", bg=(0, 0, 0), row: int = 0
+) -> np.ndarray:
+    """Boxed text badge in a top corner (``'tl'``/``'tr'``); no-op if cv2 is unavailable.
+
+    ``row`` stacks badges downwards in the same corner (row 1 sits just below row 0), so
+    several event banners -- collision, traffic violation -- can be drawn on one frame
+    without overlapping.
+    """
     annotated = np.array(frame, copy=True)
     try:
         import cv2  # type: ignore
@@ -1255,7 +1269,7 @@ def _draw_corner_badge(frame: np.ndarray, label: str, *, corner: str = "tl", bg=
         (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
         bw, bh = tw + 2 * pad, th + baseline + 2 * pad
         x0 = max(6, annotated.shape[1] - 6 - bw) if corner == "tr" else 6
-        y0 = 6
+        y0 = 6 + 16 * int(row)
         x1, y1 = x0 + bw, y0 + bh
         cv2.rectangle(annotated, (x0, y0), (x1, y1), bg, thickness=-1)
         cv2.rectangle(annotated, (x0, y0), (x1, y1), (255, 255, 255), thickness=1)
@@ -1393,10 +1407,15 @@ def _annotate_text_panel(
 
 def _annotate_full_frame(
     frame, raw, *, reward: float, action_flat=None, exec_cfg=None,
-    critic_text: str = "", collision=None, steervla_actor=None, expert_debug: bool = False,
-    hud: dict | None = None,
+    critic_text: str = "", collision=None, traffic_violation=None, steervla_actor=None,
+    expert_debug: bool = False, hud: dict | None = None,
 ) -> np.ndarray:
-    """Unified rollout-video frame: waypoint overlay + text panel + optional collision badge."""
+    """Unified rollout-video frame: waypoint overlay + text panel + optional violation badges.
+
+    ``collision`` / ``traffic_violation`` are ``(count, episode_events)`` pairs, or ``None``
+    when no such event fired on this step. They render as the same red / amber banners the
+    ``run_online_carla`` loop draws, so videos from either rollout loop read the same way.
+    """
     out = np.asarray(frame)
     if out.dtype != np.uint8:
         out = np.clip(out, 0, 255).astype(np.uint8)
@@ -1407,6 +1426,12 @@ def _annotate_full_frame(
     )
     if collision is not None:
         out = _draw_corner_badge(out, f"COLL c={int(collision[0])} e={int(collision[1])}", corner="tr", bg=(255, 0, 0))
+    if traffic_violation is not None:
+        out = _draw_corner_badge(
+            out,
+            f"TRAF VIOL v={int(traffic_violation[0])} e={int(traffic_violation[1])}",
+            corner="tr", bg=(200, 140, 0), row=1,
+        )
     return out
 
 
@@ -1423,20 +1448,27 @@ def _episode_video(frames: list[np.ndarray], fps: float):
 def _maybe_capture_frame(
     frames: list[np.ndarray], obs: dict, reward: float, *, episode_steps: int, done: bool,
     log_video: bool, video_every: int, action_flat=None, exec_cfg=None,
-    collision=None, steervla_actor=None, hud: dict | None = None,
+    collision=None, traffic_violation=None, steervla_actor=None, hud: dict | None = None,
 ) -> Optional[np.ndarray]:
     """Append an annotated frame on capture steps (every Nth step + the terminal one).
 
-    Uses the shared :func:`_annotate_full_frame` (waypoints + text panel + optional collision
-    badge). Returns the annotated frame that was appended (or ``None``) so callers can also feed
+    Uses the shared :func:`_annotate_full_frame` (waypoints + text panel + optional violation
+    badges). Returns the annotated frame that was appended (or ``None``) so callers can also feed
     a live viewer without re-annotating.
+
+    A step on which a collision or traffic violation fired is *always* captured, on top of the
+    periodic schedule -- otherwise the badge would only ever show up when the event happened to
+    land on a multiple of ``video_every``, which is how these annotations go missing from the
+    video even though the event was logged.
     """
-    if log_video and (episode_steps % video_every == 0 or done):
+    event = collision is not None or traffic_violation is not None
+    if log_video and (episode_steps % video_every == 0 or done or event):
         frame = _viz_image_from_raw(obs)
         if frame is not None:
             annotated = _annotate_full_frame(
                 frame, obs, reward=float(reward), action_flat=action_flat, exec_cfg=exec_cfg,
-                collision=collision, steervla_actor=steervla_actor, hud=hud,
+                collision=collision, traffic_violation=traffic_violation,
+                steervla_actor=steervla_actor, hud=hud,
             )
             frames.append(annotated)
             return annotated
@@ -1852,7 +1884,7 @@ def run_online_carla(
             output_action_format=str(_steervla_exec_cfg["output_action_format"]),
             action_horizon=int(_steervla_exec_cfg["action_horizon"]),
             action_dim=int(_steervla_exec_cfg["action_dim"]),
-            action_input_space=str(_steervla_exec_cfg.get("action_input_space", "policy_output")),
+            action_input_space=str(_steervla_exec_cfg.get("action_input_space", "normalized")),
         )
 
     example_transition = dict(
@@ -1985,10 +2017,11 @@ def run_online_carla(
             ),
         )
 
-    # Best-of-N candidate visualization (cast_relabel). The other nested annotation helpers
-    # that lived here are superseded by the module-level _viz_image_from_raw /
-    # _annotate_text_panel / _annotate_full_frame pipeline from surya/rl-token -- keeping the
-    # nested copies would shadow those module-level functions inside run_online_carla.
+    # Video annotation for this loop (routing-commands / cast_relabel): candidates panel,
+    # waypoint overlay, text panel and the violation banners. These nested helpers shadow the
+    # module-level _viz_image_from_raw / _annotate_text_panel / _annotate_full_frame pipeline
+    # from surya/rl-token inside run_online_carla, on purpose -- the module-level pipeline is
+    # what the residual loop uses.
     def _as_video_frame(image: np.ndarray) -> np.ndarray:
         frame = np.asarray(image)
         if frame.dtype != np.uint8:
@@ -2035,19 +2068,21 @@ def run_online_carla(
         except Exception:
             return frame
 
+    # Violation banners, top-right, stacked: collision (red) on row 0, traffic violation
+    # (amber) on row 1. Both delegate to the module-level ``_draw_corner_badge`` so the
+    # residual loop's ``_annotate_full_frame`` path renders them identically.
     def _annotate_collision_frame(
         frame: np.ndarray,
         *,
         collision_count: int,
         collision_events: int,
     ) -> np.ndarray:
-        annotated = np.array(frame, copy=True)
-        try:
-            import cv2  # type: ignore
-
-            return annotated
-        except Exception:
-            return annotated
+        return _draw_corner_badge(
+            frame,
+            f"COLL c={int(collision_count)} e={int(collision_events)}",
+            corner="tr",
+            bg=(255, 0, 0),
+        )
 
     def _annotate_traffic_violation_frame(
         frame: np.ndarray,
@@ -2055,35 +2090,13 @@ def run_online_carla(
         violation_count: int,
         episode_violations: int,
     ) -> np.ndarray:
-        annotated = np.array(frame, copy=True)
-        try:
-            import cv2  # type: ignore
-
-            _, w = annotated.shape[:2]
-            label = f"TRAF VIOL v={violation_count} e={episode_violations}"
-            font_scale = 0.38
-            thickness = 1
-            pad = 4
-            (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-            x1 = w - 6
-            x0 = max(6, x1 - tw - 2 * pad)
-            y0 = 22  # below collision banner
-            y1 = y0 + th + baseline + 2 * pad
-            cv2.rectangle(annotated, (x0, y0), (x1, y1), (200, 140, 0), thickness=-1)
-            cv2.rectangle(annotated, (x0, y0), (x1, y1), (255, 255, 255), thickness=1)
-            cv2.putText(
-                annotated,
-                label,
-                (x0 + pad, y1 - baseline - pad),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                font_scale,
-                (255, 255, 255),
-                thickness,
-                cv2.LINE_AA,
-            )
-            return annotated
-        except Exception:
-            return annotated
+        return _draw_corner_badge(
+            frame,
+            f"TRAF VIOL v={int(violation_count)} e={int(episode_violations)}",
+            corner="tr",
+            bg=(200, 140, 0),
+            row=1,
+        )
 
     def _annotate_reward_corner(frame: np.ndarray, reward_value: float) -> np.ndarray:
         annotated = np.array(frame, copy=True)
@@ -2866,12 +2879,17 @@ def run_online_carla(
                 temperature = 0.0 if _online_training_mode == "dagger_residual" else 1.0
                 return agent.sample_actions_sac_residual(obs[None], seed=subkey, temperature=temperature)
             if getattr(agent, "vla_sample_fn", None) is not None:
-                # Bounded tanh-squashed noise (not sample_actions_with_vla's learned
-                # noise_actor distribution, which is uncalibrated/near-zero-variance on a
-                # freshly-initialized eval-only agent): the pi0 checkpoint tends to stall
-                # at standstill, and only a *bounded* flow-latent's variance reliably
-                # kicks it back out (see the sac_residual branch above / brake-ratio-stall
-                # note). Matches that branch's rollout-noise convention exactly.
+                if rl_updates_on and hasattr(agent, "sample_actions_with_vla"):
+                    # DSRL proper: the learned noise actor picks the flow latent, so the RL
+                    # updates actually steer the executed policy. Bypassing this (as the
+                    # fixed-noise branch below does) makes ``enable_updates_rl`` a no-op on
+                    # behaviour -- the critic/actor train but never drive.
+                    return agent.sample_actions_with_vla(obs[None], seed=subkey), None
+                # Rollout-only / eval (no RL updates): the noise actor is still at its random
+                # init, so its samples are uncalibrated and near-zero-variance. Draw a bounded
+                # tanh-squashed latent instead -- the pi0 checkpoint tends to stall at
+                # standstill and only a *bounded* flow latent's variance reliably kicks it back
+                # out (see the sac_residual branch above / brake-ratio-stall note).
                 noise = jax.random.normal(subkey, (1, agent._flat_noise_dim()))
                 noise = jax.numpy.tanh(noise) * _vla_noise_scale
                 base = jax.numpy.asarray(agent.vla_sample_fn(obs[None], noise))
@@ -3968,6 +3986,8 @@ def run_online_residual(
     episode_collision_count = 0
     episode_collision_events = 0
     prev_collision_count = 0
+    episode_traffic_violations = 0
+    prev_traffic_violation_count = 0
     start_time = time.time()
 
     def _flush_checkpoint(step_tag: int) -> None:
@@ -4028,6 +4048,16 @@ def run_online_residual(
             episode_collision_count = max(episode_collision_count, collision_count)
             episode_collision_events += collision_delta
             prev_collision_count = collision_count
+            traffic_violation_count = int(info.get("traffic_violation_count", 0))
+            traffic_violation_delta = max(0, traffic_violation_count - prev_traffic_violation_count)
+            episode_traffic_violations += traffic_violation_delta
+            prev_traffic_violation_count = traffic_violation_count
+            if traffic_violation_delta > 0:
+                print(
+                    f"[main_carla] TRAFFIC VIOLATION at step {step}: "
+                    f"count={traffic_violation_count} episode_total={episode_traffic_violations}",
+                    flush=True,
+                )
 
             # Next base cands are diverse iff the next step runs OTF (step >= warmup).
             rng, nk = jax.random.split(rng)
@@ -4086,6 +4116,10 @@ def run_online_residual(
                 log_video=log_video, video_every=video_every,
                 action_flat=viz_action, exec_cfg=exec_cfg,
                 collision=(collision_count, episode_collision_events) if collision_delta > 0 else None,
+                traffic_violation=(
+                    (traffic_violation_count, episode_traffic_violations)
+                    if traffic_violation_delta > 0 else None
+                ),
                 steervla_actor=steervla_actor, hud=hud,
             )
             if live_viewer is not None and episode_frames:
@@ -4110,6 +4144,8 @@ def run_online_residual(
                 }
 
                 log["rollout/collision_events"] = float(collision_delta)
+                log["rollout/traffic_violation_events"] = float(traffic_violation_delta)
+                log["rollout/traffic_violation_count"] = float(traffic_violation_count)
                 if debug_task:
                     log["debug/step_reward"] = debug_step_reward
                     log.update(_drive_diagnostics_log(info))
@@ -4205,6 +4241,8 @@ def run_online_residual(
                 episode_collision_count = 0
                 episode_collision_events = 0
                 prev_collision_count = 0
+                episode_traffic_violations = 0
+                prev_traffic_violation_count = 0
                 obs, _info = env.reset(seed=FLAGS.seed + episode_count)
                 steervla_actor.reset_action_cache()
                 rng, nk = jax.random.split(rng)
@@ -4314,7 +4352,7 @@ def _run_residual_entry(config):
         raise ValueError("config.steervla.enabled must be true: residual RL needs a base policy.")
 
     extra_carla: dict[str, Any] = {}
-    exec_cfg = _steervla_action_execution_cfg(steervla_cfg, residual=True)
+    exec_cfg = _steervla_action_execution_cfg(steervla_cfg)
     if exec_cfg is not None:
         extra_carla["steervla_action_execution"] = exec_cfg
 
@@ -4444,12 +4482,64 @@ def _run_dsrl_entry(config):
     def _slug(s: str) -> str:
         return re.sub(r"[^0-9A-Za-z._-]+", "-", str(s)).strip("-") or "na"
 
+    def _coach_tag() -> str:
+        """What form the coaching takes, e.g. ``cast-gemini-hl+good_critic-none``.
+
+        Two independent sources can be active: the CAST-relabel session (window video -> VLM
+        -> per-chunk GOOD/BAD credit -> corrected subtask, optionally persisted as high-level
+        VLM-backbone training samples) and the DSRL critic's language label.
+        """
+        parts = []
+        cast_cfg = config.get("cast_relabel", None)
+        if cast_cfg is not None and bool(cast_cfg.get("enabled", False)):
+            tag = f"cast-{_slug(cast_cfg.get('provider', 'vlm'))}"
+            if bool(cast_cfg.get("store_hl_dataset", False)):
+                tag += "-hl"
+            if bool(cast_cfg.get("store_good_chunks", False)):
+                tag += "+good"
+            parts.append(tag)
+        lf_cfg = config.get("language_feedback", None)
+        if lf_cfg is not None:
+            src = str(lf_cfg.get("source", ""))
+            critic_mode = "vlm" if src == "vlm" else str(lf_cfg.get("expert_mode", "none"))
+        else:
+            critic_mode = str(config.get("critic_feedback_mode", "none"))
+        parts.append(f"critic-{_slug(critic_mode)}")
+        return "_".join(parts)
+
+    def _updates_tag() -> str:
+        """Which gradient updates are on, after the CLI flags override the config values."""
+
+        def _on(flag_value, cfg_value) -> bool:
+            return bool(cfg_value if flag_value is None else flag_value)
+
+        if not _on(FLAGS.enable_updates, config.get("enable_updates", True)):
+            return "noupd"
+        kinds = [
+            name
+            for name, flag_value, cfg_value in (
+                ("rl", FLAGS.enable_updates_rl, config.get("enable_updates_rl", True)),
+                ("bc", FLAGS.enable_updates_bc, config.get("enable_updates_bc", True)),
+                ("hl", FLAGS.enable_updates_bc_hl, config.get("enable_updates_bc_hl", True)),
+            )
+            if _on(flag_value, cfg_value)
+        ]
+        return "upd-" + "-".join(kinds) if kinds else "noupd"
+
     _agent_name = str(config.get("agent_name", "agent"))
     _route_name = str(FLAGS.route or "all-routes")
-    _exp_name_parts = [_slug(_agent_name)]
+    # The run name carries what the run *is*, not just which agent class it used: an optional
+    # CARLA_RUN_TAG (the experiment arm -- branch, ablation, ...), the coach form, which
+    # updates are enabled, and the route. A wandb sidebar full of concurrent runs is then
+    # readable without opening each one.
+    _run_tag = os.environ.get("CARLA_RUN_TAG", "").strip()
+    _exp_name_parts = [_slug(_run_tag)] if _run_tag else []
+    _exp_name_parts.append(_slug(_agent_name))
     if _agent_name == "best_of_n":
         _exp_name_parts.append(f"n{int(config.get('best_of_n', 10))}")
-    _exp_name_parts.extend([_slug(_route_name), get_exp_name(FLAGS.seed)])
+    _exp_name_parts.extend(
+        [_coach_tag(), _updates_tag(), _slug(_route_name), get_exp_name(FLAGS.seed)]
+    )
     exp_name = "_".join(_exp_name_parts)
     setup_wandb(project="OGBench-CARLA", group=FLAGS.run_group, name=exp_name, mode=wandb_mode)
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
