@@ -167,6 +167,8 @@ def get_config():
                 dict(name="simlingo_dataset_all_img512_1116", weight=0.2),
                 dict(name="simplified_reasoning_dataset", weight=0.1),
             ],
+            hl_checkpoint_every_steps=2000,
+            hl_checkpoint_dir="",
             # Local OpenPI inference (ignored when actor_url is set):
             # actor_config="pi05_steervla_cot_simplified_reasoning",
             actor_config="pi05_steervla_cot_simplified_reasoning_no_ego_history",

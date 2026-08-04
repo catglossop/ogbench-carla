@@ -1557,6 +1557,30 @@ def run_online_carla(
     bc_updates_on = enable_updates and enable_updates_bc
     hl_updates_on = enable_updates and enable_updates_bc_hl
     any_updates_on = rl_updates_on or bc_updates_on or hl_updates_on
+
+    # Export the HL-fine-tuned SteerVLA backbone as a redeployable params-only checkpoint every
+    # ``hl_checkpoint_every_steps`` env steps and at exit. Only when the HL update is actually running.
+    _steervla_cfg = agent_config.get("steervla", None)
+    _hl_ckpt_every = int(_steervla_cfg.get("hl_checkpoint_every_steps", 0)) if _steervla_cfg is not None else 0
+    _hl_ckpt_dir = str(_steervla_cfg.get("hl_checkpoint_dir", "") or "") if _steervla_cfg is not None else ""
+    _hl_ckpt_on = (
+        hl_updates_on
+        and _hl_ckpt_every > 0
+        and steervla_actor is not None
+        and bool(getattr(steervla_actor, "load_trainable_params", False))
+    )
+
+    def _save_steervla_ckpt(step_tag: int, *, final: bool = False) -> None:
+        if not _hl_ckpt_on or (not final and step_tag % _hl_ckpt_every != 0):
+            return
+        out_root = _hl_ckpt_dir or os.path.join(FLAGS.save_dir, "steervla_hl_ckpt")
+        try:
+            steervla_actor.save_checkpoint(out_root, int(step_tag))
+        except Exception as exc:  # noqa: BLE001 - checkpoint export must never kill training.
+            import traceback
+
+            print(f"[main_carla] SteerVLA HL checkpoint save failed (non-fatal): {exc}", flush=True)
+            traceback.print_exc()
     _online_training_mode = str(agent_config.get("online_training_mode", "rl")).strip().lower()
     _residual_warmup = int(agent_config.get("residual_warmup_steps", 0))
     # Rollout flow-latent scale for the frozen Pi0 base policy (see _sample_agent_action).
@@ -3754,6 +3778,8 @@ def run_online_carla(
         if agent is not None and any_updates_on and step % FLAGS.save_interval == 0:
             save_agent(agent, FLAGS.save_dir, step)
 
+        _save_steervla_ckpt(step)
+
     # online_steps was exhausted without the current episode ever hitting `done`
     # (no collision/success/off-route termination) -- the video/frame logging
     # inside the `if done:` block above never ran for it. Flush whatever frames
@@ -3771,6 +3797,9 @@ def run_online_carla(
         wandb.log(_tail_rollout_log, step=step)
 
     train_logger.close()
+
+    # Final export of the fine-tuned backbone at exit (in addition to the periodic saves above).
+    _save_steervla_ckpt(FLAGS.online_steps, final=True)
 
     if FLAGS.save_buffer:
         buffer_path = FLAGS.buffer_path or os.path.join(FLAGS.save_dir, "buffer.npz")

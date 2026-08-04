@@ -2753,6 +2753,29 @@ class SteerVLAActor:
 
         return out
 
+    def save_checkpoint(self, out_root: str | Path, step: int) -> Path | None:
+        """Export the (HL-fine-tuned) backbone as a redeployable, params-only OpenPI checkpoint.
+
+        Writes ``<out_root>/<step>/params`` in the layout :meth:`setup` loads, so it can be redeployed
+        frozen via ``steervla.checkpoint=<out_root>/<step>`` (same ``actor_config``,
+        ``load_trainable_params=False``). Saves the current inference params as ``{"params": params}``
+        like :func:`openpi.training.checkpoints.save_state` (no optimizer state). Norm stats are not
+        copied — this stack runs norm-off by default; to redeploy with ``STEERVLA_ENABLE_OPENPI_NORM=1``
+        also copy the source checkpoint's ``assets/``. No-op for a remote/non-trainable actor.
+        """
+        if self._remote is not None or self._train_state is None:
+            print("[steervla.save_checkpoint] skipped: actor is remote or not loaded trainable.", flush=True)
+            return None
+        import orbax.checkpoint as ocp
+
+        params_dir = Path(out_root) / str(int(step)) / "params"
+        params = self._params_for_inference(self._train_state.params)
+        jax.block_until_ready(params)
+        with ocp.PyTreeCheckpointer() as ckptr:
+            ckptr.save(params_dir, args=ocp.args.PyTreeSave({"params": params}), force=True)
+        print(f"[steervla.save_checkpoint] wrote params-only checkpoint -> {params_dir.parent}", flush=True)
+        return params_dir.parent
+
     def setup_qgf(
         self,
         critic_def,

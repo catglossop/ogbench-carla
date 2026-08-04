@@ -96,8 +96,8 @@ def get_config():
     config.steervla = ml_collections.ConfigDict(
         dict(
             enabled=True,
-            actor_config="pi05_steervla_cot_simplified_reasoning",
-            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning/pi05_steervla_cot_simplified_reasoning_20260523_222304/8000/",
+            actor_config="pi05_steervla_cot_simplified_reasoning_no_ego_history",
+            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_ego_history/pi05_steervla_simplified_reasoning_no_ego_history_v1/pi05_steervla_simplified_reasoning_no_ego_history_v1_20260718_201640/6000/",
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,
             include_ego_history=False,
