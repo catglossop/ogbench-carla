@@ -591,24 +591,41 @@ class BestOfNAgent(flax.struct.PyTreeNode):
         )
         return {"next_actions_critic": next_actions}
 
-    def update_with_vla(self, batch, run_rl: bool = True, run_hl: bool = True):
+    def update_with_vla(self, batch, run_rl: bool = True, run_hl: bool = True, global_step: int | None = None):
         """Flax update via :meth:`total_loss_vla` with eager VLA forwards and a jitted gradient core.
 
-        ``run_rl`` gates the critic/actor gradient step. ``run_hl`` is accepted for signature parity
-        with :class:`DSRLAgent` but is a no-op here — best-of-N has no high-level VLM backbone update.
+        ``run_rl`` gates the critic gradient step; ``run_hl`` gates the SteerVLA **high-level
+        (VLM-backbone) update** — :meth:`vlas.steervla.SteerVLAActor.update_hl` takes one (throttled)
+        gradient step on the stored ``cast_relabel`` HL dataset, exactly as in :class:`DSRLAgent`.
+        The actor holds its own OpenPI train state (a non-pytree field mutated in place), so the
+        update persists across the returned agent. This is what lets best-of-N run the CAST-relabel
+        training loop: the critic selects among CoT candidates, CAST relabels the executed chunks,
+        and the backbone is fine-tuned on the corrected subtasks.
         """
         new_rng, rng = jax.random.split(self.rng)
-        if not run_rl:
-            return self.replace(rng=new_rng), {}
-        batch = self._prepare_vla_batch(batch)
-        vla_cache = self._precompute_vla_loss_cache(batch, rng)
+        info = {}
+        agent = self
 
-        def loss_fn(grad_params):
-            return self.total_loss_vla(batch, grad_params, rng=rng, vla_cache=vla_cache)
+        if run_rl:
+            batch = self._prepare_vla_batch(batch)
+            vla_cache = self._precompute_vla_loss_cache(batch, rng)
 
-        new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
-        self.target_update(new_network)
-        return self.replace(network=new_network, rng=new_rng), info
+            def loss_fn(grad_params):
+                return self.total_loss_vla(batch, grad_params, rng=rng, vla_cache=vla_cache)
+
+            new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
+            self.target_update(new_network)
+            agent = self.replace(network=new_network, rng=new_rng)
+        else:
+            agent = self.replace(rng=new_rng)
+
+        # High-level SteerVLA update (no-op unless the actor was loaded trainable and has HL data).
+        if run_hl and agent.steervla_actor is not None and hasattr(agent.steervla_actor, "update_hl"):
+            hl_info = agent.steervla_actor.update_hl(global_step=global_step)
+            if hl_info:
+                info = {**info, **{f"vla_hl/{k}": v for k, v in hl_info.items()}}
+
+        return agent, info
 
     # ----- construction --------------------------------------------------- #
 
