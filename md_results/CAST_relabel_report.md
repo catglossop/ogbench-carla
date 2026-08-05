@@ -344,6 +344,60 @@ the config and the `--train-mode` flag `run_carla.sh` writes, the residual branc
 `return best_chunk, None` whenever `_residual_2d` is false. Jobs 47/48 logs confirm
 `train_mode=rl` with zero residual mentions.
 
+## Why group B gave poor results, and the fix (commit `623604a`)
+
+Groups B and C were not the same experiment minus the residual — they used **different
+best-of-N mechanisms**:
+
+| | B/D `agent_name=best_of_n` | C `agent_name=dsrl` + `--bon_critic_ckpt` |
+|---|---|---|
+| sampler | `SteerVLAActor.sample_candidates` — one **batched** forward | `main_carla._sample_diverse_candidates` — one at a time |
+| action cache | never reset between draws | `reset_cache()` per draw |
+| diversity | CoT temperature only | up to `--bon_max_sample_attempts` resamples, Jaccard-scored |
+| scorer | agent's internal critic | frozen `_bon_q_fn` closure |
+
+The actor caches one action chunk per env-step cadence, and `_sample_diverse_candidates`
+resets it precisely because otherwise "every draw [would be] identical" — the batched path
+never does, so B's candidates could collapse toward the same action.
+
+**Fix:** new `steervla_bon_cast_config.py` uses the flag-driven selector with a static critic,
+CAST/HL supervision and **no residual**; `steervla_bon_cast_residual_config.py` is re-parented
+onto it. A full config-tree diff now shows the two differ by exactly:
+
+```
+enable_updates_rl      False            -> True
+online_training_mode   'rl'             -> 'sac_residual'
+residual_action_space  'waypoint_chunk' -> 'accel_steer'
+residual_action_scale  0.3              -> (0.6, 0.6)
+residual_action_clip   None             -> 1.0
+```
+
+i.e. nothing but the residual. `steervla_bon_cast_relabel_config.py` is marked deprecated.
+
+### Invocation for the no-residual variant
+
+```bash
+./carla_job.sh start --job <k> --train-gpu <jax-rank> --render-adapter <phys> --route <route> -- \
+  --agent-config impls/configs/steervla_bon_cast_config.py \
+  --bon-critic-ckpt /raid/users/cglossop/critic_ckpts/step_0012000.pkl \
+  --bon-num-candidates 10 \
+  --pid-stuck-threshold 150 \
+  --hl-gpu <jax-rank> --online-steps 20000 \
+  --train-mode rl --critic-mode none \
+  --run-group <group> --save-buffer false -- \
+  --agent.siglip_device=cuda:<phys> \
+  --save_dir=<root>/exp \
+  --enable_updates=true --enable_updates_rl=false \
+  --enable_updates_bc=false --enable_updates_bc_hl=true
+```
+
+The residual variant is identical except `--agent-config …_residual_config.py`,
+`--train-mode sac_residual` and `--enable_updates_rl=true`. **`--train-mode` must be passed**:
+`run_carla.sh` always writes `config.online_training_mode` from it, so omitting it silently
+overwrites the config's value. Do **not** pass `--agent.steervla.cot_temperature` — both
+configs pin `cot_temperature` and `vla_cot_temperature` to 0.5 themselves, and the override
+would move only one of the pair.
+
 ## Results
 
 *(route metrics filled in as runs complete)*
