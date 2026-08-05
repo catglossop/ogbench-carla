@@ -134,18 +134,219 @@ datasets.
   It has already fired twice and kept the cgroup `oom_kill` counter from advancing.
 - `ramwatch.sh` — host RAM, cgroup `oom_kill` counter and per-process RSS every 30 s.
 
+## Second config: Best-of-N + CAST relabel (2026-08-04)
+
+`impls/configs/steervla_bon_cast_relabel_config.py` (commit `b088788`) merges critic-guided
+Best-of-N selection with the CAST-relabel HL training path. Run on two routes, replacing the
+cast-only runs there:
+
+| job | route | GPU | replaces |
+|---|---|---|---|
+| 47 | `merger-into-slow-traffic-v2-005` | 4 | job 43 (stopped at 12 670/20 000) |
+| 48 | `generalization-wall-1095` | 5 | job 48 (stopped at 12 810/20 000) |
+
+Differences from the cast-only runs above:
+
+- `agent_name=best_of_n`, `best_of_n=10` candidates per env step, `vla_cot_temperature=0.5`.
+  The config pins **both** `cot_temperature` and `vla_cot_temperature` to 0.5 itself, so no CLI
+  override is passed — moving only one of the pair would desync them.
+- `critic_pretrained_weights=/raid/users/cglossop/critic_ckpts/step_0012000.pkl`, used purely to
+  rank candidates. Shape-checked before launch: `value_net/Dense_0/kernel` is `(2, 3496, 256)`
+  — ensemble dim 2 and input width **3496 = 3×1152 + 40**, exactly what the config documents.
+- `hl_update_batch_size=16` (not 2), `hl_update_every=5`, `hl_update_num_steps=2`.
+- **`enable_updates_rl=true`** — see below.
+
+### Why RL updates must be on for Best-of-N
+
+The config ships `enable_updates_rl=False` (critic frozen, only HL gradients flow), but with
+that setting **the Best-of-N path never fires**. `main_carla.py:2882` gates the agent's own
+action-selection path on `rl_updates_on`:
+
+```python
+if rl_updates_on and hasattr(agent, "sample_actions_with_vla"):
+    return agent.sample_actions_with_vla(obs[None], seed=subkey), None
+# else: fixed tanh-squashed latent, single sample
+```
+
+and `BestOfNAgent.sample_actions_with_vla` *is* the candidate sampling + critic argmax. So with
+RL updates off the run silently degrades to a single-sample rollout with no selection at all.
+Launched with `--enable_updates_rl=true`, confirmed in both logs:
+
+```
+[main_carla] updates enabled -> rl=True bc=False hl=True
+[best_of_n] loaded pretrained critic from /raid/users/cglossop/critic_ckpts/step_0012000.pkl
+```
+
+and the selection is demonstrably live — 10 distinct candidates per step at temp 0.50:
+
+```
+[best_of_n][cand 0] temp=0.50 subtask='The vehicle accelerates normally while making a slight adjustment to the left.'
+[best_of_n][cand 1] temp=0.50 subtask='The vehicle accelerates normally, following the route with steady lane keeping and a slight rightward adjustment.'
+[best_of_n][cand 2] temp=0.50 subtask='The vehicle accelerates normally and makes a sharp left adjustment.'
+```
+
+Side effect worth knowing: with RL on, the critic no longer stays frozen at its pretrained
+weights — it keeps training during the run, which is not what the config's docstring intends.
+The cleaner fix is to make the gate agent-aware (Best-of-N's selection does not depend on RL
+updates at all, since its critic is pretrained), rather than coupling selection to the update
+switch. Not changed here.
+
+## Third config: static-critic Best-of-N + residual RL + CAST relabel (2026-08-04)
+
+`impls/configs/steervla_bon_cast_residual_config.py` — three mechanisms on one rollout:
+frozen-critic Best-of-N picks *which* pi0 proposal to follow, a SAC residual *corrects* the
+control it decodes to, and CAST relabel supervises the VLM backbone.
+
+Queued on all five routes as jobs **50-54** (20 000 steps each), starting as GPUs free:
+
+| job | route | status |
+|---|---|---|
+| 50 | `signalized-junction-left-turn-001` | running (GPU 7, smoke test) |
+| 51 | `opposite-vehicle-running-red-light-004` | queued |
+| 52 | `enter-actor-flow-004` | queued |
+| 53 | `merger-into-slow-traffic-v2-005` | queued |
+| 54 | `generalization-wall-1095` | queued |
+
+### This combination did not previously exist
+
+Neither loop supported all three, and no config combined cast with residual:
+
+| loop | entry | cast_relabel | BoN | residual |
+|---|---|---|---|---|
+| `run_online_carla` | everything else | 22 refs | 13 refs | 23 refs |
+| `run_online_residual` | `agent_name="sac_residual"` | **0 refs** | 1 | 38 |
+
+`run_online_carla` has all three but they did not compose: every Best-of-N branch in
+`_sample_agent_action` did `return best_chunk, None` **before** the residual branch, so the
+residual actor never ran. Three explicit guards encoded this, raising
+`"--bon_critic_ckpt … is incompatible with --train_mode='sac_residual'; use --train_mode=rl"`.
+
+**Change made.** A new `_bon_selected_to_action(best_chunk, subkey)` helper hands the selected
+chunk to the residual instead of executing it: PID-decode to `[accel, steer]`, then
+`sample_actions_sac_residual(..., base_action=base2d)`, returning the usual
+`(action, base_action)` pair so the buffer stores the base alongside the executed action.
+During `residual_warmup_steps` it executes the selected candidate unmodified, so the residual's
+critic sees on-distribution base actions first. All six Best-of-N return sites (critic-ckpt,
+Gemini, online-critic; each with a cached-chunk and a fresh-score path) route through it, and
+it is a no-op outside `accel_steer` residual mode. The three guards were narrowed from "any
+residual mode" to "any residual mode that is not `accel_steer`" — the chunk-space residual
+genuinely cannot consume a selected chunk this way. The inline `residual_action_space` check is
+used rather than `_residual_2d`, which is not defined until ~270 lines later.
+
+### Configuration
+
+Inherits `steervla_cast_relabel_train_config` (so the whole CAST/HL block is unchanged), then:
+
+| knob | value | note |
+|---|---|---|
+| `agent_name` | `dsrl` | the residual actor lives on `DSRLAgent`, not `BestOfNAgent` |
+| `online_training_mode` | `sac_residual` | must also be passed as `--train-mode`, or `run_carla.sh` overwrites it with `rl` |
+| selection critic | `--bon-critic-ckpt …/step_0012000.pkl`, `--bon-num-candidates 10` | **static** — no gradient ever touches it |
+| `residual_action_space` | `accel_steer` | residual perturbs 2-D `[accel, steer]` |
+| `residual_action_scale` | `(0.6, 0.6)` | |
+| `residual_warmup_steps` | 500 | |
+| **`batch_size`** | **64** | as requested, for the RL update |
+| `enable_updates_rl` | **True** | drives the residual SAC update *and* gates selection |
+| `enable_updates_bc_hl` | True | CAST HL update |
+| `vla_cot_temperature` / `steervla.cot_temperature` | 0.5 / 0.5 | set in the config, so no CLI override |
+
+Two critics are in play and they are not the same object: the **selection** critic is frozen at
+its pretrained weights, while `update_sac_residual` trains its own DSRL TD critic alongside the
+residual MLP. "Static critic" therefore holds for selection even though RL updates are on.
+
+Smoke test (job 50) confirms all three active:
+
+```
+[run_carla.sh] train_mode=sac_residual
+[main_carla] updates enabled -> rl=True bc=False hl=True
+[main_carla] Best-of-N action selection enabled: ckpt=…/step_0012000.pkl N=10 obs_enc_dim=3456
+[main_carla] CAST relabel enabled (provider=gemini, window=150 env steps, debug=True)
+```
+
+`obs_enc_dim=3456` = 3×1152, matching the checkpoint's `(2, 3496, 256)` input kernel
+(3456 + 40 for the action chunk).
+
+**Route note:** the request said `generalization-wall-005`, which is not in the registry — the
+fail2drive wall routes are 1095-1099. Used **`generalization-wall-1095`**, the same route as the
+earlier rounds.
+
+## Runs and W&B ids
+
+All in W&B project **`OGBench-CARLA`**, group **`DevVsCastRelabel`**
+(`https://wandb.ai/catglossop/OGBench-CARLA/runs/<id>`). Snapshot 2026-08-04 11:37.
+
+### A — cast-only (`steervla_cast_relabel_train_config`, HL-only, cot 0.5)
+
+| job | run id | route | steps | `Cannot spawn actor` | status |
+|---|---|---|---|---|---|
+| 46 | `92wbycqg` | enter-actor-flow-004 | 11 588 | 33 | running |
+| 41 | `vugzu8bc` | signalized-junction-left-turn-001 | 10 574 | 16 | running |
+| 42 | `8hst74l6` | opposite-vehicle-running-red-light-004 | **20 000** | 39 | **complete** |
+| 43 | `ra5p742b` | merger-into-slow-traffic-v2-005 | 12 670 | 146 | stopped (replaced by 47) |
+| 44 | `97eev74o` | generalization-wall-1095 | 12 810 | 0 | stopped (replaced by 48) |
+| 45 | `0wvli7wp` | generalization-animals-1081 | 12 120 | **0** | stopped on request |
+
+### B — Best-of-N + cast (`steervla_bon_cast_relabel_config`)
+
+⚠️ Launched with `enable_updates_rl=true`, so the pretrained ranking critic **trained during the
+run** instead of staying frozen — see "The critic was not static in runs 47/48" below. Superseded
+by jobs 55/56.
+
+| job | run id | route | steps | status |
+|---|---|---|---|---|
+| 47 | `yse2tuzl` | merger-into-slow-traffic-v2-005 | **20 000** | complete (drifting critic) |
+| 48 | `w3lakhnw` | generalization-wall-1095 | **20 000** | complete (drifting critic) |
+
+### C — Best-of-N + residual RL + cast (`steervla_bon_cast_residual_config`)
+
+Static selection critic (`_bon_q_fn`, a jitted closure over fixed params); the RL updates train
+the residual actor and its own separate TD critic.
+
+| job | run id | route | steps | status |
+|---|---|---|---|---|
+| 50 | `sqrj9v26` | signalized-junction-left-turn-001 | 2 237 | running |
+| 51 | `m3mlx4nj` | opposite-vehicle-running-red-light-004 | 1 686 | running |
+| 52 | `vsjgxk2p` | enter-actor-flow-004 | 160 | running |
+| 53 | `akdg92ko` | merger-into-slow-traffic-v2-005 | 6 | running |
+| 54 | *(pending)* | generalization-wall-1095 | — | queued |
+
+### D — Best-of-N + cast, RL **off** — corrected re-runs of 47/48
+
+| job | run id | route | steps | status |
+|---|---|---|---|---|
+| 55 | *(pending)* | merger-into-slow-traffic-v2-005 | — | queued |
+| 56 | *(pending)* | generalization-wall-1095 | — | queued |
+
+## The critic was not static in runs 47/48
+
+`BestOfNAgent.update_with_vla(run_rl=True)` runs `apply_loss_fn(total_loss_vla)` +
+`target_update`, and `total_loss_vla` includes `_critic_loss_vla_pure_math` — so with RL updates
+on, the critic loaded from `critic_pretrained_weights` keeps training. Job 47's `train.csv`
+confirms it fired: **1 996 gradient updates**, first at step 50 (right after `warmup_steps=50`),
+last at step 20 000, mean 1.85 s each.
+
+Root cause was a single flag controlling two unrelated things. `main_carla.py:2930` gated the
+agent's action-selection path on `rl_updates_on`, and `BestOfNAgent.sample_actions_with_vla`
+*is* the candidate sampling + critic argmax — so `enable_updates_rl=false` silently degraded the
+run to a single sample with no selection, while `true` fired selection *and* trained the critic.
+
+**Fix:** `_selection_needs_no_rl = (agent_name == "best_of_n")`, and the gate became
+`if (rl_updates_on or _selection_needs_no_rl) and hasattr(agent, "sample_actions_with_vla")`.
+Best-of-N has no noise actor and ranks with a frozen pretrained critic, so its selection never
+depended on RL updates. Jobs 55/56 re-run the two routes with `enable_updates_rl=false`: BoN
+selection fires, the critic stays pinned at `step_0012000.pkl`, and only the HL update trains.
+
+**No residual is involved in group B or D.** `BestOfNAgent` contains zero residual code
+(`grep -c residual impls/jax_agents/best_of_n.py` = 0), `online_training_mode` is `rl` in both
+the config and the `--train-mode` flag `run_carla.sh` writes, the residual branch at
+`main_carla.py:2902` needs both a residual training mode *and*
+`hasattr(agent, "sample_actions_sac_residual")`, and `_bon_selected_to_action` short-circuits to
+`return best_chunk, None` whenever `_residual_2d` is false. Jobs 47/48 logs confirm
+`train_mode=rl` with zero residual mentions.
+
 ## Results
 
-*(filled in as runs complete)*
-
-| job | route | steps | episodes | RouteCompletion | driving score | collisions | `Cannot spawn actor` | status |
-|---|---|---|---|---|---|---|---|---|
-| 46 | enter-actor-flow-004 | | | | | | | running |
-| 41 | signalized-junction-left-turn-001 | | | | | | | running |
-| 42 | opposite-vehicle-running-red-light-004 | | | | | | | running |
-| 43 | merger-into-slow-traffic-v2-005 | | | | | | | running |
-| 44 | generalization-wall-1095 | | | | | | | running |
-| 45 | generalization-animals-1081 | | | | | | | running |
+*(route metrics filled in as runs complete)*
 
 ## Inspecting
 

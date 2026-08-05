@@ -1554,6 +1554,11 @@ def run_online_carla(
     # Effective per-kind gates: RL = DSRL critic/actor, BC = full DAgger imitation path,
     # HL = high-level VLM backbone update (``update_hl`` on cast_relabel data).
     rl_updates_on = enable_updates and enable_updates_rl
+    # Best-of-N selects with a frozen pretrained critic and has no noise actor, so its
+    # action-selection path is valid regardless of whether RL updates run. Keep the two
+    # concerns separate: enable_updates_rl should decide whether the critic *trains*, not
+    # whether selection happens at all.
+    _selection_needs_no_rl = str(agent_config.get("agent_name", "")) == "best_of_n"
     bc_updates_on = enable_updates and enable_updates_bc
     hl_updates_on = enable_updates and enable_updates_bc_hl
     any_updates_on = rl_updates_on or bc_updates_on or hl_updates_on
@@ -1596,11 +1601,17 @@ def run_online_carla(
     _bon_n = max(1, int(FLAGS.bon_num_candidates))
     _bon_q_fn = None
     if FLAGS.bon_critic_ckpt:
-        if _online_training_mode in {"sac_residual", "dagger_residual"}:
+        if _online_training_mode in {"sac_residual", "dagger_residual"} and (
+            str(agent_config.get("residual_action_space", "waypoint_chunk")).strip().lower()
+            != "accel_steer"
+        ):
             raise ValueError(
-                "--bon_critic_ckpt selects actions straight from the pi0 base policy and "
-                f"is incompatible with --train_mode={_online_training_mode!r}; use "
-                "--train_mode=rl (no residual actor) instead."
+                "--bon_critic_ckpt selects a chunk straight from the pi0 base policy, which the "
+                "residual actor can only consume once it has been PID-decoded to [accel, "
+                f"steer]; --train_mode={_online_training_mode!r} therefore needs "
+                "residual_action_space='accel_steer' (best-of-N picks the base action, the "
+                "residual corrects it -- see _bon_selected_to_action). Use --train_mode=rl "
+                "for no residual actor at all."
             )
         if siglip_encoder is None:
             raise ValueError("--bon_critic_ckpt requires image_encoder='siglip' (for critic obs_enc).")
@@ -1644,11 +1655,17 @@ def run_online_carla(
     if _bon_online:
         if FLAGS.bon_critic_ckpt:
             raise ValueError("--bon_online_critic and --bon_critic_ckpt are mutually exclusive.")
-        if _online_training_mode in {"sac_residual", "dagger_residual"}:
+        if _online_training_mode in {"sac_residual", "dagger_residual"} and (
+            str(agent_config.get("residual_action_space", "waypoint_chunk")).strip().lower()
+            != "accel_steer"
+        ):
             raise ValueError(
-                "--bon_online_critic selects actions straight from the pi0 base policy and "
-                f"is incompatible with --train_mode={_online_training_mode!r}; use "
-                "--train_mode=rl (no residual actor) instead."
+                "--bon_online_critic selects a chunk straight from the pi0 base policy, which the "
+                "residual actor can only consume once it has been PID-decoded to [accel, "
+                f"steer]; --train_mode={_online_training_mode!r} therefore needs "
+                "residual_action_space='accel_steer' (best-of-N picks the base action, the "
+                "residual corrects it -- see _bon_selected_to_action). Use --train_mode=rl "
+                "for no residual actor at all."
             )
         if FLAGS.eval_only:
             raise ValueError(
@@ -1666,11 +1683,17 @@ def run_online_carla(
                 "--bon_gemini_select is mutually exclusive with --bon_critic_ckpt / "
                 "--bon_online_critic."
             )
-        if _online_training_mode in {"sac_residual", "dagger_residual"}:
+        if _online_training_mode in {"sac_residual", "dagger_residual"} and (
+            str(agent_config.get("residual_action_space", "waypoint_chunk")).strip().lower()
+            != "accel_steer"
+        ):
             raise ValueError(
-                "--bon_gemini_select selects actions straight from the pi0 base policy and "
-                f"is incompatible with --train_mode={_online_training_mode!r}; use "
-                "--train_mode=rl (no residual actor) instead."
+                "--bon_gemini_select selects a chunk straight from the pi0 base policy, which the "
+                "residual actor can only consume once it has been PID-decoded to [accel, "
+                f"steer]; --train_mode={_online_training_mode!r} therefore needs "
+                "residual_action_space='accel_steer' (best-of-N picks the base action, the "
+                "residual corrects it -- see _bon_selected_to_action). Use --train_mode=rl "
+                "for no residual actor at all."
             )
         from gemini_bon_selector import GeminiActionSelector
 
@@ -2759,6 +2782,36 @@ def run_online_carla(
         return shifted.reshape(ah * ad)
 
     last_update_info = None
+    def _bon_selected_to_action(best_chunk, subkey):
+        """Hand a best-of-N selected chunk to the residual actor, or execute it directly.
+
+        Best-of-N and the residual actor answer different questions -- selection picks *which*
+        pi0 proposal to follow, the residual then *corrects* the control it decodes to -- so in
+        a residual run the selected chunk is the residual's base action rather than the executed
+        action. Without this the BoN branches returned the chunk straight out of
+        ``_sample_agent_action`` and the residual actor never ran at all.
+
+        Only the ``accel_steer`` residual space is wired up: the chunk is PID-decoded to
+        ``[accel, steer]`` and the residual perturbs those two numbers. Returns the usual
+        ``(action, base_action_or_None)`` pair so the caller stores the base alongside the
+        executed action in the replay buffer.
+        """
+        if not _residual_2d:
+            return best_chunk, None
+        _last_vla_chunk_holder[0] = np.asarray(best_chunk[0], dtype=np.float32)
+        base2d = _decode_chunk_to_accel_steer(
+            _accel_steer_decoder, np.asarray(best_chunk)[0], obs_raw["state"]
+        )[None]
+        if step <= _residual_warmup:
+            # Warmup executes the selected candidate unmodified (zero residual), so the
+            # residual's critic sees on-distribution base actions before it starts steering.
+            base = jax.numpy.asarray(base2d)
+            return base, base
+        temperature = 0.0 if _online_training_mode == "dagger_residual" else 1.0
+        return agent.sample_actions_sac_residual(
+            obs[None], seed=subkey, temperature=temperature, base_action=base2d
+        )
+
     def _sample_agent_action(subkey):
         """Rollout policy; returns ``(action, base_action_or_None)``."""
         # master 63e19f7: pause the CARLA sim across the (slow) VLA forward so sim time
@@ -2797,14 +2850,14 @@ def run_online_carla(
                     _bon_rollout_step[0] += 1
                     best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
                     _last_vla_chunk_holder[0] = shifted
-                    return best_chunk, None
+                    return _bon_selected_to_action(best_chunk, subkey)
                 chunks, q_vals, best_idx = _score_candidates_with_critic(subkey)
                 best_chunk = chunks[best_idx][None]  # (1, 40)
                 _last_vla_chunk_holder[0] = np.asarray(best_chunk[0], dtype=np.float32)
                 if FLAGS.bon_critic_rollout_chunk:
                     _bon_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
                     _bon_rollout_step[0] = 1  # step 0 was just returned by the fresh score
-                return best_chunk, None
+                return _bon_selected_to_action(best_chunk, subkey)
             if _gemini_selector is not None and getattr(agent, "vla_sample_fn", None) is not None:
                 _ah = int(_steervla_exec_cfg["action_horizon"]) if _steervla_exec_cfg is not None else 1
                 if (
@@ -2820,14 +2873,14 @@ def run_online_carla(
                     _gemini_rollout_step[0] += 1
                     best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
                     _last_vla_chunk_holder[0] = shifted
-                    return best_chunk, None
+                    return _bon_selected_to_action(best_chunk, subkey)
                 chunks, scores, best_idx = _score_candidates_with_gemini(subkey)
                 best_chunk = chunks[best_idx][None]  # (1, 40)
                 _last_vla_chunk_holder[0] = np.asarray(best_chunk[0], dtype=np.float32)
                 if FLAGS.bon_gemini_rollout_chunk:
                     _gemini_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
                     _gemini_rollout_step[0] = 1  # step 0 was just returned by the fresh query
-                return best_chunk, None
+                return _bon_selected_to_action(best_chunk, subkey)
             if _bon_online and getattr(agent, "vla_sample_fn", None) is not None:
                 _ah = int(_steervla_exec_cfg["action_horizon"]) if _steervla_exec_cfg is not None else 1
                 if (
@@ -2844,7 +2897,7 @@ def run_online_carla(
                     _bon_rollout_step[0] += 1
                     best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
                     _last_vla_chunk_holder[0] = shifted
-                    return best_chunk, None
+                    return _bon_selected_to_action(best_chunk, subkey)
                 chunks_np, candidate_subtasks = _sample_diverse_candidates(subkey, _bon_n)
                 if FLAGS.bon_include_brake_candidate:
                     chunks_np, candidate_subtasks = _append_brake_candidate(chunks_np, candidate_subtasks)
@@ -2869,7 +2922,7 @@ def run_online_carla(
                 if FLAGS.bon_critic_rollout_chunk:
                     _bon_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
                     _bon_rollout_step[0] = 1  # step 0 was just returned by the fresh score
-                return best_chunk, None
+                return _bon_selected_to_action(best_chunk, subkey)
             if _online_training_mode in {"sac_residual", "dagger_residual"} and hasattr(agent, "sample_actions_sac_residual"):
                 noise = jax.random.normal(subkey, (1, agent._flat_noise_dim()))
                 # Match master's rollout noise (bounded tanh noise-actor output, not raw
@@ -2903,11 +2956,18 @@ def run_online_carla(
                 temperature = 0.0 if _online_training_mode == "dagger_residual" else 1.0
                 return agent.sample_actions_sac_residual(obs[None], seed=subkey, temperature=temperature)
             if getattr(agent, "vla_sample_fn", None) is not None:
-                if rl_updates_on and hasattr(agent, "sample_actions_with_vla"):
+                if (rl_updates_on or _selection_needs_no_rl) and hasattr(agent, "sample_actions_with_vla"):
                     # DSRL proper: the learned noise actor picks the flow latent, so the RL
                     # updates actually steer the executed policy. Bypassing this (as the
                     # fixed-noise branch below does) makes ``enable_updates_rl`` a no-op on
                     # behaviour -- the critic/actor train but never drive.
+                    #
+                    # ``_selection_needs_no_rl`` covers best-of-N, whose selection does NOT
+                    # depend on RL updates: it has no noise actor, and its critic is a frozen
+                    # pretrained ranker. Gating it on ``rl_updates_on`` forced a choice between
+                    # "best-of-N fires" and "the critic stays static", which are meant to be
+                    # independent -- and silently degraded the run to a single sample when RL
+                    # was off.
                     return agent.sample_actions_with_vla(obs[None], seed=subkey), None
                 # Rollout-only / eval (no RL updates): the noise actor is still at its random
                 # init, so its samples are uncalibrated and near-zero-variance. Draw a bounded

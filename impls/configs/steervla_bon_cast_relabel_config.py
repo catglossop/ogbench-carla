@@ -1,5 +1,19 @@
 """``get_config()`` for **Best-of-N selection + CAST-relabel high-level training**.
 
+.. deprecated::
+   **Superseded by :mod:`configs.steervla_bon_cast_config`.** This variant selects through
+   ``BestOfNAgent`` -> ``SteerVLAActor.sample_candidates``, which draws all N CoTs in a single
+   batched forward and never resets the actor's action cache between draws. The cache holds one
+   action chunk per env-step cadence, so candidates can collapse toward the same action; runs
+   on this path gave poor results (W&B ``yse2tuzl``, ``w3lakhnw``).
+
+   ``steervla_bon_cast_config`` uses the flag-driven path instead
+   (``--bon_critic_ckpt`` -> ``main_carla._sample_diverse_candidates``), which samples one
+   candidate at a time, resets the cache between draws, and resamples up to
+   ``--bon_max_sample_attempts`` times per slot for subtask diversity. It is also the exact
+   base of ``steervla_bon_cast_residual_config``, so the with/without-residual comparison is
+   controlled. Prefer it for new runs.
+
 This is the merge of ``steervla_best_of_n_config.py`` (critic-guided selection over CoT
 candidates) and ``steervla_cast_relabel_train_config.py`` (VLM window review -> per-chunk
 GOOD/BAD credit -> corrected subtasks -> OpenPI VLM-backbone gradient step). The two compose
