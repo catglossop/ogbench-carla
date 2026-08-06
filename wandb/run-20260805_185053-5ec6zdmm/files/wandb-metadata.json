@@ -1,0 +1,15 @@
+{
+  "os":  "Linux-6.8.0-55-generic-x86_64-with-glibc2.39",
+  "python":  "CPython 3.11.15",
+  "startedAt":  "2026-08-06T01:50:53.607762Z",
+  "program":  "<python with no main file>",
+  "git":  {
+    "remote":  "git@github.com:catglossop/ogbench-carla.git",
+    "commit":  "17fc46cebd12fb24a8b0ce37def4b0f2bb1f023f"
+  },
+  "email":  "catherine.glossop@mail.utoronto.ca",
+  "root":  "/home/cglossop/ogbench-carla",
+  "host":  "bellman",
+  "executable":  "/home/cglossop/ogbench-carla/.venv/bin/python",
+  "writerId":  "wfgqfr63rxy10z4s4v8wo0t4651kpsdj"
+}

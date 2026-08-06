@@ -2753,7 +2753,7 @@ class SteerVLAActor:
 
         return out
 
-    def save_checkpoint(self, out_root: str | Path, step: int) -> Path | None:
+    def save_checkpoint(self, out_root: str | Path, step: int, *, keep_last: int = 0) -> Path | None:
         """Export the (HL-fine-tuned) backbone as a redeployable, params-only OpenPI checkpoint.
 
         Writes ``<out_root>/<step>/params`` in the layout :meth:`setup` loads, so it can be redeployed
@@ -2762,6 +2762,11 @@ class SteerVLAActor:
         like :func:`openpi.training.checkpoints.save_state` (no optimizer state). Norm stats are not
         copied — this stack runs norm-off by default; to redeploy with ``STEERVLA_ENABLE_OPENPI_NORM=1``
         also copy the source checkpoint's ``assets/``. No-op for a remote/non-trainable actor.
+
+        ``keep_last`` > 0 prunes older step directories under ``out_root`` after a successful write,
+        retaining only the newest ``keep_last``. Each checkpoint is ~10 GB, so an un-pruned run at
+        ``hl_checkpoint_every_steps=2000`` over 20k env steps leaves ~100 GB behind; the pruning is
+        deliberately post-write so a failed save can never delete a good earlier checkpoint.
         """
         if self._remote is not None or self._train_state is None:
             print("[steervla.save_checkpoint] skipped: actor is remote or not loaded trainable.", flush=True)
@@ -2774,7 +2779,29 @@ class SteerVLAActor:
         with ocp.PyTreeCheckpointer() as ckptr:
             ckptr.save(params_dir, args=ocp.args.PyTreeSave({"params": params}), force=True)
         print(f"[steervla.save_checkpoint] wrote params-only checkpoint -> {params_dir.parent}", flush=True)
+        if int(keep_last) > 0:
+            self._prune_checkpoints(out_root, keep_last=int(keep_last))
         return params_dir.parent
+
+    @staticmethod
+    def _prune_checkpoints(out_root: str | Path, *, keep_last: int) -> None:
+        """Delete all but the ``keep_last`` newest numeric step dirs under ``out_root``.
+
+        Best-effort: a pruning failure must never take down a training run, and a partially-removed
+        directory is no worse than the disk pressure it was trying to relieve.
+        """
+        import shutil
+
+        try:
+            root = Path(out_root)
+            steps = sorted(
+                (int(p.name) for p in root.iterdir() if p.is_dir() and p.name.isdigit()),
+            )
+            for stale in steps[: max(0, len(steps) - int(keep_last))]:
+                shutil.rmtree(root / str(stale), ignore_errors=True)
+                print(f"[steervla.save_checkpoint] pruned old checkpoint {root / str(stale)}", flush=True)
+        except Exception as exc:  # noqa: BLE001 - pruning is best-effort.
+            print(f"[steervla.save_checkpoint] checkpoint pruning failed (non-fatal): {exc}", flush=True)
 
     def setup_qgf(
         self,

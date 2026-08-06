@@ -143,8 +143,15 @@ flags.DEFINE_bool(
     "then switch to the PDM-Lite expert for the remainder of the episode.",
 )
 
-# flags.DEFINE_string("save_dir", "/raid/users/celine/carla_exps", "Save directory.")
-flags.DEFINE_string("save_dir", "/home/celinet/carla_exps", "Save directory.")
+# Run artifacts root; the run's own dir is <save_dir>/<project>/<run_group>/<exp_name>, holding
+# videos/, trajectories/, checkpoints/, cast_relabel/ and flags.json.
+# The previous default (/home/celinet/carla_exps) pointed at a home directory that does not exist
+# on this box, so any launch that did not pass --save_dir died at startup with PermissionError
+# before CARLA even connected. Overridable per run with --save_dir, or globally with
+# OGBENCH_SAVE_DIR for a machine whose scratch lives somewhere else.
+flags.DEFINE_string(
+    "save_dir", os.environ.get("OGBENCH_SAVE_DIR", "/raid/users/cglossop/exps"), "Save directory."
+)
 flags.DEFINE_string("restore_path", None, "Restore path for JAX agents.")
 flags.DEFINE_integer("restore_epoch", None, "Restore epoch.")
 flags.DEFINE_string(
@@ -1568,19 +1575,38 @@ def run_online_carla(
     _steervla_cfg = agent_config.get("steervla", None)
     _hl_ckpt_every = int(_steervla_cfg.get("hl_checkpoint_every_steps", 0)) if _steervla_cfg is not None else 0
     _hl_ckpt_dir = str(_steervla_cfg.get("hl_checkpoint_dir", "") or "") if _steervla_cfg is not None else ""
+    # Retain only the newest N step dirs (0 = keep every one). Each is ~10 GB.
+    _hl_ckpt_keep = int(_steervla_cfg.get("hl_checkpoint_keep_last", 0)) if _steervla_cfg is not None else 0
     _hl_ckpt_on = (
         hl_updates_on
         and _hl_ckpt_every > 0
         and steervla_actor is not None
         and bool(getattr(steervla_actor, "load_trainable_params", False))
     )
+    if _hl_ckpt_on:
+        print(
+            f"[main_carla] SteerVLA policy checkpoints -> "
+            f"{_hl_ckpt_dir or os.path.join(FLAGS.save_dir, 'checkpoints')} "
+            f"every {_hl_ckpt_every} env steps (+ at exit), "
+            f"keep_last={_hl_ckpt_keep or 'all'} (~10 GB each, params-only/inference).",
+            flush=True,
+        )
+    elif _hl_ckpt_every > 0:
+        # A configured interval that will never fire is worth one line: the usual cause is a
+        # rollout-only run, where the weights never change so there is nothing to checkpoint.
+        print(
+            f"[main_carla] SteerVLA policy checkpointing configured (every {_hl_ckpt_every} steps) "
+            f"but inactive: hl_updates={hl_updates_on}, trainable_actor="
+            f"{steervla_actor is not None and bool(getattr(steervla_actor, 'load_trainable_params', False))}.",
+            flush=True,
+        )
 
     def _save_steervla_ckpt(step_tag: int, *, final: bool = False) -> None:
         if not _hl_ckpt_on or (not final and step_tag % _hl_ckpt_every != 0):
             return
-        out_root = _hl_ckpt_dir or os.path.join(FLAGS.save_dir, "steervla_hl_ckpt")
+        out_root = _hl_ckpt_dir or os.path.join(FLAGS.save_dir, "checkpoints")
         try:
-            steervla_actor.save_checkpoint(out_root, int(step_tag))
+            steervla_actor.save_checkpoint(out_root, int(step_tag), keep_last=_hl_ckpt_keep)
         except Exception as exc:  # noqa: BLE001 - checkpoint export must never kill training.
             import traceback
 
@@ -1844,6 +1870,9 @@ def run_online_carla(
             cast_cfg,
             save_dir=FLAGS.save_dir,
             action_chunk_steps=int(agent_config.get("action_horizon", 10)),
+            # Only used when ``cast_relabel.hl_dataset_root`` points several runs at one shared
+            # corpus (offline collection): it namespaces this run's window dirs under that root.
+            run_tag=exp_name,
         )
         print(
             f"[main_carla] CAST relabel enabled (provider={_cast_relabel.provider}, "
@@ -2062,6 +2091,10 @@ def run_online_carla(
             route_command_plan=(
                 obs_raw.get("route_command_plan") if isinstance(obs_raw, dict) else None
             ),
+            # ``route_name`` above is the current routing *command* (scene context for the VLM
+            # prompt), not the scenario. The stored HL samples need the real route so a corpus
+            # merged across routes can be split/weighted by it.
+            route_id=str(FLAGS.route or "?"),
         )
 
     # Video annotation for this loop (routing-commands / cast_relabel): candidates panel,
@@ -3501,6 +3534,11 @@ def run_online_carla(
                 subtask=_cast_step_record["subtask"],
                 reasoning=_cast_step_record["reasoning"],
                 action_chunk=replay_action,
+                # Bare routing instruction (no "The current speed is X m/s. " prefix): the offline
+                # RLDS converter stores it verbatim as the dataset's ``routing_command`` field and
+                # lets the OpenPI loader rebuild the prompt from it exactly as the actor did.
+                routing_command=_format_text_field(cot_obs_raw, "routing_command"),
+                global_step=step,
             )
             # A mid-route window review makes blocking Gemini calls (video upload + two
             # model queries) that can exceed the CARLA leaderboard watchdog timeout. Pause
@@ -3763,6 +3801,9 @@ def run_online_carla(
                 _cast_relabel.begin_episode(
                     episode_count=episode_count,
                     route_name=done_route,
+                    # ``done_route`` is the env's own scenario name (info["route"]); fall back to
+                    # the launched route if the leaderboard did not report one.
+                    route_id=str(done_route if done_route != "?" else (FLAGS.route or "?")),
                 )
             _sync_steervla_debug_noise_context(done_route)
             episode_collision_count = 0

@@ -87,6 +87,9 @@ FAIL2DRIVE_CARLA_ROOT="${FAIL2DRIVE_CARLA_ROOT:-}"
 # --- from dev (master + surya/rl-token + cast_relabel) ---
 # Empty -> leave the base config's steervla.hl_training_gpu_rank untouched.
 HL_TRAIN_GPU_RANK=""
+HL_CKPT_DIR=""
+HL_CKPT_EVERY=""
+HL_CKPT_KEEP_LAST=""
 ENABLE_UPDATES="true"
 BASE_ONLY=""
 STATE_ENCODER=""
@@ -142,6 +145,10 @@ Options:
   --discount FLOAT          RL discount factor (gamma). Default: 0.99
 
   --hl-gpu N                JAX GPU rank for the isolated HL (VLM-backbone) update.
+  --hl-ckpt-dir PATH        Where to write params-only SteerVLA policy checkpoints for later
+                            inference. Default: <save_dir>/steervla_hl_ckpt.
+  --hl-ckpt-every N         Checkpoint every N env steps (plus once at exit). 0 disables.
+  --hl-ckpt-keep-last N     Retain only the newest N checkpoints (~10 GB each). 0 = keep all.
   --enable-updates BOOL     true|false. false = rollout/buffer only. Default: true
   --base-only BOOL          true|false. Roll out the frozen base policy only (no RL).
   --state-encoder NAME      pi_prefix|pi_prefix_groups|siglip_pool|rl_token (residual stack).
@@ -239,6 +246,9 @@ while [[ $# -gt 0 ]]; do
     --include-proprio) INCLUDE_PROPRIO="$2"; shift 2 ;;
     --discount) DISCOUNT="$2"; shift 2 ;;
     --hl-gpu) HL_TRAIN_GPU_RANK="$2"; shift 2 ;;
+    --hl-ckpt-dir|--hl_ckpt_dir) HL_CKPT_DIR="$2"; shift 2 ;;
+    --hl-ckpt-every|--hl_ckpt_every) HL_CKPT_EVERY="$2"; shift 2 ;;
+    --hl-ckpt-keep-last|--hl_ckpt_keep_last) HL_CKPT_KEEP_LAST="$2"; shift 2 ;;
     --enable-updates) ENABLE_UPDATES="$2"; shift 2 ;;
     --base-only) BASE_ONLY="$2"; shift 2 ;;
     --state-encoder) STATE_ENCODER="$2"; shift 2 ;;
@@ -403,6 +413,17 @@ def get_config():
     if _HL_GPU != "" and "steervla" in config:
         # Isolate the HL (VLM-backbone) update on its own GPU. See steervla_cast_relabel_config.py.
         config.steervla.hl_training_gpu_rank = int(_HL_GPU)
+    # Policy checkpointing for later inference (params-only). Empty -> keep the config's value.
+    _HL_CKPT_DIR = r"${HL_CKPT_DIR}"
+    _HL_CKPT_EVERY = "${HL_CKPT_EVERY}"
+    _HL_CKPT_KEEP = "${HL_CKPT_KEEP_LAST}"
+    if "steervla" in config:
+        if _HL_CKPT_DIR != "":
+            config.steervla.hl_checkpoint_dir = _HL_CKPT_DIR
+        if _HL_CKPT_EVERY != "":
+            config.steervla.hl_checkpoint_every_steps = int(_HL_CKPT_EVERY)
+        if _HL_CKPT_KEEP != "":
+            config.steervla.hl_checkpoint_keep_last = int(_HL_CKPT_KEEP)
     config.enable_updates = ${ENABLE_UPDATES^}
     config.critic_feedback_mode = "${CRITIC_FEEDBACK_MODE}"
     config.online_training_mode = "${TRAIN_MODE}"
@@ -476,6 +497,7 @@ export PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla:${ROOT_DIR}/simlingo-rebuttal${
 echo "[run_carla.sh] agent_config=${BASE_AGENT_CFG}"
 echo "[run_carla.sh] enable_updates=${ENABLE_UPDATES} base_only=${BASE_ONLY:-<config default>} state_encoder=${STATE_ENCODER:-<config default>}${RLT_CHECKPOINT:+ rlt_checkpoint=${RLT_CHECKPOINT}}"
 echo "[run_carla.sh] hl_gpu_rank=${HL_TRAIN_GPU_RANK:-<config>} max_retries=${MAX_RETRIES}"
+echo "[run_carla.sh] hl_ckpt_dir=${HL_CKPT_DIR:-<config>} hl_ckpt_every=${HL_CKPT_EVERY:-<config>} hl_ckpt_keep_last=${HL_CKPT_KEEP_LAST:-<config>}"
 
 # Stable run name so save_dir + the W&B run id survive restarts (the supervisor resumes,
 # it does not fork a new run).

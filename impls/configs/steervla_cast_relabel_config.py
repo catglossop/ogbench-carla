@@ -167,8 +167,23 @@ def get_config():
                 dict(name="simlingo_dataset_all_img512_1116", weight=0.2),
                 dict(name="simplified_reasoning_dataset", weight=0.1),
             ],
+            # Policy checkpointing during the run, for later *inference* (not for resuming
+            # training): every ``hl_checkpoint_every_steps`` env steps — and once more at exit —
+            # the HL-fine-tuned backbone is exported to ``<hl_checkpoint_dir>/<step>/params`` as a
+            # params-only OpenPI checkpoint (no optimizer state). Redeploy one frozen with
+            #   steervla.checkpoint="<hl_checkpoint_dir>/<step>", load_trainable_params=False
+            # (same ``actor_config``). See SteerVLAActor.save_checkpoint.
+            #
+            # Only fires when the HL update is actually running (``enable_updates_bc_hl`` AND
+            # ``load_trainable_params``) — in a rollout-only run the weights never change, so
+            # there is nothing to checkpoint and main_carla says so at startup.
+            #
+            # 0 disables. Empty dir -> ``<save_dir>/checkpoints`` (next to videos/ and trajectories/).
             hl_checkpoint_every_steps=2000,
             hl_checkpoint_dir="",
+            # Each checkpoint is ~10 GB, so 2000-step spacing over a 20k-step run is ~100 GB.
+            # Keep only the newest N step dirs (pruned after each successful write); 0 = keep all.
+            hl_checkpoint_keep_last=3,
             # Local OpenPI inference (ignored when actor_url is set):
             # actor_config="pi05_steervla_cot_simplified_reasoning",
             actor_config="pi05_steervla_cot_simplified_reasoning_no_ego_history",

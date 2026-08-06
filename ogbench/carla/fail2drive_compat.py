@@ -188,6 +188,10 @@ def _patch_scenario_discovery() -> Optional[str]:
                 continue
             for member in inspect.getmembers(scenario_module, inspect.isclass):
                 all_scenario_classes[member[0]] = member[1]
+        # Patch here rather than in apply(): discovery imports these modules under
+        # their bare names, so this dict holds the class objects actually used to
+        # build scenarios.
+        _patch_dynamic_object_crossing_walker(all_scenario_classes)
         return all_scenario_classes
 
     get_all_scenario_classes._fail2drive_patched = True  # type: ignore[attr-defined]
@@ -195,8 +199,56 @@ def _patch_scenario_discovery() -> Optional[str]:
     return None
 
 
+def _patch_dynamic_object_crossing_walker(scenario_classes: dict) -> None:
+    """Make ``DynamicObjectCrossing`` honor the route's ``<walker value=.../>``.
+
+    bench2drive's ``srunner/scenarios/object_crash_vehicle.py`` hardcodes
+    ``request_new_actor('walker.*', ...)`` for the adversary and never reads a
+    ``walker`` parameter, so ``CarlaDataProvider.create_blueprint`` picks a
+    *random* walker. On the Fail2Drive CARLA build that pool is 51 pedestrians
+    + 18 animals, so ``generalization-animals-*`` routes get a human ~74% of the
+    time even though the route XML asks for e.g. ``walker.animal.1006``.
+
+    Fail2Drive ships no ``object_crash_vehicle.py``, so the file overlay in
+    :func:`_patch_scenario_discovery` doesn't cover this one. Patch the class
+    object that discovery actually returned (imported under its bare module
+    name, so it is *not* the same object as
+    ``srunner.scenarios.object_crash_vehicle.DynamicObjectCrossing``) and
+    rewrite only the generic ``'walker.*'`` lookup. ``_replace_walker``
+    re-spawns by concrete ``type_id`` and passes through untouched.
+    """
+    cls = scenario_classes.get('DynamicObjectCrossing')
+    if cls is None:
+        return
+    original = getattr(cls, '_initialize_actors', None)
+    if original is None or getattr(original, '_fail2drive_walker_patched', False):
+        return
+
+    def _initialize_actors(self, config):
+        try:
+            model = str(config.other_parameters['walker']['value'])
+        except (AttributeError, KeyError, TypeError):
+            return original(self, config)
+
+        from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
+
+        real = CarlaDataProvider.request_new_actor
+
+        def request_new_actor(model_arg, *args, **kwargs):
+            return real(model if model_arg == 'walker.*' else model_arg, *args, **kwargs)
+
+        CarlaDataProvider.request_new_actor = staticmethod(request_new_actor)
+        try:
+            return original(self, config)
+        finally:
+            CarlaDataProvider.request_new_actor = staticmethod(real)
+
+    _initialize_actors._fail2drive_walker_patched = True  # type: ignore[attr-defined]
+    cls._initialize_actors = _initialize_actors
+
+
 def apply() -> None:
-    """Apply all three shims. Idempotent.
+    """Apply all four shims. Idempotent.
 
     Call after CARLA's ``PythonAPI/carla`` is on ``sys.path`` (so srunner
     can import) and before the first ``RouteScenario`` is instantiated.

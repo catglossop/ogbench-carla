@@ -45,6 +45,7 @@ import json
 import os
 import re
 import textwrap
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,25 @@ DEFAULT_NUM_SUBTASK_SUGGESTIONS = 3
 # is masked out for HL samples (``action_loss_mask`` all-False), so this only fixes the shape
 # of the stored (unsupervised) action chunk; it should match ``steervla.action_dim``.
 DEFAULT_HL_ACTION_DIM = 4
+
+# Number of ``[speed_mps, yaw_deg]`` pairs stored per HL sample as ``ego_hist`` (oldest first,
+# one pair per env step, last pair = the step the sample's action was taken from). Matches the
+# SimLingo RLDS ``observation/ego_hist`` history length: the OpenPI loader uses all 4 pairs
+# (8 proprio dims) when ``include_ego_history=True`` and only the last pair when it is False.
+# Only the last pair is used by the online HL update, which rebuilds proprio from ``state``;
+# the history exists so :mod:`vlas.cast_hl_to_rlds` can emit either flavor of RLDS dataset.
+DEFAULT_EGO_HISTORY_LEN = 4
+
+# Indices into the raw CARLA ego-state vector (``ogbench.carla.carla_utils`` STATE_DIM layout),
+# the same two ``steervla.carla_state_vec_to_steervla_state`` reads. Duplicated here rather than
+# imported so this module stays importable without CARLA on ``sys.path``.
+EGO_STATE_IDX_YAW = 5
+EGO_STATE_IDX_SPEED = 15
+
+# ``hl_samples.json`` schema version. 1 = the original online-only manifest; 2 adds the fields the
+# offline RLDS converter needs (``ego_hist`` in the npz, ``routing_command`` / ``original_subtask`` /
+# ``original_reasoning`` / ``route`` / ``global_step`` / ``current_speed`` in the manifest).
+HL_SCHEMA_VERSION = 2
 
 # Seed phrases for the open-vocabulary subtask generation in step 4. The VLM is told it
 # MAY reuse these verbatim or propose new phrases in the same style. Provided by the user;
@@ -229,6 +249,21 @@ SEED_REASONING: tuple[str, ...] = (
 # ── Structured per-chunk credit + subtask suggestions ────────────────────────────────
 
 
+def _is_json_null(value: Any) -> bool:
+    """Whether a parsed JSON field means "absent" — including the *stringly-typed* nulls.
+
+    The credit prompt asks for ``label: "GOOD", "BAD", or null``, and the VLM sometimes emits the
+    string ``"null"`` (or ``"none"``/``"n/a"``) instead of a real JSON ``null``. Before this, such a
+    value raised out of :meth:`ChunkCredit.from_dict`, and because the parse is per-window that one
+    malformed chunk discarded the **entire** window's credit assignment — ~15 HL samples lost over a
+    difference in quoting. Observed once in 215 windows.
+    """
+    if value is None:
+        return True
+    text = str(value).strip().lower()
+    return text in ("", "null", "none", "nil", "n/a", "na")
+
+
 @dataclass(frozen=True)
 class ChunkCredit:
     """Credit assignment + suggested subtasks (and a new reasoning trace) for one action chunk."""
@@ -263,7 +298,7 @@ class ChunkCredit:
         idx = int(raw["chunk_index"])
         label_raw = raw.get("label")
         label: str | None = None
-        if label_raw is not None and str(label_raw).strip():
+        if not _is_json_null(label_raw):
             label_val = str(label_raw).strip().upper()
             if label_val not in ("GOOD", "BAD"):
                 raise ValueError(f"chunk label must be GOOD or BAD, got {label_raw!r}.")
@@ -273,7 +308,7 @@ class ChunkCredit:
             raise ValueError("suggested_subtasks must be a list of strings.")
         suggested = tuple(str(s).strip() for s in subtasks_raw if str(s).strip())
         source_raw = raw.get("credit_source")
-        credit_source = str(source_raw).strip().lower() if source_raw is not None else ""
+        credit_source = "" if _is_json_null(source_raw) else str(source_raw).strip().lower()
         if credit_source not in ("", "direct", "precursor"):
             raise ValueError(f"credit_source must be direct or precursor, got {source_raw!r}.")
         if label == "BAD" and not credit_source:
@@ -780,6 +815,22 @@ class HLSample:
     # (the reinforce path), so the action is a valid FAST-supervision target. False on the correct/
     # relabel path, where the subtask was replaced but the action is still the uncorrected one.
     action_matches_subtask: bool = False
+    # ── offline-conversion extras (ignored by the online ``update_hl`` path) ──────────────
+    # ``(ego_history_len, 2)`` float32 of raw ``[speed_mps, yaw_deg]`` over the env steps ending at
+    # this sample's step (oldest first). Feeds the RLDS ``observation/ego_hist`` field; ``None``
+    # when no ego history was captured (the converter then tiles the current pair).
+    ego_hist: np.ndarray | None = None
+    # Bare routing instruction ("Turn right in 20 meter.") *without* the "The current speed is
+    # X m/s. " prefix that ``prompt`` carries. The RLDS loader rebuilds the prompt from
+    # ``routing_command`` + ``speed``, so storing it verbatim avoids a lossy prefix strip.
+    routing_command: str = ""
+    # The CoT the model actually produced at rollout, kept even on the corrective path (where
+    # ``subtask``/``reasoning`` hold the VLM's replacement) so a converted dataset can report /
+    # filter on what was changed.
+    original_subtask: str = ""
+    original_reasoning: str = ""
+    route: str = ""
+    global_step: int = -1
 
     def manifest_entry(self, sample_file: str) -> dict[str, Any]:
         return {
@@ -799,6 +850,14 @@ class HLSample:
             "action_chunk_steps": int(self.actions.shape[0]),
             "action_dim": int(self.actions.shape[-1]),
             "action_supervision": False,
+            # Offline-conversion extras (see the field docs above).
+            "routing_command": self.routing_command,
+            "original_subtask": self.original_subtask,
+            "original_reasoning": self.original_reasoning,
+            "route": self.route,
+            "global_step": int(self.global_step),
+            "current_speed": float(self.current_speed),
+            "ego_history_len": 0 if self.ego_hist is None else int(np.asarray(self.ego_hist).shape[0]),
         }
 
 
@@ -871,6 +930,8 @@ def build_hl_samples_from_window(
     window_index: int,
     store_good_chunks: bool = True,
     relabel_all: bool = False,
+    route: str = "",
+    ego_history_len: int = DEFAULT_EGO_HISTORY_LEN,
 ) -> list[HLSample]:
     """Turn a window's chunks into ``steervla_hl_dataset_format`` samples.
 
@@ -917,10 +978,18 @@ def build_hl_samples_from_window(
         actions = _shape_hl_action_chunk(actions_src, action_chunk_steps, action_dim)
         action_loss_mask = np.zeros((int(action_chunk_steps),), dtype=bool)
 
+        state_vec = np.asarray(model_input.get("state"), dtype=np.float32).reshape(-1)
+        ego_hist = model_input.get("ego_hist")
+        if ego_hist is None:
+            ego_hist = _ego_hist_from_state(
+                state_vec,
+                current_speed=float(model_input.get("current_speed", 0.0)),
+                ego_history_len=ego_history_len,
+            )
         samples.append(
             HLSample(
                 image=np.asarray(model_input["image"], dtype=np.uint8),
-                state=np.asarray(model_input.get("state"), dtype=np.float32).reshape(-1),
+                state=state_vec,
                 current_speed=float(model_input.get("current_speed", 0.0)),
                 prompt=prompt,
                 subtask=subtask_target,
@@ -934,9 +1003,39 @@ def build_hl_samples_from_window(
                 label=(label_str or None),
                 credit_source=str(chunk.get("credit_source") or ""),
                 action_matches_subtask=bool(action_matches_subtask),
+                ego_hist=np.asarray(ego_hist, dtype=np.float32),
+                routing_command=str(model_input.get("routing_command") or ""),
+                original_subtask=str(model_input.get("subtask") or ""),
+                original_reasoning=str(model_input.get("reasoning") or ""),
+                route=str(route),
+                global_step=int(model_input.get("global_step", -1)),
             )
         )
     return samples
+
+
+def _ego_hist_from_state(
+    state_vec: np.ndarray | None,
+    *,
+    current_speed: float,
+    ego_history_len: int,
+) -> np.ndarray:
+    """``(ego_history_len, 2)`` of ``[speed, yaw]`` built by tiling the *current* pair.
+
+    Fallback for samples with no captured per-step history (and the reader-side fallback for
+    datasets written before ``ego_hist`` existed). Only the last pair is used when the OpenPI
+    loader runs with ``include_ego_history=False``, so tiling is exact for that configuration
+    and a constant-history approximation for the ego-history one.
+    """
+    speed = float(current_speed)
+    yaw = 0.0
+    if state_vec is not None:
+        flat = np.asarray(state_vec, dtype=np.float32).reshape(-1)
+        if flat.size > EGO_STATE_IDX_SPEED:
+            speed = float(flat[EGO_STATE_IDX_SPEED])
+        if flat.size > EGO_STATE_IDX_YAW:
+            yaw = float(flat[EGO_STATE_IDX_YAW])
+    return np.tile(np.array([speed, yaw], dtype=np.float32), (max(1, int(ego_history_len)), 1))
 
 
 def _shape_hl_action_chunk(
@@ -967,27 +1066,36 @@ def write_hl_samples(samples: list[HLSample], out_dir: Path) -> list[dict[str, A
 
     Layout (per window ``tag`` dir)::
 
-        <out_dir>/sample_0000.npz   # image, state, current_speed, actions, action_loss_mask
+        <out_dir>/sample_0000.npz   # image, state, ego_hist, current_speed, actions, action_loss_mask
         <out_dir>/hl_samples.json   # dataset_format + per-sample text targets + provenance
+
+    ``ego_hist`` and the extra manifest fields (``routing_command`` / ``original_*`` / ``route`` /
+    ``global_step``) exist for the offline RLDS conversion (:mod:`vlas.cast_hl_to_rlds`); the online
+    ``SteerVLAActor.update_hl`` reader ignores every key it does not know, so old and new pools
+    interleave freely.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest: list[dict[str, Any]] = []
     for i, s in enumerate(samples):
         sample_file = f"sample_{i:04d}.npz"
-        np.savez_compressed(
-            out_dir / sample_file,
-            image=s.image,
-            state=s.state,
-            current_speed=np.float32(s.current_speed),
-            actions=s.actions,
-            action_loss_mask=s.action_loss_mask,
-        )
+        arrays: dict[str, Any] = {
+            "image": s.image,
+            "state": s.state,
+            "current_speed": np.float32(s.current_speed),
+            "actions": s.actions,
+            "action_loss_mask": s.action_loss_mask,
+        }
+        if s.ego_hist is not None:
+            arrays["ego_hist"] = np.asarray(s.ego_hist, dtype=np.float32)
+        np.savez_compressed(out_dir / sample_file, **arrays)
         manifest.append(s.manifest_entry(sample_file))
     (out_dir / "hl_samples.json").write_text(
         json.dumps(
             {
                 "dataset_format": "steervla_hl_dataset_format",
+                # Bumped to 2 when ego_hist / routing_command / original_* / route were added.
+                "schema_version": HL_SCHEMA_VERSION,
                 "action_supervision": False,
                 "num_samples": len(manifest),
                 "samples": manifest,
@@ -1102,6 +1210,7 @@ class OnlineCastRelabelSession:
         save_dir: str | Path,
         action_chunk_steps: int = DEFAULT_ACTION_CHUNK_STEPS,
         video_frame_stride: int = 2,
+        run_tag: str = "",
     ) -> None:
         self.cfg = _as_config_dict(cast_cfg)
         self.save_dir = Path(save_dir)
@@ -1129,7 +1238,23 @@ class OnlineCastRelabelSession:
         # reasoning as HL samples. Set False to keep the dataset corrective (BAD chunks only).
         self.store_good_chunks = bool(self.cfg.get("store_good_chunks", True))
         self.hl_action_dim = int(self.cfg.get("hl_action_dim", DEFAULT_HL_ACTION_DIM))
-        self.hl_dataset_dir = self.save_dir / str(self.cfg.get("hl_dataset_subdir", "cast_relabel_hl_dataset"))
+        # Per-step ego history stored with each HL sample (see DEFAULT_EGO_HISTORY_LEN).
+        self.ego_history_len = max(1, int(self.cfg.get("ego_history_len", DEFAULT_EGO_HISTORY_LEN)))
+        # Where the HL samples land. Default: ``<save_dir>/<hl_dataset_subdir>`` (per-run, which is
+        # what the online update wants). ``hl_dataset_root`` overrides that with an absolute path
+        # shared across runs — the offline-collection mode, where many routes/seeds accumulate into
+        # one corpus that :mod:`vlas.cast_hl_to_rlds` later converts in a single pass. The run tag
+        # keeps one level of nesting under the root so window dirs from different runs can't collide
+        # *and* the layout the actor globs (``<hl_dataset_dir>/<window>/hl_samples.json``) is
+        # preserved, so an offline-collection dir is still directly loadable by ``update_hl``.
+        self.run_tag = str(run_tag or Path(self.save_dir).name or "run")
+        hl_root = str(self.cfg.get("hl_dataset_root", "") or "").strip()
+        if hl_root:
+            self.hl_dataset_dir = Path(hl_root).expanduser() / self.run_tag
+        else:
+            self.hl_dataset_dir = self.save_dir / str(
+                self.cfg.get("hl_dataset_subdir", "cast_relabel_hl_dataset")
+            )
         if self.store_hl_dataset:
             self.hl_dataset_dir.mkdir(parents=True, exist_ok=True)
         # When set, render the trajectory graphs (speed / throttle / steer / brake / route
@@ -1170,6 +1295,7 @@ class OnlineCastRelabelSession:
     def reset_episode(self) -> None:
         self.episode_count = 0
         self.route_name = "?"
+        self.route_id = "?"
         self.frames: list[np.ndarray] = []
         self.frame_subtasks: list[str] = []
         self.frame_episode_steps: list[int] = []
@@ -1181,6 +1307,9 @@ class OnlineCastRelabelSession:
         # Raw model inputs captured at chunk-start steps (abs episode step -> dict), used to build
         # high-level dataset samples at window review time. Cleared per window.
         self._model_inputs: dict[int, dict[str, Any]] = {}
+        # Rolling ``[speed, yaw]`` over the last ``ego_history_len`` env steps of THIS episode, so a
+        # chunk-start sample can carry a real ego history rather than a tiled current pair.
+        self._ego_hist: deque[tuple[float, float]] = deque(maxlen=self.ego_history_len)
 
     def begin_episode(
         self,
@@ -1188,9 +1317,15 @@ class OnlineCastRelabelSession:
         episode_count: int,
         route_name: str,
         route_command_plan: list[dict[str, Any]] | None = None,
+        route_id: str = "",
     ) -> None:
         self.episode_count = int(episode_count)
+        # NOTE: ``route_name`` is what main_carla passes as scene context for the VLM prompt, and it
+        # is the current *routing command* ("follow the road."), not the scenario name. ``route_id``
+        # is the actual route (``--route``), used only for dataset provenance/grouping. Keeping them
+        # separate leaves the VLM prompt byte-identical to previous runs.
         self.route_name = str(route_name)
+        self.route_id = str(route_id or route_name)
         # Full ordered maneuver plan for the episode (constant), surfaced to the VLM coach as
         # the overall "task" context. May be empty if the route planner was unavailable.
         self.route_command_plan = list(route_command_plan) if route_command_plan else []
@@ -1216,6 +1351,8 @@ class OnlineCastRelabelSession:
         subtask: str = "",
         reasoning: str = "",
         action_chunk: np.ndarray | None = None,
+        routing_command: str = "",
+        global_step: int = -1,
     ) -> None:
         """Stash the raw SteerVLA model input for the high-level dataset (chunk-start steps only).
 
@@ -1224,7 +1361,13 @@ class OnlineCastRelabelSession:
         taken from (``obs["image"]`` / ``obs["state"]``), not the annotated video frame. ``subtask``
         / ``reasoning`` are the **original** CoT targets the model produced for this chunk — used as
         the HL supervision targets when a GOOD/unlabeled chunk is reinforced as-is.
+
+        The ego-history ring is pushed on **every** call (not just chunk starts) so the retained
+        sample carries the ``ego_history_len`` env steps leading up to it; ``routing_command`` is the
+        bare instruction behind ``prompt``'s "The current speed is X m/s. " prefix, kept verbatim for
+        the RLDS conversion.
         """
+        self._push_ego_history(state, current_speed)
         if not self.store_hl_dataset or image is None:
             return
         # Chunk starts are every ``action_chunk_steps`` env steps from the (1-based) episode start.
@@ -1233,12 +1376,40 @@ class OnlineCastRelabelSession:
         self._model_inputs[int(episode_step)] = {
             "image": np.asarray(image, dtype=np.uint8),
             "state": None if state is None else np.asarray(state, dtype=np.float32).reshape(-1),
+            "ego_hist": self._ego_history_array(),
             "current_speed": float(current_speed),
             "prompt": str(prompt or ""),
             "subtask": str(subtask or ""),
             "reasoning": str(reasoning or ""),
+            "routing_command": str(routing_command or ""),
+            "global_step": int(global_step),
             "action_chunk": None if action_chunk is None else np.asarray(action_chunk, dtype=np.float32),
         }
+
+    def _push_ego_history(self, state: np.ndarray | None, current_speed: float) -> None:
+        """Append this env step's raw ``[speed_mps, yaw_deg]`` to the rolling ego history."""
+        speed = float(current_speed)
+        yaw = 0.0
+        if state is not None:
+            flat = np.asarray(state, dtype=np.float32).reshape(-1)
+            if flat.size > EGO_STATE_IDX_SPEED:
+                speed = float(flat[EGO_STATE_IDX_SPEED])
+            if flat.size > EGO_STATE_IDX_YAW:
+                yaw = float(flat[EGO_STATE_IDX_YAW])
+        self._ego_hist.append((speed, yaw))
+
+    def _ego_history_array(self) -> np.ndarray:
+        """``(ego_history_len, 2)`` float32, oldest first, left-padded with the oldest pair.
+
+        Padding only happens in the first few steps of an episode, where fewer than
+        ``ego_history_len`` steps exist yet.
+        """
+        hist = list(self._ego_hist)
+        if not hist:
+            return np.zeros((self.ego_history_len, 2), dtype=np.float32)
+        while len(hist) < self.ego_history_len:
+            hist.insert(0, hist[0])
+        return np.asarray(hist[-self.ego_history_len:], dtype=np.float32)
 
     # ── querying ─────────────────────────────────────────────────────────────────
     def should_query(self, episode_step: int, *, force: bool = False) -> bool:
@@ -1461,12 +1632,15 @@ class OnlineCastRelabelSession:
                 window_index=self.window_count,
                 store_good_chunks=self.store_good_chunks,
                 relabel_all=self.debug_task,
+                route=self.route_id,
+                ego_history_len=self.ego_history_len,
             )
             if not hl_samples:
                 return 0
             hl_dir = self.hl_dataset_dir / tag
             write_hl_samples(hl_samples, hl_dir)
             self.hl_sample_count += len(hl_samples)
+            self._append_window_index(tag, hl_samples)
             print(
                 f"[cast_relabel] wrote {len(hl_samples)} high-level samples "
                 f"(total {self.hl_sample_count}) -> {hl_dir}",
@@ -1479,6 +1653,32 @@ class OnlineCastRelabelSession:
             print(f"[cast_relabel] HL sample storage failed (non-fatal): {exc}", flush=True)
             traceback.print_exc()
             return 0
+
+    def _append_window_index(self, tag: str, hl_samples: list[HLSample]) -> None:
+        """Append one line per stored window to ``<hl_dataset_dir>/windows.jsonl``.
+
+        A cheap running index of the corpus (route / episode / window / label counts) so an
+        offline-collection run can be inspected — and its conversion planned — without walking
+        every per-window ``hl_samples.json``. Non-fatal: a failure here loses only the index.
+        """
+        try:
+            n_bad = sum(1 for s in hl_samples if (s.label or "") == "BAD")
+            n_precursor = sum(1 for s in hl_samples if s.credit_source == "precursor")
+            line = {
+                "tag": tag,
+                "run_tag": self.run_tag,
+                "route": self.route_id,
+                "episode": int(self.episode_count),
+                "window_index": int(self.window_count),
+                "num_samples": len(hl_samples),
+                "num_bad": int(n_bad),
+                "num_precursor": int(n_precursor),
+                "num_good_or_unlabeled": len(hl_samples) - int(n_bad),
+            }
+            with (self.hl_dataset_dir / "windows.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(line) + "\n")
+        except Exception as exc:  # noqa: BLE001 - index is best-effort.
+            print(f"[cast_relabel] window index append failed (non-fatal): {exc}", flush=True)
 
     # ── logging ──────────────────────────────────────────────────────────────────
     def _log_debug_video(
