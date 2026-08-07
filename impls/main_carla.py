@@ -4593,13 +4593,182 @@ def _run_residual_entry(config):
         wandb.finish()
 
 
+def run_online_grpo(env, steervla_actor, vla_sample_fn, config, obs_raw, *, raw_holder, exec_cfg):
+    """GRPO on the SteerVLA high-level (CoT/subtask) policy; the frozen action expert is untouched.
+
+    Each group is ``group_size`` rollouts of the frozen base policy on the SAME route/env seed, so the
+    only within-group variation is CoT sampling (the actor's free-running RNG counter). The per-episode
+    environment return is the reward; trajectory-level group-relative advantages ``A_g=(R_g-mean)/std``
+    are assigned to every CoT sampled in rollout g, then :meth:`SteerVLAActor.update_hl_grpo` takes the
+    (minibatched) policy-gradient step with a KL penalty to a frozen reference. Repeats until the
+    ``online_steps`` env-step budget is spent.
+    """
+    grpo = config.get("grpo") or {}
+    group_size = max(2, int(grpo.get("group_size", 8)))
+    beta_kl = float(grpo.get("beta_kl", 0.01))
+    num_epochs = int(grpo.get("num_update_steps", 1))
+    adv_eps = float(grpo.get("advantage_eps", 1e-6))
+    ckpt_every_groups = int(grpo.get("checkpoint_every_groups", 5))
+    ckpt_root = os.path.join(FLAGS.save_dir, "steervla_hl_ckpt")
+
+    log_video = bool(config.get("log_episode_video", True))
+    video_fps = float(config.get("episode_video_fps", 10.0))
+    video_every = max(1, int(config.get("episode_video_every", 2)))
+    train_logger = CsvLogger(os.path.join(FLAGS.save_dir, "train.csv"))
+
+    base_model = getattr(steervla_actor, "model", None)
+    base_noise_dim = int(base_model.action_horizon) * int(base_model.action_dim) if base_model is not None else 40
+    env_seed = int(FLAGS.seed)  # fixed across the group: identical dynamics, CoT sampling varies
+    rng = jax.random.PRNGKey(FLAGS.seed)
+
+    total_steps = int(FLAGS.online_steps)
+    step = 0
+    group_idx = 0
+    while step < total_steps:
+        per_rollout_records: list[list[dict]] = []
+        returns: list[float] = []
+        group_frames: list[np.ndarray] = []
+        for g in range(group_size):
+            obs_raw, _ = env.reset(seed=env_seed)
+            steervla_actor.reset_action_cache()
+            steervla_actor.grpo_begin_episode()
+            ep_return, ep_steps, done = 0.0, 0, False
+            frames: list[np.ndarray] = []
+            while not done:
+                rng, nk = jax.random.split(rng)
+                noise = jax.random.normal(nk, (1, base_noise_dim), dtype=jnp.float32)
+                base_chunk = _base_chunk(vla_sample_fn, raw_holder, obs_raw, noise)
+                next_obs_raw, reward, terminated, truncated, info = env.step(base_chunk)
+                ep_return += float(reward)
+                ep_steps += 1
+                step += 1
+                done = bool(terminated or truncated)
+                if log_video and g == 0:
+                    _maybe_capture_frame(
+                        frames, next_obs_raw, reward, episode_steps=ep_steps, done=done,
+                        log_video=log_video, video_every=video_every,
+                        action_flat=base_chunk, exec_cfg=exec_cfg, steervla_actor=steervla_actor,
+                    )
+                obs_raw = next_obs_raw
+            recs = steervla_actor.grpo_take_records()
+            per_rollout_records.append(recs)
+            returns.append(ep_return)
+            if g == 0:
+                group_frames = frames
+            print(
+                f"[grpo] group {group_idx} rollout {g + 1}/{group_size}: return={ep_return:.3f} "
+                f"steps={ep_steps} cots={len(recs)} (env_step {step}/{total_steps})",
+                flush=True,
+            )
+
+        R = np.asarray(returns, dtype=np.float32)
+        adv = (R - R.mean()) / (R.std() + adv_eps)  # trajectory-level, group-normalized
+        pooled: list[dict] = []
+        pooled_adv: list[float] = []
+        for recs, a in zip(per_rollout_records, adv):
+            pooled.extend(recs)
+            pooled_adv.extend([float(a)] * len(recs))
+
+        info: dict[str, float] = {}
+        if pooled:
+            info = steervla_actor.update_hl_grpo(
+                pooled, np.asarray(pooled_adv, dtype=np.float32),
+                beta=beta_kl, num_epochs=num_epochs, global_step=step,
+            )
+        else:
+            print("[grpo] group produced no CoT samples; skipping update.", flush=True)
+
+        metrics = {f"grpo/{k}": float(v) for k, v in info.items()}
+        metrics.update({
+            "grpo/group": float(group_idx),
+            "grpo/beta_kl": beta_kl,
+            "grpo/return_mean": float(R.mean()),
+            "grpo/return_std": float(R.std()),
+            "grpo/return_max": float(R.max()),
+            "grpo/return_min": float(R.min()),
+        })
+        if log_video and group_frames:
+            video = _episode_video(group_frames, video_fps)
+            if video is not None:
+                metrics["grpo/rollout_video"] = video
+        wandb.log(metrics, step=step)
+        train_logger.log({k: v for k, v in metrics.items() if np.isscalar(v)}, step=step)
+
+        group_idx += 1
+        if ckpt_every_groups > 0 and group_idx % ckpt_every_groups == 0:
+            try:
+                steervla_actor.save_checkpoint(ckpt_root, step)
+            except Exception as exc:  # noqa: BLE001 - checkpoint export must never kill training.
+                print(f"[grpo] checkpoint save failed (non-fatal): {exc}", flush=True)
+
+    try:
+        steervla_actor.save_checkpoint(ckpt_root, step)  # final export
+    except Exception as exc:  # noqa: BLE001
+        print(f"[grpo] final checkpoint save failed (non-fatal): {exc}", flush=True)
+
+
+def _run_grpo_entry(config):
+    """GRPO-on-HL-policy online CARLA entry (frozen SteerVLA base + action expert; only CoT trained)."""
+    if FLAGS.route is None:
+        raise ValueError("--route is required (see --list_routes=true).")
+
+    steervla_cfg = config.get("steervla", None)
+    if steervla_cfg is None or not steervla_cfg.get("enabled"):
+        raise ValueError("config.steervla.enabled must be true: GRPO trains the HL policy of a base VLA.")
+    if not bool(steervla_cfg.get("load_trainable_params", False)):
+        raise ValueError("GRPO needs steervla.load_trainable_params=true to update the HL backbone.")
+
+    wandb_mode = _resolve_wandb_mode()
+    route_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", str(FLAGS.route)).strip("-")
+    exp_name = FLAGS.exp_name or f"grpo-{route_tag}-{get_exp_name(FLAGS.seed)}"
+    wandb_id = re.sub(r"[^A-Za-z0-9_-]+", "-", exp_name).strip("-")[:128] or None
+    setup_wandb(
+        project="OGBench-CARLA-GRPO", group=FLAGS.run_group, name=exp_name, mode=wandb_mode,
+        id=wandb_id, resume=("allow" if FLAGS.resume else None),
+    )
+    FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
+    os.makedirs(FLAGS.save_dir, exist_ok=True)
+    with open(os.path.join(FLAGS.save_dir, "flags.json"), "w") as f:
+        json.dump(get_flag_dict(), f)
+
+    carla_yaml, extra_carla, exec_cfg = _resolve_carla_env_config(config)
+    env = _make_carla_env(carla_yaml, FLAGS.route, extra_carla_config=extra_carla)
+    try:
+        random.seed(FLAGS.seed)
+        np.random.seed(FLAGS.seed)
+        obs, _info = env.reset(seed=FLAGS.seed)
+        if not isinstance(obs, dict) or "state" not in obs or "image" not in obs:
+            raise ValueError("CARLA env must return a Dict obs with 'state' and 'image'.")
+
+        raw_holder: dict = {"obs": obs}
+        from vlas.steervla import create_steervla_pi0_cot_sample_fn
+
+        vla_sample_fn, steervla_actor = create_steervla_pi0_cot_sample_fn(
+            steervla_cfg, raw_holder, training_gpu_rank=int(config.get("training_gpu_rank", -1))
+        )
+        _configure_jax_training_device(int(config.get("training_gpu_rank", -1)))
+
+        run_online_grpo(
+            env, steervla_actor, vla_sample_fn, config, obs,
+            raw_holder=raw_holder, exec_cfg=exec_cfg,
+        )
+    finally:
+        try:
+            env.close()
+        except Exception:
+            pass
+        wandb.finish()
+
+
 def main(_):
     if FLAGS.list_routes:
         _list_routes_and_exit()
         return
 
     config = FLAGS.agent
-    if str(config.get("agent_name", "")) == "sac_residual":
+    if str(config.get("online_training_mode", "")).strip().lower() == "grpo_hl":
+        _run_grpo_entry(config)
+    elif str(config.get("agent_name", "")) == "sac_residual":
         _run_residual_entry(config)
     else:
         _run_dsrl_entry(config)
