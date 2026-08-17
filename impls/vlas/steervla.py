@@ -1313,12 +1313,8 @@ class SteerVLAActor:
         self._hl_replay_logged_once = False
         self._hl_replay_missing_warned = False
         self._hl_train_step = None
-        # GRPO (HL policy) state: jitted step, frozen KL reference params, and the per-episode CoT
-        # recorder (populated only while grpo_begin_episode has been called; see _sample_or_reuse_cot).
         self._hl_grpo_step = None
         self._hl_ref_params = None
-        self._grpo_recording = False
-        self._grpo_records: list[dict[str, Any]] = []
         self._hl_update_calls = 0
         # Diagnostics for :meth:`update_hl`, whose skip paths are otherwise silent (it returns
         # ``{}``), which makes an absent ``vla_hl/batch_text`` table impossible to explain.
@@ -2181,7 +2177,7 @@ class SteerVLAActor:
             state_norm = self._normalize_state_batch(state_pad)[0]
             state_for_model = pad_to_dim(state_norm, model_action_dim)
 
-            # GRPO records carry the exact sampled token ids (see _grpo_record_cot); use them verbatim
+            # GRPO records carry the exact sampled token ids (see grpo_records_from_candidates); use them
             # so the CE is the log-prob of the tokens the policy actually emitted. Text records
             # (cast_relabel / replay pools) tokenize their reasoning/subtask strings as before.
             if "reasoning_ids" in rec:
@@ -2869,11 +2865,12 @@ class SteerVLAActor:
     ) -> dict[str, float]:
         """GRPO gradient steps on the HL policy over a pooled group of CoT samples.
 
-        ``records`` is every CoT sampled across the group's rollouts (schema from :meth:`_grpo_record_cot`);
-        ``advantages`` is the aligned per-record group-relative advantage (trajectory-level, so every CoT
-        of a rollout shares its episode advantage). The group is far larger than one forward can hold, so
-        it is shuffled and processed in ``hl_update_batch_size`` minibatches (remainder dropped, or padded
-        by repetition when the whole group is smaller than one minibatch) for ``num_epochs`` passes.
+        ``records`` is the pooled candidate CoTs across scored states (schema from
+        :meth:`grpo_records_from_candidates`); ``advantages`` is the aligned per-record group-relative
+        advantage (the K candidates of one scored state share that state's normalized VLM scores). The
+        pool can exceed one forward, so it is shuffled and processed in ``hl_update_batch_size`` minibatches
+        (remainder dropped, or padded by repetition when the pool is smaller than one minibatch) for
+        ``num_epochs`` passes.
         Updates ``self._train_state`` in place and marks the inference weights dirty. No-op unless the
         actor was loaded trainable and has a frozen reference.
         """
@@ -3825,51 +3822,46 @@ class SteerVLAActor:
             self._last_cot_out = self._cached_cot
             return self._cached_cot
         cot_out = self._sample_cot_checked(rng, obs_jax)
-        if self._grpo_recording:
-            self._grpo_record_cot(cot_out)
         if self._cot_cache_enabled(batch_size):
             self._cached_cot = dict(cot_out)
             self._cached_cot_actions_used = 0
         self._last_cot_out = cot_out
         return cot_out
 
-    # ----- GRPO (HL policy) rollout recording ----------------------------- #
+    def grpo_records_from_candidates(
+        self, cands: dict[str, Any], raw: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """K per-candidate HL records for :meth:`update_hl_grpo`, from a :meth:`sample_candidates` batch.
 
-    def grpo_begin_episode(self) -> None:
-        """Start recording every freshly sampled CoT (state + sampled reasoning/subtask tokens)."""
-        self._grpo_recording = True
-        self._grpo_records = []
-
-    def grpo_take_records(self) -> list[dict[str, Any]]:
-        """Return the CoT samples recorded since :meth:`grpo_begin_episode` and stop recording."""
-        recs, self._grpo_records = self._grpo_records, []
-        self._grpo_recording = False
-        return recs
-
-    def _grpo_record_cot(self, cot_out: dict[str, Any]) -> None:
-        """Store one HL decision: raw CARLA obs + the *actual* sampled reasoning/subtask token ids.
-
-        Storing token ids (not decoded text) keeps the later policy-gradient CE on the exact tokens the
-        policy emitted, avoiding detok->retok drift. ``prompt`` is the bare instruction the sampler used
-        (deterministic in ego speed), so re-tokenizing it in :meth:`_build_hl_observation_batch` is exact.
+        Each record carries the sampled reasoning/subtask token ids for that candidate (so the
+        policy-gradient CE is on the emitted tokens, no detok->retok drift) plus the shared scene (raw
+        CARLA state + image + the bare instruction the sampler used). Schema matches
+        :meth:`_build_hl_observation_batch` (action loss + FAST masked off: HL-only supervision).
         """
-        raw = self.raw_obs_holder.get("obs") if self.raw_obs_holder is not None else None
-        if raw is None or "state" not in raw or "image" not in raw:
-            return
+        cot = cands["cot_out"]
+        rea = np.asarray(jax.device_get(cot["tokenized_reasoning"]), dtype=np.int32)
+        rea_mask = np.asarray(jax.device_get(cot["tokenized_reasoning_mask"]), dtype=bool)
+        sub = np.asarray(jax.device_get(cot["tokenized_subtask"]), dtype=np.int32)
+        sub_mask = np.asarray(jax.device_get(cot["tokenized_subtask_mask"]), dtype=bool)
         state_vec = np.asarray(raw["state"], dtype=np.float32).reshape(-1)
         speed = float(state_vec[15]) if state_vec.shape[0] > 15 else 0.0
-        self._grpo_records.append({
-            "state": state_vec,
-            "state_format": "carla_raw",
-            "prompt": routing_instruction_prompt(routing_command=self.routing_command, current_speed_mps=speed),
-            "image": np.asarray(raw["image"]),
-            "reasoning_ids": np.asarray(jax.device_get(cot_out["tokenized_reasoning"][0]), dtype=np.int32),
-            "reasoning_mask": np.asarray(jax.device_get(cot_out["tokenized_reasoning_mask"][0]), dtype=bool),
-            "subtask_ids": np.asarray(jax.device_get(cot_out["tokenized_subtask"][0]), dtype=np.int32),
-            "subtask_mask": np.asarray(jax.device_get(cot_out["tokenized_subtask_mask"][0]), dtype=bool),
-            "action_supervision": False,
-            "supervise_fast": False,
-        })
+        prompt = routing_instruction_prompt(routing_command=self.routing_command, current_speed_mps=speed)
+        image = np.asarray(raw["image"])
+        return [
+            {
+                "state": state_vec,
+                "state_format": "carla_raw",
+                "prompt": prompt,
+                "image": image,
+                "reasoning_ids": rea[k],
+                "reasoning_mask": rea_mask[k],
+                "subtask_ids": sub[k],
+                "subtask_mask": sub_mask[k],
+                "action_supervision": False,
+                "supervise_fast": False,
+            }
+            for k in range(rea.shape[0])
+        ]
 
     def _mark_action_served(self, batch_size: int) -> None:
         if self._cot_cache_enabled(batch_size) and self._cached_cot is not None:

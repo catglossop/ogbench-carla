@@ -382,6 +382,51 @@ def build_chunks_payload(
     return payload
 
 
+def build_candidate_score_prompt(
+    context: dict[str, Any],
+    candidate_subtasks: list[str],
+) -> str:
+    """Prompt the VLM critic to score K candidate next-subtasks for the current driving scene.
+
+    Used by the GRPO HL path: ``context`` carries the env signals the critic should weigh (speed,
+    route progress, cumulative + recent reward, collisions), and the current frame is attached as an
+    image part by :meth:`GeminiVLMCOach.complete_image_text`. The model returns one score per candidate
+    in the given order — higher = more likely to advance the route safely and efficiently.
+    """
+    cand_block = "\n".join(f"{i}: {s}" for i, s in enumerate(candidate_subtasks))
+    n = len(candidate_subtasks)
+    return textwrap.dedent(
+        f"""
+        You are grading candidate next-actions for an autonomous vehicle. The attached image is the
+        current front-camera view. Below is the driving context (env reward signals included) followed
+        by {n} candidate next-subtasks the policy is considering from THIS state.
+
+        Driving context:
+        ```json
+        {json.dumps(context, indent=2)}
+        ```
+
+        Candidate next-subtasks (index: text):
+        {cand_block}
+
+        Score each candidate in [0, 1] for how well it advances the route safely and efficiently from
+        the current scene (avoid collisions and stalls; make forward progress toward route completion;
+        prefer candidates consistent with the reward context). Return ONLY JSON of the form
+        {{"scores": [s_0, ..., s_{n - 1}]}} with exactly {n} numbers in candidate order.
+        """
+    ).strip()
+
+
+def parse_candidate_scores(text: str, *, num: int) -> list[float]:
+    """Parse ``{"scores": [...]}`` into ``num`` floats in [0, 1].
+    """
+    payload = _extract_json_payload(text)
+    raw = payload.get("scores")
+    if not isinstance(raw, list) or len(raw) != num:
+        raise ValueError(f"VLM candidate scoring expected a 'scores' list of length {num}, got: {raw!r}")
+    return [min(1.0, max(0.0, float(v))) for v in raw]
+
+
 def build_debug_task_prompt(
     *,
     events: list[CoachEvent],

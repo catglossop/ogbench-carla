@@ -1,15 +1,18 @@
-"""``get_config()`` for GRPO on the SteerVLA high-level (CoT/subtask) policy.
+"""``get_config()`` for GRPO on the SteerVLA high-level (CoT/subtask) policy, scored by a VLM critic.
 
-Use with ``--agent=impls/configs/steervla_grpo_config.py``. ``main_carla`` dispatches to the GRPO
-path when ``online_training_mode == "grpo_hl"`` (see :func:`main_carla._run_grpo_entry`). This is a
-standalone RL baseline: no cast_relabel, no VLM coach, no DSRL critic. Each group is ``grpo.group_size``
-rollouts of the frozen base policy on the SAME route/env seed (only CoT sampling varies), the per-episode
-environment return is the reward, and :meth:`vlas.steervla.SteerVLAActor.update_hl_grpo` takes a
-group-relative policy-gradient step on the CoT tokens with a KL penalty to a frozen reference. The action
-expert is never modified (the CoT cross-entropy is independent of it).
+Use with ``--agent=impls/configs/steervla_grpo_config.py``. ``main_carla`` dispatches to the GRPO path
+when ``online_training_mode == "grpo_hl"`` (see :func:`main_carla._run_grpo_entry`). At each scored
+decision state along a single rolling rollout, the actor samples ``grpo.group_size`` candidate CoTs for
+the current observation and a VLM critic scores each candidate subtask in [0, 1] from the current frame +
+env-reward context (speed / route progress / cumulative + last-step reward). The scores form the group
+(``A_k=(s_k-mean)/std``); the K candidate CoTs are recorded with those advantages, the top-scored
+candidate is executed to advance the episode, and :meth:`vlas.steervla.SteerVLAActor.update_hl_grpo`
+takes a group-relative policy-gradient step on the CoT tokens with a KL penalty to a frozen reference.
+The action expert is never modified (the CoT cross-entropy is independent of it).
 
 Requires ``steervla.load_trainable_params=True`` (the HL backbone must be a full OpenPI TrainState) and a
-positive ``steervla.cot_temperature`` (greedy decoding gives an all-zero-advantage group -> no signal).
+positive ``grpo.score_temperature`` (greedy candidates are identical -> zero-variance scores -> no signal).
+The VLM critic uses the inherited ``vlm_coach`` block (provider / model).
 """
 
 import ml_collections
@@ -20,8 +23,8 @@ from configs.steervla_dsrl_config import get_config as get_dsrl_config
 def get_config():
     config = get_dsrl_config()
 
-    # GRPO runs its own group loop; the DSRL critic/coach are unused. Keep the critic language source
-    # off so no VLM coach spins up if some other codepath inspects it.
+    # GRPO runs its own loop; the DSRL critic is unused (the VLM critic is built directly from the
+    # vlm_coach block in _run_grpo_entry). Keep the DSRL critic language source off.
     config.language_feedback.source = "expert"
     config.language_feedback.expert_mode = "none"
     config.online_training_mode = "grpo_hl"
@@ -45,28 +48,27 @@ def get_config():
     # Freeze the memory-heavy pretrained subtrees for the HL step (SigLIP tower + tied token embedder);
     # the CoT policy gradient only needs the LLM transformer blocks + CoT heads. [] = full fine-tune.
     config.steervla.hl_freeze_regexes = [".*img.*", ".*embedder.*"]
-    # Minibatch size for the GRPO update: a full group of rollouts is far too large for one Pi0-CoT
+    # Minibatch size for the GRPO update: a pooled group of candidate CoTs can exceed one Pi0-CoT
     # forward+backward, so update_hl_grpo shuffles the pooled CoTs into minibatches of this size.
-    # 16 fits an 80 GB card (see steervla_cast_relabel_config.py); drop to 8 if memory is tight.
-    config.steervla.hl_update_batch_size = 16
-    # GRPO needs exploration: sample CoTs stochastically so the group's rollouts differ. Greedy (0.0)
-    # yields identical CoTs -> zero-variance returns -> zero advantages -> no learning signal.
-    config.steervla.cot_temperature = 1.0
+    config.steervla.hl_update_batch_size = 64
 
     config.grpo = ml_collections.ConfigDict(
         dict(
-            # Rollouts per group. Advantages are normalized within the group, so >=2 is required; more
-            # rollouts give a lower-variance baseline at linear wall-clock cost (each is a full episode).
+            # Candidate CoTs sampled + VLM-scored per decision state (all K scored in one call); >=2.
             group_size=8,
-            # KL(πθ‖π_ref) penalty weight against the frozen base HL policy (0 = pure REINFORCE).
+            # Candidate sampling temperature; >0 for diversity (greedy -> zero-variance scores).
+            score_temperature=1.0,
+            # Score every N env steps; the frozen base policy drives the rest. 1 = every decision state.
+            score_every=1,
+            # Scored states (K candidates each) pooled before one update_hl_grpo step.
+            update_every_states=4,
+            # KL(πθ‖π_ref) penalty weight vs the frozen base HL policy (0 = pure REINFORCE).
             beta_kl=0.01,
-            # Passes over the pooled group each update (minibatched inside update_hl_grpo).
+            # Passes over the pooled group per update (minibatched inside update_hl_grpo).
             num_update_steps=1,
             advantage_eps=1e-6,
-            # Export the fine-tuned HL backbone to <save_dir>/steervla_hl_ckpt/<step> every N groups
-            # (0 = only the final export). Redeploy frozen on other routes: steervla.checkpoint=<step>
-            # dir, same actor_config, load_trainable_params=False.
-            checkpoint_every_groups=5,
+            # Export the HL backbone to <save_dir>/steervla_hl_ckpt/<step> every N env steps (0 = final only).
+            checkpoint_every_steps=2000,
         )
     )
 

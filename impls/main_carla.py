@@ -4593,23 +4593,31 @@ def _run_residual_entry(config):
         wandb.finish()
 
 
-def run_online_grpo(env, steervla_actor, vla_sample_fn, config, obs_raw, *, raw_holder, exec_cfg):
-    """GRPO on the SteerVLA high-level (CoT/subtask) policy; the frozen action expert is untouched.
+def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, *, raw_holder, exec_cfg):
+    """GRPO on the SteerVLA high-level (CoT/subtask) policy, scored by a VLM critic (action expert frozen).
 
-    Each group is ``group_size`` rollouts of the frozen base policy on the SAME route/env seed, so the
-    only within-group variation is CoT sampling (the actor's free-running RNG counter). The per-episode
-    environment return is the reward; trajectory-level group-relative advantages ``A_g=(R_g-mean)/std``
-    are assigned to every CoT sampled in rollout g, then :meth:`SteerVLAActor.update_hl_grpo` takes the
-    (minibatched) policy-gradient step with a KL penalty to a frozen reference. Repeats until the
+    At each scored decision state the actor samples ``group_size`` candidate CoTs for the current
+    observation (one batched forward); the VLM critic scores each candidate subtask in [0, 1] given the
+    current frame + env-reward context (speed / route progress / cumulative + last-step reward). The
+    scores form the group: advantage ``A_k=(s_k-mean)/std``. The K candidate CoTs are recorded with
+    those advantages, and the argmax-score candidate's action chunk is executed to advance the episode.
+    Records accumulate across ``update_every_states`` scored states, then :meth:`update_hl_grpo` takes
+    the (minibatched) policy-gradient step with a KL penalty to a frozen reference. Runs until the
     ``online_steps`` env-step budget is spent.
     """
+    from coaches.cast_relabel import build_candidate_score_prompt, parse_candidate_scores
+
     grpo = config.get("grpo") or {}
-    group_size = max(2, int(grpo.get("group_size", 8)))
+    n_cand = max(2, int(grpo.get("group_size", 8)))
+    score_temp = float(grpo.get("score_temperature", 1.0))
     beta_kl = float(grpo.get("beta_kl", 0.01))
     num_epochs = int(grpo.get("num_update_steps", 1))
+    score_every = max(1, int(grpo.get("score_every", 1)))  # env steps between scored decision states
+    update_every = max(1, int(grpo.get("update_every_states", 4)))  # scored states pooled per update
     adv_eps = float(grpo.get("advantage_eps", 1e-6))
-    ckpt_every_groups = int(grpo.get("checkpoint_every_groups", 5))
+    ckpt_every_steps = int(grpo.get("checkpoint_every_steps", 2000))
     ckpt_root = os.path.join(FLAGS.save_dir, "steervla_hl_ckpt")
+    routing_command = str((config.get("steervla") or {}).get("routing_command", "Follow the route."))
 
     log_video = bool(config.get("log_episode_video", True))
     video_fps = float(config.get("episode_video_fps", 10.0))
@@ -4618,91 +4626,119 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, config, obs_raw, *, raw_
 
     base_model = getattr(steervla_actor, "model", None)
     base_noise_dim = int(base_model.action_horizon) * int(base_model.action_dim) if base_model is not None else 40
-    env_seed = int(FLAGS.seed)  # fixed across the group: identical dynamics, CoT sampling varies
     rng = jax.random.PRNGKey(FLAGS.seed)
-
     total_steps = int(FLAGS.online_steps)
-    step = 0
-    group_idx = 0
-    while step < total_steps:
-        per_rollout_records: list[list[dict]] = []
-        returns: list[float] = []
-        group_frames: list[np.ndarray] = []
-        for g in range(group_size):
-            obs_raw, _ = env.reset(seed=env_seed)
-            steervla_actor.reset_action_cache()
-            steervla_actor.grpo_begin_episode()
-            ep_return, ep_steps, done = 0.0, 0, False
-            frames: list[np.ndarray] = []
-            while not done:
-                rng, nk = jax.random.split(rng)
-                noise = jax.random.normal(nk, (1, base_noise_dim), dtype=jnp.float32)
-                base_chunk = _base_chunk(vla_sample_fn, raw_holder, obs_raw, noise)
-                next_obs_raw, reward, terminated, truncated, info = env.step(base_chunk)
-                ep_return += float(reward)
-                ep_steps += 1
-                step += 1
-                done = bool(terminated or truncated)
-                if log_video and g == 0:
-                    _maybe_capture_frame(
-                        frames, next_obs_raw, reward, episode_steps=ep_steps, done=done,
-                        log_video=log_video, video_every=video_every,
-                        action_flat=base_chunk, exec_cfg=exec_cfg, steervla_actor=steervla_actor,
-                    )
-                obs_raw = next_obs_raw
-            recs = steervla_actor.grpo_take_records()
-            per_rollout_records.append(recs)
-            returns.append(ep_return)
-            if g == 0:
-                group_frames = frames
+
+    pooled: list[dict] = []
+    pooled_adv: list[float] = []
+    score_stats: list[np.ndarray] = []
+    states_since_update = 0
+    update_idx = 0
+
+    obs = obs_raw
+    info: dict[str, Any] = {}
+    steervla_actor.reset_action_cache()
+    episode_return, episode_steps, episode_count, last_reward = 0.0, 0, 0, 0.0
+    frames: list[np.ndarray] = []
+
+    def _do_update(step_tag: int) -> None:
+        nonlocal pooled, pooled_adv, score_stats, states_since_update, update_idx
+        if not pooled:
+            return
+        uinfo = steervla_actor.update_hl_grpo(
+            pooled, np.asarray(pooled_adv, dtype=np.float32),
+            beta=beta_kl, num_epochs=num_epochs, global_step=step_tag,
+        )
+        all_scores = np.concatenate(score_stats) if score_stats else np.zeros((1,), dtype=np.float32)
+        metrics = {f"grpo/{k}": float(v) for k, v in uinfo.items()}
+        metrics.update({
+            "grpo/update": float(update_idx),
+            "grpo/beta_kl": beta_kl,
+            "grpo/n_states": float(states_since_update),
+            "grpo/score_mean": float(all_scores.mean()),
+            "grpo/score_std": float(all_scores.std()),
+        })
+        wandb.log(metrics, step=step_tag)
+        train_logger.log({k: v for k, v in metrics.items() if np.isscalar(v)}, step=step_tag)
+        pooled, pooled_adv, score_stats, states_since_update = [], [], [], 0
+        update_idx += 1
+
+    for step in tqdm.tqdm(range(1, total_steps + 1), dynamic_ncols=True):
+        raw_holder["obs"] = obs
+        if step % score_every == 0:
+            # Sample, VLM-score, and record K candidate CoTs; execute the top-scored one.
+            rng, ck = jax.random.split(rng)
+            cands = steervla_actor.sample_candidates(n_cand, temperature=score_temp, raw=obs, rng=ck)
+            subtasks = list(cands["subtask_texts"])
+            chunks = np.asarray(cands["actions"], dtype=np.float32).reshape(n_cand, -1)
+            context = {
+                "routing_command": routing_command,
+                "current_speed_mps": round(float(_ego_speed_mps(obs)), 2),
+                "route_progress_pct": round(float(info.get("route_progress_pct", 0.0)), 2),
+                "episode_return_so_far": round(episode_return, 3),
+                "last_step_reward": round(last_reward, 3),
+                "episode_step": episode_steps,
+            }
+            frame = _viz_image_from_raw(obs)
+            if frame is None:
+                frame = obs.get("image")
+            text = coach.complete_image_text(frame, build_candidate_score_prompt(context, subtasks))
+            scores = np.asarray(parse_candidate_scores(text, num=n_cand), dtype=np.float32)
+            adv = (scores - scores.mean()) / (scores.std() + adv_eps)
+            pooled.extend(steervla_actor.grpo_records_from_candidates(cands, obs))
+            pooled_adv.extend(float(a) for a in adv)
+            score_stats.append(scores)
+            states_since_update += 1
+            action = chunks[int(np.argmax(scores))]
+        else:
+            rng, nk = jax.random.split(rng)
+            action = _base_chunk(
+                vla_sample_fn, raw_holder, obs, jax.random.normal(nk, (1, base_noise_dim), dtype=jnp.float32)
+            )
+
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        episode_return += float(reward)
+        episode_steps += 1
+        last_reward = float(reward)
+        done = bool(terminated or truncated)
+        if log_video:
+            _maybe_capture_frame(
+                frames, next_obs, reward, episode_steps=episode_steps, done=done,
+                log_video=log_video, video_every=video_every,
+                action_flat=action, exec_cfg=exec_cfg, steervla_actor=steervla_actor,
+            )
+        obs = next_obs
+
+        if done:
+            ep_metrics: dict[str, Any] = {
+                "grpo/episode": float(episode_count),
+                "grpo/episode_return": episode_return,
+                "grpo/episode_steps": float(episode_steps),
+            }
+            if log_video and frames:
+                video = _episode_video(frames, video_fps)
+                if video is not None:
+                    ep_metrics["grpo/rollout_video"] = video
+            wandb.log(ep_metrics, step=step)
             print(
-                f"[grpo] group {group_idx} rollout {g + 1}/{group_size}: return={ep_return:.3f} "
-                f"steps={ep_steps} cots={len(recs)} (env_step {step}/{total_steps})",
+                f"[grpo] episode {episode_count}: return={episode_return:.3f} steps={episode_steps} "
+                f"(env_step {step}/{total_steps})",
                 flush=True,
             )
+            episode_count += 1
+            episode_return, episode_steps, last_reward = 0.0, 0, 0.0
+            frames = []
+            obs, info = env.reset(seed=FLAGS.seed + episode_count)
+            steervla_actor.reset_action_cache()
 
-        R = np.asarray(returns, dtype=np.float32)
-        adv = (R - R.mean()) / (R.std() + adv_eps)  # trajectory-level, group-normalized
-        pooled: list[dict] = []
-        pooled_adv: list[float] = []
-        for recs, a in zip(per_rollout_records, adv):
-            pooled.extend(recs)
-            pooled_adv.extend([float(a)] * len(recs))
+        if states_since_update >= update_every:
+            _do_update(step)
+        if ckpt_every_steps > 0 and step % ckpt_every_steps == 0:
+            steervla_actor.save_checkpoint(ckpt_root, step)
 
-        info: dict[str, float] = {}
-        if pooled:
-            info = steervla_actor.update_hl_grpo(
-                pooled, np.asarray(pooled_adv, dtype=np.float32),
-                beta=beta_kl, num_epochs=num_epochs, global_step=step,
-            )
-        else:
-            print("[grpo] group produced no CoT samples; skipping update.", flush=True)
-
-        metrics = {f"grpo/{k}": float(v) for k, v in info.items()}
-        metrics.update({
-            "grpo/group": float(group_idx),
-            "grpo/beta_kl": beta_kl,
-            "grpo/return_mean": float(R.mean()),
-            "grpo/return_std": float(R.std()),
-            "grpo/return_max": float(R.max()),
-            "grpo/return_min": float(R.min()),
-        })
-        if log_video and group_frames:
-            video = _episode_video(group_frames, video_fps)
-            if video is not None:
-                metrics["grpo/rollout_video"] = video
-        wandb.log(metrics, step=step)
-        train_logger.log({k: v for k, v in metrics.items() if np.isscalar(v)}, step=step)
-
-        group_idx += 1
-        if ckpt_every_groups > 0 and group_idx % ckpt_every_groups == 0:
-            try:
-                steervla_actor.save_checkpoint(ckpt_root, step)
-            except Exception as exc:  # noqa: BLE001 - checkpoint export must never kill training.
-                print(f"[grpo] checkpoint save failed (non-fatal): {exc}", flush=True)
-
+    _do_update(total_steps)
     try:
-        steervla_actor.save_checkpoint(ckpt_root, step)  # final export
+        steervla_actor.save_checkpoint(ckpt_root, total_steps)  # final export
     except Exception as exc:  # noqa: BLE001
         print(f"[grpo] final checkpoint save failed (non-fatal): {exc}", flush=True)
 
@@ -4748,8 +4784,17 @@ def _run_grpo_entry(config):
         )
         _configure_jax_training_device(int(config.get("training_gpu_rank", -1)))
 
+        # VLM critic: reuse the coach the DSRL/CAST path uses (provider/model from the vlm_coach block).
+        from coaches.vlm_feedback import create_coach
+
+        vlm_cfg = config.get("vlm_coach") or {}
+        coach = create_coach(
+            str(vlm_cfg.get("provider", "gemini")),
+            model=str(vlm_cfg.get("gemini_model", "gemini-2.0-flash")),
+        )
+
         run_online_grpo(
-            env, steervla_actor, vla_sample_fn, config, obs,
+            env, steervla_actor, vla_sample_fn, coach, config, obs,
             raw_holder=raw_holder, exec_cfg=exec_cfg,
         )
     finally:
