@@ -409,6 +409,85 @@ def _openpi_hl_train_step(
     return new_state, info
 
 
+def _cot_ce_per_example(model, rng, observation, actions) -> jnp.ndarray:
+    """Per-example CoT cross-entropy ``(B,)`` = ``-logπ(cot | state)`` of the teacher-forced tokens.
+
+    With the batch's ``action_loss_mask`` all-``False`` the flow loss is zero, so this is purely the
+    reasoning+subtask CE — the same quantity the HL BC step trains, just kept per-example.
+    """
+    if hasattr(model, "compute_loss_with_aux"):
+        chunked_loss, _ = model.compute_loss_with_aux(rng, observation, actions, train=True)
+    else:
+        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+    ce = jnp.asarray(chunked_loss)
+    return ce.reshape(ce.shape[0], -1).mean(axis=-1) if ce.ndim > 1 else ce
+
+
+def _openpi_hl_grpo_step(
+    config: openpi_train_config.TrainConfig,
+    rng: jax.Array,
+    state: training_utils.TrainState,
+    ref_params,
+    batch: tuple[_openpi_model.Observation, jnp.ndarray],
+    advantages: jnp.ndarray,
+    beta: jnp.ndarray,
+):
+    """One GRPO gradient step on the HL (CoT/subtask) policy; the action expert is never modified.
+
+    Trajectory-level GRPO: ``advantages`` is one group-relative scalar per example (every CoT sampled
+    in a rollout shares its episode advantage). Since CoT CE is ``-logπ(cot)``, the policy-gradient
+    surrogate is ``mean(A · ce_theta)`` (minimizing it raises ``logπ`` for positive-advantage samples),
+    and the KL(πθ‖π_ref) penalty uses Schulman's k3 estimator from the per-example log-ratio against the
+    frozen ``ref_params``. Grads are filtered to ``config.trainable_filter`` (same freeze story as the BC
+    step); the action-expert params never enter the CoT CE, so they receive no gradient regardless.
+    """
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
+    ref_model = nnx.merge(state.model_def, ref_params)
+    ref_model.eval()
+
+    observation, actions = batch
+    train_rng = jax.random.fold_in(rng, state.step)
+    # Reference log-prob is a constant (frozen params, forward-only): compute outside the grad path so
+    # XLA keeps no backward activations for it and no gradient can flow into the reference.
+    ce_ref = jax.lax.stop_gradient(_cot_ce_per_example(ref_model, train_rng, observation, actions))
+
+    def loss_fn(model, rng, observation, actions):
+        ce_theta = _cot_ce_per_example(model, rng, observation, actions)
+        pg_loss = jnp.mean(advantages * ce_theta)
+        log_ratio = ce_ref - ce_theta  # logπθ - logπ_ref
+        kl = jnp.mean(jnp.exp(-log_ratio) + log_ratio - 1.0)  # k3 KL(πθ‖π_ref) >= 0
+        loss = pg_loss + beta * kl
+        return loss, {"pg_loss": pg_loss, "kl": kl, "ce_theta": jnp.mean(ce_theta), "ce_ref": jnp.mean(ce_ref)}
+
+    diff_state = nnx.DiffState(0, config.trainable_filter)
+    (loss, aux), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
+
+    params = state.params.filter(config.trainable_filter)
+    updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+
+    nnx.update(model, new_params)
+    new_params = nnx.state(model)
+
+    new_state = dataclasses.replace(state, step=state.step + 1, params=new_params, opt_state=new_opt_state)
+    if state.ema_decay is not None:
+        new_state = dataclasses.replace(
+            new_state,
+            ema_params=jax.tree.map(
+                lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new,
+                state.ema_params,
+                new_params,
+            ),
+        )
+
+    info = {"loss": loss, "grad_norm": optax.global_norm(grads), "mean_adv": jnp.mean(advantages)}
+    info.update(aux)
+    return new_state, info
+
+
 @dataclasses.dataclass(frozen=True)
 class _SliceActionDim(openpi_transforms.DataTransformFn):
     """Slice env action dims on the last axis (safe for ``(H, D)`` and ``(B, H, D)``)."""
@@ -1151,6 +1230,7 @@ class SteerVLAActor:
         hl_update_every: int = 1,
         hl_update_batch_size: int = 2,
         hl_update_num_steps: int = 1,
+        hl_lr: float | None = None,
         hl_freeze_regexes: list[str] | None = None,
         hl_replay_root: str | Path | None = None,
         hl_replay_pools: list[dict] | None = None,
@@ -1191,6 +1271,10 @@ class SteerVLAActor:
         self.hl_update_every = max(1, int(hl_update_every))
         self.hl_update_batch_size = max(1, int(hl_update_batch_size))
         self.hl_update_num_steps = max(1, int(hl_update_num_steps))
+        # Flat LR override for the HL optimizer. The pretraining actor_config ships a warmup->1e-4
+        # cosine schedule (tuned for from-scratch BC); RL fine-tuning wants a small constant rate, so
+        # when set this replaces the schedule with a flat ``hl_lr`` (no warmup ramp). None = keep config.
+        self.hl_lr: float | None = float(hl_lr) if hl_lr else None
         # Optional regexes of param paths to FREEZE in the trainable state (e.g. the SigLIP vision
         # tower and the tied token embedder), so their grad + Adam buffers are dropped and the HL
         # update fits. Applied in :meth:`setup` before the train state is built. None = full fine-tune.
@@ -1234,6 +1318,8 @@ class SteerVLAActor:
         self._hl_replay_logged_once = False
         self._hl_replay_missing_warned = False
         self._hl_train_step = None
+        self._hl_grpo_step = None
+        self._hl_ref_params = None
         self._hl_update_calls = 0
         # Diagnostics for :meth:`update_hl`, whose skip paths are otherwise silent (it returns
         # ``{}``), which makes an absent ``vla_hl/batch_text`` table impossible to explain.
@@ -1421,6 +1507,16 @@ class SteerVLAActor:
             )
             print(f"[steervla] extra freeze regexes for trainable state: {self.hl_freeze_regexes}", flush=True)
 
+        if self.load_trainable_params and self.hl_lr:
+            # Flat constant LR (warmup_steps=0, peak == decay) instead of the pretraining warmup-cosine.
+            self.train_cfg = dataclasses.replace(
+                self.train_cfg,
+                lr_schedule=_optimizer.CosineDecaySchedule(
+                    warmup_steps=0, peak_lr=self.hl_lr, decay_steps=10**9, decay_lr=self.hl_lr
+                ),
+            )
+            print(f"[steervla] HL optimizer LR overridden to flat {self.hl_lr:g}", flush=True)
+
         if self.load_trainable_params:
             # Full trainable state (optimizer + opt_state + freeze/trainable filters), pinned to one
             # GPU. Matches ``scripts/train.py :: init_train_state`` so the actor's weights can be
@@ -1508,6 +1604,17 @@ class SteerVLAActor:
             self._hl_train_step = jax.jit(
                 functools.partial(_openpi_hl_train_step, self.train_cfg),
                 donate_argnums=(1,),
+            )
+            # GRPO (HL policy) step: same donate/static convention as above. Snapshot the loaded params
+            # as the frozen KL reference. Must be a real buffer copy (jnp.copy), not an identity map:
+            # the step donates the train state, so a shared buffer would be freed after the first update
+            # and corrupt the reference. Both are used only by ``update_hl_grpo``.
+            self._hl_grpo_step = jax.jit(
+                functools.partial(_openpi_hl_grpo_step, self.train_cfg),
+                donate_argnums=(1,),
+            )
+            self._hl_ref_params = jax.tree.map(
+                lambda x: jnp.copy(x) if isinstance(x, jax.Array) else x, self._train_state.params
             )
             if self._train_rng is None:
                 self._train_rng = jax.random.key(0)
@@ -2085,12 +2192,20 @@ class SteerVLAActor:
             state_norm = self._normalize_state_batch(state_pad)[0]
             state_for_model = pad_to_dim(state_norm, model_action_dim)
 
-            rea_tok, rea_mask = self.tokenizer.tokenize_reasoning(
-                str(rec.get("reasoning", "")).strip() or "Follow the route."
-            )
-            sub_tok, sub_mask = self.tokenizer.tokenize_subtask(
-                str(rec.get("subtask", "")).strip() or "Follow the route."
-            )
+            # GRPO records carry the exact sampled token ids. Text records
+            # (cast_relabel / replay pools) tokenize their reasoning/subtask strings as before.
+            if "reasoning_ids" in rec:
+                rea_tok, rea_mask = rec["reasoning_ids"], rec["reasoning_mask"]
+            else:
+                rea_tok, rea_mask = self.tokenizer.tokenize_reasoning(
+                    str(rec.get("reasoning", "")).strip() or "Follow the route."
+                )
+            if "subtask_ids" in rec:
+                sub_tok, sub_mask = rec["subtask_ids"], rec["subtask_mask"]
+            else:
+                sub_tok, sub_mask = self.tokenizer.tokenize_subtask(
+                    str(rec.get("subtask", "")).strip() or "Follow the route."
+                )
 
             img_batch.append(_resize_hl_image(rec["image"]))
             state_batch.append(np.asarray(state_for_model, dtype=np.float32))
@@ -2751,6 +2866,66 @@ class SteerVLAActor:
         except Exception as exc:  # noqa: BLE001 - memory telemetry must never break the update.
             print(f"[steervla.update_hl] memory_stats unavailable ({exc}).", flush=True)
 
+        return out
+
+    def update_hl_grpo(
+        self,
+        records: list[dict[str, Any]],
+        advantages: np.ndarray,
+        *,
+        beta: float,
+        num_epochs: int = 1,
+        global_step: int | None = None,
+    ) -> dict[str, float]:
+        """GRPO gradient steps on the HL policy over a pooled group of CoT samples.
+
+        ``records`` is the pooled candidate CoTs across scored states (schema from
+        :meth:`grpo_records_from_candidates`); ``advantages`` is the aligned per-record group-relative
+        advantage (the K candidates of one scored state share that state's normalized VLM scores). The
+        pool can exceed one forward, so it is shuffled and processed in ``hl_update_batch_size`` minibatches
+        (remainder dropped, or padded by repetition when the pool is smaller than one minibatch) for
+        ``num_epochs`` passes.
+        Updates ``self._train_state`` in place and marks the inference weights dirty. No-op unless the
+        actor was loaded trainable and has a frozen reference.
+        """
+        if self._remote is not None or self._train_state is None or self._hl_grpo_step is None:
+            return self._hl_skip("GRPO update needs a local trainable actor (load_trainable_params=True)")
+        records = list(records)
+        advantages = np.asarray(advantages, dtype=np.float32).reshape(-1)
+        if not records or advantages.shape[0] != len(records):
+            return self._hl_skip("GRPO update got no records or mismatched advantages")
+
+        mb = int(self.hl_update_batch_size)
+        n = len(records)
+        rng_np = np.random.default_rng(int(global_step or 0))
+        beta_arr = jnp.asarray(float(beta), dtype=jnp.float32)
+        infos: list[dict[str, Any]] = []
+        for _ in range(max(1, int(num_epochs))):
+            order = rng_np.permutation(n)
+            if n >= mb:
+                batches = [order[i : i + mb] for i in range(0, n - mb + 1, mb)]  # drop remainder
+            else:
+                batches = [np.resize(order, mb)]  # pad the whole (small) group up to one minibatch
+            for idx in batches:
+                sub_records = [records[i] for i in idx]
+                sub_adv = jnp.asarray(advantages[idx], dtype=jnp.float32)
+                observation, actions = self._build_hl_observation_batch(sub_records)
+                self._train_rng, step_rng = jax.random.split(self._train_rng)
+                self._train_state, info = self._hl_grpo_step(
+                    step_rng, self._train_state, self._hl_ref_params, (observation, actions), sub_adv, beta_arr
+                )
+                infos.append(info)
+        self._weights_dirty = True
+
+        out: dict[str, float] = {}
+        if infos:
+            for k in infos[-1]:
+                try:
+                    out[str(k)] = float(np.mean([float(jax.device_get(i[k])) for i in infos]))
+                except Exception:
+                    continue
+        out["n_samples"] = float(n)
+        out["n_minibatches"] = float(len(infos))
         return out
 
     def save_checkpoint(self, out_root: str | Path, step: int, *, keep_last: int = 0) -> Path | None:
@@ -3666,6 +3841,58 @@ class SteerVLAActor:
             self._cached_cot_actions_used = 0
         self._last_cot_out = cot_out
         return cot_out
+
+    def _grpo_scene_fields(self, raw: dict[str, Any]) -> tuple[np.ndarray, str, np.ndarray]:
+        """Shared (state, prompt, image) for GRPO HL records built from a raw CARLA obs."""
+        state_vec = np.asarray(raw["state"], dtype=np.float32).reshape(-1)
+        speed = float(state_vec[15]) if state_vec.shape[0] > 15 else 0.0
+        prompt = routing_instruction_prompt(routing_command=self.routing_command, current_speed_mps=speed)
+        return state_vec, prompt, np.asarray(raw["image"])
+
+    def grpo_records_from_candidates(
+        self, cands: dict[str, Any], raw: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """K per-candidate HL records for :meth:`update_hl_grpo`, from a :meth:`sample_candidates` batch.
+
+        Each record carries the sampled reasoning/subtask token ids for that candidate plus the shared scene.
+        Schema matches _build_hl_observation_batch (action loss + FAST masked off: HL-only supervision).
+        """
+        cot = cands["cot_out"]
+        rea = np.asarray(jax.device_get(cot["tokenized_reasoning"]), dtype=np.int32)
+        rea_mask = np.asarray(jax.device_get(cot["tokenized_reasoning_mask"]), dtype=bool)
+        sub = np.asarray(jax.device_get(cot["tokenized_subtask"]), dtype=np.int32)
+        sub_mask = np.asarray(jax.device_get(cot["tokenized_subtask_mask"]), dtype=bool)
+        state_vec, prompt, image = self._grpo_scene_fields(raw)
+        return [
+            {
+                "state": state_vec,
+                "state_format": "carla_raw",
+                "prompt": prompt,
+                "image": image,
+                "reasoning_ids": rea[k],
+                "reasoning_mask": rea_mask[k],
+                "subtask_ids": sub[k],
+                "subtask_mask": sub_mask[k],
+                "action_supervision": False,
+                "supervise_fast": False,
+            }
+            for k in range(rea.shape[0])
+        ]
+
+    def grpo_stop_record(self, raw: dict[str, Any], *, reasoning: str, subtask: str) -> dict[str, Any]:
+        """Canned text-based HL record (debug stop-injection); the CoT is tokenized from the given
+        reasoning/subtask text by _build_hl_observation_batch (no ``*_ids``)."""
+        state_vec, prompt, image = self._grpo_scene_fields(raw)
+        return {
+            "state": state_vec,
+            "state_format": "carla_raw",
+            "prompt": prompt,
+            "image": image,
+            "reasoning": str(reasoning),
+            "subtask": str(subtask),
+            "action_supervision": False,
+            "supervise_fast": False,
+        }
 
     def _mark_action_served(self, batch_size: int) -> None:
         if self._cot_cache_enabled(batch_size) and self._cached_cot is not None:
@@ -4619,6 +4846,7 @@ def create_steervla_pi0_cot_sample_fn(
         hl_update_every=int(steervla_cfg.get("hl_update_every", 1)),
         hl_update_batch_size=int(steervla_cfg.get("hl_update_batch_size", 2)),
         hl_update_num_steps=int(steervla_cfg.get("hl_update_num_steps", 1)),
+        hl_lr=steervla_cfg.get("hl_lr"),
         hl_freeze_regexes=steervla_cfg.get("hl_freeze_regexes"),
         # HL replay pools (pretraining-data stabilization). See extract_hl_replay.py.
         hl_replay_root=steervla_cfg.get("hl_replay_root"),

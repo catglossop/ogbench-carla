@@ -417,6 +417,10 @@ class VLMCOach(ABC):
         """Text-only completion (used for per-chunk feedback refinement)."""
         raise NotImplementedError(f"{type(self).__name__} does not support text-only completion.")
 
+    def complete_image_text(self, image: Any, prompt: str) -> str:
+        """Single-image + text completion (used by the GRPO VLM critic to score candidates)."""
+        raise NotImplementedError(f"{type(self).__name__} does not support image+text completion.")
+
 
 # ── Gemini REST API helpers (Python-3.8-compatible; no google-genai package needed) ──
 
@@ -609,6 +613,23 @@ class GeminiVLMCOach(VLMCOach):
             [{"parts": [{"text": prompt}]}],
             self.api_key,
         )
+
+    def complete_image_text(self, image: Any, prompt: str) -> str:
+        """Single-frame + text completion via an inline JPEG part."""
+        import base64
+        import io
+
+        import numpy as np
+        from PIL import Image
+
+        arr = np.asarray(image)
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        buf = io.BytesIO()
+        Image.fromarray(arr).save(buf, format="JPEG", quality=90)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        parts = [{"inline_data": {"mime_type": "image/jpeg", "data": b64}}, {"text": prompt}]
+        return _gemini_generate_content(self.model, [{"parts": parts}], self.api_key)
 
 
 class PerceptronVLMCOach(VLMCOach):

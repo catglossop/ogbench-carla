@@ -137,7 +137,7 @@ Options:
                               expert-lang  -> language on expert action
                             Default: delta
 
-  --train-mode MODE         rl|dagger|sac_residual|dagger_residual. Default: sac_residual
+  --train-mode MODE         rl|dagger|sac_residual|dagger_residual|grpo_hl. Default: dagger
 
   --include-proprio BOOL    true|false. Include ego-state vector as explicit input to residual
                             actor and critic (residual_append_state). Default: false
@@ -309,10 +309,10 @@ case "$CRITIC_MODE" in
 esac
 
 case "$TRAIN_MODE" in
-  rl|dagger|sac_residual|dagger_residual) ;;
+  rl|dagger|sac_residual|dagger_residual|grpo_hl) ;;
   *)
     echo "Invalid --train-mode: $TRAIN_MODE" >&2
-    echo "Expected one of: rl, dagger, sac_residual, dagger_residual" >&2
+    echo "Expected one of: rl, dagger, sac_residual, dagger_residual, grpo_hl" >&2
     exit 2
     ;;
 esac

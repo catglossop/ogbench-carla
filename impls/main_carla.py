@@ -1380,8 +1380,16 @@ def _annotate_text_panel(
         def _clip(txt: str, n: int = 120) -> str:
             return txt if len(txt) <= n else (txt[: n - 3] + "...")
 
-        lines = []
-        if hud:
+        white = (255, 255, 255)
+        lines: list[str] = []
+        colors: list[tuple] = []  # per-line BGR; parallel to ``lines``
+        if hud and hud.get("lines"):
+            # Generic header lines (GRPO overlay): rendered verbatim, with optional per-line colors.
+            hud_lines = [str(x) for x in hud["lines"]]
+            hud_colors = hud.get("line_colors") or [white] * len(hud_lines)
+            lines.extend(hud_lines)
+            colors.extend(hud_colors[i] if i < len(hud_colors) and hud_colors[i] else white for i in range(len(hud_lines)))
+        elif hud:
             lines.append(
                 f"Action base={hud.get('base', '-')} residual={hud.get('residual', '-')} "
                 f"final={hud.get('final', '-')} scale={hud.get('scale', '-')}"
@@ -1399,13 +1407,23 @@ def _annotate_text_panel(
             f"Reasoning: {_clip(reasoning)}",
             f"Subtask: {_clip(subtask)}",
         ]
+        colors += [white] * (len(lines) - len(colors))  # remaining lines default white
+
+        def _fit(txt: str) -> str:
+            """Shrink ``txt`` (with an ellipsis) until it fits the panel width; avoids right-edge cutoff."""
+            if not txt or cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0][0] <= w - 8:
+                return txt
+            while txt and cv2.getTextSize(txt + "...", cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0][0] > w - 8:
+                txt = txt[:-1]
+            return txt + "..."
+
         panel_h = max(72, line_h * (len(lines) + 1))
         annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
         annotated[:h, :, :] = annotated_top
         cv2.line(annotated, (0, h), (w - 1, h), (255, 255, 255), 1)
         y = h + line_h
-        for line in lines:
-            cv2.putText(annotated, line, (4, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
+        for line, color in zip(lines, colors):
+            cv2.putText(annotated, _fit(line), (4, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1, cv2.LINE_AA)
             y += line_h
         return annotated
     except Exception:
@@ -4593,13 +4611,332 @@ def _run_residual_entry(config):
         wandb.finish()
 
 
+def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, *, raw_holder, exec_cfg):
+    """GRPO on the SteerVLA high-level (CoT/subtask) policy, scored by a VLM critic (action expert frozen).
+
+    At each scored decision state the actor samples ``group_size`` candidate CoTs for the current
+    observation (one batched forward); the VLM critic scores each candidate subtask in [0, 1] given the
+    current frame + env-reward context (speed / route progress / cumulative + last-step reward). The
+    scores form the group: advantage ``A_k=(s_k-mean)/std``. The K candidate CoTs are recorded with
+    those advantages, and the argmax-score candidate's action chunk is executed to advance the episode.
+    Records accumulate across ``update_every_states`` scored states, then :meth:`update_hl_grpo` takes
+    the (minibatched) policy-gradient step with a KL penalty to a frozen reference. Runs until the
+    ``online_steps`` env-step budget is spent.
+    """
+    from coaches.cast_relabel import build_candidate_score_prompt, parse_candidate_scores
+
+    grpo = config.get("grpo") or {}
+    n_cand = max(2, int(grpo.get("group_size", 8)))
+    score_temp = float(grpo.get("score_temperature", 1.0))
+    beta_kl = float(grpo.get("beta_kl", 0.01))
+    num_epochs = int(grpo.get("num_update_steps", 1))
+    score_every = max(1, int(grpo.get("score_every", 1)))  # env steps between scored decision states
+    update_every = max(1, int(grpo.get("update_every_states", 4)))  # scored states pooled per update
+    adv_eps = float(grpo.get("advantage_eps", 1e-6))
+    vlm_retries = max(1, int(grpo.get("vlm_score_retries", 3)))
+    ckpt_every_steps = int(grpo.get("checkpoint_every_steps", 2000))
+    ckpt_root = os.path.join(FLAGS.save_dir, "steervla_hl_ckpt")
+    routing_command = str((config.get("steervla") or {}).get("routing_command", "Follow the route."))
+
+    # Debug stop task: env reward -> -ego_speed (surfaced to the VLM) and the scoring objective flips to
+    # "prefer stopping". inject_stop_candidate swaps one candidate for a canned stop CoT + zero chunk.
+    debug_task = bool(grpo.get("debug_task", False))
+    inject_stop = bool(grpo.get("inject_stop_candidate", False))
+    stop_reasoning = str(grpo.get("stop_reasoning", "The vehicle must come to a stop."))
+    stop_subtask = str(grpo.get("stop_subtask", "The vehicle comes to a complete stop and remains stationary."))
+    score_objective = (
+        "how much it reduces speed and brings the vehicle to a complete stop (reward = -speed; a fully "
+        "stopped vehicle scores highest)" if debug_task else None
+    )
+
+    log_video = bool(config.get("log_episode_video", True))
+    video_fps = float(config.get("episode_video_fps", 10.0))
+    video_every = max(1, int(config.get("episode_video_every", 2)))
+    train_logger = CsvLogger(os.path.join(FLAGS.save_dir, "train.csv"))
+
+    base_model = getattr(steervla_actor, "model", None)
+    base_noise_dim = int(base_model.action_horizon) * int(base_model.action_dim) if base_model is not None else 40
+    rng = jax.random.PRNGKey(FLAGS.seed)
+    total_steps = int(FLAGS.online_steps)
+
+    pooled: list[dict] = []
+    pooled_adv: list[float] = []
+    score_stats: list[np.ndarray] = []
+    winner_scores: list[float] = []  # top score picked per scored state (for update metrics)
+    inject_wins: list[float] = []    # 1.0 when the injected stop candidate won, else 0.0
+    score_fail_count = 0             # scored states whose VLM scoring failed all retries (drove base)
+    states_since_update = 0
+    update_idx = 0
+
+    obs = obs_raw
+    info: dict[str, Any] = {}
+    steervla_actor.reset_action_cache()
+    episode_return, episode_steps, episode_count, last_reward = 0.0, 0, 0, 0.0
+    episode_speed_sum = 0.0
+    frames: list[np.ndarray] = []
+
+    def _do_update(step_tag: int) -> None:
+        nonlocal pooled, pooled_adv, score_stats, winner_scores, inject_wins, states_since_update, update_idx
+        nonlocal score_fail_count
+        if not pooled:
+            return
+        uinfo = steervla_actor.update_hl_grpo(
+            pooled, np.asarray(pooled_adv, dtype=np.float32),
+            beta=beta_kl, num_epochs=num_epochs, global_step=step_tag,
+        )
+        all_scores = np.concatenate(score_stats) if score_stats else np.zeros((1,), dtype=np.float32)
+        metrics = {f"grpo/{k}": float(v) for k, v in uinfo.items()}
+        metrics.update({
+            "grpo/update": float(update_idx),
+            "grpo/beta_kl": beta_kl,
+            "grpo/n_states": float(states_since_update),
+            "grpo/score_mean": float(all_scores.mean()),
+            "grpo/score_std": float(all_scores.std()),
+            "grpo/winner_score_mean": float(np.mean(winner_scores)) if winner_scores else 0.0,
+            # Scored states in this window whose VLM scoring failed all retries (drove the base chunk
+            # instead, and were not pooled); a persistent nonzero value means the critic is unreliable.
+            "grpo/score_failures": float(score_fail_count),
+        })
+        if inject_stop:
+            metrics["grpo/inject_stop_won_frac"] = float(np.mean(inject_wins)) if inject_wins else 0.0
+        wandb.log(metrics, step=step_tag)
+        train_logger.log({k: v for k, v in metrics.items() if np.isscalar(v)}, step=step_tag)
+        pooled, pooled_adv, score_stats, winner_scores, inject_wins, states_since_update = [], [], [], [], [], 0
+        score_fail_count = 0
+        update_idx += 1
+
+    for step in tqdm.tqdm(range(1, total_steps + 1), dynamic_ncols=True):
+        raw_holder["obs"] = obs
+        hud = None
+        win_reasoning = win_subtask = None
+        scoring_failed = False
+        scored = step % score_every == 0
+        if scored:
+            # Sample K candidate CoTs, VLM-score them, record them with advantages; execute the top one.
+            rng, ck = jax.random.split(rng)
+            cands = steervla_actor.sample_candidates(n_cand, temperature=score_temp, raw=obs, rng=ck)
+            subtasks = list(cands["subtask_texts"])
+            reasonings = list(cands["reasoning_texts"])
+            chunks = np.asarray(cands["actions"], dtype=np.float32).reshape(n_cand, -1)
+            recs = steervla_actor.grpo_records_from_candidates(cands, obs)
+            if inject_stop:
+                # Swap candidate 0 for a canned stop: zero chunk (car brakes) + stop CoT record.
+                chunks[0] = 0.0
+                subtasks[0] = stop_subtask
+                reasonings[0] = stop_reasoning
+                recs[0] = steervla_actor.grpo_stop_record(obs, reasoning=stop_reasoning, subtask=stop_subtask)
+            context = {
+                "routing_command": routing_command,
+                "current_speed_mps": round(float(_ego_speed_mps(obs)), 2),
+                "route_progress_pct": round(float(info.get("route_progress_pct", 0.0)), 2),
+                "episode_return_so_far": round(episode_return, 3),
+                "last_step_reward": round(last_reward, 3),
+                "episode_step": episode_steps,
+            }
+            frame = _viz_image_from_raw(obs)
+            if frame is None:
+                frame = obs.get("image")
+            prompt = build_candidate_score_prompt(context, subtasks, objective=score_objective)
+            # The VLM occasionally returns malformed JSON (worsening as the HL policy degrades and its
+            # CoTs garble); retry, then skip the state so one bad reply can't kill a multi-thousand-step run.
+            scores = None
+            for attempt in range(vlm_retries):
+                try:
+                    scores = np.asarray(
+                        parse_candidate_scores(coach.complete_image_text(frame, prompt), num=n_cand),
+                        dtype=np.float32,
+                    )
+                    break
+                except Exception as exc:  # noqa: BLE001 - transient VLM/JSON errors are retried below.
+                    print(f"[grpo] VLM scoring attempt {attempt + 1}/{vlm_retries} failed: {exc}", flush=True)
+            if scores is None:
+                print("[grpo] VLM scoring failed after retries; driving base chunk (state not pooled).", flush=True)
+                scored, scoring_failed, score_fail_count = False, True, score_fail_count + 1
+        if scored:
+            adv = (scores - scores.mean()) / (scores.std() + adv_eps)
+            pooled.extend(recs)
+            pooled_adv.extend(float(a) for a in adv)
+            score_stats.append(scores)
+            winner = int(np.argmax(scores))
+            winner_scores.append(float(scores[winner]))
+            inject_wins.append(1.0 if (inject_stop and winner == 0) else 0.0)
+            states_since_update += 1
+            action = chunks[winner]
+            win_reasoning, win_subtask = reasonings[winner], subtasks[winner]
+            # HUD: one line per candidate (score + subtask); the executed winner is drawn in green
+            # ('>' marker + WIN tag), the injected stop candidate in cyan.
+            hud_lines = [f"step={episode_steps} ret={episode_return:+.1f} win=c{winner}"]
+            hud_colors: list[tuple] = [(255, 255, 255)]
+            for i in range(n_cand):
+                is_win = i == winner
+                is_stop = inject_stop and i == 0
+                hud_lines.append(
+                    f"{'>' if is_win else ' '}c{i} s={scores[i]:.2f}"
+                    f"{' STOP' if is_stop else ''} {subtasks[i][:40]}{'  <-WIN' if is_win else ''}"
+                )
+                hud_colors.append((0, 255, 0) if is_win else ((255, 255, 0) if is_stop else (255, 255, 255)))
+            hud = {"lines": hud_lines, "line_colors": hud_colors}
+        else:
+            rng, nk = jax.random.split(rng)
+            action = _base_chunk(
+                vla_sample_fn, raw_holder, obs, jax.random.normal(nk, (1, base_noise_dim), dtype=jnp.float32)
+            )
+            if scoring_failed:
+                # Explicit red banner so the fallback is obvious in the rollout video (also grpo/score_failures).
+                red = (0, 0, 255)
+                hud = {
+                    "lines": [
+                        f"step={episode_steps} ret={episode_return:+.1f} SCORING FAILED",
+                        "default action = base policy chunk (state not pooled)",
+                    ],
+                    "line_colors": [red, red],
+                }
+
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        if isinstance(next_obs, dict) and win_subtask is not None:
+            # Surface the executed candidate's CoT so the video panel's Reasoning/Subtask populate.
+            next_obs["reasoning_text"], next_obs["subtask_text"] = win_reasoning, win_subtask
+        speed = float(_ego_speed_mps(next_obs))
+        # Debug stop task: optimize -speed instead of the env reward (surfaced to the VLM via context).
+        reward_used = -speed if debug_task else float(reward)
+        episode_return += reward_used
+        episode_steps += 1
+        episode_speed_sum += speed
+        last_reward = reward_used
+        done = bool(terminated or truncated)
+        if log_video:
+            _maybe_capture_frame(
+                frames, next_obs, reward_used, episode_steps=episode_steps, done=done,
+                log_video=log_video, video_every=video_every,
+                action_flat=action, exec_cfg=exec_cfg, steervla_actor=steervla_actor, hud=hud,
+            )
+        obs = next_obs
+
+        if done:
+            # Full rollout logging (success / route progress / collisions / termination / video); in debug
+            # mode episode_return is the -speed objective and is logged under debug/episode_return.
+            _log_episode_end(
+                info,
+                episode_return=episode_return,
+                episode_steps=episode_steps,
+                episode_index=episode_count,
+                frames=frames,
+                log_video=log_video,
+                video_fps=video_fps,
+                step=step,
+                train_logger=train_logger,
+                collision_events=int(info.get("collision_count", 0)),
+                debug_task=debug_task,
+                debug_return=episode_return,
+            )
+            grpo_ep = {
+                "grpo/episode": float(episode_count),
+                "grpo/episode_mean_speed_mps": episode_speed_sum / max(episode_steps, 1),
+            }
+            wandb.log(grpo_ep, step=step)
+            train_logger.log(grpo_ep, step=step)
+            print(
+                f"[grpo] episode {episode_count}: return={episode_return:.3f} steps={episode_steps} "
+                f"mean_speed={episode_speed_sum / max(episode_steps, 1):.3f} (env_step {step}/{total_steps})",
+                flush=True,
+            )
+            episode_count += 1
+            episode_return, episode_steps, last_reward, episode_speed_sum = 0.0, 0, 0.0, 0.0
+            frames = []
+            obs, info = env.reset(seed=FLAGS.seed + episode_count)
+            steervla_actor.reset_action_cache()
+
+        if states_since_update >= update_every:
+            _do_update(step)
+        if ckpt_every_steps > 0 and step % ckpt_every_steps == 0:
+            steervla_actor.save_checkpoint(ckpt_root, step)
+
+    _do_update(total_steps)
+    try:
+        steervla_actor.save_checkpoint(ckpt_root, total_steps)  # final export
+    except Exception as exc:  # noqa: BLE001
+        print(f"[grpo] final checkpoint save failed (non-fatal): {exc}", flush=True)
+
+
+def _run_grpo_entry(config):
+    """GRPO-on-HL-policy online CARLA entry (frozen SteerVLA base + action expert; only CoT trained)."""
+    if FLAGS.route is None:
+        raise ValueError("--route is required (see --list_routes=true).")
+
+    steervla_cfg = config.get("steervla", None)
+    if steervla_cfg is None or not steervla_cfg.get("enabled"):
+        raise ValueError("config.steervla.enabled must be true: GRPO trains the HL policy of a base VLA.")
+    if not bool(steervla_cfg.get("load_trainable_params", False)):
+        raise ValueError("GRPO needs steervla.load_trainable_params=true to update the HL backbone.")
+
+    wandb_mode = _resolve_wandb_mode()
+    # Match the residual scheme: <route>-<mode>-sd###_<ts>, where <mode> encodes the GRPO variant.
+    grpo_cfg = config.get("grpo") or {}
+    mode_parts = ["grpo"]
+    if bool(grpo_cfg.get("debug_task", False)):
+        mode_parts.append("dbg")
+    if bool(grpo_cfg.get("inject_stop_candidate", False)):
+        mode_parts.append("inject")
+    mode_tag = "-".join(mode_parts)
+    route_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", str(FLAGS.route)).strip("-")
+    exp_name = FLAGS.exp_name or f"{route_tag}-{mode_tag}-{get_exp_name(FLAGS.seed)}"
+    wandb_id = re.sub(r"[^A-Za-z0-9_-]+", "-", exp_name).strip("-")[:128] or None
+    setup_wandb(
+        project="OGBench-CARLA-GRPO", group=FLAGS.run_group, name=exp_name, mode=wandb_mode,
+        id=wandb_id, resume=("allow" if FLAGS.resume else None),
+    )
+    FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
+    os.makedirs(FLAGS.save_dir, exist_ok=True)
+    with open(os.path.join(FLAGS.save_dir, "flags.json"), "w") as f:
+        json.dump(get_flag_dict(), f)
+
+    carla_yaml, extra_carla, exec_cfg = _resolve_carla_env_config(config)
+    env = _make_carla_env(carla_yaml, FLAGS.route, extra_carla_config=extra_carla)
+    try:
+        random.seed(FLAGS.seed)
+        np.random.seed(FLAGS.seed)
+        obs, _info = env.reset(seed=FLAGS.seed)
+        if not isinstance(obs, dict) or "state" not in obs or "image" not in obs:
+            raise ValueError("CARLA env must return a Dict obs with 'state' and 'image'.")
+
+        raw_holder: dict = {"obs": obs}
+        from vlas.steervla import create_steervla_pi0_cot_sample_fn
+
+        vla_sample_fn, steervla_actor = create_steervla_pi0_cot_sample_fn(
+            steervla_cfg, raw_holder, training_gpu_rank=int(config.get("training_gpu_rank", -1))
+        )
+        _configure_jax_training_device(int(config.get("training_gpu_rank", -1)))
+
+        # VLM critic: reuse the coach the DSRL/CAST path uses (provider/model from the vlm_coach block).
+        from coaches.vlm_feedback import create_coach
+
+        vlm_cfg = config.get("vlm_coach") or {}
+        coach = create_coach(
+            str(vlm_cfg.get("provider", "gemini")),
+            model=str(vlm_cfg.get("gemini_model", "gemini-2.0-flash")),
+        )
+
+        run_online_grpo(
+            env, steervla_actor, vla_sample_fn, coach, config, obs,
+            raw_holder=raw_holder, exec_cfg=exec_cfg,
+        )
+    finally:
+        try:
+            env.close()
+        except Exception:
+            pass
+        wandb.finish()
+
+
 def main(_):
     if FLAGS.list_routes:
         _list_routes_and_exit()
         return
 
     config = FLAGS.agent
-    if str(config.get("agent_name", "")) == "sac_residual":
+    if str(config.get("online_training_mode", "")).strip().lower() == "grpo_hl":
+        _run_grpo_entry(config)
+    elif str(config.get("agent_name", "")) == "sac_residual":
         _run_residual_entry(config)
     else:
         _run_dsrl_entry(config)
