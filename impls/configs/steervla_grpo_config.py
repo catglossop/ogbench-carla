@@ -43,7 +43,7 @@ def get_config():
     # SteerVLAActor.setup when load_trainable_params=True.
     config.steervla.load_trainable_params = True
     # Isolate the HL (VLM-backbone) gradient step on its own JAX GPU (index into jax.devices("gpu"),
-    # NOT CARLA's -graphicsadapter). -1 keeps it on training_gpu_rank. run_carla.sh --hl-gpu overrides.
+    # -1 keeps it on training_gpu_rank. run_carla.sh --hl-gpu overrides.
     config.steervla.hl_training_gpu_rank = 1
     # Freeze the memory-heavy pretrained subtrees for the HL step (SigLIP tower + tied token embedder);
     # the CoT policy gradient only needs the LLM transformer blocks + CoT heads. [] = full fine-tune.
