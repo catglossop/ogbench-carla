@@ -382,16 +382,26 @@ def build_chunks_payload(
     return payload
 
 
+_DEFAULT_SCORE_OBJECTIVE = (
+    "how well it advances the route safely and efficiently from the current scene (avoid collisions "
+    "and stalls; make forward progress toward route completion; prefer candidates consistent with the "
+    "reward context)"
+)
+
+
 def build_candidate_score_prompt(
     context: dict[str, Any],
     candidate_subtasks: list[str],
+    *,
+    objective: str | None = None,
 ) -> str:
     """Prompt the VLM critic to score K candidate next-subtasks for the current driving scene.
 
     Used by the GRPO HL path: ``context`` carries the env signals the critic should weigh (speed,
     route progress, cumulative + recent reward, collisions), and the current frame is attached as an
-    image part by :meth:`GeminiVLMCOach.complete_image_text`. The model returns one score per candidate
-    in the given order — higher = more likely to advance the route safely and efficiently.
+    image part by :meth:`GeminiVLMCOach.complete_image_text`. ``objective`` overrides the scoring
+    criterion (e.g. the debug stop task passes a "prefer stopping" objective that matches a -speed
+    reward); when None the default route-progress criterion is used.
     """
     cand_block = "\n".join(f"{i}: {s}" for i, s in enumerate(candidate_subtasks))
     n = len(candidate_subtasks)
@@ -409,10 +419,8 @@ def build_candidate_score_prompt(
         Candidate next-subtasks (index: text):
         {cand_block}
 
-        Score each candidate in [0, 1] for how well it advances the route safely and efficiently from
-        the current scene (avoid collisions and stalls; make forward progress toward route completion;
-        prefer candidates consistent with the reward context). Return ONLY JSON of the form
-        {{"scores": [s_0, ..., s_{n - 1}]}} with exactly {n} numbers in candidate order.
+        Score each candidate in [0, 1] for {objective or _DEFAULT_SCORE_OBJECTIVE}. Return ONLY JSON of
+        the form {{"scores": [s_0, ..., s_{n - 1}]}} with exactly {n} numbers in candidate order.
         """
     ).strip()
 

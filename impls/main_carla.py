@@ -1380,8 +1380,16 @@ def _annotate_text_panel(
         def _clip(txt: str, n: int = 120) -> str:
             return txt if len(txt) <= n else (txt[: n - 3] + "...")
 
-        lines = []
-        if hud:
+        white = (255, 255, 255)
+        lines: list[str] = []
+        colors: list[tuple] = []  # per-line BGR; parallel to ``lines``
+        if hud and hud.get("lines"):
+            # Generic header lines (GRPO overlay): rendered verbatim, with optional per-line colors.
+            hud_lines = [str(x) for x in hud["lines"]]
+            hud_colors = hud.get("line_colors") or [white] * len(hud_lines)
+            lines.extend(hud_lines)
+            colors.extend(hud_colors[i] if i < len(hud_colors) and hud_colors[i] else white for i in range(len(hud_lines)))
+        elif hud:
             lines.append(
                 f"Action base={hud.get('base', '-')} residual={hud.get('residual', '-')} "
                 f"final={hud.get('final', '-')} scale={hud.get('scale', '-')}"
@@ -1399,13 +1407,14 @@ def _annotate_text_panel(
             f"Reasoning: {_clip(reasoning)}",
             f"Subtask: {_clip(subtask)}",
         ]
+        colors += [white] * (len(lines) - len(colors))  # remaining lines default white
         panel_h = max(72, line_h * (len(lines) + 1))
         annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
         annotated[:h, :, :] = annotated_top
         cv2.line(annotated, (0, h), (w - 1, h), (255, 255, 255), 1)
         y = h + line_h
-        for line in lines:
-            cv2.putText(annotated, line, (4, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
+        for line, color in zip(lines, colors):
+            cv2.putText(annotated, line, (4, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1, cv2.LINE_AA)
             y += line_h
         return annotated
     except Exception:
@@ -4619,6 +4628,17 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
     ckpt_root = os.path.join(FLAGS.save_dir, "steervla_hl_ckpt")
     routing_command = str((config.get("steervla") or {}).get("routing_command", "Follow the route."))
 
+    # Debug stop task: env reward -> -ego_speed (surfaced to the VLM) and the scoring objective flips to
+    # "prefer stopping". inject_stop_candidate swaps one candidate for a canned stop CoT + zero chunk.
+    debug_task = bool(grpo.get("debug_task", False))
+    inject_stop = bool(grpo.get("inject_stop_candidate", False))
+    stop_reasoning = str(grpo.get("stop_reasoning", "The vehicle must come to a stop."))
+    stop_subtask = str(grpo.get("stop_subtask", "The vehicle comes to a complete stop and remains stationary."))
+    score_objective = (
+        "how much it reduces speed and brings the vehicle to a complete stop (reward = -speed; a fully "
+        "stopped vehicle scores highest)" if debug_task else None
+    )
+
     log_video = bool(config.get("log_episode_video", True))
     video_fps = float(config.get("episode_video_fps", 10.0))
     video_every = max(1, int(config.get("episode_video_every", 2)))
@@ -4632,6 +4652,8 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
     pooled: list[dict] = []
     pooled_adv: list[float] = []
     score_stats: list[np.ndarray] = []
+    winner_scores: list[float] = []  # top score picked per scored state (for update metrics)
+    inject_wins: list[float] = []    # 1.0 when the injected stop candidate won, else 0.0
     states_since_update = 0
     update_idx = 0
 
@@ -4639,10 +4661,11 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
     info: dict[str, Any] = {}
     steervla_actor.reset_action_cache()
     episode_return, episode_steps, episode_count, last_reward = 0.0, 0, 0, 0.0
+    episode_speed_sum = 0.0
     frames: list[np.ndarray] = []
 
     def _do_update(step_tag: int) -> None:
-        nonlocal pooled, pooled_adv, score_stats, states_since_update, update_idx
+        nonlocal pooled, pooled_adv, score_stats, winner_scores, inject_wins, states_since_update, update_idx
         if not pooled:
             return
         uinfo = steervla_actor.update_hl_grpo(
@@ -4657,20 +4680,30 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
             "grpo/n_states": float(states_since_update),
             "grpo/score_mean": float(all_scores.mean()),
             "grpo/score_std": float(all_scores.std()),
+            "grpo/winner_score_mean": float(np.mean(winner_scores)) if winner_scores else 0.0,
         })
+        if inject_stop:
+            metrics["grpo/inject_stop_won_frac"] = float(np.mean(inject_wins)) if inject_wins else 0.0
         wandb.log(metrics, step=step_tag)
         train_logger.log({k: v for k, v in metrics.items() if np.isscalar(v)}, step=step_tag)
-        pooled, pooled_adv, score_stats, states_since_update = [], [], [], 0
+        pooled, pooled_adv, score_stats, winner_scores, inject_wins, states_since_update = [], [], [], [], [], 0
         update_idx += 1
 
     for step in tqdm.tqdm(range(1, total_steps + 1), dynamic_ncols=True):
         raw_holder["obs"] = obs
+        hud = None
         if step % score_every == 0:
-            # Sample, VLM-score, and record K candidate CoTs; execute the top-scored one.
+            # Sample K candidate CoTs, VLM-score them, record them with advantages; execute the top one.
             rng, ck = jax.random.split(rng)
             cands = steervla_actor.sample_candidates(n_cand, temperature=score_temp, raw=obs, rng=ck)
             subtasks = list(cands["subtask_texts"])
             chunks = np.asarray(cands["actions"], dtype=np.float32).reshape(n_cand, -1)
+            recs = steervla_actor.grpo_records_from_candidates(cands, obs)
+            if inject_stop:
+                # Swap candidate 0 for a canned stop: zero chunk (car brakes) + stop CoT record.
+                chunks[0] = 0.0
+                subtasks[0] = stop_subtask
+                recs[0] = steervla_actor.grpo_stop_record(obs, reasoning=stop_reasoning, subtask=stop_subtask)
             context = {
                 "routing_command": routing_command,
                 "current_speed_mps": round(float(_ego_speed_mps(obs)), 2),
@@ -4682,14 +4715,32 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
             frame = _viz_image_from_raw(obs)
             if frame is None:
                 frame = obs.get("image")
-            text = coach.complete_image_text(frame, build_candidate_score_prompt(context, subtasks))
+            text = coach.complete_image_text(
+                frame, build_candidate_score_prompt(context, subtasks, objective=score_objective)
+            )
             scores = np.asarray(parse_candidate_scores(text, num=n_cand), dtype=np.float32)
             adv = (scores - scores.mean()) / (scores.std() + adv_eps)
-            pooled.extend(steervla_actor.grpo_records_from_candidates(cands, obs))
+            pooled.extend(recs)
             pooled_adv.extend(float(a) for a in adv)
             score_stats.append(scores)
+            winner = int(np.argmax(scores))
+            winner_scores.append(float(scores[winner]))
+            inject_wins.append(1.0 if (inject_stop and winner == 0) else 0.0)
             states_since_update += 1
-            action = chunks[int(np.argmax(scores))]
+            action = chunks[winner]
+            # HUD: one line per candidate (score + subtask); the executed winner is drawn in green
+            # ('>' marker + WIN tag), the injected stop candidate in cyan.
+            hud_lines = [f"step={episode_steps} ret={episode_return:+.1f} win=c{winner}"]
+            hud_colors: list[tuple] = [(255, 255, 255)]
+            for i in range(n_cand):
+                is_win = i == winner
+                is_stop = inject_stop and i == 0
+                hud_lines.append(
+                    f"{'>' if is_win else ' '}c{i} s={scores[i]:.2f}"
+                    f"{' STOP' if is_stop else ''} {subtasks[i][:44]}{'  <-WIN' if is_win else ''}"
+                )
+                hud_colors.append((0, 255, 0) if is_win else ((255, 255, 0) if is_stop else (255, 255, 255)))
+            hud = {"lines": hud_lines, "line_colors": hud_colors}
         else:
             rng, nk = jax.random.split(rng)
             action = _base_chunk(
@@ -4697,15 +4748,19 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
             )
 
         next_obs, reward, terminated, truncated, info = env.step(action)
-        episode_return += float(reward)
+        speed = float(_ego_speed_mps(next_obs))
+        # Debug stop task: optimize -speed instead of the env reward (surfaced to the VLM via context).
+        reward_used = -speed if debug_task else float(reward)
+        episode_return += reward_used
         episode_steps += 1
-        last_reward = float(reward)
+        episode_speed_sum += speed
+        last_reward = reward_used
         done = bool(terminated or truncated)
         if log_video:
             _maybe_capture_frame(
-                frames, next_obs, reward, episode_steps=episode_steps, done=done,
+                frames, next_obs, reward_used, episode_steps=episode_steps, done=done,
                 log_video=log_video, video_every=video_every,
-                action_flat=action, exec_cfg=exec_cfg, steervla_actor=steervla_actor,
+                action_flat=action, exec_cfg=exec_cfg, steervla_actor=steervla_actor, hud=hud,
             )
         obs = next_obs
 
@@ -4714,6 +4769,7 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
                 "grpo/episode": float(episode_count),
                 "grpo/episode_return": episode_return,
                 "grpo/episode_steps": float(episode_steps),
+                "grpo/episode_mean_speed_mps": episode_speed_sum / max(episode_steps, 1),
             }
             if log_video and frames:
                 video = _episode_video(frames, video_fps)
@@ -4722,11 +4778,11 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
             wandb.log(ep_metrics, step=step)
             print(
                 f"[grpo] episode {episode_count}: return={episode_return:.3f} steps={episode_steps} "
-                f"(env_step {step}/{total_steps})",
+                f"mean_speed={episode_speed_sum / max(episode_steps, 1):.3f} (env_step {step}/{total_steps})",
                 flush=True,
             )
             episode_count += 1
-            episode_return, episode_steps, last_reward = 0.0, 0, 0.0
+            episode_return, episode_steps, last_reward, episode_speed_sum = 0.0, 0, 0.0, 0.0
             frames = []
             obs, info = env.reset(seed=FLAGS.seed + episode_count)
             steervla_actor.reset_action_cache()

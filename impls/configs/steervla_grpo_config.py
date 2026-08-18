@@ -69,6 +69,14 @@ def get_config():
             advantage_eps=1e-6,
             # Export the HL backbone to <save_dir>/steervla_hl_ckpt/<step> every N env steps (0 = final only).
             checkpoint_every_steps=2000,
+            # Debug stop task: env reward -> -ego_speed and the VLM is told to prefer stopping (verifies
+            # the policy learns to select slow/stopping candidates from the surfaced reward).
+            debug_task=False,
+            # Debug: replace one sampled candidate with a canned stop CoT (below) so we can check the
+            # policy learns to select a known-good option. Works with or without debug_task.
+            inject_stop_candidate=False,
+            stop_reasoning="The vehicle must come to a stop. Brake to a complete stop.",
+            stop_subtask="The vehicle comes to a complete stop and remains stationary.",
         )
     )
 

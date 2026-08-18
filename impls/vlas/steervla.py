@@ -2177,8 +2177,7 @@ class SteerVLAActor:
             state_norm = self._normalize_state_batch(state_pad)[0]
             state_for_model = pad_to_dim(state_norm, model_action_dim)
 
-            # GRPO records carry the exact sampled token ids (see grpo_records_from_candidates); use them
-            # so the CE is the log-prob of the tokens the policy actually emitted. Text records
+            # GRPO records carry the exact sampled token ids. Text records
             # (cast_relabel / replay pools) tokenize their reasoning/subtask strings as before.
             if "reasoning_ids" in rec:
                 rea_tok, rea_mask = rec["reasoning_ids"], rec["reasoning_mask"]
@@ -3828,25 +3827,27 @@ class SteerVLAActor:
         self._last_cot_out = cot_out
         return cot_out
 
+    def _grpo_scene_fields(self, raw: dict[str, Any]) -> tuple[np.ndarray, str, np.ndarray]:
+        """Shared (state, prompt, image) for GRPO HL records built from a raw CARLA obs."""
+        state_vec = np.asarray(raw["state"], dtype=np.float32).reshape(-1)
+        speed = float(state_vec[15]) if state_vec.shape[0] > 15 else 0.0
+        prompt = routing_instruction_prompt(routing_command=self.routing_command, current_speed_mps=speed)
+        return state_vec, prompt, np.asarray(raw["image"])
+
     def grpo_records_from_candidates(
         self, cands: dict[str, Any], raw: dict[str, Any]
     ) -> list[dict[str, Any]]:
         """K per-candidate HL records for :meth:`update_hl_grpo`, from a :meth:`sample_candidates` batch.
 
-        Each record carries the sampled reasoning/subtask token ids for that candidate (so the
-        policy-gradient CE is on the emitted tokens, no detok->retok drift) plus the shared scene (raw
-        CARLA state + image + the bare instruction the sampler used). Schema matches
-        :meth:`_build_hl_observation_batch` (action loss + FAST masked off: HL-only supervision).
+        Each record carries the sampled reasoning/subtask token ids for that candidate plus the shared scene.
+        Schema matches _build_hl_observation_batch (action loss + FAST masked off: HL-only supervision).
         """
         cot = cands["cot_out"]
         rea = np.asarray(jax.device_get(cot["tokenized_reasoning"]), dtype=np.int32)
         rea_mask = np.asarray(jax.device_get(cot["tokenized_reasoning_mask"]), dtype=bool)
         sub = np.asarray(jax.device_get(cot["tokenized_subtask"]), dtype=np.int32)
         sub_mask = np.asarray(jax.device_get(cot["tokenized_subtask_mask"]), dtype=bool)
-        state_vec = np.asarray(raw["state"], dtype=np.float32).reshape(-1)
-        speed = float(state_vec[15]) if state_vec.shape[0] > 15 else 0.0
-        prompt = routing_instruction_prompt(routing_command=self.routing_command, current_speed_mps=speed)
-        image = np.asarray(raw["image"])
+        state_vec, prompt, image = self._grpo_scene_fields(raw)
         return [
             {
                 "state": state_vec,
@@ -3862,6 +3863,21 @@ class SteerVLAActor:
             }
             for k in range(rea.shape[0])
         ]
+
+    def grpo_stop_record(self, raw: dict[str, Any], *, reasoning: str, subtask: str) -> dict[str, Any]:
+        """Canned text-based HL record (debug stop-injection); the CoT is tokenized from the given
+        reasoning/subtask text by _build_hl_observation_batch (no ``*_ids``)."""
+        state_vec, prompt, image = self._grpo_scene_fields(raw)
+        return {
+            "state": state_vec,
+            "state_format": "carla_raw",
+            "prompt": prompt,
+            "image": image,
+            "reasoning": str(reasoning),
+            "subtask": str(subtask),
+            "action_supervision": False,
+            "supervise_fast": False,
+        }
 
     def _mark_action_served(self, batch_size: int) -> None:
         if self._cot_cache_enabled(batch_size) and self._cached_cot is not None:
