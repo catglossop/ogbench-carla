@@ -50,7 +50,7 @@ def get_config():
     config.steervla.hl_freeze_regexes = [".*img.*", ".*embedder.*"]
     # Minibatch size for the GRPO update: a pooled group of candidate CoTs can exceed one Pi0-CoT
     # forward+backward, so update_hl_grpo shuffles the pooled CoTs into minibatches of this size.
-    config.steervla.hl_update_batch_size = 64
+    config.steervla.hl_update_batch_size = 32
 
     config.grpo = ml_collections.ConfigDict(
         dict(

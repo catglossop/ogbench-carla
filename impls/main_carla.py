@@ -4811,8 +4811,16 @@ def _run_grpo_entry(config):
         raise ValueError("GRPO needs steervla.load_trainable_params=true to update the HL backbone.")
 
     wandb_mode = _resolve_wandb_mode()
+    # Match the residual scheme: <route>-<mode>-sd###_<ts>, where <mode> encodes the GRPO variant.
+    grpo_cfg = config.get("grpo") or {}
+    mode_parts = ["grpo"]
+    if bool(grpo_cfg.get("debug_task", False)):
+        mode_parts.append("dbg")
+    if bool(grpo_cfg.get("inject_stop_candidate", False)):
+        mode_parts.append("inject")
+    mode_tag = "-".join(mode_parts)
     route_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", str(FLAGS.route)).strip("-")
-    exp_name = FLAGS.exp_name or f"grpo-{route_tag}-{get_exp_name(FLAGS.seed)}"
+    exp_name = FLAGS.exp_name or f"{route_tag}-{mode_tag}-{get_exp_name(FLAGS.seed)}"
     wandb_id = re.sub(r"[^A-Za-z0-9_-]+", "-", exp_name).strip("-")[:128] or None
     setup_wandb(
         project="OGBench-CARLA-GRPO", group=FLAGS.run_group, name=exp_name, mode=wandb_mode,
