@@ -35,7 +35,7 @@ def get_config():
     config.language_feedback.expert_mode = "none"
     config.training_gpu_rank = 0
     config.siglip_device = "cuda:0"
-    config.batch_size = 32
+    config.batch_size = 64
     config.warmup_steps = 50
     
     config.enable_updates = True
@@ -68,6 +68,19 @@ def get_config():
             # Video encoding (kept consistent with main_carla's rollout video sampling).
             video_fps=10.0,
             video_frame_stride=2,
+            # Attach an env-reward + route-progress plot (vs video time, with chunk boundaries and
+            # collisions marked) to the window review call alongside the video. These two signals
+            # are the ones the per-timestamp block keeps at full density -- speed and the control
+            # channels are thinned to every 2nd timestamp -- so the plot is where their shape over
+            # the window is actually legible. Set False for a video-and-text-only review.
+            include_plots_in_prompt=True,
+            # Cross-window correction memory: a bounded record of the longitudinal changes earlier
+            # windows already made ("stop -> accelerate: 7x"), injected into BOTH the review and
+            # the credit prompt so successive windows don't reverse each other and the HL dataset
+            # doesn't end up teaching both directions of the same decision. This is the whole
+            # rendered block's word budget -- it is pruned oldest-note-first and, if still over,
+            # summarized by the coach. Persisted to cast_relabel/correction_memory.json. 0 = off.
+            correction_memory_words=300,
             save_artifacts=True,
             # Persist every BAD/relabeled chunk as a SteerVLA high-level (VLM-backbone) training
             # sample in the steervla_hl_dataset_format schema (image + ego state + prompt +

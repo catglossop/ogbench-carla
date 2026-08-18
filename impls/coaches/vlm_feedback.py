@@ -147,6 +147,31 @@ def _build_route_progress_block(metadata: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+# Decimal places for every numeric in the per-timestamp block. The values are float32 and were
+# previously dumped at full repr precision (``-0.6499999761581421`` for a steer of -0.65), which
+# reads as significance that isn't there. 2dp is safe for the env reward too: across ~342k recorded
+# steps only 0.1% of nonzero rewards fall below 0.005.
+TELEMETRY_DECIMALS = 2
+
+# Speed/control fields are emitted on every Nth timestamp; every other field appears on all of
+# them. The block only ever holds video-aligned steps (one per ``video_frame_stride`` env steps),
+# so N=2 means speed and controls land every 2 frames — every 4 env steps at the default stride.
+# Reward and route progress stay on every row: they are the signals the credit pass leans on, and
+# they are also attached to the prompt as a plot.
+CONTROL_SAMPLE_EVERY = 2
+
+_CONTROL_FIELDS = ("ego_speed_mps", "control_throttle", "control_steer", "control_brake")
+
+
+def _round(value: Any, places: int = TELEMETRY_DECIMALS) -> Any:
+    """Round a numeric to ``places`` dp, passing anything that isn't a number straight through."""
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return round(float(value), places)
+    return value
+
+
 def _build_per_timestamp_block(metadata: dict[str, Any]) -> str:
     """Render a timestamp-keyed JSON block of per-step trajectory data for the prompt.
 
@@ -155,36 +180,45 @@ def _build_per_timestamp_block(metadata: dict[str, Any]) -> str:
     subtask, chain-of-thought reasoning, and the prompt the policy received at that moment. Steps
     that were not captured in the video (``video_timestamp_sec is None``) are skipped, since the
     VLM can only cross-reference moments it can actually see.
+
+    Two densities, so the block stays readable without dropping what matters: ``reward_total`` and
+    ``route_progress_pct`` (plus the step index, collision flag and CoT text) appear on every row,
+    while speed and the control channels are thinned to every ``CONTROL_SAMPLE_EVERY``-th row —
+    they vary smoothly and are plotted in full alongside the video.
     """
     steps = metadata.get("steps", []) or []
     per_timestamp: dict[str, Any] = {}
+    kept = 0
     for s in steps:
         if not isinstance(s, dict):
             continue
         ts = s.get("video_timestamp_sec")
         if ts is None:
             continue
-        key = f"{float(ts):.2f}"
-        per_timestamp[key] = {
-            "episode_step": s.get("episode_step"),
-            "ego_speed_mps": s.get("ego_speed_mps"),
-            "control_throttle": s.get("control_throttle"),
-            "control_steer": s.get("control_steer"),
-            "control_brake": s.get("control_brake"),
-            "collision": s.get("collision"),
-            "route_progress_pct": s.get("route_progress_pct"),
-            # Env reward actually earned at this step — the objective the RL side optimizes.
-            "reward_total": s.get("reward_total"),
-            "subtask": s.get("subtask", ""),
-            "reasoning": s.get("reasoning", ""),
-            "prompt": s.get("prompt", ""),
-        }
+        entry: dict[str, Any] = {"episode_step": s.get("episode_step")}
+        if kept % max(1, CONTROL_SAMPLE_EVERY) == 0:
+            for field in _CONTROL_FIELDS:
+                entry[field] = _round(s.get(field))
+        entry["collision"] = s.get("collision")
+        entry["route_progress_pct"] = _round(s.get("route_progress_pct"))
+        # Env reward actually earned at this step — the objective the RL side optimizes.
+        entry["reward_total"] = _round(s.get("reward_total"))
+        entry["subtask"] = s.get("subtask", "")
+        entry["reasoning"] = s.get("reasoning", "")
+        entry["prompt"] = s.get("prompt", "")
+        per_timestamp[f"{float(ts):.2f}"] = entry
+        kept += 1
     if not per_timestamp:
         return ""
     return (
         "\nPer-timestamp trajectory data (keys are video seconds; each value is the vehicle "
         "state/controls plus the executed subtask, chain-of-thought reasoning, and the prompt "
-        "the policy received at that moment). ``reward_total`` is the environment reward earned "
+        "the policy received at that moment). ``reward_total`` and ``route_progress_pct`` are "
+        "given on EVERY timestamp; ``ego_speed_mps`` and the ``control_*`` channels are sampled "
+        f"every {CONTROL_SAMPLE_EVERY} timestamps to keep this readable — where they are absent "
+        "they simply were not sampled, so read them off the neighbouring timestamps or the "
+        "attached plot rather than assuming a change. All numbers are rounded to "
+        f"{TELEMETRY_DECIMALS} decimal places. ``reward_total`` is the environment reward earned "
         "at that step — the objective the policy is being trained on. It is dominated by route "
         "progress and is reduced by collisions, route/traffic infractions, and harsh steering or "
         "braking; a sustained near-zero or negative stretch marks behavior the environment itself "
@@ -227,8 +261,15 @@ def build_coaching_prompt(
 
     collision_events = metadata.get("collision_events", [])
     if collision_events:
+
+        def _collision_time(event: dict[str, Any]) -> str:
+            # A collision step whose frame failed to extract carries no timestamp; formatting it
+            # as a float would raise and take the whole window's review down with it.
+            ts = event.get("video_timestamp_sec")
+            return f"{float(ts):.2f}s" if ts is not None else "unknown (not captured in video)"
+
         collision_lines = "\n".join(
-            f"  t={e.get('video_timestamp_sec', '?'):.2f}s  "
+            f"  t={_collision_time(e)}  "
             f"new_event={e.get('new_event')}  contact_active={e.get('contact_active')}"
             for e in collision_events
         )
@@ -239,6 +280,22 @@ def build_coaching_prompt(
     else:
         collision_section = "\nNo collisions were recorded by the on-board sensors.\n"
 
+    # Attached alongside the video when the caller uploads plots. Without this the images arrive
+    # unannounced and the model has no reason to read them as the same window it is watching.
+    plots_section = (
+        "\nA plot is attached with this video: env reward per step (top) and route progress "
+        "(bottom), both against the SAME video-time axis as the video and your event timestamps. "
+        "Light vertical rules are action-chunk boundaries; red rules are collisions. Use it to "
+        "locate flat-zero reward stretches and places where progress stops climbing, then look at "
+        "those moments in the video to say what caused them.\n"
+        if include_plots else ""
+    )
+
+    # Bounded record of what earlier windows of this run already corrected, so successive reviews
+    # don't flip the same behaviour back and forth. Written by coaches.correction_memory; absent
+    # until something has actually been corrected.
+    memory_block = str(metadata.get("correction_memory") or "")
+
     return textwrap.dedent(
         f"""
         You are reviewing a driving rollout video for an autonomous vehicle policy.
@@ -247,7 +304,7 @@ def build_coaching_prompt(
         ```json
         {metadata_block}
         ```
-        {collision_section}{progress_block}{per_timestamp_block}
+        {collision_section}{progress_block}{memory_block}{plots_section}{per_timestamp_block}
         Carefully watch the full video and identify moments where driving behavior was clearly
         good or clearly bad (lane keeping, speed, turns, collisions/near-misses,
         stopping, yielding, route progress, etc.). The collision log above shows ground-truth
@@ -537,7 +594,9 @@ class GeminiVLMCOach(VLMCOach):
                     }
                 )
 
-        prompt = build_coaching_prompt(metadata)
+        prompt = build_coaching_prompt(
+            metadata, include_plots=bool(include_plots_in_prompt and plot_paths)
+        )
         parts.append({"text": prompt})
 
         text = _gemini_generate_content(self.model, [{"parts": parts}], self.api_key)

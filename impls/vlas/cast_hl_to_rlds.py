@@ -531,12 +531,20 @@ def write_tfds_dataset(
     reasoning_field: str,
     version: str,
     description: str,
+    val_fraction: float = 0.0,
 ) -> Path:
     """Build ``<out_dir>/<dataset_name>/<version>/`` as a TFDS dataset and return that path.
 
     The builder class is created on the fly so ``--dataset-name`` is free-form. Nothing needs to
     import it later: ``tfds.builder(name, data_dir=...)`` (what the OpenPI loader calls) falls back
     to ``builder_from_files``, which reconstructs the dataset from the ``features.json`` written here.
+
+    ``val_fraction`` > 0 also emits a ``val`` split. OpenPI's ``scripts/train.py`` builds its eval
+    loader with ``split="val"`` unconditionally — not gated on ``eval_interval`` — and TFDS raises
+    on an unknown split name, so a train-only dataset cannot be trained on there at all. The
+    holdout is taken as the **last** ``val_fraction`` of episodes rather than a random draw:
+    episodes are relabel windows in rollout order, so a tail split keeps whole windows (and the
+    frames that share their VLM review) on one side of the boundary.
     """
     import tensorflow_datasets as tfds
 
@@ -548,7 +556,14 @@ def write_tfds_dataset(
         reasoning_field=reasoning_field,
     )
 
-    def _generate() -> Iterator[tuple[str, dict[str, Any]]]:
+    n_val = int(len(episodes) * float(val_fraction)) if val_fraction > 0 else 0
+    # Never let the holdout swallow the corpus, and never emit an empty split (TFDS accepts it,
+    # but the loader's .repeat() on an empty dataset hangs instead of raising).
+    n_val = min(max(n_val, 1), len(episodes) - 1) if n_val > 0 and len(episodes) > 1 else 0
+    train_episodes = episodes[: len(episodes) - n_val] if n_val else episodes
+    val_episodes = episodes[len(episodes) - n_val :] if n_val else []
+
+    def _generate(episodes: list[list[CastSample]]) -> Iterator[tuple[str, dict[str, Any]]]:
         for i, episode in enumerate(episodes):
             head = episode[0]
             steps = [
@@ -590,10 +605,13 @@ def write_tfds_dataset(
             return tfds.core.DatasetInfo(builder=self, description=description, features=features)
 
         def _split_generators(self, dl_manager):  # nothing to download.
-            return {"train": _generate()}
+            splits = {"train": _generate(train_episodes)}
+            if val_episodes:
+                splits["val"] = _generate(val_episodes)
+            return splits
 
         def _generate_examples(self):  # pragma: no cover - unused; _split_generators yields directly.
-            yield from _generate()
+            yield from _generate(train_episodes)
 
     # TFDS derives the dataset name from the class name unless the class sets ``name`` itself.
     def _exec_body(ns: dict[str, Any]) -> None:
@@ -648,6 +666,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("episode", "window"),
         default="episode",
         help="RLDS episode granularity: one CARLA episode, or one relabel window.",
+    )
+    p.add_argument(
+        "--val-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Also emit a 'val' split from the last N%% of episodes. Required for OpenPI's "
+            "scripts/train.py, which builds an eval loader with split='val' unconditionally."
+        ),
     )
     p.add_argument(
         "--split",
@@ -759,6 +786,7 @@ def main(argv: list[str] | None = None) -> int:
             reasoning_field=reasoning_field,
             version=args.version,
             description=description,
+            val_fraction=args.val_fraction,
         )
         stats_path = Path(built) / "cast_conversion_stats.json"
         stats_path.write_text(

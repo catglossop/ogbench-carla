@@ -57,14 +57,117 @@ def load_trajectory_metadata(metadata_path: str | Path) -> dict[str, Any]:
 
 
 def step_time_sec(step: dict[str, Any], metadata: dict[str, Any]) -> float:
-    """Map a step record to seconds on the rollout video timeline."""
+    """Map a step record to seconds on the rollout video timeline.
+
+    Steps that became a video frame carry their own timestamp. For the ones in between, env steps
+    advance at ``video_fps * video_frame_stride`` Hz (one frame every ``stride`` steps, ``fps``
+    frames per second), and the clock starts at the window's *first* step — not at episode step 1,
+    which is what a mid-episode window would otherwise be measured against.
+    """
     ts = step.get("video_timestamp_sec")
     if ts is not None:
         return float(ts)
-    stride = int(metadata.get("video_frame_stride", 2))
-    fps = float(metadata.get("video_fps", 10.0))
-    ep_step = int(step["episode_step"])
-    return max(0.0, (ep_step - 1) * stride / fps)
+    stride = max(1, int(metadata.get("video_frame_stride", 2)))
+    fps = float(metadata.get("video_fps", 10.0)) or 10.0
+    env_hz = fps * stride
+    steps = metadata.get("steps") or []
+    first = 1
+    for s in steps:
+        if isinstance(s, dict) and s.get("episode_step") is not None:
+            first = int(s["episode_step"])
+            break
+    return max(0.0, (int(step["episode_step"]) - first) / env_hz)
+
+
+def generate_reward_progress_plot(
+    metadata: dict[str, Any],
+    output_path: str | Path,
+    *,
+    chunk_steps: int | None = None,
+) -> Path:
+    """Render the two dense signals — env reward and route progress — against video time.
+
+    These are the channels the per-timestamp block keeps at full density and the credit pass leans
+    on, so the coach gets them as a picture as well as a table: a stretch of flat-zero reward or a
+    progress curve that stops climbing is far easier to spot here than in a few hundred JSON rows.
+    Action-chunk boundaries are drawn as light rules so an event's timestamp can be read straight
+    off to the chunk that owns it, and collisions are marked in red.
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise ImportError("Trajectory plots require matplotlib.") from exc
+
+    steps = [s for s in (metadata.get("steps") or []) if isinstance(s, dict)]
+    if not steps:
+        raise ValueError("Trajectory metadata contains no steps.")
+
+    times = [step_time_sec(s, metadata) for s in steps]
+    reward = [float(s.get("reward_total") or 0.0) for s in steps]
+    progress = [float(s.get("route_progress_pct") or 0.0) for s in steps]
+    collisions = [t for t, s in zip(times, steps) if s.get("collision")]
+    duration = max(times) if times else 0.0
+
+    chunk_steps = int(chunk_steps or metadata.get("action_chunk_steps") or 0)
+    fps = float(metadata.get("video_fps", 10.0)) or 10.0
+    stride = max(1, int(metadata.get("video_frame_stride", 2)))
+    chunk_sec = (chunk_steps / (fps * stride)) if chunk_steps else 0.0
+
+    # Light background and large type: the figure is read by a VLM, not scanned on a monitor.
+    fig, (ax_r, ax_p) = plt.subplots(2, 1, figsize=(11, 6), sharex=True)
+    fig.suptitle(
+        f"Episode {metadata.get('episode', '?')} · window {metadata.get('window_index', '?')} — "
+        f"env reward and route progress vs video time",
+        fontsize=13,
+    )
+
+    for ax in (ax_r, ax_p):
+        if chunk_sec > 0:
+            n_chunks = round(duration / chunk_sec) + 1
+            for k in range(n_chunks + 1):
+                ax.axvline(k * chunk_sec, color="#B9C3CE", linewidth=0.6, alpha=0.9, zorder=0)
+        for ct in collisions:
+            ax.axvline(ct, color="#D0483F", linewidth=1.6, alpha=0.9, zorder=1)
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.set_xlim(0, max(duration, 1e-3))
+
+    ax_r.plot(times, reward, color="#C26A14", linewidth=1.6, zorder=2)
+    ax_r.fill_between(times, 0, reward, color="#C26A14", alpha=0.15, zorder=2)
+    ax_r.axhline(0.0, color="#46535F", linewidth=0.8)
+    ax_r.set_ylabel("Env reward / step", fontsize=11)
+    ax_r.set_title(
+        f"Reward — total {sum(reward):.2f}, mean {sum(reward) / len(reward):.3f} over the window",
+        fontsize=10,
+    )
+
+    ax_p.plot(times, progress, color="#12768A", linewidth=1.8, zorder=2)
+    ax_p.set_ylabel("Route progress (%)", fontsize=11)
+    ax_p.set_xlabel("Video time (s)  —  same clock as the video and the event timestamps", fontsize=11)
+    gained = progress[-1] - progress[0] if progress else 0.0
+    ax_p.set_title(
+        f"Route progress — {progress[0]:.1f}% to {progress[-1]:.1f}% (+{gained:.2f}%) "
+        f"{'· route NOT complete' if progress[-1] < 99.5 else '· route complete'}",
+        fontsize=10,
+    )
+
+    # Legend as a figure caption rather than in-axes text, which would sit on top of the traces.
+    caption = []
+    if chunk_sec > 0:
+        caption.append(f"grey vertical rules = action chunk boundaries ({chunk_sec:.2f}s each)")
+    if collisions:
+        caption.append(f"red vertical rules = collisions ({len(collisions)})")
+    if caption:
+        fig.text(0.5, -0.02, "   ·   ".join(caption), ha="center", fontsize=9, color="#46535F")
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return output_path
 
 
 def compact_metadata_for_prompt(metadata: dict[str, Any]) -> dict[str, Any]:

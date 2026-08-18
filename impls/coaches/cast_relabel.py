@@ -46,7 +46,7 @@ import os
 import re
 import textwrap
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +58,8 @@ from coaches.action_chunk_feedback import (
     DEFAULT_CHUNK_DURATION_SEC,
     build_action_chunk_specs,
 )
+from coaches.correction_memory import DEFAULT_MAX_WORDS as DEFAULT_MEMORY_WORDS
+from coaches.correction_memory import CorrectionMemory
 from coaches.online_vlm_coach import write_frames_to_mp4
 from coaches.vlm_feedback import CoachEvent, create_coach
 
@@ -82,6 +84,23 @@ DEFAULT_EGO_HISTORY_LEN = 4
 # imported so this module stays importable without CARLA on ``sys.path``.
 EGO_STATE_IDX_YAW = 5
 EGO_STATE_IDX_SPEED = 15
+
+# PaliGemma location sentinels (``<loc0000>``..``<loc1023>``) that the CoT decode emits verbatim, so
+# every subtask/reasoning string captured at rollout arrives as
+# ``'<loc1022>The vehicle remained stopped.;<loc1021>'``. ``vlas.steervla`` strips these before they
+# become HL training targets; the same has to happen before they go into a VLM prompt, or the coach
+# is asked to reason about — and imitate the phrasing of — tokens that are not language. Duplicated
+# from ``vlas.steervla.strip_cot_sentinels`` rather than imported so this module stays importable
+# without JAX / OpenPI on the path (same reasoning as the ego-state indices above).
+_LOC_SENTINEL_RE = re.compile(r"<loc\d+>")
+
+
+def strip_cot_sentinels(text: Any) -> str:
+    """``'<loc1022>The vehicle accelerates.;<loc1021>'`` -> ``'The vehicle accelerates.'``"""
+    s = _LOC_SENTINEL_RE.sub(" ", str(text or ""))
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.rstrip(" ;").strip()
+
 
 # ``hl_samples.json`` schema version. 1 = the original online-only manifest; 2 adds the fields the
 # offline RLDS converter needs (``ego_hist`` in the npz, ``routing_command`` / ``original_subtask`` /
@@ -342,6 +361,55 @@ def _extract_json_payload(text: str) -> dict[str, Any]:
         raise ValueError("CAST relabel response must be a JSON object.")
     return payload
 
+
+def retime_chunk_specs(
+    chunk_specs: list[ActionChunkSpec],
+    metadata: dict[str, Any],
+) -> list[ActionChunkSpec]:
+    """Snap each chunk's video time range onto the frames actually recorded for its steps.
+
+    :func:`build_action_chunk_specs` lays chunks out on a uniform clock
+    (``chunk_index * chunk_duration_sec``), which assumes exactly
+    ``action_chunk_steps / video_frame_stride`` frames per chunk. That is not what the rollout
+    records: ``main_carla`` samples a frame every ``video_frame_stride`` env steps **and** on every
+    collision / traffic-violation step, so an eventful chunk contributes extra frames and every
+    later chunk's true position in the video slides earlier than the uniform grid says. Since the
+    VLM reads its event timestamps off the video and we then map those timestamps onto this table,
+    the drift lands directly on the credit assignment.
+
+    Here each chunk is re-timed from ``metadata["steps"]`` — whose ``video_timestamp_sec`` values
+    are the window-relative frame times computed by
+    :meth:`OnlineCastRelabelSession._build_metadata` — so the table describes the video as encoded.
+    Chunks with no recorded frame keep their uniform-grid estimate.
+    """
+    steps = metadata.get("steps") or []
+    fps = float(metadata.get("video_fps") or 0.0)
+    if not steps or fps <= 0.0:
+        return list(chunk_specs)
+    frame_dt = 1.0 / fps
+    out: list[ActionChunkSpec] = []
+    for spec in chunk_specs:
+        # ``episode_step_start/end`` are window-relative and 1-based; ``steps`` is the window.
+        span = steps[max(0, int(spec.episode_step_start) - 1): int(spec.episode_step_end)]
+        times = [
+            float(s["video_timestamp_sec"])
+            for s in span
+            if isinstance(s, dict) and s.get("video_timestamp_sec") is not None
+        ]
+        if not times:
+            out.append(spec)
+            continue
+        out.append(
+            replace(
+                spec,
+                video_time_start_sec=round(min(times), 3),
+                # The last frame of the chunk is on screen until the next one replaces it.
+                video_time_end_sec=round(max(times) + frame_dt, 3),
+            )
+        )
+    return out
+
+
 def build_chunks_payload(
     chunk_specs: list[ActionChunkSpec],
     metadata: dict[str, Any],
@@ -353,12 +421,25 @@ def build_chunks_payload(
     gives it the one hard, per-chunk signal it can otherwise not see: which chunks the environment
     itself paid for and which it penalized. Reward keys are omitted for chunks whose steps carry no
     reward (older trajectories), so the prompt never shows misleading zeros.
+
+    ``original_subtask`` is the subtask the policy actually executed over the chunk. Without it the
+    prompt's "keep the original subtask for GOOD chunks" and "smooth the subtasks relative to the
+    adjacent subtasks" instructions are unactionable — the credit call is a fresh, text-only
+    request (:meth:`vlm_feedback.GeminiVLMCOach.complete_text` carries no history from the review
+    call), so anything not serialized here is invisible to it.
     """
+    # ``metadata["steps"]`` is the window in order, so position ``i`` is window-relative step
+    # ``i + 1`` — the numbering ``chunk_specs`` uses. Keying by the record's ``episode_step``
+    # instead (absolute: 301-450 by the third window of an episode, against spec ranges of 1-150)
+    # matched nothing for every window after the first, so the reward columns the prompt then
+    # spends a paragraph explaining how to weigh were simply absent from all of them.
     step_rewards: dict[int, float] = {}
-    for s in metadata.get("steps", []) or []:
-        if not isinstance(s, dict) or s.get("reward_total") is None or s.get("episode_step") is None:
+    for idx, s in enumerate(metadata.get("steps", []) or []):
+        if not isinstance(s, dict) or s.get("reward_total") is None:
             continue
-        step_rewards[int(s["episode_step"])] = float(s["reward_total"])
+        step_rewards[idx + 1] = float(s["reward_total"])
+
+    originals = metadata.get("chunk_original_subtask", {}) or {}
 
     payload: list[dict[str, Any]] = []
     for spec in chunk_specs:
@@ -369,6 +450,10 @@ def build_chunks_payload(
             "video_time_start_sec": round(spec.video_time_start_sec, 3),
             "video_time_end_sec": round(spec.video_time_end_sec, 3),
         }
+        # Stripped again here so the prompt is clean even for metadata built elsewhere.
+        original = strip_cot_sentinels(originals.get(str(spec.chunk_index), ""))
+        if original:
+            entry["original_subtask"] = original
         span = [
             step_rewards[st]
             for st in range(int(spec.episode_step_start), int(spec.episode_step_end) + 1)
@@ -435,7 +520,7 @@ def build_debug_task_prompt(
 
         Example subtask phrasings (open vocabulary — reuse verbatim OR write new phrases in
         the SAME concise style; describe what the vehicle should do, not meta commentary). For this debug task, the subtasks should be the ones that result in the vehicle remaining stopped or slowing down.:
-        {seed_block}
+        {seed_subtask_block}
 
         For EVERY chunk_index above, return:
         - label: "GOOD", "BAD", or null. Does not matter for this debug task.
@@ -491,6 +576,10 @@ def build_credit_relabel_prompt(
     seed_subtask_block = "\n".join(f"- {s}" for s in seeds_subtasks)
     seeds_reasonings = list(seed_reasonings)[:max_seed_examples]
     seed_reasoning_block = "\n".join(f"- {s}" for s in seeds_reasonings)
+    # What earlier windows of this run already corrected (coaches.correction_memory). This call is
+    # stateless, so without it every window re-decides the same trade-off from scratch and the HL
+    # dataset can end up teaching both directions of one decision.
+    memory_block = str(metadata.get("correction_memory") or "")
 
     return textwrap.dedent(
         f"""
@@ -521,7 +610,10 @@ def build_credit_relabel_prompt(
         {json.dumps(events_payload, indent=2)}
         ```
 
-        Action chunks in this window. ``reward_total_sum`` / ``reward_total_mean`` /
+        Action chunks in this window. ``original_subtask`` is the subtask the policy ACTUALLY
+        executed over that chunk — it is what you are deciding whether to keep or replace, and the
+        sequence of them across chunks is what you are smoothing. ``reward_total_sum`` /
+        ``reward_total_mean`` /
         ``reward_total_min`` are the environment reward earned over each chunk's steps — the
         objective the policy is trained on. It rises with route progress and falls with collisions,
         route/traffic infractions, and harsh steering or braking. Treat a chunk with a low or
@@ -535,6 +627,7 @@ def build_credit_relabel_prompt(
         {json.dumps(chunks_payload, indent=2)}
         ```
 
+        {memory_block}
         Example subtask phrasings (open vocabulary — reuse verbatim OR write new phrases in
         the SAME concise style; describe what the vehicle should do, not meta commentary). HOWEVER
         the new subtasks should NOT reference objects in the scene and should focus on the driving behavior of
@@ -571,8 +664,9 @@ def build_credit_relabel_prompt(
           event. For GOOD chunks, keep the original subtask. If a chunk is BAD because the
           vehicle stopped or crawled prematurely while the route is unfinished and the way
           ahead is clear (no red light, stop sign, close leading vehicle, or pedestrian/yield),
-          suggest a subtask that has it accelerate and make forward progress along the route.  
-          DO NOT USE "reverse" or "back up" or "backwards" OR ANYTHING LIKE THIS IN THE SUBTASK. 
+          suggest a subtask that has it accelerate and make forward progress along the route.
+          For GOOD or null chunks, keep the chunk's ``original_subtask`` verbatim.
+          DO NOT USE "reverse" or "back up" or "backwards" OR ANYTHING LIKE THIS IN THE SUBTASK.
           This will not be understood by the model and will destroy the training signal.
         - suggested_reasoning: for BAD chunks whose subtask you are changing (direct AND
           precursor), write a fresh, concise chain-of-thought (1-3 sentences, present tense)
@@ -583,7 +677,10 @@ def build_credit_relabel_prompt(
           the reasoning that leads to the first corrected subtask. Leave it as "" for GOOD or
           null chunks (no change needed). The suggested reasoning can reference objects in the scene, but the subtasks should not.
         
-        **IMPORTANT:** Also try to smooth the subtasks relative to the adjacent subtasks in the chunk. If there is rapid changes of the subtask, you can suggest a subtask that smooths the transition.
+        **IMPORTANT:** Also try to smooth the subtasks relative to the adjacent chunks' subtasks
+        (compare against each chunk's ``original_subtask`` above, and against the subtasks you are
+        assigning to its neighbours). If there are rapid changes of the subtask, you can suggest a
+        subtask that smooths the transition.
 
         Return ONLY valid JSON (no markdown fences):
         {{
@@ -733,6 +830,10 @@ def generate_cast_relabel(
         steps_per_chunk=steps_per_chunk,
         chunk_duration_sec=chunk_duration_sec,
     )
+    # The uniform grid above assumes a fixed number of frames per chunk; the recorded video does
+    # not have one (see retime_chunk_specs). Snap the table to the frames that were actually
+    # encoded, so the chunk time ranges are on the same clock as the events the VLM reads off it.
+    chunk_specs = retime_chunk_specs(chunk_specs, metadata)
     # Step 2: VLM watches the window and flags what went well (GOOD) / poorly (BAD).
     events = coach.analyze(
         video_path,
@@ -1231,6 +1332,12 @@ class OnlineCastRelabelSession:
         # forces every chunk's suggested subtasks toward "remain stopped / slow down".
         self.debug_task = bool(self.cfg.get("debug_task", False))
         self.query_on_episode_end = bool(self.cfg.get("query_on_episode_end", True))
+        # Minimum env steps a forced end-of-episode window must span to be worth reviewing.
+        # Defaults to one action chunk — below that there is no chunk to assign credit to, and the
+        # sub-second video is rejected by the VLM API anyway (see should_query).
+        self.min_final_window_steps = int(
+            self.cfg.get("min_final_window_steps", self.action_chunk_steps)
+        )
         # High-level (VLM-backbone) dataset storage: persist BAD/relabeled chunks as SteerVLA
         # ``steervla_hl_dataset_format`` samples for a later VLM-backbone fine-tuning step.
         self.store_hl_dataset = bool(self.cfg.get("store_hl_dataset", True))
@@ -1257,9 +1364,11 @@ class OnlineCastRelabelSession:
             )
         if self.store_hl_dataset:
             self.hl_dataset_dir.mkdir(parents=True, exist_ok=True)
-        # When set, render the trajectory graphs (speed / throttle / steer / brake / route
-        # progress vs video time) per window and attach them to the VLM coach prompt.
-        self.include_plots_in_prompt = bool(self.cfg.get("include_plots_in_prompt", False))
+        # Render the env-reward + route-progress graph per window and attach it to the review
+        # call alongside the video. On by default: these are the two signals the per-timestamp
+        # block keeps dense, and their shape over the window is the thing a table hides. Set
+        # ``include_plots_in_prompt=False`` for a video-and-text-only review.
+        self.include_plots_in_prompt = bool(self.cfg.get("include_plots_in_prompt", True))
 
         raw_seeds = self.cfg.get("seed_subtasks")
         self.seed_subtasks: tuple[str, ...] = (
@@ -1278,6 +1387,19 @@ class OnlineCastRelabelSession:
         self.window_env_steps = n_chunks * self.action_chunk_steps
 
         self._coach = create_coach(self.provider, model=self.gemini_model)
+        # Bounded cross-window memory of corrections already made, injected into both prompts so
+        # later windows don't reverse earlier ones. ``correction_memory_words`` caps the whole
+        # rendered block; 0 disables the cache entirely.
+        memory_words = int(self.cfg.get("correction_memory_words", DEFAULT_MEMORY_WORDS))
+        self._memory: CorrectionMemory | None = (
+            CorrectionMemory(
+                self.artifact_dir / "correction_memory.json",
+                max_words=memory_words,
+                coach=self._coach,
+            )
+            if memory_words > 0
+            else None
+        )
         if self.provider == "gemini":
             _key = os.environ.get("GEMINI_API_KEY", "")
             if not _key or _key.startswith("YOUR_"):
@@ -1416,7 +1538,25 @@ class OnlineCastRelabelSession:
         if len(self.frames) <= self._frames_cursor:
             return False
         if force:
-            return self.query_on_episode_end
+            if not self.query_on_episode_end:
+                return False
+            # An episode that ends just past a window boundary leaves a remainder of a few env
+            # steps. Reviewing it uploads a sub-second video (1-4 frames), which Gemini rejects
+            # with a 400 — every time, ~2-5% of all windows. Such a window spans less than one
+            # action chunk, so it could not have produced a usable credit assignment anyway.
+            # Require at least one whole chunk before spending the call.
+            pending_steps = len(self.trajectory_steps) - self._traj_cursor
+            if pending_steps < self.min_final_window_steps:
+                print(
+                    f"[cast_relabel] skipping end-of-episode window: only {pending_steps} env "
+                    f"steps pending (< {self.min_final_window_steps} = one action chunk).",
+                    flush=True,
+                )
+                self._frames_cursor = len(self.frames)
+                self._traj_cursor = len(self.trajectory_steps)
+                self._model_inputs = {}
+                return False
+            return True
         if self.window_env_steps <= 0 or episode_step <= 0:
             return False
         if episode_step % self.window_env_steps != 0:
@@ -1458,10 +1598,47 @@ class OnlineCastRelabelSession:
         traj_window: list[dict[str, Any]],
         frames_window_subtasks: list[str],
         *,
+        frame_episode_steps: list[int],
         step_offset: int,
         done_info: dict[str, Any] | None,
     ) -> dict[str, Any]:
         done_info = done_info or {}
+        # ── Window-relative video clock ────────────────────────────────────────────────
+        # The ``video_timestamp_sec`` main_carla records counts frames from the start of the RUN
+        # (``episode_video_frame_index`` is never reset, not per window and not per episode), but
+        # the video handed to the VLM covers only THIS window and starts at t=0. Left alone, the
+        # per-timestamp block in the review prompt is keyed to a clock the VLM cannot see —
+        # window 3 of a 150-step cadence describes seconds 15.0-22.4 of a 7.5 s video, and it only
+        # gets worse as the run goes on. Re-derive the frame index and timestamp from the frames
+        # this session actually recorded for the window, keyed by episode step.
+        #
+        # Deriving them from the recorded frames (rather than ``episode_step * stride``) also
+        # absorbs the non-uniform cadence: main_carla samples a frame every ``video_frame_stride``
+        # steps AND on every collision / traffic-violation step, so eventful windows carry extra
+        # frames and a stride-based mapping mis-times everything after the first one.
+        step_to_frame: dict[int, int] = {}
+        for idx, ep_step in enumerate(frame_episode_steps or []):
+            step_to_frame.setdefault(int(ep_step), int(idx))
+        fps = float(self.video_fps) if float(self.video_fps) > 0.0 else 1.0
+        steps_out: list[dict[str, Any]] = []
+        for s in traj_window:
+            rec = dict(s)
+            # These strings go straight into the review prompt's per-timestamp block.
+            for key in ("subtask", "reasoning"):
+                if rec.get(key):
+                    rec[key] = strip_cot_sentinels(rec[key])
+            frame_idx = step_to_frame.get(int(rec.get("episode_step", -1)))
+            if frame_idx is None:
+                rec["video_frame_index"] = None
+                rec["video_timestamp_sec"] = None
+                rec["in_video"] = False
+            else:
+                rec["video_frame_index"] = frame_idx
+                rec["video_timestamp_sec"] = round(frame_idx / fps, 3)
+                rec["in_video"] = True
+            steps_out.append(rec)
+        traj_window = steps_out
+
         collision_events: list[dict[str, Any]] = []
         for s in traj_window:
             if s.get("collision") or s.get("collision_active"):
@@ -1473,11 +1650,18 @@ class OnlineCastRelabelSession:
                     }
                 )
         # Original subtask per (window-relative) chunk index: first subtask seen in the chunk.
+        # Mapped through each frame's recorded episode step for the same reason as the clock
+        # above — ``offset * stride`` drifts as soon as one off-cadence frame is captured.
+        first_abs_step = int(traj_window[0].get("episode_step", 1)) if traj_window else 1
+        frame_chunk_indices: list[int] = []
         chunk_original_subtask: dict[str, str] = {}
-        for offset, subtask in enumerate(frames_window_subtasks):
-            # Recorded frame ``offset`` maps to window env step ``offset * stride + 1``.
-            window_step = offset * self.video_frame_stride + 1
-            chunk_index = (window_step - 1) // self.action_chunk_steps
+        for offset, ep_step in enumerate(frame_episode_steps or []):
+            window_step = int(ep_step) - first_abs_step + 1
+            chunk_index = max(0, (window_step - 1) // self.action_chunk_steps)
+            frame_chunk_indices.append(chunk_index)
+            subtask = strip_cot_sentinels(
+                frames_window_subtasks[offset] if offset < len(frames_window_subtasks) else ""
+            )
             key = str(chunk_index)
             if subtask and key not in chunk_original_subtask:
                 chunk_original_subtask[key] = subtask
@@ -1534,7 +1718,15 @@ class OnlineCastRelabelSession:
             "window_reward_total": window_reward_total,
             "window_reward_mean": window_reward_mean,
             "collision_events": collision_events,
+            # Rendered cross-window correction memory, picked up by BOTH prompt builders straight
+            # off the metadata (so no signature threading) and recorded in the window artifact, so
+            # every window says exactly which memory was in play when it was reviewed.
+            "correction_memory": self._memory.render() if self._memory else "",
             "chunk_original_subtask": chunk_original_subtask,
+            # Window-relative chunk index of each recorded frame, so the debug-video annotation
+            # (and any offline viewer) can line frames up with chunks without re-deriving the
+            # non-uniform frame cadence.
+            "frame_chunk_indices": frame_chunk_indices,
             "steps": traj_window,
         }
 
@@ -1548,6 +1740,7 @@ class OnlineCastRelabelSession:
     ) -> None:
         frames_window = self.frames[self._frames_cursor:]
         subtasks_window = self.frame_subtasks[self._frames_cursor:]
+        frame_steps_window = self.frame_episode_steps[self._frames_cursor:]
         traj_window = self.trajectory_steps[self._traj_cursor:]
         step_offset = self._traj_cursor
         self.window_count += 1
@@ -1559,7 +1752,11 @@ class OnlineCastRelabelSession:
         video_path = work_dir / "rollout.mp4"
         write_frames_to_mp4(frames_window, video_path, fps=self.video_fps)
         metadata = self._build_metadata(
-            traj_window, subtasks_window, step_offset=step_offset, done_info=done_info
+            traj_window,
+            subtasks_window,
+            frame_episode_steps=frame_steps_window,
+            step_offset=step_offset,
+            done_info=done_info,
         )
         (work_dir / "trajectory.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
@@ -1569,12 +1766,25 @@ class OnlineCastRelabelSession:
             flush=True,
         )
 
+        # Attach the two dense signals (env reward + route progress) to the review call as an
+        # image. The per-timestamp block thins speed/controls but keeps these two on every row;
+        # the plot gives the coach their shape at a glance, on the same clock as the video.
+        # Non-fatal: a missing matplotlib or a bad window must not cost us the review.
         plot_paths: list[Path] | None = None
         if self.include_plots_in_prompt:
-            from coaches.trajectory_plots import generate_trajectory_plots
+            try:
+                from coaches.trajectory_plots import generate_reward_progress_plot
 
-            plot_map = generate_trajectory_plots(metadata, work_dir / "plots")
-            plot_paths = [plot_map["combined"]]
+                plot_paths = [
+                    generate_reward_progress_plot(
+                        metadata,
+                        work_dir / "plots" / "reward_progress.png",
+                        chunk_steps=self.action_chunk_steps,
+                    )
+                ]
+            except Exception as exc:  # noqa: BLE001 - the plot is an extra, not a prerequisite
+                print(f"[cast_relabel] reward/progress plot failed (non-fatal): {exc}", flush=True)
+                plot_paths = None
 
         events, cast_json = generate_cast_relabel(
             self._coach,
@@ -1590,11 +1800,26 @@ class OnlineCastRelabelSession:
         )
         (work_dir / "cast_relabel.json").write_text(json.dumps(cast_json, indent=2), encoding="utf-8")
 
+        # Fold this window's corrections in *after* the prompts were built, so a window is never
+        # shown its own outcome — only what came before it.
+        if self._memory is not None:
+            try:
+                self._memory.observe_window(
+                    cast_json, window_index=self.window_count, route=self.route_id
+                )
+            except Exception as exc:  # noqa: BLE001 - the memory is an aid, not a prerequisite
+                print(f"[cast_relabel] correction memory update failed (non-fatal): {exc}", flush=True)
+
         # Persist BAD/relabeled chunks as high-level (VLM-backbone) SteerVLA samples.
         n_hl = self._store_hl_samples(cast_json, metadata, traj_window, tag)
 
         if self.debug:
-            self._log_debug_video(frames_window, subtasks_window, cast_json, global_step=global_step)
+            self._log_debug_video(
+                frames_window,
+                cast_json,
+                frame_chunk_indices=metadata.get("frame_chunk_indices") or [],
+                global_step=global_step,
+            )
         self._log_scalars(events, cast_json, n_hl_samples=n_hl, global_step=global_step)
 
         # Advance cursors so the next window starts fresh.
@@ -1684,9 +1909,9 @@ class OnlineCastRelabelSession:
     def _log_debug_video(
         self,
         frames_window: list[np.ndarray],
-        subtasks_window: list[str],
         cast_json: dict[str, Any],
         *,
+        frame_chunk_indices: list[int],
         global_step: int | None,
     ) -> None:
         try:
@@ -1695,11 +1920,13 @@ class OnlineCastRelabelSession:
             return
         if wandb.run is None or not frames_window:
             return
-        # Window-relative chunk index per recorded frame.
-        frame_chunk_indices = [
-            (offset * self.video_frame_stride) // self.action_chunk_steps
-            for offset in range(len(frames_window))
-        ]
+        # Window-relative chunk index per recorded frame, derived in ``_build_metadata`` from each
+        # frame's episode step (a stride-based estimate drifts on off-cadence frames).
+        if len(frame_chunk_indices) < len(frames_window):
+            frame_chunk_indices = list(frame_chunk_indices) + [
+                (offset * self.video_frame_stride) // self.action_chunk_steps
+                for offset in range(len(frame_chunk_indices), len(frames_window))
+            ]
         annotated = annotate_cast_relabel_frames(frames_window, frame_chunk_indices, cast_json)
         if not annotated:
             return
