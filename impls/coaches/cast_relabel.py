@@ -419,20 +419,31 @@ def build_candidate_score_prompt(
         Candidate next-subtasks (index: text):
         {cand_block}
 
-        Score each candidate in [0, 1] for {objective or _DEFAULT_SCORE_OBJECTIVE}. Return ONLY JSON of
-        the form {{"scores": [s_0, ..., s_{n - 1}]}} with exactly {n} numbers in candidate order.
+        Score each candidate in [0, 1] for {objective or _DEFAULT_SCORE_OBJECTIVE}. Respond with ONE
+        line of raw JSON and nothing else -- no markdown fences, no prose, no trailing commas:
+        {{"scores": [s_0, ..., s_{n - 1}]}} -- exactly {n} decimals in candidate order, comma-separated.
         """
     ).strip()
 
 
 def parse_candidate_scores(text: str, *, num: int) -> list[float]:
     """Parse ``{"scores": [...]}`` into ``num`` floats in [0, 1].
+
+    Tries strict JSON, then a regex salvage tolerant of the VLM's usual malformations (missing/
+    trailing commas, stray prose). Raises only when neither yields exactly ``num`` numbers, so a
+    genuinely unparseable reply still fails loudly instead of training on a silently degraded group.
     """
-    payload = _extract_json_payload(text)
-    raw = payload.get("scores")
-    if not isinstance(raw, list) or len(raw) != num:
-        raise ValueError(f"VLM candidate scoring expected a 'scores' list of length {num}, got: {raw!r}")
-    return [min(1.0, max(0.0, float(v))) for v in raw]
+    try:
+        raw = _extract_json_payload(text).get("scores")
+        if isinstance(raw, list) and len(raw) == num:
+            return [min(1.0, max(0.0, float(v))) for v in raw]
+    except (ValueError, json.JSONDecodeError):
+        pass
+    m = re.search(r'"?scores"?\s*:\s*\[([^\]]*)\]', text, flags=re.DOTALL)
+    nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", m.group(1) if m else text)
+    if len(nums) != num:
+        raise ValueError(f"VLM candidate scoring could not be parsed into {num} scores; raw reply: {text!r}")
+    return [min(1.0, max(0.0, float(v))) for v in nums]
 
 
 def build_debug_task_prompt(

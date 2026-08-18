@@ -1230,6 +1230,7 @@ class SteerVLAActor:
         hl_update_every: int = 1,
         hl_update_batch_size: int = 2,
         hl_update_num_steps: int = 1,
+        hl_lr: float | None = None,
         hl_freeze_regexes: list[str] | None = None,
         hl_replay_root: str | Path | None = None,
         hl_replay_pools: list[dict] | None = None,
@@ -1270,6 +1271,10 @@ class SteerVLAActor:
         self.hl_update_every = max(1, int(hl_update_every))
         self.hl_update_batch_size = max(1, int(hl_update_batch_size))
         self.hl_update_num_steps = max(1, int(hl_update_num_steps))
+        # Flat LR override for the HL optimizer. The pretraining actor_config ships a warmup->1e-4
+        # cosine schedule (tuned for from-scratch BC); RL fine-tuning wants a small constant rate, so
+        # when set this replaces the schedule with a flat ``hl_lr`` (no warmup ramp). None = keep config.
+        self.hl_lr: float | None = float(hl_lr) if hl_lr else None
         # Optional regexes of param paths to FREEZE in the trainable state (e.g. the SigLIP vision
         # tower and the tied token embedder), so their grad + Adam buffers are dropped and the HL
         # update fits. Applied in :meth:`setup` before the train state is built. None = full fine-tune.
@@ -1501,6 +1506,16 @@ class SteerVLAActor:
                 freeze_filter=nnx.Any(self.train_cfg.freeze_filter, *extra),
             )
             print(f"[steervla] extra freeze regexes for trainable state: {self.hl_freeze_regexes}", flush=True)
+
+        if self.load_trainable_params and self.hl_lr:
+            # Flat constant LR (warmup_steps=0, peak == decay) instead of the pretraining warmup-cosine.
+            self.train_cfg = dataclasses.replace(
+                self.train_cfg,
+                lr_schedule=_optimizer.CosineDecaySchedule(
+                    warmup_steps=0, peak_lr=self.hl_lr, decay_steps=10**9, decay_lr=self.hl_lr
+                ),
+            )
+            print(f"[steervla] HL optimizer LR overridden to flat {self.hl_lr:g}", flush=True)
 
         if self.load_trainable_params:
             # Full trainable state (optimizer + opt_state + freeze/trainable filters), pinned to one
@@ -4831,6 +4846,7 @@ def create_steervla_pi0_cot_sample_fn(
         hl_update_every=int(steervla_cfg.get("hl_update_every", 1)),
         hl_update_batch_size=int(steervla_cfg.get("hl_update_batch_size", 2)),
         hl_update_num_steps=int(steervla_cfg.get("hl_update_num_steps", 1)),
+        hl_lr=steervla_cfg.get("hl_lr"),
         hl_freeze_regexes=steervla_cfg.get("hl_freeze_regexes"),
         # HL replay pools (pretraining-data stabilization). See extract_hl_replay.py.
         hl_replay_root=steervla_cfg.get("hl_replay_root"),

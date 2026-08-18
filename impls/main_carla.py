@@ -1408,13 +1408,22 @@ def _annotate_text_panel(
             f"Subtask: {_clip(subtask)}",
         ]
         colors += [white] * (len(lines) - len(colors))  # remaining lines default white
+
+        def _fit(txt: str) -> str:
+            """Shrink ``txt`` (with an ellipsis) until it fits the panel width; avoids right-edge cutoff."""
+            if not txt or cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0][0] <= w - 8:
+                return txt
+            while txt and cv2.getTextSize(txt + "...", cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0][0] > w - 8:
+                txt = txt[:-1]
+            return txt + "..."
+
         panel_h = max(72, line_h * (len(lines) + 1))
         annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
         annotated[:h, :, :] = annotated_top
         cv2.line(annotated, (0, h), (w - 1, h), (255, 255, 255), 1)
         y = h + line_h
         for line, color in zip(lines, colors):
-            cv2.putText(annotated, line, (4, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1, cv2.LINE_AA)
+            cv2.putText(annotated, _fit(line), (4, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1, cv2.LINE_AA)
             y += line_h
         return annotated
     except Exception:
@@ -4624,6 +4633,7 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
     score_every = max(1, int(grpo.get("score_every", 1)))  # env steps between scored decision states
     update_every = max(1, int(grpo.get("update_every_states", 4)))  # scored states pooled per update
     adv_eps = float(grpo.get("advantage_eps", 1e-6))
+    vlm_retries = max(1, int(grpo.get("vlm_score_retries", 3)))
     ckpt_every_steps = int(grpo.get("checkpoint_every_steps", 2000))
     ckpt_root = os.path.join(FLAGS.save_dir, "steervla_hl_ckpt")
     routing_command = str((config.get("steervla") or {}).get("routing_command", "Follow the route."))
@@ -4654,6 +4664,7 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
     score_stats: list[np.ndarray] = []
     winner_scores: list[float] = []  # top score picked per scored state (for update metrics)
     inject_wins: list[float] = []    # 1.0 when the injected stop candidate won, else 0.0
+    score_fail_count = 0             # scored states whose VLM scoring failed all retries (drove base)
     states_since_update = 0
     update_idx = 0
 
@@ -4666,6 +4677,7 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
 
     def _do_update(step_tag: int) -> None:
         nonlocal pooled, pooled_adv, score_stats, winner_scores, inject_wins, states_since_update, update_idx
+        nonlocal score_fail_count
         if not pooled:
             return
         uinfo = steervla_actor.update_hl_grpo(
@@ -4681,28 +4693,37 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
             "grpo/score_mean": float(all_scores.mean()),
             "grpo/score_std": float(all_scores.std()),
             "grpo/winner_score_mean": float(np.mean(winner_scores)) if winner_scores else 0.0,
+            # Scored states in this window whose VLM scoring failed all retries (drove the base chunk
+            # instead, and were not pooled); a persistent nonzero value means the critic is unreliable.
+            "grpo/score_failures": float(score_fail_count),
         })
         if inject_stop:
             metrics["grpo/inject_stop_won_frac"] = float(np.mean(inject_wins)) if inject_wins else 0.0
         wandb.log(metrics, step=step_tag)
         train_logger.log({k: v for k, v in metrics.items() if np.isscalar(v)}, step=step_tag)
         pooled, pooled_adv, score_stats, winner_scores, inject_wins, states_since_update = [], [], [], [], [], 0
+        score_fail_count = 0
         update_idx += 1
 
     for step in tqdm.tqdm(range(1, total_steps + 1), dynamic_ncols=True):
         raw_holder["obs"] = obs
         hud = None
-        if step % score_every == 0:
+        win_reasoning = win_subtask = None
+        scoring_failed = False
+        scored = step % score_every == 0
+        if scored:
             # Sample K candidate CoTs, VLM-score them, record them with advantages; execute the top one.
             rng, ck = jax.random.split(rng)
             cands = steervla_actor.sample_candidates(n_cand, temperature=score_temp, raw=obs, rng=ck)
             subtasks = list(cands["subtask_texts"])
+            reasonings = list(cands["reasoning_texts"])
             chunks = np.asarray(cands["actions"], dtype=np.float32).reshape(n_cand, -1)
             recs = steervla_actor.grpo_records_from_candidates(cands, obs)
             if inject_stop:
                 # Swap candidate 0 for a canned stop: zero chunk (car brakes) + stop CoT record.
                 chunks[0] = 0.0
                 subtasks[0] = stop_subtask
+                reasonings[0] = stop_reasoning
                 recs[0] = steervla_actor.grpo_stop_record(obs, reasoning=stop_reasoning, subtask=stop_subtask)
             context = {
                 "routing_command": routing_command,
@@ -4715,10 +4736,23 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
             frame = _viz_image_from_raw(obs)
             if frame is None:
                 frame = obs.get("image")
-            text = coach.complete_image_text(
-                frame, build_candidate_score_prompt(context, subtasks, objective=score_objective)
-            )
-            scores = np.asarray(parse_candidate_scores(text, num=n_cand), dtype=np.float32)
+            prompt = build_candidate_score_prompt(context, subtasks, objective=score_objective)
+            # The VLM occasionally returns malformed JSON (worsening as the HL policy degrades and its
+            # CoTs garble); retry, then skip the state so one bad reply can't kill a multi-thousand-step run.
+            scores = None
+            for attempt in range(vlm_retries):
+                try:
+                    scores = np.asarray(
+                        parse_candidate_scores(coach.complete_image_text(frame, prompt), num=n_cand),
+                        dtype=np.float32,
+                    )
+                    break
+                except Exception as exc:  # noqa: BLE001 - transient VLM/JSON errors are retried below.
+                    print(f"[grpo] VLM scoring attempt {attempt + 1}/{vlm_retries} failed: {exc}", flush=True)
+            if scores is None:
+                print("[grpo] VLM scoring failed after retries; driving base chunk (state not pooled).", flush=True)
+                scored, scoring_failed, score_fail_count = False, True, score_fail_count + 1
+        if scored:
             adv = (scores - scores.mean()) / (scores.std() + adv_eps)
             pooled.extend(recs)
             pooled_adv.extend(float(a) for a in adv)
@@ -4728,6 +4762,7 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
             inject_wins.append(1.0 if (inject_stop and winner == 0) else 0.0)
             states_since_update += 1
             action = chunks[winner]
+            win_reasoning, win_subtask = reasonings[winner], subtasks[winner]
             # HUD: one line per candidate (score + subtask); the executed winner is drawn in green
             # ('>' marker + WIN tag), the injected stop candidate in cyan.
             hud_lines = [f"step={episode_steps} ret={episode_return:+.1f} win=c{winner}"]
@@ -4737,7 +4772,7 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
                 is_stop = inject_stop and i == 0
                 hud_lines.append(
                     f"{'>' if is_win else ' '}c{i} s={scores[i]:.2f}"
-                    f"{' STOP' if is_stop else ''} {subtasks[i][:44]}{'  <-WIN' if is_win else ''}"
+                    f"{' STOP' if is_stop else ''} {subtasks[i][:40]}{'  <-WIN' if is_win else ''}"
                 )
                 hud_colors.append((0, 255, 0) if is_win else ((255, 255, 0) if is_stop else (255, 255, 255)))
             hud = {"lines": hud_lines, "line_colors": hud_colors}
@@ -4746,8 +4781,21 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
             action = _base_chunk(
                 vla_sample_fn, raw_holder, obs, jax.random.normal(nk, (1, base_noise_dim), dtype=jnp.float32)
             )
+            if scoring_failed:
+                # Explicit red banner so the fallback is obvious in the rollout video (also grpo/score_failures).
+                red = (0, 0, 255)
+                hud = {
+                    "lines": [
+                        f"step={episode_steps} ret={episode_return:+.1f} SCORING FAILED",
+                        "default action = base policy chunk (state not pooled)",
+                    ],
+                    "line_colors": [red, red],
+                }
 
         next_obs, reward, terminated, truncated, info = env.step(action)
+        if isinstance(next_obs, dict) and win_subtask is not None:
+            # Surface the executed candidate's CoT so the video panel's Reasoning/Subtask populate.
+            next_obs["reasoning_text"], next_obs["subtask_text"] = win_reasoning, win_subtask
         speed = float(_ego_speed_mps(next_obs))
         # Debug stop task: optimize -speed instead of the env reward (surfaced to the VLM via context).
         reward_used = -speed if debug_task else float(reward)
@@ -4765,17 +4813,28 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
         obs = next_obs
 
         if done:
-            ep_metrics: dict[str, Any] = {
+            # Full rollout logging (success / route progress / collisions / termination / video); in debug
+            # mode episode_return is the -speed objective and is logged under debug/episode_return.
+            _log_episode_end(
+                info,
+                episode_return=episode_return,
+                episode_steps=episode_steps,
+                episode_index=episode_count,
+                frames=frames,
+                log_video=log_video,
+                video_fps=video_fps,
+                step=step,
+                train_logger=train_logger,
+                collision_events=int(info.get("collision_count", 0)),
+                debug_task=debug_task,
+                debug_return=episode_return,
+            )
+            grpo_ep = {
                 "grpo/episode": float(episode_count),
-                "grpo/episode_return": episode_return,
-                "grpo/episode_steps": float(episode_steps),
                 "grpo/episode_mean_speed_mps": episode_speed_sum / max(episode_steps, 1),
             }
-            if log_video and frames:
-                video = _episode_video(frames, video_fps)
-                if video is not None:
-                    ep_metrics["grpo/rollout_video"] = video
-            wandb.log(ep_metrics, step=step)
+            wandb.log(grpo_ep, step=step)
+            train_logger.log(grpo_ep, step=step)
             print(
                 f"[grpo] episode {episode_count}: return={episode_return:.3f} steps={episode_steps} "
                 f"mean_speed={episode_speed_sum / max(episode_steps, 1):.3f} (env_step {step}/{total_steps})",

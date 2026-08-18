@@ -51,6 +51,9 @@ def get_config():
     # Minibatch size for the GRPO update: a pooled group of candidate CoTs can exceed one Pi0-CoT
     # forward+backward, so update_hl_grpo shuffles the pooled CoTs into minibatches of this size.
     config.steervla.hl_update_batch_size = 32
+    # Flat HL learning rate for RL fine-tuning. The pretraining schedule ramps to 1e-4 (BC rate); that
+    # hot LR drove the observed late-run CoT collapse, so GRPO pins a small constant rate instead.
+    config.steervla.hl_lr = 1e-5
 
     config.grpo = ml_collections.ConfigDict(
         dict(
@@ -67,6 +70,9 @@ def get_config():
             # Passes over the pooled group per update (minibatched inside update_hl_grpo).
             num_update_steps=1,
             advantage_eps=1e-6,
+            # VLM scoring attempts before giving up on a state (transient/malformed replies get retried;
+            # after this many failures the state is skipped and the base policy drives that step).
+            vlm_score_retries=3,
             # Export the HL backbone to <save_dir>/steervla_hl_ckpt/<step> every N env steps (0 = final only).
             checkpoint_every_steps=2000,
             # Debug stop task: env reward -> -ego_speed and the VLM is told to prefer stopping (verifies
