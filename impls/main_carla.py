@@ -1527,6 +1527,52 @@ def _log_episode_end(
     frames.clear()
 
 
+# Per-episode rollout columns to aggregate (first present wins; the residual and DSRL loops
+# name a few differently), so the aggregator works for either.
+_EVAL_COLS = {
+    "return": ("rollout/episode_return",),
+    "driving_score": ("rollout/driving_score",),
+    "route_progress_pct": ("rollout/final_route_progress_pct", "rollout/episode_route_progress_pct"),
+    "success": ("rollout/success", "rollout/final_step_success"),
+    "collisions": ("rollout/episode_collision_events",),
+    "episode_length": ("rollout/episode_length", "rollout/episode_steps"),
+}
+
+
+def _write_eval_summary(save_dir: str, *, route: str, seed: int) -> Optional[dict]:
+    """Aggregate per-episode rollout rows in train.csv -> eval_summary.json + wandb.summary."""
+    import csv as _csv
+
+    path = os.path.join(save_dir, "train.csv")
+    if not os.path.exists(path):
+        return None
+    vals: dict[str, list[float]] = {m: [] for m in _EVAL_COLS}
+    n = 0
+    with open(path, newline="") as f:
+        for row in _csv.DictReader(f):
+            if not row.get("rollout/episodes"):  # only per-episode rows carry this
+                continue
+            n += 1
+            for m, cols in _EVAL_COLS.items():
+                v = next((row[c] for c in cols if row.get(c)), "")
+                if v:
+                    vals[m].append(float(v))
+    if n == 0:
+        return None
+    stats = {m: {"mean": float(np.mean(v)), "std": float(np.std(v))} for m, v in vals.items() if v}
+    summary = {"route": route, "seed": int(seed), "n_episodes": n, **stats}
+    with open(os.path.join(save_dir, "eval_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print(
+        f"[eval] {route} seed={seed} n={n}: "
+        + ", ".join(f"{m}={s['mean']:.3f}+/-{s['std']:.3f}" for m, s in stats.items()),
+        flush=True,
+    )
+    if wandb.run is not None:
+        wandb.summary.update({f"eval/{m}_mean": s["mean"] for m, s in stats.items()})
+    return summary
+
+
 # --------------------------------------------------------------------------- #
 # Online RL loop                                                              #
 # --------------------------------------------------------------------------- #
@@ -4383,6 +4429,8 @@ def run_online_residual(
                     debug_task=debug_task, debug_return=debug_return,
                 )
                 episode_count += 1
+                if 0 < FLAGS.max_episodes <= episode_count:
+                    break  # bounded eval: stop after exactly --max_episodes episodes
                 episode_return = 0.0
                 debug_return = 0.0
                 episode_steps = 0
@@ -4504,6 +4552,11 @@ def _run_residual_entry(config):
     if exec_cfg is not None:
         extra_carla["steervla_action_execution"] = exec_cfg
 
+    if FLAGS.eval_only:
+        # Deterministic eval: greedy CoT + traffic seed tied to --seed (set before actor/env build).
+        extra_carla["traffic_manager_seed"] = int(FLAGS.seed)
+        steervla_cfg["cot_temperature"] = 0.0
+
     # Bring CARLA up before JAX initializes its thread pool (forking afterwards can deadlock
     # the UE4 RenderThread). The reset below starts the simulator.
     env = _make_carla_env(carla_yaml, FLAGS.route, extra_carla_config=extra_carla or None)
@@ -4603,6 +4656,8 @@ def _run_residual_entry(config):
             episode_count_start=episode_count_start,
             buffer=resumed_buffer,
         )
+        if FLAGS.eval_only:
+            _write_eval_summary(FLAGS.save_dir, route=str(FLAGS.route), seed=int(FLAGS.seed))
     finally:
         try:
             env.close()
@@ -5045,6 +5100,8 @@ def _run_dsrl_entry(config):
             siglip_encoder=session.siglip_encoder,
             siglip_include_prompt_subtask=session.siglip_include_prompt_subtask,
         )
+        if FLAGS.eval_only:
+            _write_eval_summary(FLAGS.save_dir, route=str(FLAGS.route), seed=int(FLAGS.seed))
     finally:
         try:
             env.close()
