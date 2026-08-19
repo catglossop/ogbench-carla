@@ -670,6 +670,103 @@ def _list_routes_and_exit() -> None:
         )
 
 
+class CastPoolWatcher:
+    """Worker-side half of a pooled CAST run: hot-reload the newest policy the trainer publishes.
+
+    Polls the shared checkpoint dir every ``check_every`` env steps (a stat of a few directories,
+    so it is cheap enough to sit in the rollout loop) and, when a strictly newer *published* version
+    appears, restores it into the live actor mid-episode.
+
+    Reloading mid-episode means one episode's trajectory can span two policy versions. That is why
+    :class:`coaches.cast_relabel.OnlineCastRelabelSession` stamps ``policy_version`` per chunk rather
+    than per window -- the trainer's staleness filter then ages out supervision by the version that
+    actually produced it, not by when the window happened to flush.
+
+    The load takes tens of seconds with no ``world.tick()``, so the leaderboard watchdogs are paused
+    across it exactly as the wrapper does for long VLA inference; otherwise a reload would look like
+    a hung agent and kill the episode.
+    """
+
+    def __init__(self, *, checkpoint_dir, actor, cast_session, check_every: int = 50):
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.actor = actor
+        self.cast_session = cast_session
+        self.check_every = max(1, int(check_every))
+        self.version = 0
+        self.reloads = 0
+
+    def maybe_reload(self, env, step: int) -> bool:
+        """Called once per env step; returns True if a new policy version was loaded."""
+        if step % self.check_every != 0:
+            return False
+        from cast_pool import discover_latest_version
+
+        found = discover_latest_version(self.checkpoint_dir, min_version=self.version)
+        if found is None:
+            return False
+        version, version_dir = found
+        print(f"[cast_pool.worker] new policy version {version} published; hot-reloading.", flush=True)
+        # Same off-tick guard the CAST window review uses for its blocking Gemini calls.
+        pause = getattr(env, "pause_for_vla_inference", None)
+        resume = getattr(env, "resume_after_vla_inference", None)
+        if pause is not None:
+            pause()
+        try:
+            ok = self.actor.reload_params_from_checkpoint(version_dir)
+        finally:
+            if resume is not None:
+                resume()
+        if not ok:
+            return False  # keep self.version so the next poll retries this same version.
+        self.version = version
+        self.reloads += 1
+        if self.cast_session is not None:
+            # From here on, samples this worker produces are attributed to the new version.
+            self.cast_session.policy_version = version
+        return True
+
+
+def _maybe_build_cast_pool_watcher(agent_config, cast_session, steervla_actor):
+    """Wire this process as a pooled-run rollout worker, or return None for a solo run.
+
+    Enforces the two invariants a pooled worker must satisfy: it writes into the shared pool (which
+    ``cast_relabel.hl_dataset_root`` already handles, namespaced by run tag), and it takes **no**
+    gradient steps of its own -- all training is centralized in ``impls/train_hl_pooled.py`` so every
+    route trains one policy instead of drifting into N.
+    """
+    pool_cfg = agent_config.get("cast_pool")
+    if pool_cfg is None or not bool(pool_cfg.get("enabled", False)):
+        return None
+    if str(pool_cfg.get("role", "worker")).strip().lower() != "worker":
+        return None
+    ckpt_dir = str(pool_cfg.get("checkpoint_dir", "") or "").strip()
+    if not ckpt_dir:
+        print("[cast_pool.worker] cast_pool.enabled but checkpoint_dir is empty; no hot-reload.", flush=True)
+        return None
+    if steervla_actor is None:
+        return None
+    if getattr(steervla_actor, "load_trainable_params", False):
+        print(
+            "[cast_pool.worker] WARNING: this worker loaded a trainable actor. A pooled worker "
+            "should run load_trainable_params=False (the trainer owns the only train state), and "
+            "hot-reload is refused for a trainable actor.",
+            flush=True,
+        )
+        return None
+    watcher = CastPoolWatcher(
+        checkpoint_dir=ckpt_dir,
+        actor=steervla_actor,
+        cast_session=cast_session,
+        check_every=int(pool_cfg.get("worker_check_every_steps", 50)),
+    )
+    print(
+        f"[cast_pool.worker] pooled mode: watching {ckpt_dir} every "
+        f"{watcher.check_every} env steps; samples -> {getattr(cast_session, 'hl_dataset_dir', '?')}",
+        flush=True,
+    )
+    return watcher
+
+
 def _steervla_action_execution_cfg(steervla_cfg) -> dict[str, Any] | None:
     """Env + replay-buffer layout for OpenPI SteerVLA chunks (simlingo-style control)."""
     if steervla_cfg is None or not steervla_cfg.get("enabled"):
@@ -1909,6 +2006,11 @@ def run_online_carla(
                 flush=True,
             )
         capture_rollout_video = True
+
+    # Pooled CAST run: this process is one of N rollout workers feeding a shared sample pool that a
+    # separate trainer consumes (impls/train_hl_pooled.py). The worker takes no gradient steps -- it
+    # only produces relabeled samples and hot-reloads whatever policy version the trainer publishes.
+    _cast_pool_watcher = _maybe_build_cast_pool_watcher(agent_config, _cast_relabel, steervla_actor)
     _online_training_mode = str(agent_config.get("online_training_mode", "rl")).strip().lower()
     _lang_dim = critic_language_dim(agent_config)
     _bon_viz_interval = int(agent_config.get("bon_viz_interval", 0))
@@ -3573,6 +3675,16 @@ def run_online_carla(
                 finally:
                     if _pause_offtick and hasattr(env, "resume_after_vla_inference"):
                         env.resume_after_vla_inference()
+
+        # Pooled run: pick up a newly published policy version mid-episode (see CastPoolWatcher).
+        if _cast_pool_watcher is not None and _cast_pool_watcher.maybe_reload(env, step):
+            wandb.log(
+                {
+                    "cast_pool/worker_policy_version": _cast_pool_watcher.version,
+                    "cast_pool/worker_reloads": _cast_pool_watcher.reloads,
+                },
+                step=step,
+            )
 
         if (
             log_images

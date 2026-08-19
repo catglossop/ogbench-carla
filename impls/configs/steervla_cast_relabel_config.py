@@ -131,6 +131,15 @@ def get_config():
             hl_update_batch_size=64,
             hl_update_every=5,
             hl_update_num_steps=2,
+            # Flat LR for the HL optimizer, replacing the pretraining schedule. The actor_config ships
+            # a warmup_cosine_decay (warmup 1000 steps -> peak 2e-5, decaying over 200k), and
+            # init_train_state starts the restored TrainState back at step=0, so that warmup restarts
+            # here: an 8k-env-step run only reaches ~1.6k gradient steps, spending most of the run at a
+            # near-zero LR (~2e-8 on the first update) and only reaching peak at the very end. That
+            # makes early and late updates incomparable and interacts badly with how heavily the small
+            # online pool is re-sampled. A flat LR trains the whole run in one regime instead.
+            # Set to None (or drop the key) to fall back to the actor_config's schedule.
+            hl_lr=1e-5,
             # Freeze the memory-heavy pretrained subtrees for the HL (VLM-backbone) update so its
             # grad + Adam(mu/nu) buffers fit. The HL step supervises only the CoT/subtask targets
             # (action loss masked), so the SigLIP vision tower (``.*img.*``) and the tied Gemma token
@@ -216,10 +225,14 @@ def get_config():
             use_pi_action_chunk_for_env=True,
             action_horizon=10,
             action_dim=4,
-            # Query Pi0-CoT once, then execute this many rows before re-querying (1 = every step).
-            actions_per_model_query=1,
+            # Query Pi0-CoT once, then serve this many **env steps** from the chunk before re-querying
+            # (1 = every step). Env steps are 20 Hz CARLA ticks, chunk rows are 4 Hz waypoints, so the
+            # chunk advances one row per ``env_steps_per_chunk_row`` (=5) env steps: 5 here = hold one
+            # chunk for 0.25 s and re-plan, matching the model's training policy rate.
+            actions_per_model_query=5,
             # Reuse sampled CoT reasoning/subtask for this many env actions before re-sampling CoT.
-            actions_per_cot=1,
+            # Matched to actions_per_model_query so the CoT and the chunk refresh on the same step.
+            actions_per_cot=5,
             output_action_format="DELTA_XY_T_DELTA_XY_SPACE",
             sample_actions_num_steps=10,
             # Decode action chunks in small micro-batches (CoT stays batched). Large

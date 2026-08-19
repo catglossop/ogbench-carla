@@ -1221,6 +1221,7 @@ class SteerVLAActor:
         action_dim: int = 4,
         actions_per_model_query: int = 1,
         actions_per_cot: int = 1,
+        env_steps_per_chunk_row: int = 5,
         sample_actions_num_steps: int = 10,
         action_decode_batch_size: int = 2,
         training_gpu_rank: int = -1,
@@ -1238,6 +1239,7 @@ class SteerVLAActor:
         hl_online_bad_fraction: float = -1.0,
         hl_online_precursor_fraction: float = -1.0,
         hl_min_online_samples: int = 1,
+        hl_keep_last_rounds: int = 0,
         hl_log_batch_tokens: bool = True,
         return_normalized_action_chunk: bool = False,
         fixed_subtask_text: Optional[str] = None,
@@ -1308,6 +1310,8 @@ class SteerVLAActor:
         # of the batch from the offline replay pools (and, if those can't cover it either, by resampling
         # what's available). Set to 0 to allow replay-only updates before any online sample lands.
         self.hl_min_online_samples = max(0, int(hl_min_online_samples))
+        # Pooled training: keep only samples from the last N policy versions (0 = keep everything).
+        self.hl_keep_last_rounds = max(0, int(hl_keep_last_rounds))
         # Decode every HL batch's tokens back to text right before the gradient step consumes them
         # (:meth:`_dump_hl_batch_tokens`). Cheap (one host transfer + sentencepiece decode per update)
         # and the only place tokenization damage — truncated reasoning, empty segments, masked
@@ -1355,6 +1359,9 @@ class SteerVLAActor:
         self.action_dim = int(action_dim)
         self.actions_per_model_query = max(1, int(actions_per_model_query))
         self.actions_per_cot = max(1, int(actions_per_cot))
+        # Env steps per chunk row: CARLA ticks at ``carla_fps`` (20) and one env step is one tick,
+        # but a chunk row is a waypoint at the model's ``policy_fps`` (4). See _next_cached_action.
+        self.env_steps_per_chunk_row = max(1, int(env_steps_per_chunk_row))
         self.sample_actions_num_steps = int(sample_actions_num_steps)
         self.action_decode_batch_size = max(1, int(action_decode_batch_size))
         self.return_normalized_action_chunk = bool(return_normalized_action_chunk)
@@ -1459,6 +1466,9 @@ class SteerVLAActor:
 
     def setup(self, *, training_gpu_rank: int = -1) -> None:
         """Remote: ping ``/get_info``. Local: restore checkpoint and build Pi0-CoT module."""
+        # Remembered so :meth:`reload_params_from_checkpoint` can restore a later checkpoint onto the
+        # same single device this actor was placed on.
+        self._reload_gpu_rank = int(training_gpu_rank)
         if self._remote is not None:
             self._remote.get_info()
             return
@@ -1772,6 +1782,65 @@ class SteerVLAActor:
         self._build_sample_wrappers()
         self._weights_dirty = False
 
+    def reload_params_from_checkpoint(self, checkpoint_dir: str | Path) -> bool:
+        """Swap in a params-only checkpoint **in place**, without rebuilding the actor.
+
+        This is the worker half of a pooled CAST run (:mod:`cast_pool`): the trainer publishes a new
+        params-only export and every rollout worker hot-reloads it mid-episode, so all routes keep
+        driving the newest policy without a CARLA restart. ``checkpoint_dir`` is the version dir --
+        the same thing ``steervla.checkpoint`` accepts -- and must contain ``params/``.
+
+        Only valid for a **local, inference-only** actor. A trainable actor owns an optimizer state
+        that a params-only restore would silently desynchronize from its params, so reloading one is
+        refused; that process is the trainer, and it updates its own weights through ``update_hl``.
+
+        Rebuilding the sample wrappers is required, not optional: ``module_jit`` snapshots the
+        weights, so without :meth:`_build_sample_wrappers` the new params would never reach
+        inference. The action/CoT caches are dropped for the same reason -- a chunk sampled by the
+        previous policy must not go on being executed by the new one.
+
+        Returns True on success. On failure the previous weights are left untouched (the model is
+        only rebound after the restore returns), so a torn read costs one round's freshness rather
+        than the run.
+        """
+        if self._remote is not None:
+            print("[steervla.reload_params] skipped: actor is remote.", flush=True)
+            return False
+        if self.load_trainable_params:
+            print(
+                "[steervla.reload_params] skipped: actor is trainable (its opt_state would desync); "
+                "only inference-only rollout workers hot-reload.",
+                flush=True,
+            )
+            return False
+        params_dir = Path(checkpoint_dir) / "params"
+        if not params_dir.is_dir():
+            print(f"[steervla.reload_params] no params/ under {checkpoint_dir}; keeping current weights.", flush=True)
+            return False
+        t0 = time.time()
+        try:
+            params, device = restore_openpi_params_on_single_gpu(
+                params_dir=params_dir, training_gpu_rank=self._reload_gpu_rank
+            )
+            model = self.train_cfg.model.load(params)
+        except Exception as exc:  # noqa: BLE001 - a failed reload must never kill the rollout.
+            print(
+                f"[steervla.reload_params] FAILED to load {params_dir} ({exc}); keeping current weights.",
+                flush=True,
+            )
+            return False
+        self.model = model
+        self._jax_device = device
+        self._hl_jax_device = device
+        self._build_sample_wrappers()
+        self.reset_action_cache()
+        print(
+            f"[steervla.reload_params] loaded {checkpoint_dir} in {time.time() - t0:.1f}s "
+            "(sample wrappers rebuilt, action/CoT cache cleared).",
+            flush=True,
+        )
+        return True
+
     # ------------------------------------------------------------------
     # High-level (VLM-backbone) online update from the cast_relabel HL dataset
     # ------------------------------------------------------------------
@@ -1814,15 +1883,28 @@ class SteerVLAActor:
         """List all samples in one pool, tagging each with the pool's supervision flags.
 
         The online cast_relabel dir keeps a ``hl_samples.json`` per window subdir; an extracted replay
-        pool keeps a single ``hl_samples.json`` at its root — both globs are checked. ``action_supervision``
+        pool keeps a single ``hl_samples.json`` at its root — both globs are checked. A **pooled** run
+        (``impls/cast_pool.py``) adds a third depth, ``<pool_root>/<worker>/<window>/``, so several
+        rollout workers can write one shared corpus that the trainer reads whole. ``action_supervision``
         / ``supervise_fast`` / ``state_format`` come from the manifest (defaults match the online
         ``steervla_hl_dataset_format``: no flow, per-sample FAST, raw CARLA state).
+
+        Window dirs still being written carry the ``cast_pool.TMP_PREFIX`` and are skipped, so a
+        half-written manifest is never scanned.
         """
         entries: list[dict[str, Any]] = []
         root = pool.get("dir")
         if root is None or not Path(root).is_dir():
             return entries
-        manifests = sorted(Path(root).glob("hl_samples.json")) + sorted(Path(root).glob("*/hl_samples.json"))
+        root = Path(root)
+        manifests = (
+            sorted(root.glob("hl_samples.json"))
+            + sorted(root.glob("*/hl_samples.json"))
+            + sorted(root.glob("*/*/hl_samples.json"))
+        )
+        manifests = [
+            m for m in manifests if not any(p.name.startswith(".tmp-") for p in m.relative_to(root).parents)
+        ]
         for manifest_path in manifests:
             try:
                 manifest = json.loads(manifest_path.read_text())
@@ -1853,9 +1935,37 @@ class SteerVLAActor:
                         "supervise_fast": pool_fast,
                         "state_format": state_format,
                         "pool": pool.get("name", "online"),
+                        # Which policy version produced this sample (pooled runs; see
+                        # impls/cast_pool.py). -1 for pools that predate the field or for the
+                        # offline replay pools, which are version-less and never age out.
+                        # NOTE: version 0 (the pre-round base policy) is a real version — read it
+                        # with an explicit None check, not ``or -1``, which would make 0 unversioned
+                        # and thus permanently exempt from the staleness filter.
+                        "policy_version": (
+                            -1 if s.get("policy_version") is None else int(s["policy_version"])
+                        ),
                     }
                 )
         return entries
+
+    def _filter_stale_entries(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop online samples produced more than ``hl_keep_last_rounds`` policy versions ago.
+
+        Pooled training swaps the policy every round, so an old sample supervises a backbone that no
+        longer produces the behavior it was correcting. Keeping a sliding window of versions bounds
+        both that staleness and how many times any one sample can be re-drawn. Version ``-1``
+        (unversioned pools, including every offline replay pool) is always kept -- those are
+        pretraining data, not on-policy corrections.
+        """
+        keep = int(self.hl_keep_last_rounds)
+        if keep <= 0:
+            return entries
+        versions = [int(e.get("policy_version", -1)) for e in entries]
+        newest = max((v for v in versions if v >= 0), default=-1)
+        if newest < 0:
+            return entries  # nothing versioned; nothing to age out.
+        floor = newest - keep + 1
+        return [e for e in entries if int(e.get("policy_version", -1)) < 0 or int(e["policy_version"]) >= floor]
 
     @staticmethod
     def _largest_remainder(total: int, fracs: list[float]) -> list[int]:
@@ -2009,7 +2119,7 @@ class SteerVLAActor:
         if not pools:
             self._hl_pool_size = 0
             return None
-        scanned = [{"pool": p, "entries": self._scan_pool(p)} for p in pools]
+        scanned = [{"pool": p, "entries": self._filter_stale_entries(self._scan_pool(p))} for p in pools]
         # Warn once if replay pools were configured but none resolved on disk (extraction not run).
         if self._hl_replay_pool_specs and not getattr(self, "_hl_replay_missing_warned", False):
             replay_have = any(
@@ -3543,14 +3653,29 @@ class SteerVLAActor:
         return shifted.reshape(flat.shape[0], expected)
 
     def _next_cached_action(self, batch_size: int) -> jnp.ndarray | None:
+        """Serve one env action from the cached chunk, re-anchored to the ego's *actual* progress.
+
+        ``actions_per_model_query`` counts **env steps**, not chunk rows. The two are not the same
+        rate: a chunk row is a waypoint at the policy rate the model was trained at (4 Hz for the
+        SimLingo/SteerVLA data, i.e. 0.25 s apart), while a CARLA env step is a single 20 Hz tick
+        (0.05 s) -- ``env_steps_per_chunk_row`` (= ``carla_fps // policy_fps`` = 5) is the ratio.
+        So the plan may only be shifted forward one row every ``env_steps_per_chunk_row`` env steps;
+        shifting once per env step would replay the model's trajectory 5x too fast (the longitudinal
+        PID would read the speed target ~1 s into the plan after only 0.2 s of sim, braking early and
+        over-throttling out of a stop). Holding the chunk for the intervening ticks and re-running the
+        PID against the fresh ego speed is exactly what ``simlingo/team_code/agent_steervla.py`` does
+        between VLM queries; the env re-decodes the chunk with a fresh state vector on every step.
+        """
         if self.actions_per_model_query <= 1 or batch_size != 1 or self._cached_action_chunk is None:
             return None
-        max_cached_steps = min(self.actions_per_model_query, int(self.action_horizon))
+        rows_per_query = int(self.action_horizon) * self.env_steps_per_chunk_row
+        max_cached_steps = min(self.actions_per_model_query, rows_per_query)
         if self._cached_action_step >= max_cached_steps:
             self._cached_action_chunk = None
             self._cached_action_step = 0
             return None
-        out = self._shift_cached_action_chunk(self._cached_action_chunk, self._cached_action_step)
+        row = self._cached_action_step // self.env_steps_per_chunk_row
+        out = self._shift_cached_action_chunk(self._cached_action_chunk, row)
         self._cached_action_step += 1
         return jnp.asarray(out)
 
@@ -4837,6 +4962,7 @@ def create_steervla_pi0_cot_sample_fn(
         action_dim=int(steervla_cfg.get("action_dim", 4)),
         actions_per_model_query=int(steervla_cfg.get("actions_per_model_query", 1)),
         actions_per_cot=int(steervla_cfg.get("actions_per_cot", 1)),
+        env_steps_per_chunk_row=int(steervla_cfg.get("env_steps_per_chunk_row", 5)),
         sample_actions_num_steps=int(steervla_cfg.get("sample_actions_num_steps", 10)),
         action_decode_batch_size=int(steervla_cfg.get("action_decode_batch_size", 2)),
         training_gpu_rank=int(srank),
@@ -4855,6 +4981,7 @@ def create_steervla_pi0_cot_sample_fn(
         hl_online_bad_fraction=float(steervla_cfg.get("hl_online_bad_fraction", -1.0)),
         hl_online_precursor_fraction=float(steervla_cfg.get("hl_online_precursor_fraction", -1.0)),
         hl_min_online_samples=int(steervla_cfg.get("hl_min_online_samples", 1)),
+        hl_keep_last_rounds=int(steervla_cfg.get("hl_keep_last_rounds", 0)),
         hl_log_batch_tokens=bool(steervla_cfg.get("hl_log_batch_tokens", True)),
         return_normalized_action_chunk=bool(steervla_cfg.get("use_pi_action_chunk_for_env", True)),
         fixed_subtask_text=steervla_cfg.get("fixed_subtask_text"),

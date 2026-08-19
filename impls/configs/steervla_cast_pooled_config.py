@@ -1,0 +1,98 @@
+"""``get_config()`` for a **pooled** CAST-relabel run: many routes, one policy.
+
+Same per-worker pipeline as ``steervla_cast_relabel_config.py`` (window rollout -> VLM review ->
+per-chunk GOOD/BAD credit -> corrected subtask + fresh reasoning), but the training is centralized:
+
+  * N rollout **workers** (one CARLA job per route) write their HL samples into one shared pool and
+    take **no** gradient steps. They are inference-only, so each is far lighter than a solo
+    cast_relabel worker (no optimizer state, no backward activations).
+  * One **trainer** (``impls/train_hl_pooled.py``) owns the only trainable OpenPI ``TrainState``.
+    Every ``cast_pool.round_new_samples`` fresh samples it takes one large ``update_hl`` round over
+    the pooled corpus -- corrections from every route in the same batch -- then exports and
+    publishes a params-only checkpoint.
+  * Workers hot-reload the newest published version mid-episode, so all routes converge back onto
+    one policy after every round without a CARLA restart.
+
+Nothing blocks: workers keep driving while the trainer trains, and a CARLA crash on one route costs
+that route's share of the next round rather than stalling the pool. See ``impls/cast_pool.py`` for
+the filesystem protocol and ``run_cast_pool.sh`` for the launcher.
+
+Launch with ``./run_cast_pool.sh --routes a,b,c --worker-gpus 2,3,4 --trainer-gpu 7``; the launcher
+fills in ``pool_root`` / ``checkpoint_dir`` / ``role`` per process, so they are left empty here.
+"""
+
+import ml_collections
+
+from configs.steervla_cast_relabel_config import get_config as get_cast_relabel_config
+
+
+def get_config():
+    config = get_cast_relabel_config()
+
+    # ── worker training switches ──────────────────────────────────────────────────────
+    # A pooled worker is a pure sample producer. All gradient work happens in the trainer process,
+    # so that every route trains ONE policy instead of N drifting copies. (The trainer overrides
+    # load_trainable_params back to True for itself.)
+    config.enable_updates = False
+    config.enable_updates_rl = False
+    config.enable_updates_bc = False
+    config.enable_updates_bc_hl = False
+    config.steervla.load_trainable_params = False
+    # Irrelevant for an inference-only worker, and actively wrong to leave on: no worker should be
+    # exporting policy checkpoints, only the trainer publishes versions.
+    config.steervla.hl_checkpoint_every_steps = 0
+
+    # Send this worker's HL samples to the shared pool instead of its own run dir. The session
+    # namespaces them as ``<hl_dataset_root>/<run_tag>/<window>/``, which is exactly the layout the
+    # trainer's pooled scan expects. Declared (empty) here so run_cast_pool.sh can set it per run.
+    config.cast_relabel.hl_dataset_root = ""
+
+    # ── trainer-side HL knobs ─────────────────────────────────────────────────────────
+    # One big round instead of the solo config's small, frequent updates. The trainer has a whole
+    # GPU to itself (no inference model sharing it), so the batch can go well above the ~64 that
+    # fits alongside a rollout; 128 peaked comfortably under a 112 GB budget in the solo runs at 64,
+    # so start here and raise if memory allows.
+    config.steervla.hl_update_batch_size = 128
+    config.steervla.hl_update_every = 1  # the trainer's round IS the throttle; never skip a call.
+    config.steervla.hl_update_num_steps = 32
+    # Sliding window over policy versions: drop online samples produced more than N rounds ago. They
+    # were corrections for a backbone that has since been replaced, and keeping them indefinitely is
+    # what drives the sample-reuse blowup seen in the solo runs. Offline replay pools are exempt
+    # (version -1) -- they are pretraining data, not on-policy corrections.
+    config.steervla.hl_keep_last_rounds = 3
+    # With ~5-6 workers each producing ~15 samples per window, a round's worth of fresh data lands
+    # much faster than in a solo run, so the pool is far less starved; keep the start gate low.
+    config.steervla.hl_min_online_samples = 20
+
+    # ── pooled-run coordination ───────────────────────────────────────────────────────
+    config.cast_pool = ml_collections.ConfigDict(
+        dict(
+            enabled=True,
+            # "worker" (rollout, set by run_cast_pool.sh for each route) or "trainer".
+            role="worker",
+            # Shared HL sample pool and published-checkpoint dir. Both are filled in per run by
+            # run_cast_pool.sh; the worker's own samples land under <pool_root>/<run_tag>/ via
+            # cast_relabel.hl_dataset_root, which already namespaces by run tag.
+            pool_root="",
+            checkpoint_dir="",
+            # Trainer: fire a round once this many NEW samples have landed across all workers.
+            # ~15 samples per window per worker, so 90 is roughly one window from each of 6 routes.
+            round_new_samples=90,
+            # Trainer: size of the pooled update. These override the steervla.hl_update_* values
+            # above at call time, so a round is a single deliberate unit of training.
+            round_batch_size=128,
+            round_num_steps=32,
+            # Trainer: seconds between pool polls while waiting for a round to fill.
+            poll_interval_sec=15.0,
+            # Trainer: published versions to retain (~10 GB each). Must stay comfortably above 1 --
+            # pruning a version a worker is mid-load would fail that worker's reload.
+            checkpoint_keep_last=5,
+            # Trainer: stop after N rounds (0 = run until killed).
+            max_rounds=0,
+            # Worker: env steps between checkpoint-dir polls. A poll is a couple of stat calls, so
+            # this can be tight; the real cost is the reload itself (tens of seconds, off-tick).
+            worker_check_every_steps=50,
+        )
+    )
+
+    return config

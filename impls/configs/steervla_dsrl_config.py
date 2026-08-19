@@ -161,12 +161,16 @@ def get_config():
             use_pi_action_chunk_for_env=True,
             action_horizon=10,
             action_dim=4,
-            # Query Pi0-CoT once, then execute this many rows from the returned action chunk
-            # before querying again. Set to 1 to query every env step.
-            actions_per_model_query=1,
+            # Query Pi0-CoT once, then serve this many **env steps** from the returned action chunk
+            # before querying again. Set to 1 to query every env step. NOTE: env steps are 20 Hz
+            # CARLA ticks while chunk rows are 4 Hz waypoints, so the cached chunk only advances one
+            # row per ``env_steps_per_chunk_row`` (=5) env steps -- 5 here means "hold one chunk for
+            # 5 ticks (0.25 s) and re-query", i.e. plan at the 4 Hz policy rate the model was trained
+            # at, rather than re-planning every tick. See SteerVLAActor._next_cached_action.
+            actions_per_model_query=5,
             # Reuse sampled CoT reasoning/subtask for this many env actions before sampling
-            # CoT again. With actions_per_model_query=5, this reuses CoT across two action chunks.
-            actions_per_cot=1,
+            # CoT again. Matching actions_per_model_query refreshes the CoT and the chunk together.
+            actions_per_cot=5,
             output_action_format="DELTA_XY_T_DELTA_XY_SPACE",
             sample_actions_num_steps=10, # default is 10
             # When set, skip sample_cot and teacher-force CoT like inspect_outputs.ipynb.

@@ -996,6 +996,10 @@ class HLSample:
     original_reasoning: str = ""
     route: str = ""
     global_step: int = -1
+    # Pooled runs (impls/cast_pool.py): which published policy version produced this sample.
+    # Captured at chunk-start, not at window flush, because workers hot-reload mid-episode -- a
+    # single window can straddle two versions. -1 outside a pooled run.
+    policy_version: int = -1
 
     def manifest_entry(self, sample_file: str) -> dict[str, Any]:
         return {
@@ -1023,6 +1027,7 @@ class HLSample:
             "global_step": int(self.global_step),
             "current_speed": float(self.current_speed),
             "ego_history_len": 0 if self.ego_hist is None else int(np.asarray(self.ego_hist).shape[0]),
+            "policy_version": int(self.policy_version),
         }
 
 
@@ -1174,6 +1179,7 @@ def build_hl_samples_from_window(
                 original_reasoning=str(model_input.get("reasoning") or ""),
                 route=str(route),
                 global_step=int(model_input.get("global_step", -1)),
+                policy_version=int(model_input.get("policy_version", -1)),
             )
         )
     return samples
@@ -1418,6 +1424,10 @@ class OnlineCastRelabelSession:
         # keeps one level of nesting under the root so window dirs from different runs can't collide
         # *and* the layout the actor globs (``<hl_dataset_dir>/<window>/hl_samples.json``) is
         # preserved, so an offline-collection dir is still directly loadable by ``update_hl``.
+        # Live policy version for a pooled run: bumped by main_carla's checkpoint watcher each time
+        # this worker hot-reloads a newly published checkpoint, and stamped onto every HL sample so
+        # the trainer can age out supervision from superseded policies. Stays 0 in a solo run.
+        self.policy_version = 0
         self.run_tag = str(run_tag or Path(self.save_dir).name or "run")
         hl_root = str(self.cfg.get("hl_dataset_root", "") or "").strip()
         if hl_root:
@@ -1570,6 +1580,9 @@ class OnlineCastRelabelSession:
             "routing_command": str(routing_command or ""),
             "global_step": int(global_step),
             "action_chunk": None if action_chunk is None else np.asarray(action_chunk, dtype=np.float32),
+            # Snapshot the live policy version here rather than at window flush: a pooled worker
+            # hot-reloads mid-episode, so chunks in one window can come from different versions.
+            "policy_version": int(self.policy_version),
         }
 
     def _push_ego_history(self, state: np.ndarray | None, current_speed: float) -> None:
@@ -1927,7 +1940,21 @@ class OnlineCastRelabelSession:
             if not hl_samples:
                 return 0
             hl_dir = self.hl_dataset_dir / tag
-            write_hl_samples(hl_samples, hl_dir)
+            # Build under a ``.tmp-`` name and rename into place. In a pooled run the trainer globs
+            # this tree continuously, and a window is many MB of .npz written over several seconds --
+            # the rename makes it appear atomically, complete or not at all. See impls/cast_pool.py.
+            try:
+                from cast_pool import commit_staged_dir, staging_dir_for
+            except ImportError:  # imported as ``impls.coaches.cast_relabel`` without impls/ on path
+                from impls.cast_pool import commit_staged_dir, staging_dir_for
+
+            staged = staging_dir_for(hl_dir)
+            if staged.exists():
+                import shutil
+
+                shutil.rmtree(staged, ignore_errors=True)
+            write_hl_samples(hl_samples, staged)
+            commit_staged_dir(staged, hl_dir)
             self.hl_sample_count += len(hl_samples)
             self._append_window_index(tag, hl_samples)
             print(
