@@ -94,6 +94,9 @@ ENABLE_UPDATES="true"
 BASE_ONLY=""
 STATE_ENCODER=""
 RLT_CHECKPOINT=""
+# Override the frozen base policy: e.g. deploy a relabelled Stage-1 ckpt. Empty -> config default.
+STEERVLA_CKPT=""
+ACTOR_CONFIG=""
 # Crash supervisor: relaunch main_carla (resuming from checkpoint) after a CARLA native
 # crash (SIGSEGV/SIGABRT, exit code >=128). 0 disables the retry loop.
 MAX_RETRIES="${MAX_RETRIES:-50}"
@@ -157,6 +160,8 @@ Options:
 
   --agent-config PATH       Base agent config. Default: impls/configs/pi0_residual_sac_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
+  --steervla-checkpoint PATH  Override config.steervla.checkpoint (deploy a relabelled ckpt).
+  --actor-config NAME       Override config.steervla.actor_config (match the ckpt's model).
 
   --pretrained-critic PATH  Path to a pretrained critic .pkl from pretrain_critic.py.
                             Injects obs_encoder + critic params before online training begins.
@@ -256,6 +261,8 @@ while [[ $# -gt 0 ]]; do
     --max-retries) MAX_RETRIES="$2"; shift 2 ;;
     --agent-config) BASE_AGENT_CFG="$2"; shift 2 ;;
     --carla-config) BASE_CARLA_CFG="$2"; shift 2 ;;
+    --steervla-checkpoint|--steervla_checkpoint) STEERVLA_CKPT="$2"; shift 2 ;;
+    --actor-config|--actor_config) ACTOR_CONFIG="$2"; shift 2 ;;
     --pretrained-critic|--pretrained_critic) PRETRAINED_CRITIC="$2"; shift 2 ;;
     --qgf-critic-ckpt|--qgf_critic_ckpt) QGF_CRITIC_CKPT="$2"; shift 2 ;;
     --qgf-guidance-weight|--qgf_guidance_weight) QGF_GUIDANCE_WEIGHT="$2"; shift 2 ;;
@@ -417,7 +424,14 @@ def get_config():
     _HL_CKPT_DIR = r"${HL_CKPT_DIR}"
     _HL_CKPT_EVERY = "${HL_CKPT_EVERY}"
     _HL_CKPT_KEEP = "${HL_CKPT_KEEP_LAST}"
+    # Base-policy overrides (e.g. deploy a relabelled Stage-1 ckpt). Empty -> keep config value.
+    _STEERVLA_CKPT = r"${STEERVLA_CKPT}"
+    _ACTOR_CONFIG = r"${ACTOR_CONFIG}"
     if "steervla" in config:
+        if _STEERVLA_CKPT != "":
+            config.steervla.checkpoint = _STEERVLA_CKPT
+        if _ACTOR_CONFIG != "":
+            config.steervla.actor_config = _ACTOR_CONFIG
         if _HL_CKPT_DIR != "":
             config.steervla.hl_checkpoint_dir = _HL_CKPT_DIR
         if _HL_CKPT_EVERY != "":
@@ -494,7 +508,7 @@ echo "[run_carla.sh] save_video_local=${SAVE_VIDEO_LOCAL}"
 # loop below, so a one-shot `VAR=... cmd` prefix here would only have applied to the next echo.
 export PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla:${ROOT_DIR}/simlingo-rebuttal${PYTHONPATH:+:$PYTHONPATH}"
 
-echo "[run_carla.sh] agent_config=${BASE_AGENT_CFG}"
+echo "[run_carla.sh] agent_config=${BASE_AGENT_CFG}${STEERVLA_CKPT:+ steervla_checkpoint=${STEERVLA_CKPT}}${ACTOR_CONFIG:+ actor_config=${ACTOR_CONFIG}}"
 echo "[run_carla.sh] enable_updates=${ENABLE_UPDATES} base_only=${BASE_ONLY:-<config default>} state_encoder=${STATE_ENCODER:-<config default>}${RLT_CHECKPOINT:+ rlt_checkpoint=${RLT_CHECKPOINT}}"
 echo "[run_carla.sh] hl_gpu_rank=${HL_TRAIN_GPU_RANK:-<config>} max_retries=${MAX_RETRIES}"
 echo "[run_carla.sh] hl_ckpt_dir=${HL_CKPT_DIR:-<config>} hl_ckpt_every=${HL_CKPT_EVERY:-<config>} hl_ckpt_keep_last=${HL_CKPT_KEEP_LAST:-<config>}"
