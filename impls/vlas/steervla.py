@@ -1251,22 +1251,40 @@ class SteerVLAActor:
 
         obs_full = _merge_cot_output_into_observation(obs_jax, cot_out)
 
-        # Prepare noise for inference
+        # Prepare noise for inference.
+        #
+        # Two flat noise conventions exist in this stack:
+        #   MODEL layout  action_horizon * model.action_dim   (Pi0 latent width; DSRL noise actor)
+        #   ENV   layout  action_horizon * self.action_dim    (real driving dims only)
+        # They are checked in that order; on a collision the model layout wins.
         batch_size = obs_jax.state.shape[0]
         model_ah = int(self.model.action_horizon)
         model_ad = int(self.model.action_dim)
-        cfg_ah = min(int(self.action_horizon), model_ah)
-        cfg_ad = min(int(self.action_dim), model_ad)
+        env_ah = int(self.action_horizon)
+        env_ad = int(self.action_dim)
+        model_flat = model_ah * model_ad
+        env_flat = env_ah * env_ad
         noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
         if noise_jax.ndim == 3:
+            # Already (B, H, D); follow the caller's shape instead of truncating to env dims.
+            cfg_ah = min(int(noise_jax.shape[1]), model_ah)
+            cfg_ad = min(int(noise_jax.shape[2]), model_ad)
             noise_chunk = noise_jax[:, :cfg_ah, :cfg_ad]
-        elif int(noise_jax.shape[-1]) == int(self.action_horizon) * int(self.action_dim):
-            noise_chunk = noise_jax.reshape(batch_size, int(self.action_horizon), int(self.action_dim))[
-                :, :cfg_ah, :cfg_ad
-            ]
+        elif int(noise_jax.shape[-1]) == model_flat:
+            # MODEL layout, e.g. the DSRL noise actor (``actor_action_dim * action_horizon``).
+            cfg_ah, cfg_ad = model_ah, model_ad
+            noise_chunk = noise_jax.reshape(batch_size, model_ah, model_ad)
+        elif int(noise_jax.shape[-1]) == env_flat:
+            # ENV layout: noise on the real driving dims only.
+            cfg_ah, cfg_ad = min(env_ah, model_ah), min(env_ad, model_ad)
+            noise_chunk = noise_jax.reshape(batch_size, env_ah, env_ad)[:, :cfg_ah, :cfg_ad]
         else:
-            noise_chunk = noise_jax[:, None, :cfg_ad]
-            cfg_ah = 1
+            raise ValueError(
+                f"SteerVLAActor received noise of shape {tuple(noise_jax.shape)}. Expected 3-D "
+                f"(batch, horizon, dim), or a flat width of {model_flat} (model layout "
+                f"{model_ah}x{model_ad}) or {env_flat} (env layout {env_ah}x{env_ad}). Silently "
+                f"zero-filling the flow initialization is not safe."
+            )
         noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(noise_chunk)
         
         # Sample the actions
@@ -1646,7 +1664,13 @@ class SteerVLAActor:
         self._call_counter += 1
         rng = jax.random.PRNGKey(self._call_counter)
         rng_noise, rng_act = jax.random.split(rng)
-        noise_jax = jax.random.normal(rng_noise, (1, self.model.action_dim), dtype=jnp.float32)
+        # Full model-layout noise, matching Pi0CoT._denoise's own default
+        # ``normal(rng, (batch, action_horizon, action_dim))``.
+        noise_jax = jax.random.normal(
+            rng_noise,
+            (1, int(self.model.action_horizon), int(self.model.action_dim)),
+            dtype=jnp.float32,
+        )
         noise_jax = noise_jax * jnp.asarray(self.noise_scale, dtype=jnp.float32)
         actions = self._forward_pi0(1, noise_jax, raw=state, rng=rng_act, force_accel_steer=True)
         self._mark_action_served(1)
