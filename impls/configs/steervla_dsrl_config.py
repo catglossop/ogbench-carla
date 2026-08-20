@@ -60,9 +60,9 @@ def get_config():
     # aaa4c7a; off by default so real runs optimise the env reward. cast_relabel inherits this.
     config.debug_task = False
     # Rollout-only: best-of-N random VLA noises minimizing first-step speed delta_xy.
-    config.debug_noise = False
+    config.debug_noise = True
     config.debug_noise_samples = 8
-    config.debug_noise_log_every_n_steps = 10
+    config.debug_noise_log_every_n_steps = 1
     # When debug_noise=True: if True, execute the slowest candidate; if False, log only and use actor noise.
     config.use_best_noise = False
     config.image_log_curr_interval = 10

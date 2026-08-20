@@ -15,6 +15,6 @@ impls/coaches/episode_0001_plots/
 simulation_results*
 md_results/
 batch_examples/
-
+wandb/
 # Generated temp configs + carla_job.sh bookkeeping/logs (see CLAUDE.md).
 .run_carla/

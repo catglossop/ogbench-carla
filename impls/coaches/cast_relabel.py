@@ -1954,12 +1954,14 @@ class OnlineCastRelabelSession:
 
                 shutil.rmtree(staged, ignore_errors=True)
             write_hl_samples(hl_samples, staged)
-            commit_staged_dir(staged, hl_dir)
+            # May land at ``<tag>__r2`` if a crash-restart regenerated a tag this run_tag already
+            # used -- commit_staged_dir never overwrites a complete window. Log/index the real name.
+            written_dir = commit_staged_dir(staged, hl_dir)
             self.hl_sample_count += len(hl_samples)
-            self._append_window_index(tag, hl_samples)
+            self._append_window_index(written_dir.name, hl_samples)
             print(
                 f"[cast_relabel] wrote {len(hl_samples)} high-level samples "
-                f"(total {self.hl_sample_count}) -> {hl_dir}",
+                f"(total {self.hl_sample_count}) -> {written_dir}",
                 flush=True,
             )
             return len(hl_samples)

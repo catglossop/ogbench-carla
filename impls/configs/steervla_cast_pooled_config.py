@@ -19,6 +19,14 @@ the filesystem protocol and ``run_cast_pool.sh`` for the launcher.
 
 Launch with ``./run_cast_pool.sh --routes a,b,c --worker-gpus 2,3,4 --trainer-gpu 7``; the launcher
 fills in ``pool_root`` / ``checkpoint_dir`` / ``role`` per process, so they are left empty here.
+
+**GPU memory.** JAX preallocates ~75% of a card on first use, so an unfractioned worker reserves
+~110 GB of an H200 while actually needing far less (an inference-only actor plus a ~7 GB CarlaUE4
+renderer) -- exactly one worker fits per GPU, which is what caps a pool at "one route per free
+card". ``run_cast_pool.sh --worker-mem-fraction`` sets ``XLA_PYTHON_CLIENT_MEM_FRACTION`` per worker
+so several routes can share a card; that flag, not anything in this file, is what makes a 5-6 route
+pool fit on 2-3 GPUs. The trainer keeps a whole GPU (``--trainer-mem-fraction``, default 0.90) --
+its pooled ``update_hl`` at ``round_batch_size`` is the largest allocation in the run.
 """
 
 import ml_collections
@@ -47,12 +55,26 @@ def get_config():
     # trainer's pooled scan expects. Declared (empty) here so run_cast_pool.sh can set it per run.
     config.cast_relabel.hl_dataset_root = ""
 
+    # ── rollout knobs (workers) ───────────────────────────────────────────────────────
+    # Pinned explicitly rather than inherited. With actions_per_model_query=5 a chunk is held for
+    # five 20 Hz ticks, and interpolate_waypoints re-zeroes arc length at the plan's first point --
+    # so without re-anchoring the decoder assumes the ego never moved and re-issues the same steer
+    # for the whole hold, leaving the lateral loop open (see commit 69fd7c3). The actor already
+    # defaults this to True, but a pooled run holds chunks on every one of its workers, so the
+    # dependency is stated here instead of relying on that default.
+    config.steervla.reanchor_cached_chunk = True
+
     # ── trainer-side HL knobs ─────────────────────────────────────────────────────────
     # One big round instead of the solo config's small, frequent updates. The trainer has a whole
-    # GPU to itself (no inference model sharing it), so the batch can go well above the ~64 that
-    # fits alongside a rollout; 128 peaked comfortably under a 112 GB budget in the solo runs at 64,
-    # so start here and raise if memory allows.
-    config.steervla.hl_update_batch_size = 128
+    # GPU to itself (no inference model sharing it), so the batch can go above the ~64 that fits
+    # alongside a rollout -- but not as far as it looks.
+    #
+    # MEASURED 2026-08-19 on an H200 (143 GB) at mem_fraction 0.90: batch 128 needs ~93 GiB of live
+    # activations (XLA rematerialization could not get under its 82 GiB budget) plus a ~55 GB
+    # transient. It survived a replay-only smoke batch and then OOM'd on the first REAL round, whose
+    # batch was 90 online + 38 replay. So a replay-only trial does not clear batch 128 -- keep 64,
+    # which halves the activation footprint, and raise only with a real online-heavy batch to test.
+    config.steervla.hl_update_batch_size = 64
     config.steervla.hl_update_every = 1  # the trainer's round IS the throttle; never skip a call.
     config.steervla.hl_update_num_steps = 32
     # Sliding window over policy versions: drop online samples produced more than N rounds ago. They
@@ -80,7 +102,7 @@ def get_config():
             round_new_samples=90,
             # Trainer: size of the pooled update. These override the steervla.hl_update_* values
             # above at call time, so a round is a single deliberate unit of training.
-            round_batch_size=128,
+            round_batch_size=64,  # see the MEASURED note above before raising this.
             round_num_steps=32,
             # Trainer: seconds between pool polls while waiting for a round to fill.
             poll_interval_sec=15.0,

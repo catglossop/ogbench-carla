@@ -173,13 +173,22 @@ def commit_staged_dir(staged: str | Path, final_dir: str | Path) -> Path:
 
     ``os.replace`` on a directory is atomic within a filesystem, which is what makes the trainer's
     glob safe: a window is either absent or complete, never partially visible.
+
+    A pre-existing target is **never** deleted. Window tags (``ep0004_win0012``) are unique within a
+    process, so the only way to collide is across a crash-restart: ``run_carla.sh`` keeps
+    ``--exp_name`` stable across retries (so the W&B run resumes), but ``run_online_carla`` restarts
+    ``episode_count``/``window_count`` at 0, so a restarted worker regenerates tags it already used
+    under the same ``run_tag``. Overwriting there would destroy complete, already-VLM-reviewed
+    windows -- and because the trainer gates rounds on ``count_pool_samples`` growing past a
+    high-water mark it never lowers, a shrinking pool stalls training outright. So a colliding
+    window is parked at ``<tag>__r2``, ``<tag>__r3``, ... instead; those still match the reader
+    globs, so the samples stay in the pool.
     """
     staged, final_dir = Path(staged), Path(final_dir)
-    if final_dir.exists():
-        # A retried window (same tag) -- drop the stale copy so replace() can't fail on a non-empty
-        # target. Losing an already-superseded window is harmless; the new one carries the same data.
-        import shutil
-
-        shutil.rmtree(final_dir, ignore_errors=True)
-    os.replace(staged, final_dir)
-    return final_dir
+    target = final_dir
+    attempt = 2
+    while target.exists():
+        target = final_dir.parent / f"{final_dir.name}__r{attempt}"
+        attempt += 1
+    os.replace(staged, target)
+    return target

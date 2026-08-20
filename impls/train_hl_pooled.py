@@ -28,6 +28,29 @@ import sys
 import time
 from pathlib import Path
 
+
+def _preset_xla_mem_fraction() -> None:
+    """Apply ``--mem_fraction`` to ``XLA_PYTHON_CLIENT_MEM_FRACTION`` before JAX loads.
+
+    JAX reads this variable exactly once, when its backend initializes, and something in the
+    import graph below pulls JAX in at module load -- long before absl parses flags. So the value
+    is scraped straight from ``sys.argv`` here rather than read from a flag, and an explicit
+    ``--mem_fraction`` wins over an inherited environment variable. Relying on the launcher to
+    export it is what silently left a pooled trainer on JAX's 75% default and OOM'd round 1.
+    """
+    for i, arg in enumerate(sys.argv[1:], start=1):
+        val = None
+        if arg.startswith("--mem_fraction="):
+            val = arg.split("=", 1)[1]
+        elif arg == "--mem_fraction" and i + 1 < len(sys.argv):
+            val = sys.argv[i + 1]
+        if val:
+            os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(float(val))
+            return
+
+
+_preset_xla_mem_fraction()
+
 # Match main_carla.py: put ``impls/`` on sys.path so intra-impls imports are top-level.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -43,7 +66,30 @@ flags.DEFINE_string("pool_root", "", "Shared HL sample pool written by the rollo
 flags.DEFINE_string("checkpoint_dir", "", "Where to publish params-only policy versions (required).")
 flags.DEFINE_integer("training_gpu", -1, "JAX GPU index for the trainable state (-1 = default device).")
 flags.DEFINE_integer("max_rounds", 0, "Stop after N rounds (0 = run until killed).")
+flags.DEFINE_float(
+    "mem_fraction",
+    0.0,
+    "XLA_PYTHON_CLIENT_MEM_FRACTION for this process (0 = leave the environment alone). Applied at "
+    "module import, before JAX initializes -- see _preset_xla_mem_fraction.",
+)
+flags.DEFINE_integer("round_batch_size", 0, "Override cast_pool.round_batch_size (0 = config value).")
+flags.DEFINE_integer("round_num_steps", 0, "Override cast_pool.round_num_steps (0 = config value).")
 flags.DEFINE_string("run_name", "", "wandb run name; defaults to the pool dir name.")
+flags.DEFINE_bool(
+    "smoke_test",
+    False,
+    "Pre-flight check: build the trainable state, run ONE update round immediately (ignoring the "
+    "new-sample gate), export+publish it, then exit. Use this to validate trainer VRAM at the "
+    "configured round_batch_size on its GPU before committing multi-hour CARLA workers. With an "
+    "empty pool this trains on the offline replay pools alone, so pair it with "
+    "--steervla_min_online=0.",
+)
+flags.DEFINE_integer(
+    "steervla_min_online",
+    -1,
+    "Override steervla.hl_min_online_samples (-1 = use the config value). Set 0 for a smoke test "
+    "against an empty pool, so update_hl proceeds on replay data alone.",
+)
 flags.DEFINE_string("wandb_project", "OGBench-CARLA", "wandb project.")
 flags.DEFINE_string("wandb_group", "cast_pool", "wandb group.")
 
@@ -76,8 +122,8 @@ def main(_):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     round_new_samples = int(pool_cfg.get("round_new_samples", 90))
-    round_batch_size = int(pool_cfg.get("round_batch_size", 128))
-    round_num_steps = int(pool_cfg.get("round_num_steps", 32))
+    round_batch_size = int(FLAGS.round_batch_size or pool_cfg.get("round_batch_size", 128))
+    round_num_steps = int(FLAGS.round_num_steps or pool_cfg.get("round_num_steps", 32))
     poll_interval = float(pool_cfg.get("poll_interval_sec", 15.0))
     keep_last_ckpts = int(pool_cfg.get("checkpoint_keep_last", 5))
     max_rounds = int(FLAGS.max_rounds or pool_cfg.get("max_rounds", 0))
@@ -119,6 +165,12 @@ def main(_):
     actor.hl_dataset_dir = pool_root
     # The trainer is driven by rounds, not by a per-env-step throttle: every call must do work.
     actor.hl_update_every = 1
+    if FLAGS.steervla_min_online >= 0:
+        actor.hl_min_online_samples = int(FLAGS.steervla_min_online)
+        print(
+            f"[cast_pool.trainer] hl_min_online_samples overridden to {actor.hl_min_online_samples}.",
+            flush=True,
+        )
     print(
         f"[cast_pool.trainer] watching pool {pool_root} — a round fires every "
         f"{round_new_samples} new samples (batch {round_batch_size} x {round_num_steps} steps).",
@@ -139,8 +191,25 @@ def main(_):
 
     while True:
         total, windows = count_pool_samples(pool_root)
+        if total < seen_samples:
+            # The pool shrank. commit_staged_dir no longer overwrites complete windows, so this
+            # should not happen in normal operation -- but if a worker's dir is pruned or a disk
+            # hiccup drops a manifest, a high-water mark that only ever rises would gate the next
+            # round behind re-earning the whole deficit, stalling training silently. Re-baseline.
+            print(
+                f"[cast_pool.trainer] pool shrank ({seen_samples} -> {total}); re-baselining the "
+                "new-sample counter.",
+                flush=True,
+            )
+            seen_samples = total
         new = total - seen_samples
-        if new < round_new_samples:
+        if FLAGS.smoke_test:
+            print(
+                f"[cast_pool.trainer] SMOKE TEST: forcing one round now (pool has {total} samples "
+                f"in {windows} windows; the {round_new_samples}-sample gate is bypassed).",
+                flush=True,
+            )
+        elif new < round_new_samples:
             if time.time() - last_log > 60.0:
                 workers = pool_worker_names(pool_root)
                 print(
@@ -169,6 +238,13 @@ def main(_):
             # the version number or the new-sample credit -- retry on the next poll.
             version -= 1
             print("[cast_pool.trainer] update_hl returned nothing this round; retrying after poll.", flush=True)
+            if FLAGS.smoke_test:
+                # Nothing to retry against in a smoke test -- the gate is already bypassed, so a
+                # declined update means the pool is unusable (see the skip reason update_hl printed).
+                raise SystemExit(
+                    "[cast_pool.trainer] SMOKE TEST FAILED: update_hl declined. With an empty pool "
+                    "pass --steervla_min_online=0 so it can train on the replay pools alone."
+                )
             time.sleep(poll_interval)
             continue
         train_secs = time.time() - t0
@@ -178,6 +254,8 @@ def main(_):
         if saved is None:
             print("[cast_pool.trainer] checkpoint export failed; not publishing this version.", flush=True)
             version -= 1
+            if FLAGS.smoke_test:
+                raise SystemExit("[cast_pool.trainer] SMOKE TEST FAILED: checkpoint export failed.")
             time.sleep(poll_interval)
             continue
         publish_checkpoint(
@@ -211,6 +289,13 @@ def main(_):
         })
         wandb.log(metrics, step=version)
 
+        if FLAGS.smoke_test:
+            print(
+                f"[cast_pool.trainer] SMOKE TEST passed: one round at batch {round_batch_size} x "
+                f"{round_num_steps} steps completed and published as version {version}. Exiting.",
+                flush=True,
+            )
+            break
         if max_rounds and rounds_done >= max_rounds:
             print(f"[cast_pool.trainer] reached max_rounds={max_rounds}; exiting.", flush=True)
             break
