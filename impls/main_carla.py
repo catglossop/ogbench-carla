@@ -1558,9 +1558,23 @@ def _annotate_full_frame(
 
 
 def _episode_video(frames: list[np.ndarray], fps: float):
-    """Stack captured frames into a W&B video (T, C, H, W); None if empty."""
+    """Stack captured frames into a W&B video (T, C, H, W); None if empty.
+
+    Frame heights vary within a rollout because the annotation panel grows with its line count
+    (e.g. GRPO's ~9-line candidate HUD vs a 1-line warmup/scoring-failed banner), so zero-pad every
+    frame to the batch max H/W before stacking rather than crashing at episode end on ``np.stack``.
+    """
     if not frames:
         return None
+    hmax = max(f.shape[0] for f in frames)
+    wmax = max(f.shape[1] for f in frames)
+    if any(f.shape[0] != hmax or f.shape[1] != wmax for f in frames):
+        padded = []
+        for f in frames:
+            buf = np.zeros((hmax, wmax, f.shape[2]), dtype=f.dtype)
+            buf[: f.shape[0], : f.shape[1], :] = f
+            padded.append(buf)
+        frames = padded
     video = np.stack(frames, axis=0)
     if video.ndim == 4:
         video = np.transpose(video, (0, 3, 1, 2))
