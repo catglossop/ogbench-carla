@@ -57,6 +57,9 @@ def get_config():
 
     config.grpo = ml_collections.ConfigDict(
         dict(
+            # Drive the GREEDY base (cot_temperature=0, no scoring/pooling/updates) for the first N env
+            # steps to log an in-run base baseline before GRPO exploration begins. 0 = off.
+            warmup_steps=0,
             # Candidate CoTs sampled + VLM-scored per decision state (all K scored in one call); >=2.
             group_size=8,
             # Candidate sampling temperature; >0 for diversity (greedy -> zero-variance scores).
