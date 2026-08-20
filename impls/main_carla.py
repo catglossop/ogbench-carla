@@ -1558,9 +1558,23 @@ def _annotate_full_frame(
 
 
 def _episode_video(frames: list[np.ndarray], fps: float):
-    """Stack captured frames into a W&B video (T, C, H, W); None if empty."""
+    """Stack captured frames into a W&B video (T, C, H, W); None if empty.
+
+    Frame heights vary within a rollout because the annotation panel grows with its line count
+    (e.g. GRPO's ~9-line candidate HUD vs a 1-line warmup/scoring-failed banner), so zero-pad every
+    frame to the batch max H/W before stacking rather than crashing at episode end on ``np.stack``.
+    """
     if not frames:
         return None
+    hmax = max(f.shape[0] for f in frames)
+    wmax = max(f.shape[1] for f in frames)
+    if any(f.shape[0] != hmax or f.shape[1] != wmax for f in frames):
+        padded = []
+        for f in frames:
+            buf = np.zeros((hmax, wmax, f.shape[2]), dtype=f.dtype)
+            buf[: f.shape[0], : f.shape[1], :] = f
+            padded.append(buf)
+        frames = padded
     video = np.stack(frames, axis=0)
     if video.ndim == 4:
         video = np.transpose(video, (0, 3, 1, 2))
@@ -4835,6 +4849,7 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
     adv_eps = float(grpo.get("advantage_eps", 1e-6))
     vlm_retries = max(1, int(grpo.get("vlm_score_retries", 3)))
     ckpt_every_steps = int(grpo.get("checkpoint_every_steps", 2000))
+    warmup_steps = max(0, int(grpo.get("warmup_steps", 0)))
     ckpt_root = os.path.join(FLAGS.save_dir, "steervla_hl_ckpt")
     routing_command = str((config.get("steervla") or {}).get("routing_command", "Follow the route."))
 
@@ -4858,6 +4873,13 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
     base_noise_dim = int(base_model.action_horizon) * int(base_model.action_dim) if base_model is not None else 40
     rng = jax.random.PRNGKey(FLAGS.seed)
     total_steps = int(FLAGS.online_steps)
+
+    # Warmup drives the greedy base (cot_temperature=0) so the in-run baseline matches the eval base;
+    # GRPO's scored candidates sample at score_temperature regardless, so this only affects the base path.
+    base_cot_temp = float(getattr(steervla_actor, "cot_temperature", 0.0))
+    if warmup_steps > 0:
+        steervla_actor.cot_temperature = 0.0
+        print(f"[grpo] warmup: greedy base for {warmup_steps} steps before scoring/updates.", flush=True)
 
     pooled: list[dict] = []
     pooled_adv: list[float] = []
@@ -4907,10 +4929,14 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
 
     for step in tqdm.tqdm(range(1, total_steps + 1), dynamic_ncols=True):
         raw_holder["obs"] = obs
+        if warmup_steps > 0 and step == warmup_steps + 1:
+            steervla_actor.cot_temperature = base_cot_temp  # end warmup -> restore CoT sampling
+            print(f"[grpo] warmup complete at step {warmup_steps}; GRPO scoring/updates begin.", flush=True)
         hud = None
         win_reasoning = win_subtask = None
         scoring_failed = False
-        scored = step % score_every == 0
+        in_warmup = step <= warmup_steps
+        scored = (not in_warmup) and (step % score_every == 0)
         if scored:
             # Sample K candidate CoTs, VLM-score them, record them with advantages; execute the top one.
             rng, ck = jax.random.split(rng)
@@ -4990,6 +5016,11 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
                         "default action = base policy chunk (state not pooled)",
                     ],
                     "line_colors": [red, red],
+                }
+            elif in_warmup:
+                hud = {
+                    "lines": [f"step={episode_steps} ret={episode_return:+.1f} WARMUP base (greedy)"],
+                    "line_colors": [(0, 200, 255)],
                 }
 
         next_obs, reward, terminated, truncated, info = env.step(action)
