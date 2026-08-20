@@ -168,6 +168,13 @@ def get_config():
             # 5 ticks (0.25 s) and re-query", i.e. plan at the 4 Hz policy rate the model was trained
             # at, rather than re-planning every tick. See SteerVLAActor._next_cached_action.
             actions_per_model_query=5,
+            # Transform the replayed chunk's route waypoints into the ego's current body frame on
+            # every held tick. Without it the lateral PID is open-loop for the whole hold: the
+            # decoder assumes the ego sits exactly at the pose the chunk was sampled from, so any
+            # cross-track or heading error the ego accumulates is invisible until the next model
+            # query. Set False to reproduce the old behaviour when A/B-ing
+            # ``actions_per_model_query``. No effect when that is 1.
+            reanchor_cached_chunk=True,
             # Reuse sampled CoT reasoning/subtask for this many env actions before sampling
             # CoT again. Matching actions_per_model_query refreshes the CoT and the chunk together.
             actions_per_cot=5,

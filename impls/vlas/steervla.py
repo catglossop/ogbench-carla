@@ -1222,6 +1222,7 @@ class SteerVLAActor:
         actions_per_model_query: int = 1,
         actions_per_cot: int = 1,
         env_steps_per_chunk_row: int = 5,
+        reanchor_cached_chunk: bool = True,
         sample_actions_num_steps: int = 10,
         action_decode_batch_size: int = 2,
         training_gpu_rank: int = -1,
@@ -1362,6 +1363,10 @@ class SteerVLAActor:
         # Env steps per chunk row: CARLA ticks at ``carla_fps`` (20) and one env step is one tick,
         # but a chunk row is a waypoint at the model's ``policy_fps`` (4). See _next_cached_action.
         self.env_steps_per_chunk_row = max(1, int(env_steps_per_chunk_row))
+        # Transform a replayed chunk's route waypoints into the ego's *current* body frame before
+        # serving it. Only meaningful when ``actions_per_model_query > 1``. See
+        # :meth:`_reanchor_route_to_current_pose`; set False to reproduce the old open-loop replay.
+        self.reanchor_cached_chunk = bool(reanchor_cached_chunk)
         self.sample_actions_num_steps = int(sample_actions_num_steps)
         self.action_decode_batch_size = max(1, int(action_decode_batch_size))
         self.return_normalized_action_chunk = bool(return_normalized_action_chunk)
@@ -1405,6 +1410,13 @@ class SteerVLAActor:
         self._call_counter = 0
         self._cached_action_chunk: np.ndarray | None = None
         self._cached_action_step = 0
+        # Ego pose (world x, y, yaw_rad) the cached chunk was sampled from, and the diagnostics
+        # from the last re-anchor. ``last_action_was_cached`` lets the caller tell a replayed
+        # action from a fresh model query (the noise argument is ignored on replayed steps).
+        self._cached_action_pose: np.ndarray | None = None
+        self._reanchor_disabled_reason: str | None = None
+        self.last_reanchor: dict[str, float] = {}
+        self.last_action_was_cached: bool = False
         self._cached_cot: dict[str, Any] | None = None
         self._cached_cot_actions_used = 0
         # Pooled prefix embedding cache (DSRL / residual state encoders). Both are read
@@ -3652,6 +3664,152 @@ class SteerVLAActor:
             shifted[:, keep:, :] = shifted[:, keep - 1: keep, :]
         return shifted.reshape(flat.shape[0], expected)
 
+    # Indices into the CARLA gym ``obs["state"]`` vector built by
+    # ``ogbench/carla/carla_utils.py :: _ego_state_vector``: world x, y and yaw (degrees).
+    _EGO_STATE_IDX_X = 0
+    _EGO_STATE_IDX_Y = 1
+    _EGO_STATE_IDX_YAW_DEG = 5
+
+    # Output formats whose trailing two action columns are ego-frame xy route deltas, i.e. the
+    # ones a rigid SE(2) transform is valid for. The ``*_delta_course_space`` formats store a
+    # heading angle in that slot instead, and rotating it as if it were a point is meaningless.
+    _ROUTE_XY_FORMATS = frozenset({"delta_xy_t_delta_xy_space"})
+
+    def _ego_pose_from_state(self, state: Any) -> np.ndarray | None:
+        """``(x, y, yaw_rad)`` in CARLA world coords from an ``obs["state"]`` vector, else None."""
+        if state is None:
+            return None
+        s = np.asarray(state, dtype=np.float64).reshape(-1)
+        if s.size <= self._EGO_STATE_IDX_YAW_DEG:
+            return None
+        x = float(s[self._EGO_STATE_IDX_X])
+        y = float(s[self._EGO_STATE_IDX_Y])
+        yaw = float(np.deg2rad(s[self._EGO_STATE_IDX_YAW_DEG]))
+        if not np.isfinite((x, y, yaw)).all():
+            return None
+        if x == 0.0 and y == 0.0:
+            # ``_get_state_vector`` returns all-zeros before the ego actor exists.
+            return None
+        return np.array([x, y, yaw], dtype=np.float64)
+
+    def _current_ego_pose(self) -> np.ndarray | None:
+        if self.raw_obs_holder is None:
+            return None
+        raw = self.raw_obs_holder.get("obs")
+        if not isinstance(raw, dict):
+            return None
+        return self._ego_pose_from_state(raw.get("state"))
+
+    def _reanchor_disabled(self, reason: str) -> None:
+        """Log the first reason re-anchoring is inactive, then stay quiet."""
+        if self._reanchor_disabled_reason is None:
+            self._reanchor_disabled_reason = reason
+            print(f"[reanchor] inactive: {reason}", flush=True)
+
+    def _reanchor_route_to_current_pose(
+        self, out_flat: np.ndarray, base_flat: np.ndarray
+    ) -> np.ndarray:
+        """Re-express a replayed chunk's route waypoints in the ego's *current* body frame.
+
+        The route columns are ego-frame xy deltas along a **spatial** path anchored at the pose the
+        chunk was sampled from. Serving that chunk verbatim for ``actions_per_model_query`` ticks
+        leaves the lateral controller open-loop: ``LateralPIDController`` derives its heading error
+        purely from these waypoints (``ogbench/carla/steervla_simlingo_control.py`` passes it only
+        the ego *speed* besides the chunk), and ``interpolate_waypoints`` re-zeroes arc length at
+        the plan's first point. The decoder therefore *assumes* the ego is sitting exactly at the
+        pose the chunk was sampled from, and re-issues the steering appropriate to that pose for
+        the whole hold. Any cross-track or heading error the ego accumulates in between is
+        invisible until the next model query -- which is precisely the error a controller exists
+        to remove. Measured on a 30 m-radius arc at 10 m/s over a 5-tick hold
+        (``test_reanchor_cached_chunk.py``): with 0.4 m of lateral drift the un-re-anchored steer
+        stays pinned at 0.152 while the re-anchored one corrects to -0.109; with 4 deg of yaw lag
+        it stays at 0.152 versus 0.320. When the ego tracks the plan exactly the two agree, as
+        they should.
+
+        Fix: rigid SE(2) transform of the cumulative waypoints into the current body frame, drop
+        the points now behind the ego, and re-derive the deltas. This is the continuous analogue of
+        :meth:`_shift_cached_action_chunk`'s integer row shift, driven by the ego's *measured*
+        progress instead of by assuming it tracked the plan exactly.
+
+        The speed columns are deliberately left untouched. The PID reads them as
+        ``|wp[2] - wp[0]| * 2`` -- a displacement magnitude over a fixed 0.5 s window -- which is
+        invariant under rotation and translation. That channel is time-indexed, so only the
+        whole-row shift can advance it, and it stays closed-loop anyway via the fresh ego speed.
+        """
+        if not self.reanchor_cached_chunk:
+            self._reanchor_disabled("reanchor_cached_chunk=False")
+            return out_flat
+        horizon = int(self.action_horizon)
+        adim = int(self.action_dim)
+        if adim < 4:
+            self._reanchor_disabled(f"action_dim={adim} has no xy route columns")
+            return out_flat
+        fmt = str(self.output_action_format or "").strip().lower()
+        if fmt not in self._ROUTE_XY_FORMATS:
+            self._reanchor_disabled(f"output_action_format={self.output_action_format!r} is not an xy route format")
+            return out_flat
+        pose_now = self._current_ego_pose()
+        pose_query = self._cached_action_pose
+        if pose_now is None or pose_query is None:
+            self._reanchor_disabled("no ego pose available from raw_obs_holder['obs']['state']")
+            return out_flat
+
+        # Old ego origin expressed in the current ego frame, using the same world->ego convention
+        # as ``carla_utils._compute_target_point_ego`` (x forward): t = R(yaw_now)^T (o_old - o_now).
+        d_world = pose_query[:2] - pose_now[:2]
+        cy, sy = float(np.cos(pose_now[2])), float(np.sin(pose_now[2]))
+        t = np.array(
+            [d_world[0] * cy + d_world[1] * sy, -d_world[0] * sy + d_world[1] * cy],
+            dtype=np.float64,
+        )
+        dyaw_raw = float(pose_now[2] - pose_query[2])
+        dyaw = float(np.arctan2(np.sin(dyaw_raw), np.cos(dyaw_raw)))
+        if float(np.hypot(t[0], t[1])) < 1e-3 and abs(dyaw) < 1e-4:
+            # Ego has not moved since the query -- the cached frame *is* the current frame.
+            self.last_reanchor = {"dx_m": 0.0, "dy_m": 0.0, "dyaw_deg": 0.0, "dropped": 0.0, "padded": 0.0}
+            return out_flat
+
+        base = np.asarray(base_flat, dtype=np.float64).reshape(-1, horizon, adim)[0]
+        # Cumulative route points in the query-time ego frame; pts[0] is the query origin itself.
+        pts = np.cumsum(
+            np.concatenate([np.zeros((1, 2), dtype=np.float64), base[:, 2:4]], axis=0), axis=0
+        )
+        c, s = float(np.cos(-dyaw)), float(np.sin(-dyaw))
+        rot = np.array([[c, -s], [s, c]], dtype=np.float64)
+        pts_now = pts @ rot.T + t
+
+        ahead = np.flatnonzero(pts_now[:, 0] > 1e-3)
+        if ahead.size == 0:
+            # Whole plan is behind the ego (it overran the chunk); nothing sane to steer toward.
+            self._reanchor_disabled("cached route fully behind the ego")
+            return out_flat
+        kept = pts_now[int(ahead[0]) :][:horizon]
+        new_deltas = np.diff(
+            np.concatenate([np.zeros((1, 2), dtype=np.float64), kept], axis=0), axis=0
+        )
+        padded = horizon - new_deltas.shape[0]
+        if padded > 0:
+            # Same tail convention as _shift_cached_action_chunk: extend along the last delta.
+            new_deltas = np.concatenate(
+                [new_deltas, np.repeat(new_deltas[-1:], padded, axis=0)], axis=0
+            )
+
+        out = np.array(out_flat, dtype=np.float32).reshape(-1, horizon, adim)
+        out[:, :, 2:4] = new_deltas.astype(np.float32)[None]
+        self.last_reanchor = {
+            "dx_m": float(t[0]),
+            "dy_m": float(t[1]),
+            "dyaw_deg": float(np.degrees(dyaw)),
+            "dropped": float(int(ahead[0])),
+            "padded": float(max(padded, 0)),
+        }
+        print(
+            f"[reanchor] ego moved dx={t[0]:+.3f} dy={t[1]:+.3f} m dyaw={np.degrees(dyaw):+.2f} deg "
+            f"-> dropped {int(ahead[0])} route pts, padded {max(padded, 0)}",
+            flush=True,
+        )
+        return out.reshape(out.shape[0], horizon * adim)
+
     def _next_cached_action(self, batch_size: int) -> jnp.ndarray | None:
         """Serve one env action from the cached chunk, re-anchored to the ego's *actual* progress.
 
@@ -3665,6 +3823,11 @@ class SteerVLAActor:
         over-throttling out of a stop). Holding the chunk for the intervening ticks and re-running the
         PID against the fresh ego speed is exactly what ``simlingo/team_code/agent_steervla.py`` does
         between VLM queries; the env re-decodes the chunk with a fresh state vector on every step.
+
+        Holding the chunk is not enough on its own, though: the env only feeds the decoder a fresh
+        ego *speed*, so the lateral loop would be open-loop for the whole hold. The route waypoints
+        are therefore re-anchored to the ego's current pose on every replayed step -- see
+        :meth:`_reanchor_route_to_current_pose`.
         """
         if self.actions_per_model_query <= 1 or batch_size != 1 or self._cached_action_chunk is None:
             return None
@@ -3675,7 +3838,11 @@ class SteerVLAActor:
             self._cached_action_step = 0
             return None
         row = self._cached_action_step // self.env_steps_per_chunk_row
+        # Time-indexed shift for the speed columns, pose-based re-anchor for the route columns.
+        # The re-anchor reads the *unshifted* chunk: it accounts for all progress since the query
+        # continuously, so the integer row shift would double-count it on the route channel.
         out = self._shift_cached_action_chunk(self._cached_action_chunk, row)
+        out = self._reanchor_route_to_current_pose(out, self._cached_action_chunk)
         self._cached_action_step += 1
         return jnp.asarray(out)
 
@@ -3683,6 +3850,8 @@ class SteerVLAActor:
         if self.actions_per_model_query <= 1 or batch_size != 1:
             return
         self._cached_action_chunk = np.asarray(jax.device_get(action), dtype=np.float32)
+        # Pose this chunk's ego-frame waypoints are anchored at, for _reanchor_route_to_current_pose.
+        self._cached_action_pose = self._current_ego_pose()
         # Step 0 was just returned from the fresh model query.
         self._cached_action_step = 1
 
@@ -4026,6 +4195,8 @@ class SteerVLAActor:
     def reset_action_cache(self) -> None:
         self._cached_action_chunk = None
         self._cached_action_step = 0
+        self._cached_action_pose = None
+        self.last_reanchor = {}
         self._cached_cot = None
         self._cached_cot_actions_used = 0
         self._last_cot_out = None
@@ -4694,6 +4865,10 @@ class SteerVLAActor:
         """
         batch_size = int(noise_jax.shape[0])
         cached = self._next_cached_action(batch_size)
+        # A replayed chunk ignores ``noise_jax`` entirely: with ``actions_per_model_query=k`` the
+        # noise actor only influences 1 in k executed actions. main_carla logs this as
+        # ``vla/action_cached`` so an RL run's true on-policy fraction is visible.
+        self.last_action_was_cached = cached is not None
         if cached is not None:
             # Cache-hit path still corresponds to a real env step with a fresh `raw_obs_holder["obs"]`.
             # Re-stash the currently reused CoT so replay capture for this step remains aligned.
@@ -4987,6 +5162,7 @@ def create_steervla_pi0_cot_sample_fn(
         actions_per_model_query=int(steervla_cfg.get("actions_per_model_query", 1)),
         actions_per_cot=int(steervla_cfg.get("actions_per_cot", 1)),
         env_steps_per_chunk_row=int(steervla_cfg.get("env_steps_per_chunk_row", 5)),
+        reanchor_cached_chunk=bool(steervla_cfg.get("reanchor_cached_chunk", True)),
         sample_actions_num_steps=int(steervla_cfg.get("sample_actions_num_steps", 10)),
         action_decode_batch_size=int(steervla_cfg.get("action_decode_batch_size", 2)),
         training_gpu_rank=int(srank),

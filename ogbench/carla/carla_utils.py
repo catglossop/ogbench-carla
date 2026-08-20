@@ -3178,6 +3178,10 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
     ) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
         flat = np.asarray(action, dtype=np.float32).reshape(-1)
         control = None
+        if self._steervla_decoder is not None:
+            # Cleared so ``info["pid_debug"]`` below can only ever report *this* tick's PID call --
+            # the legacy 2-D control path leaves the decoder untouched.
+            self._steervla_decoder.last_debug = {}
         if self._steervla_exec_cfg is not None and self._steervla_decoder is not None:
             ah = int(self._steervla_exec_cfg["action_horizon"])
             ad = int(self._steervla_exec_cfg["action_dim"])
@@ -3240,6 +3244,11 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         reward, terminated, info = self._apply_episode_max_steps(reward, terminated, info)
         if self._expert_agent is not None:
             self.tick_expert()
+        if self._steervla_decoder is not None and self._steervla_decoder.last_debug:
+            # PID internals for this tick (steer / desired vs actual speed / heading error /
+            # lookahead distance). main_carla logs these as ``pid/*`` -- the lookahead and
+            # heading-error traces are what distinguish a healthy chunk replay from a stale one.
+            info["pid_debug"] = dict(self._steervla_decoder.last_debug)
         return self._obs_dict(), float(reward), terminated, False, info
 
     def checkpoint(self) -> Dict[str, Any]:

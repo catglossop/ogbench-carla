@@ -1685,6 +1685,23 @@ def run_online_carla(
     hl_updates_on = enable_updates and enable_updates_bc_hl
     any_updates_on = rl_updates_on or bc_updates_on or hl_updates_on
 
+    # A chunk replayed from SteerVLAActor's cache ignores the noise argument entirely (see
+    # ``SteerVLAActor.__call__``), so with ``actions_per_model_query=k`` the DSRL noise actor only
+    # shapes 1 in k executed actions while its loss assumes it shaped all of them. The action
+    # expert cannot be re-run cheaply on the held steps -- a new observation needs a fresh prefix
+    # forward, which is the expensive part -- so this is a genuine trade of on-policy fidelity for
+    # throughput, not a bug to paper over. Surface it rather than letting it silently halve the
+    # apparent effect of ``enable_updates_rl``.
+    _apmq = int((agent_config.get("steervla") or {}).get("actions_per_model_query", 1))
+    if rl_updates_on and _apmq > 1:
+        print(
+            f"[main_carla] WARNING: actions_per_model_query={_apmq} with RL updates enabled -- the "
+            f"noise actor influences only ~{100.0 / _apmq:.0f}% of executed actions (the rest are "
+            "replayed from the chunk cache, which ignores the sampled noise). Watch "
+            "``vla/action_cached``; set actions_per_model_query=1 for a fully on-policy DSRL run.",
+            flush=True,
+        )
+
     # Export the HL-fine-tuned SteerVLA backbone as a redeployable params-only checkpoint every
     # ``hl_checkpoint_every_steps`` env steps and at exit. Only when the HL update is actually running.
     _steervla_cfg = agent_config.get("steervla", None)
@@ -3785,6 +3802,22 @@ def run_online_carla(
                 f"env_step={t_step_end - t_step_start:.3f}s log={t_log_end - t_log_start:.3f}s",
                 flush=True,
             )
+        # Controller / chunk-replay diagnostics. ``pid/heading_error`` is the one to watch when
+        # tuning ``actions_per_model_query``: a stale (un-re-anchored) chunk pins it to a constant
+        # between model queries, i.e. the lateral loop is open. ``vla/action_cached`` is the
+        # fraction of executed actions replayed from the chunk cache -- on those steps the DSRL
+        # noise actor's output is ignored.
+        _pid_debug = info.get("pid_debug")
+        if isinstance(_pid_debug, dict):
+            for _k, _v in _pid_debug.items():
+                step_wb[f"pid/{_k}"] = float(_v)
+        if steervla_actor is not None:
+            _cached = bool(getattr(steervla_actor, "last_action_was_cached", False))
+            step_wb["vla/action_cached"] = float(_cached)
+            _reanchor = getattr(steervla_actor, "last_reanchor", None)
+            if _cached and isinstance(_reanchor, dict):
+                for _k, _v in _reanchor.items():
+                    step_wb[f"reanchor/{_k}"] = float(_v)
         step_wb["training/in_expo_warmup"] = float(in_expo_warmup)
         step_wb["training/enable_updates"] = float(enable_updates)
         step_wb["training/rl_updates_on"] = float(rl_updates_on)

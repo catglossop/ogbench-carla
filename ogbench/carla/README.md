@@ -257,8 +257,43 @@ uv run python impls/main_carla.py \
 
 There are a couple levers to pull to optimize the speed a bit: 
 
-- `actions_per_model_query`: int - how many actions in the action chunk to execute open loop (speed)
+- `actions_per_model_query`: int - how many **env steps** (20 Hz CARLA ticks) to serve from one
+  model query before querying again (speed)
 - `actions_per_cot`: int - how many actions to execute before getting new CoT (speed)
+- `reanchor_cached_chunk`: bool, default `True` - re-express the replayed chunk's route waypoints
+  in the ego's current body frame on every held tick
+
+### What `actions_per_model_query` actually holds
+
+Env steps and chunk rows are not the same rate. CARLA ticks at 20 Hz and one env step is one
+tick, while a chunk row is a waypoint at the 4 Hz policy rate the model was trained at
+(`env_steps_per_chunk_row = carla_fps // policy_fps = 5`). So `actions_per_model_query=5` holds
+**one** chunk row's worth of time (0.25 s) — it does not execute five rows of the plan. Executing
+five rows would be `actions_per_model_query=25`.
+
+During the hold the env re-runs the PID every tick, but hands the decoder only a fresh ego
+*speed* (`SimlingoStyleWaypointDecoder._flat_action_to_pid` reads `state_vec` solely for
+`EGO_STATE_IDX_SPEED`). The longitudinal loop therefore stays closed, but the lateral loop would
+not: `interpolate_waypoints` re-zeroes arc length at the plan's first point, so the decoder
+assumes the ego is sitting exactly at the pose the chunk was sampled from and re-issues the
+steering appropriate to *that* pose for the whole hold. Cross-track and heading error accumulated
+in between are invisible until the next query.
+
+`reanchor_cached_chunk` fixes this: the cached waypoints get a rigid SE(2) transform into the
+current body frame (the pose comes from `obs["state"]`, x/y at 0/1 and yaw at 5), the points now
+behind the ego are dropped, and the deltas are re-derived. The speed columns are left alone — the
+PID reads them as `|wp[2] - wp[0]| * 2`, a displacement magnitude that is invariant to rotation and
+translation, and that channel is time-indexed so only the whole-row shift can advance it. Run
+`impls/vlas/test_reanchor_cached_chunk.py` for the correctness check and an off/on A/B.
+
+Two things to watch when tuning this knob, both logged to W&B by `main_carla.py`:
+
+- `pid/heading_error` — pinned to a constant between model queries means the lateral loop is open.
+- `vla/action_cached` — fraction of executed actions replayed from the cache. A replayed chunk
+  ignores the sampled noise, so under DSRL the noise actor only shapes 1 in
+  `actions_per_model_query` executed actions. Use `actions_per_model_query=1` for a fully
+  on-policy RL run; the action expert cannot be re-run cheaply on held ticks, because a new
+  observation needs a fresh (expensive) prefix forward.
 
 
 

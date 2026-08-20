@@ -183,6 +183,13 @@ class SimlingoStyleWaypointDecoder:
         self._stuck_counter = 0
         self._force_move = 0
 
+        # Scalars from the most recent ``control_pid`` call, surfaced through the env's ``info``
+        # dict as ``pid_debug`` so a run can be diagnosed without parsing the ``[RC-PID]`` prints.
+        # ``heading_error`` is the one that exposes a stale (un-re-anchored) cached chunk: it pins
+        # to a constant for the whole hold, because this decoder is handed only the ego *speed*
+        # besides the waypoints and so cannot see the ego drifting off the plan.
+        self.last_debug: dict[str, float] = {}
+
     def control_pid(
         self,
         route_waypoints: np.ndarray,
@@ -244,6 +251,19 @@ class SimlingoStyleWaypointDecoder:
             # building forward momentum, so clamp steer small while forcing through.
             steer = float(np.clip(steer, -0.05, 0.05))
         print(f"[RC-PID] Steer: {steer:.4f}  Throttle: {throttle:.4f}  Brake: {brake}", flush=True)
+
+        self.last_debug = {
+            "steer": float(steer),
+            "throttle": float(throttle),
+            "brake": float(brake),
+            "desired_speed": float(desired_speed),
+            "speed": float(speed),
+            "speed_error": float(desired_speed - speed),
+            "heading_error": float(self.turn_controller.last_heading_error),
+            "lookahead_m": float(self.turn_controller.last_lookahead_m),
+            "route_len_m": float(0.1 * route_interp.shape[0]),
+            "forcing_move": float(forcing_move),
+        }
 
         return steer, throttle, brake
 

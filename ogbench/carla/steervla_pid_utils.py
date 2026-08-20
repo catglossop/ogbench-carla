@@ -63,6 +63,15 @@ class LateralPIDController:
         self._saved_window: list[float] = []
         self._window: list[float] = []
 
+        # Last-call diagnostics (read by SimlingoStyleWaypointDecoder for the ``pid/*`` metrics).
+        # ``last_lookahead_m`` is the arc length of the lookahead point along the 0.1 m-resampled
+        # route; it is purely speed-driven, since ``interpolate_waypoints`` re-zeroes arc length at
+        # the route's first point. ``last_heading_error`` is the signal to watch when tuning
+        # ``actions_per_model_query`` -- see SteerVLAActor._reanchor_route_to_current_pose.
+        self.last_heading_error: float = 0.0
+        self.last_lookahead_idx: int = 0
+        self.last_lookahead_m: float = 0.0
+
     def step(self, route_np: np.ndarray, current_speed: float) -> float:
         current_speed = current_speed * 3.6
         if self.inference_mode:
@@ -76,12 +85,16 @@ class LateralPIDController:
 
         n_lookahead = min(n_lookahead, len(route_np) - 1)
         desired_heading_vec = route_np[n_lookahead]
+        self.last_lookahead_idx = int(n_lookahead)
+        # ``interpolate_waypoints`` resamples to 0.1 m spacing starting 0.1 m from the origin.
+        self.last_lookahead_m = 0.1 * (int(n_lookahead) + 1)
 
         yaw_path = np.arctan2(desired_heading_vec[1], desired_heading_vec[0])
         heading_error = yaw_path % (2 * np.pi)
         heading_error = heading_error if heading_error < np.pi else heading_error - 2 * np.pi
 
         heading_error = heading_error * 180.0 / np.pi / 90.0
+        self.last_heading_error = float(heading_error)
 
         self._window.append(float(heading_error))
         self._window = self._window[-self.n :]
