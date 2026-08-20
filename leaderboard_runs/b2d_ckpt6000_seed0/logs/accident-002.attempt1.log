@@ -1,0 +1,194 @@
+$ /home/carla/ogbench-carla/.venv/bin/python impls/main_carla.py --agent=/home/carla/ogbench-carla/leaderboard_runs/b2d_ckpt6000_seed0/configs/slot0_agent.py --carla_config=/home/carla/ogbench-carla/leaderboard_runs/b2d_ckpt6000_seed0/configs/slot0_carla.yaml --route=accident-002 --eval_only=true --max_episodes=1 --online_steps=6000 --save_dir=/home/carla/ogbench-carla/leaderboard_runs/b2d_ckpt6000_seed0/runs/accident-002 --seed=0 --run_group=leaderboard --save_video_local=false
+
+wandb: WARNING `start_method` is deprecated and will be removed in a future version of wandb. This setting is currently non-functional and safely ignored.
+[carla spawn guard] installed request_new_actor liveness guard
+[carla physics guard] installed set_simulate_physics liveness guard
+[carla] launched UE4 (pid=20909) on display :30 sim_gpu_rank=1; VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json; log=/tmp/carla_rpc12000.log
+[carla] cmd: /home/carla/carla-0-9-16/CarlaUE4.sh -RenderOffScreen -nosound -carla-rpc-port=12000 -graphicsadapter=1 -carla-streaming-port=12001
+[carla] waiting up to 180s for UE4 RPC on port 12000...
+[carla] RPC ready after 7s
+load_world success , attempts=0
+traffic_manager init success, try_time=0
+I0820 16:25:09.550760 126466097702720 simple_watchdog_timer.py:25] WDT: Started
+I0820 16:25:10.550918 126466097702720 simple_watchdog_timer.py:92] WDT: Stopped
+I0820 16:25:11.315309 126466097702720 simple_watchdog_timer.py:25] WDT: Started
+I0820 16:25:11.316383 126466097702720 simple_watchdog_timer.py:25] WDT: Started
+I0820 16:25:11.323619 126466097702720 simple_watchdog_timer.py:92] WDT: Stopped
+Using a slow image processor as `use_fast` is unset and a slow processor was saved with this model. `use_fast=True` will be the default behavior in v4.52, even if the model was saved with a slow processor. This will result in minor differences in outputs. You'll still be able to use a slow processor with `use_fast=False`.
+[main_carla] SigLIP encoder google/siglip2-so400m-patch14-384 embed_dim=1152 obs_dim=3456 device=cuda:1
+INFO:2026-08-20 16:25:16,787:jax._src.xla_bridge:925: Unable to initialize backend 'rocm': module 'jaxlib.xla_extension' has no attribute 'GpuAllocatorConfig'
+I0820 16:25:16.787241 126466097702720 xla_bridge.py:925] Unable to initialize backend 'rocm': module 'jaxlib.xla_extension' has no attribute 'GpuAllocatorConfig'
+INFO:2026-08-20 16:25:16,787:jax._src.xla_bridge:925: Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
+I0820 16:25:16.787671 126466097702720 xla_bridge.py:925] Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
+[main_carla] JAX default device -> cuda:1 (training_gpu_rank=1)
+I0820 16:25:17.158380 126466097702720 config.py:125] JAX version 0.5.3 available.
+Params directory:  /home/carla/.cache/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning_no_ego_history/pi05_steervla_simplified_reasoning_no_ego_history_v1/pi05_steervla_simplified_reasoning_no_ego_history_v1_20260718_201640/6000/params
+Restoring OpenPI params on single GPU 1
+I0820 16:25:17.265368 126466097702720 abstract_checkpointer.py:35] orbax-checkpoint version: 0.11.13
+I0820 16:25:17.265448 126466097702720 base_pytree_checkpoint_handler.py:334] Created BasePyTreeCheckpointHandler: use_ocdbt=True, use_zarr3=False, pytree_metadata_options=PyTreeMetadataOptions(support_rich_types=False), array_metadata_store=<orbax.checkpoint._src.metadata.array_metadata_store.Store object at 0x730397b24b10>
+I0820 16:25:17.282012 126466097702720 checkpointer.py:298] Restoring checkpoint from /home/carla/.cache/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning_no_ego_history/pi05_steervla_simplified_reasoning_no_ego_history_v1/pi05_steervla_simplified_reasoning_no_ego_history_v1_20260718_201640/6000/params.
+I0820 16:25:21.382861 126466097702720 base_pytree_checkpoint_handler.py:114] [process=0] /jax/checkpoint/read/bytes_per_sec: 3.0 GiB/s (total bytes: 12.5 GiB) (time elapsed: 4 seconds) (per-host)
+I0820 16:25:21.383083 126466097702720 checkpointer.py:309] Finished restoring checkpoint in 4.10 seconds from /home/carla/.cache/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning_no_ego_history/pi05_steervla_simplified_reasoning_no_ego_history_v1/pi05_steervla_simplified_reasoning_no_ego_history_v1_20260718_201640/6000/params.
+I0820 16:25:25.662595 126466097702720 config.py:225] Norm stats not found in /home/carla/ogbench-carla/assets/pi05_steervla_cot_simplified_reasoning_no_ego_history/steervla_simlingo_cot, skipping.
+[main_carla] SteerVLA policy checkpointing configured (every 2000 steps) but inactive: hl_updates=False, trainable_actor=False.
+[main_carla] all updates disabled: rollout-only (no gradient updates)
+[main_carla] warmup: no updates while step < 50
+[main_carla] SigLIP observations = [image_embed, prompt_embed, subtask_embed]
+[DEBUG - steervla] Prompt text: Prompt:The current speed is 0.1 m/s. follow the road.;State:128 255;
+
+  0%|          | 0/6000 [00:00<?, ?it/s][DEBUG - steervla] Prompt text: Prompt:The current speed is 0.1 m/s. follow the road.;State:128 255;
+[DEBUG - steervla] CoT time: 3.104 seconds
+[DEBUG - steervla] Reason text: <loc1020>Follow the route.;<loc1019>
+[DEBUG - steervla] Subtask text: <loc1022>The vehicle accelerates normally while making a slight adjustment to the left.;<loc1021>
+[DEBUG - steervla] FAST segment (14 tok): Action: <loc0762><loc0621><loc0700><loc0604>Ӕ<loc0690><loc0742><loc0682><loc0131><loc0750>|
+[DEBUG - steervla] Prefix embed time: 0.583 seconds
+[DEBUG - steervla] Sample actions (standard) time: 0.9416928291320801 seconds
+[main_carla] VLA sample took 5.4s
+
+  0%|          | 0/6000 [00:05<?, ?it/s]
+[1m> Stopping the route (wrapper)[0m
+I0820 16:25:35.146536 126466097702720 simple_watchdog_timer.py:92] WDT: Stopped
+I0820 16:25:35.146703 126466097702720 simple_watchdog_timer.py:92] WDT: Stopped
+
+[1m========= Results of RouteScenario_24816 (repetition 0) ------ [91mFAILURE[0m [1m=========[0m
+
+╒═══════════════════════╤═════════════════════╕
+│ Start Time            │ 2026-08-20 16:25:11 │
+├───────────────────────┼─────────────────────┤
+│ End Time              │ 2026-08-20 16:25:35 │
+├───────────────────────┼─────────────────────┤
+│ System Time           │ 23.83s              │
+├───────────────────────┼─────────────────────┤
+│ Game Time             │ 0.0s                │
+├───────────────────────┼─────────────────────┤
+│ Ratio (Game / System) │ 0.0                 │
+╘═══════════════════════╧═════════════════════╛
+
+╒═══════════════════════╤═════════╤═════════╕
+│ Criterion             │ Result  │ Value   │
+├───────────────────────┼─────────┼─────────┤
+│ RouteCompletionTest   │ [91mFAILURE[0m │ 0 %     │
+├───────────────────────┼─────────┼─────────┤
+│ OutsideRouteLanesTest │ [92mSUCCESS[0m │ 0 %     │
+├───────────────────────┼─────────┼─────────┤
+│ CollisionTest         │ [92mSUCCESS[0m │ 0 times │
+├───────────────────────┼─────────┼─────────┤
+│ RunningRedLightTest   │ [92mSUCCESS[0m │ 0 times │
+├───────────────────────┼─────────┼─────────┤
+│ RunningStopTest       │ [92mSUCCESS[0m │ 0 times │
+├───────────────────────┼─────────┼─────────┤
+│ MinSpeedTest          │ [92mSUCCESS[0m │ 100 %   │
+├───────────────────────┼─────────┼─────────┤
+│ InRouteTest           │ [92mSUCCESS[0m │         │
+├───────────────────────┼─────────┼─────────┤
+│ AgentBlockedTest      │ [92mSUCCESS[0m │         │
+├───────────────────────┼─────────┼─────────┤
+│ ScenarioTimeoutTest   │ [92mSUCCESS[0m │ 0 times │
+├───────────────────────┼─────────┼─────────┤
+│ Timeout               │ [92mSUCCESS[0m │         │
+╘═══════════════════════╧═════════╧═════════╛
+
+Traceback (most recent call last):
+  File "/home/carla/ogbench-carla/impls/main_carla.py", line 5579, in <module>
+    app.run(main)
+  File "/home/carla/ogbench-carla/.venv/lib/python3.11/site-packages/absl/app.py", line 410, in run
+    _run_main(main, args)
+  File "/home/carla/ogbench-carla/.venv/lib/python3.11/site-packages/absl/app.py", line 355, in _run_main
+    sys.exit(main(argv))
+             ^^^^^^^^^^
+  File "/home/carla/ogbench-carla/impls/main_carla.py", line 5142, in main
+    _run_dsrl_entry(config)
+  File "/home/carla/ogbench-carla/impls/main_carla.py", line 5237, in _run_dsrl_entry
+    run_online_carla(
+  File "/home/carla/ogbench-carla/impls/main_carla.py", line 3281, in run_online_carla
+    action_jax, base_action_jax = _sample_agent_action(sub)
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/carla/ogbench-carla/impls/main_carla.py", line 3195, in _sample_agent_action
+    base = jax.numpy.asarray(agent.vla_sample_fn(obs[None], noise))
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/carla/ogbench-carla/impls/vlas/steervla.py", line 5215, in sample_fn
+    return actor(observations, noise)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/carla/ogbench-carla/impls/vlas/steervla.py", line 4906, in __call__
+    else self._forward_pi0(batch_size, noise_jax, raw=None)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/carla/ogbench-carla/impls/vlas/steervla.py", line 4506, in _forward_pi0
+    traj_np = self._postprocess_action_trajectory(traj, observation_state=obs_jax.state)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/carla/ogbench-carla/impls/vlas/steervla.py", line 3226, in _postprocess_action_trajectory
+    traj_np = steervla_physical_denormalize_actions(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/carla/ogbench-carla/impls/vlas/steervla.py", line 558, in steervla_physical_denormalize_actions
+    from openpi.visualizing.steervla_visualization import denormalize_actions
+  File "/home/carla/ogbench-carla/.venv/lib/python3.11/site-packages/openpi/visualizing/steervla_visualization.py", line 17, in <module>
+    import matplotlib
+  File "/home/carla/ogbench-carla/.venv/lib/python3.11/site-packages/matplotlib/__init__.py", line 989, in <module>
+    rcParamsDefault = _rc_params_in_file(
+                      ^^^^^^^^^^^^^^^^^^^
+  File "/home/carla/ogbench-carla/.venv/lib/python3.11/site-packages/matplotlib/__init__.py", line 931, in _rc_params_in_file
+    config[key] = val  # try to convert to proper type or raise
+    ~~~~~~^^^^^
+  File "/home/carla/ogbench-carla/.venv/lib/python3.11/site-packages/matplotlib/__init__.py", line 779, in __setitem__
+    cval = valid_key(val)
+           ^^^^^^^^^^^^^^
+  File "/home/carla/ogbench-carla/.venv/lib/python3.11/site-packages/matplotlib/rcsetup.py", line 476, in validate_font_properties
+    parse_fontconfig_pattern(s)
+  File "/home/carla/ogbench-carla/.venv/lib/python3.11/site-packages/matplotlib/_fontconfig_pattern.py", line 83, in parse_fontconfig_pattern
+    parser = _make_fontconfig_parser()
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/carla/ogbench-carla/.venv/lib/python3.11/site-packages/matplotlib/_fontconfig_pattern.py", line 66, in _make_fontconfig_parser
+    Optional(comma_separated(family)("families"))
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/carla/ogbench-carla/.venv/lib/python3.11/site-packages/matplotlib/_fontconfig_pattern.py", line 58, in comma_separated
+    return elem + ZeroOrMore(Suppress(",") + elem)
+           ~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  File "/home/carla/ogbench-carla/.venv/lib/python3.11/site-packages/pyparsing/core.py", line 1652, in __add__
+    return And([self, other])
+           ^^^^^^^^^^^^^^^^^^
+  File "/home/carla/ogbench-carla/.venv/lib/python3.11/site-packages/pyparsing/core.py", line 4523, in __init__
+    self._may_return_empty = all(e.mayReturnEmpty for e in self.exprs)
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/carla/ogbench-carla/.venv/lib/python3.11/site-packages/pyparsing/core.py", line 4523, in <genexpr>
+    self._may_return_empty = all(e.mayReturnEmpty for e in self.exprs)
+                                 ^^^^^^^^^^^^^^^^
+  File "/home/carla/ogbench-carla/.venv/lib/python3.11/site-packages/pyparsing/core.py", line 3536, in mayReturnEmpty
+    self.re  # noqa
+    ^^^^^^^
+  File "/home/carla/.local/share/uv/python/cpython-3.11.13-linux-x86_64-gnu/lib/python3.11/functools.py", line 1001, in __get__
+    val = self.func(instance)
+          ^^^^^^^^^^^^^^^^^^^
+  File "/home/carla/ogbench-carla/.venv/lib/python3.11/site-packages/pyparsing/core.py", line 3521, in re
+    self._re = re.compile(self.pattern, self.flags)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/carla/.local/share/uv/python/cpython-3.11.13-linux-x86_64-gnu/lib/python3.11/re/__init__.py", line 227, in compile
+    return _compile(pattern, flags)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/carla/.local/share/uv/python/cpython-3.11.13-linux-x86_64-gnu/lib/python3.11/re/__init__.py", line 294, in _compile
+    p = _compiler.compile(pattern, flags)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/carla/.local/share/uv/python/cpython-3.11.13-linux-x86_64-gnu/lib/python3.11/re/_compiler.py", line 749, in compile
+    code = _code(p, flags)
+           ^^^^^^^^^^^^^^^
+  File "/home/carla/.local/share/uv/python/cpython-3.11.13-linux-x86_64-gnu/lib/python3.11/re/_compiler.py", line 582, in _code
+    _compile(code, p.data, flags)
+  File "/home/carla/.local/share/uv/python/cpython-3.11.13-linux-x86_64-gnu/lib/python3.11/re/_compiler.py", line 119, in _compile
+    _compile(code, av[2], flags)
+  File "/home/carla/.local/share/uv/python/cpython-3.11.13-linux-x86_64-gnu/lib/python3.11/re/_compiler.py", line 128, in _compile
+    _compile(code, p, _combine_flags(flags, add_flags, del_flags))
+  File "/home/carla/.local/share/uv/python/cpython-3.11.13-linux-x86_64-gnu/lib/python3.11/re/_compiler.py", line 176, in _compile
+    _compile(code, av, flags)
+  File "/home/carla/.local/share/uv/python/cpython-3.11.13-linux-x86_64-gnu/lib/python3.11/re/_compiler.py", line 86, in _compile
+    charset, hascased = _optimize_charset(av, iscased, tolower, fixes)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/carla/.local/share/uv/python/cpython-3.11.13-linux-x86_64-gnu/lib/python3.11/re/_compiler.py", line 339, in _optimize_charset
+    data = _mk_bitmap(charmap)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/carla/.local/share/uv/python/cpython-3.11.13-linux-x86_64-gnu/lib/python3.11/re/_compiler.py", line 388, in _mk_bitmap
+    return [_int(s[i - _CODEBITS: i], 2)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/carla/.local/share/uv/python/cpython-3.11.13-linux-x86_64-gnu/lib/python3.11/re/_compiler.py", line 388, in <listcomp>
+    return [_int(s[i - _CODEBITS: i], 2)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: 'int' object is not callable
+I0820 16:25:39.275830 126466097702720 simple_watchdog_timer.py:92] WDT: Stopped
+I0820 16:25:39.275916 126466097702720 simple_watchdog_timer.py:92] WDT: Stopped
