@@ -99,6 +99,8 @@ STEERVLA_CKPT=""
 ACTOR_CONFIG=""
 # GRPO-only: greedy-base warmup steps before scoring/updates begin. Empty -> config default (0).
 GRPO_WARMUP=""
+# Override config.steervla.cot_temperature (e.g. 1.0 to sample the base CoT). Empty -> config default.
+COT_TEMPERATURE=""
 # Crash supervisor: relaunch main_carla (resuming from checkpoint) after a CARLA native
 # crash (SIGSEGV/SIGABRT, exit code >=128). 0 disables the retry loop.
 MAX_RETRIES="${MAX_RETRIES:-50}"
@@ -165,6 +167,7 @@ Options:
   --steervla-checkpoint PATH  Override config.steervla.checkpoint (deploy a relabelled ckpt).
   --actor-config NAME       Override config.steervla.actor_config (match the ckpt's model).
   --grpo-warmup N           GRPO only: drive the greedy base for N steps before scoring/updates.
+  --cot-temperature T       Override config.steervla.cot_temperature (e.g. 1.0 to sample base CoTs).
 
   --pretrained-critic PATH  Path to a pretrained critic .pkl from pretrain_critic.py.
                             Injects obs_encoder + critic params before online training begins.
@@ -267,6 +270,7 @@ while [[ $# -gt 0 ]]; do
     --steervla-checkpoint|--steervla_checkpoint) STEERVLA_CKPT="$2"; shift 2 ;;
     --actor-config|--actor_config) ACTOR_CONFIG="$2"; shift 2 ;;
     --grpo-warmup|--grpo_warmup) GRPO_WARMUP="$2"; shift 2 ;;
+    --cot-temperature|--cot_temperature) COT_TEMPERATURE="$2"; shift 2 ;;
     --pretrained-critic|--pretrained_critic) PRETRAINED_CRITIC="$2"; shift 2 ;;
     --qgf-critic-ckpt|--qgf_critic_ckpt) QGF_CRITIC_CKPT="$2"; shift 2 ;;
     --qgf-guidance-weight|--qgf_guidance_weight) QGF_GUIDANCE_WEIGHT="$2"; shift 2 ;;
@@ -431,11 +435,14 @@ def get_config():
     # Base-policy overrides (e.g. deploy a relabelled Stage-1 ckpt). Empty -> keep config value.
     _STEERVLA_CKPT = r"${STEERVLA_CKPT}"
     _ACTOR_CONFIG = r"${ACTOR_CONFIG}"
+    _COT_TEMP = "${COT_TEMPERATURE}"
     if "steervla" in config:
         if _STEERVLA_CKPT != "":
             config.steervla.checkpoint = _STEERVLA_CKPT
         if _ACTOR_CONFIG != "":
             config.steervla.actor_config = _ACTOR_CONFIG
+        if _COT_TEMP != "":
+            config.steervla.cot_temperature = float(_COT_TEMP)
         if _HL_CKPT_DIR != "":
             config.steervla.hl_checkpoint_dir = _HL_CKPT_DIR
         if _HL_CKPT_EVERY != "":
@@ -517,7 +524,7 @@ export PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla:${ROOT_DIR}/simlingo-rebuttal${
 
 echo "[run_carla.sh] agent_config=${BASE_AGENT_CFG}${STEERVLA_CKPT:+ steervla_checkpoint=${STEERVLA_CKPT}}${ACTOR_CONFIG:+ actor_config=${ACTOR_CONFIG}}"
 echo "[run_carla.sh] enable_updates=${ENABLE_UPDATES} base_only=${BASE_ONLY:-<config default>} state_encoder=${STATE_ENCODER:-<config default>}${RLT_CHECKPOINT:+ rlt_checkpoint=${RLT_CHECKPOINT}}"
-echo "[run_carla.sh] hl_gpu_rank=${HL_TRAIN_GPU_RANK:-<config>} max_retries=${MAX_RETRIES}${GRPO_WARMUP:+ grpo_warmup=${GRPO_WARMUP}}"
+echo "[run_carla.sh] hl_gpu_rank=${HL_TRAIN_GPU_RANK:-<config>} max_retries=${MAX_RETRIES}${GRPO_WARMUP:+ grpo_warmup=${GRPO_WARMUP}}${COT_TEMPERATURE:+ cot_temperature=${COT_TEMPERATURE}}"
 echo "[run_carla.sh] hl_ckpt_dir=${HL_CKPT_DIR:-<config>} hl_ckpt_every=${HL_CKPT_EVERY:-<config>} hl_ckpt_keep_last=${HL_CKPT_KEEP_LAST:-<config>}"
 
 # Stable run name so save_dir + the W&B run id survive restarts (the supervisor resumes,
