@@ -1,19 +1,16 @@
-"""VLM coaches that review driving rollout videos and annotate good/bad moments.
+"""VLM feedback **v2** -- prompt-iteration copy of ``vlm_feedback.py``.
 
-Supports:
-  - Google Gemini (``gemini-2.0-flash`` by default)
-  - Perceptron video QA API
+Byte-identical to v1 at creation time. Imported only by ``cast_relabel_v2.py``, which is itself
+only used when ``cast_relabel.prompt_version = 2``; v1 is untouched so a running experiment keeps
+its prompts stable while these are edited.
 
-Run from ``impls/``::
-
-    python -m coaches.vlm_feedback \\
-        --video /path/to/rollout.mp4 \\
-        --metadata /path/to/metadata.json \\
-        --provider gemini \\
-        --output /path/to/annotated.mp4
-
-Output videos are twice as wide as the input: original footage on the left,
-black panel on the right with timed coach annotations.
+PROMPT TO ITERATE ON (this file):
+  * ``build_coaching_prompt`` -- the window-review prompt. This is step 2 of CAST: the VLM watches
+    the window video and emits timestamped GOOD/BAD events. It already asks
+      "Are there any stop signs or traffic lights in the video? What are their states?"
+      "Does the vehicle properly stop at red lights and stop signs?"
+    but nothing constrains WHERE the stop should happen, so a stop 30 m short of the line still
+    reads as GOOD. If the ego is stopping early, this prompt is the first place to look.
 """
 
 from __future__ import annotations
@@ -317,8 +314,8 @@ def build_coaching_prompt(
         - What other vehicles are there? What lanes are they in? 
         - Is there a leading vehicle? If so, how far ahead is it? Is it stopped or moving? 
         - Are there any pedestrians or cyclists in the video? If so, what are they doing? 
-        - Are there any stop signs or traffic lights in the video? What are their states?
-        - Is the vehicle stopped at a crosswalk or in the middle of the road?
+        - Are there any stop signs or traffic lights in the video? When are they red or green? Timing is important here.
+        - Where is the egovehicle in relation to other vehicles, pedestirans, lanes, crosswalks etc.?
         - According to the overall task (the ordered routing-command plan above) and the current
           routing command in the per-timestamp data, what maneuver should the vehicle be
           performing right now (following the road, turning left/right at the intersection,

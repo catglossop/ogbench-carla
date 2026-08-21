@@ -109,9 +109,12 @@ DEFAULT_REASONING_FIELD = "gemini_refined_label"
 # offline pipeline pixel-identical to the online one instead of round-tripping through 512.
 DEFAULT_IMAGE_SIZE = 224
 
-# Indices into the raw CARLA ego-state vector; mirrors coaches.cast_relabel.
-EGO_STATE_IDX_YAW = 5
+# Indices into the raw CARLA ego-state vector; mirrors coaches.cast_relabel. Index 11 is ``avel.z``
+# (yaw rate, deg/s); scaled by SIMLINGO_FRAME_DT it becomes the per-frame heading delta SimLingo
+# stores in ``ego_hist[..., 1]``. See ``vlas.steervla.carla_yaw_rate_to_simlingo_course``.
+EGO_STATE_IDX_YAW_RATE = 11
 EGO_STATE_IDX_SPEED = 15
+SIMLINGO_FRAME_DT = 0.25
 
 # PaliGemma CoT segment sentinels, and the speed prefix the loader re-adds itself.
 _LOC_SENTINEL_RE = re.compile(r"<loc\d+>")
@@ -362,7 +365,7 @@ def resize_stretch(image: np.ndarray, size: int) -> np.ndarray:
 
 
 def _fit_ego_hist(ego_hist: Any, state: Any, current_speed: float, ego_history_len: int) -> np.ndarray:
-    """``(ego_history_len, 2)`` of raw ``[speed, yaw]``, padded/truncated as needed.
+    """``(ego_history_len, 2)`` of ``[speed, course]``, padded/truncated as needed.
 
     Falls back to tiling the current pair (read out of the raw CARLA state vector) for corpora
     written before ``ego_hist`` was stored.
@@ -375,14 +378,14 @@ def _fit_ego_hist(ego_hist: Any, state: Any, current_speed: float, ego_history_l
         return np.ascontiguousarray(np.concatenate([pad, arr], axis=0))
 
     speed = float(current_speed)
-    yaw = 0.0
+    course = 0.0
     if state is not None:
         flat = np.asarray(state, dtype=np.float32).reshape(-1)
         if flat.size > EGO_STATE_IDX_SPEED:
             speed = float(flat[EGO_STATE_IDX_SPEED])
-        if flat.size > EGO_STATE_IDX_YAW:
-            yaw = float(flat[EGO_STATE_IDX_YAW])
-    return np.tile(np.array([speed, yaw], dtype=np.float32), (ego_history_len, 1))
+        if flat.size > EGO_STATE_IDX_YAW_RATE:
+            course = float(flat[EGO_STATE_IDX_YAW_RATE]) * SIMLINGO_FRAME_DT
+    return np.tile(np.array([speed, course], dtype=np.float32), (ego_history_len, 1))
 
 
 def _fit_action_chunk(actions: Any, action_dim: int = 4) -> np.ndarray:

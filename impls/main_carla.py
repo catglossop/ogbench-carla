@@ -1557,11 +1557,37 @@ def _annotate_full_frame(
     return out
 
 
+# Longest edge for video kept only for humans to look at (W&B panels, local .mp4 dumps). The camera
+# now renders at 1024x512 and the CAST debug overlay doubles frame width on top of that, so an
+# un-downscaled episode video is ~2048px wide -- megabytes per episode, uploaded every time, for a
+# panel nobody inspects at full size. This does NOT touch the frames handed to a model: the Gemini
+# CAST coach still uploads its window at the native sensor resolution (see
+# ``coaches/cast_relabel.py``'s ``write_frames_to_mp4``), and the VLA reads ``obs["image"]``.
+_SAVED_VIDEO_MAX_WIDTH = 512
+
+
+def _shrink_frames_for_saving(frames: list[np.ndarray], max_width: int = _SAVED_VIDEO_MAX_WIDTH):
+    """Downscale frames for logging/saving only. Aspect-preserving; no-op if already small."""
+    if not frames:
+        return frames
+    h, w = np.asarray(frames[0]).shape[:2]
+    if w <= max_width:
+        return frames
+    scale = max_width / float(w)
+    new_wh = (max_width, max(1, int(round(h * scale))))
+    try:
+        import cv2
+
+        return [cv2.resize(np.asarray(f), new_wh, interpolation=cv2.INTER_AREA) for f in frames]
+    except Exception:  # noqa: BLE001 - a failed shrink must never cost the video.
+        return frames
+
+
 def _episode_video(frames: list[np.ndarray], fps: float):
     """Stack captured frames into a W&B video (T, C, H, W); None if empty."""
     if not frames:
         return None
-    video = np.stack(frames, axis=0)
+    video = np.stack(_shrink_frames_for_saving(frames), axis=0)
     if video.ndim == 4:
         video = np.transpose(video, (0, 3, 1, 2))
     return wandb.Video(video, fps=fps, format="mp4")
@@ -2044,7 +2070,21 @@ def run_online_carla(
     _cast_relabel: OnlineCastRelabelSession | None = None
     cast_cfg = agent_config.get("cast_relabel")
     if cast_cfg is not None and bool(cast_cfg.get("enabled", False)):
-        _cast_relabel = OnlineCastRelabelSession(
+        # ``cast_relabel.prompt_version`` selects which copy of the labeling prompts to run.
+        # 1 (default) = coaches/cast_relabel.py + coaches/vlm_feedback.py -- the stable pair.
+        # 2           = coaches/cast_relabel_v2.py + coaches/vlm_feedback_v2.py -- the scratch pair
+        #               for prompt iteration. Nothing in v2 is imported unless this is set to 2, so
+        #               editing those files cannot perturb a run that did not opt in.
+        _cast_cls = OnlineCastRelabelSession
+        _prompt_version = int(cast_cfg.get("prompt_version", 1) or 1)
+        if _prompt_version == 2:
+            from coaches.cast_relabel_v2 import OnlineCastRelabelSession as _CastV2
+
+            _cast_cls = _CastV2
+            print("[cast_relabel] prompt_version=2 -> using cast_relabel_v2 + vlm_feedback_v2", flush=True)
+        elif _prompt_version != 1:
+            raise ValueError(f"cast_relabel.prompt_version must be 1 or 2, got {_prompt_version}")
+        _cast_relabel = _cast_cls(
             cast_cfg,
             save_dir=FLAGS.save_dir,
             action_chunk_steps=int(agent_config.get("action_horizon", 10)),
@@ -2718,6 +2758,9 @@ def run_online_carla(
     ) -> None:
         import cv2  # type: ignore
 
+        # Local .mp4 dumps are for eyeballing, so shrink them like the W&B copies. The per-frame
+        # PNG dump below is written from the same shrunk frames, keeping the two consistent.
+        frames = _shrink_frames_for_saving(frames)
         h, w = frames[0].shape[:2]
         tag = f"ep{ep_idx:04d}{suffix}"
         path = str(_video_dir / f"{tag}.mp4")

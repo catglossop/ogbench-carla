@@ -52,6 +52,12 @@ def get_config():
     config.cast_relabel = ml_collections.ConfigDict(
         dict(
             enabled=True,
+            # Which copy of the labeling prompts to run.
+            #   1 = coaches/cast_relabel.py + coaches/vlm_feedback.py      (stable)
+            #   2 = coaches/cast_relabel_v2.py + coaches/vlm_feedback_v2.py (scratch, for iterating
+            #       on the GOOD/BAD review + subtask prompts). v2 is not imported at all unless
+            #       this is 2, so editing it cannot perturb a run that did not opt in.
+            prompt_version=1,
             # Log annotated debug videos (per-chunk GOOD/BAD + suggested subtasks) to wandb.
             debug=True,
             debug_task=False,

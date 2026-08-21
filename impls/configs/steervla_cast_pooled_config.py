@@ -62,7 +62,15 @@ def get_config():
     # for the whole hold, leaving the lateral loop open (see commit 69fd7c3). The actor already
     # defaults this to True, but a pooled run holds chunks on every one of its workers, so the
     # dependency is stated here instead of relying on that default.
+    # Use the v2 coaching prompts (coaches/cast_relabel_v2.py + coaches/vlm_feedback_v2.py).
+    config.cast_relabel.prompt_version = 2
+
     config.steervla.reanchor_cached_chunk = True
+    # Chunk hold / CoT reuse. Decoupled deliberately: the chunk is re-queried every 3 env steps
+    # while the CoT reasoning+subtask is reused for 5, so the policy re-plans its trajectory more
+    # often than it re-thinks its intent. Re-anchoring above is what makes a >1 hold safe.
+    config.steervla.actions_per_model_query = 3
+    config.steervla.actions_per_cot = 5
 
     # ── trainer-side HL knobs ─────────────────────────────────────────────────────────
     # One big round instead of the solo config's small, frequent updates. The trainer has a whole
@@ -75,8 +83,14 @@ def get_config():
     # batch was 90 online + 38 replay. So a replay-only trial does not clear batch 128 -- keep 64,
     # which halves the activation footprint, and raise only with a real online-heavy batch to test.
     config.steervla.hl_update_batch_size = 64
-    config.steervla.hl_update_every = 1  # the trainer's round IS the throttle; never skip a call.
-    config.steervla.hl_update_num_steps = 32
+    # NOTE: inert in a pooled run. ``train_hl_pooled.py`` forces ``hl_update_every = 1`` because the
+    # trainer is driven by ROUNDS, not by a per-call throttle -- ``cast_pool.round_new_samples`` is
+    # the pooled equivalent of this knob. Left at the requested 8 so the intent is recorded; to
+    # actually train 8x less often, multiply ``round_new_samples`` instead.
+    config.steervla.hl_update_every = 8
+    # 32 steps per round over-fits a round's worth of fresh corrections; 2 keeps each round a light
+    # nudge, closer to the solo cast_relabel runs (which used 1).
+    config.steervla.hl_update_num_steps = 2
     # Sliding window over policy versions: drop online samples produced more than N rounds ago. They
     # were corrections for a backbone that has since been replaced, and keeping them indefinitely is
     # what drives the sample-reuse blowup seen in the solo runs. Offline replay pools are exempt
@@ -103,7 +117,7 @@ def get_config():
             # Trainer: size of the pooled update. These override the steervla.hl_update_* values
             # above at call time, so a round is a single deliberate unit of training.
             round_batch_size=64,  # see the MEASURED note above before raising this.
-            round_num_steps=32,
+            round_num_steps=2,
             # Trainer: seconds between pool polls while waiting for a round to fill.
             poll_interval_sec=15.0,
             # Trainer: published versions to retain (~10 GB each). Must stay comfortably above 1 --

@@ -235,6 +235,37 @@ ROUTING_COMMAND_TEXT = {
     6: "do a lane change to the right",
 }
 
+
+def format_routing_command(
+    command_id: int,
+    next_command_id: int,
+    *,
+    dist_m: int,
+    include_distance: bool,
+) -> str:
+    """Render the routing instruction in SimLingo's training grammar.
+
+    Ported verbatim from simlingo's ``eval_route_as == 'command'`` branch (kept in this repo at
+    ``ogbench/carla/carla.py``), because that is what produced the ``routing_command`` strings the
+    SteerVLA checkpoint was fine-tuned on. Two forms, and the trailing clause is the part this env
+    used to drop:
+
+        follow the road.
+        follow the road then go right at the next intersection.
+        go right at the next intersection in 20 meter then follow the road.
+
+    The follow-on clause is omitted when it would repeat the current command, which is why plain
+    ``follow the road.`` dominates -- 888 of 1017 sampled training steps, against 128 that carry a
+    ``then`` clause and 1 manoeuvre with a distance but no continuation.
+    """
+    command = ROUTING_COMMAND_TEXT.get(int(command_id), "follow the road")
+    next_command = ROUTING_COMMAND_TEXT.get(int(next_command_id), "follow the road")
+    suffix = "" if next_command == command else f" then {next_command}"
+    if include_distance:
+        return f"{command} in {int(dist_m)} meter{suffix}."
+    return f"{command}{suffix}."
+
+
 # Pre-computed per-town speed-limit lookup tables (simlingo, km/h, CARLA world coords).
 _SPEED_LIMITS_DIR = Path(__file__).resolve().parent.parent.parent / "impls" / "coaches" / "simlingo" / "speed_limits"
 
@@ -1496,6 +1527,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._routing_last_command: int = -1
         self._routing_dist_to_waypoint: int = 0  # metres; only shown when far_cmd != LANEFOLLOW
         self._routing_include_distance: bool = False
+        self._routing_next_command: int = 4  # the manoeuvre after the current one ("then ...")
         self._target_points_ego: np.ndarray = np.zeros((2, 2), dtype=np.float32)  # (2, 2) ego-frame
         self._speed_limit_tree: Any | None = None
         self._speed_limit_values: Any | None = None
@@ -1876,6 +1908,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._routing_last_command = -1
         self._routing_dist_to_waypoint = 0
         self._routing_include_distance = False
+        self._routing_next_command = 4
         self._target_points_ego = np.zeros((2, 2), dtype=np.float32)
         self._route_planner = None
         try:
@@ -2174,17 +2207,20 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
 
         if len(waypoint_route) > 2:
             far_wp, cmd = waypoint_route[1]
-            next_far_wp, _ = waypoint_route[2]
+            next_far_wp, next_cmd = waypoint_route[2]
         elif len(waypoint_route) > 1:
             far_wp, cmd = waypoint_route[1]
-            next_far_wp, _ = waypoint_route[1]
+            next_far_wp, next_cmd = waypoint_route[1]
         else:
             far_wp, cmd = waypoint_route[0]
-            next_far_wp, _ = waypoint_route[0]
+            next_far_wp, next_cmd = waypoint_route[0]
 
         far_cmd_int = int(getattr(cmd, "value", cmd))
         if not (1 <= far_cmd_int <= 6):
             return
+        next_cmd_int = int(getattr(next_cmd, "value", next_cmd))
+        if not (1 <= next_cmd_int <= 6):
+            next_cmd_int = far_cmd_int
 
         yaw = _math.radians(tf.rotation.yaw)
         cos_y, sin_y = _math.cos(yaw), _math.sin(yaw)
@@ -2204,12 +2240,17 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             self._routing_last_command = prev_tmp
         self._routing_last_command_tmp = far_cmd_int
         if self._routing_last_command in (1, 2, 3) and far_cmd_int == 4:
+            # Just cleared a manoeuvre: keep naming it (without distance) and let LANEFOLLOW become
+            # the follow-on, exactly as simlingo's ``eval_route_as == 'command'`` branch does
+            # (mirrored in ``ogbench/carla/carla.py``).
             self._current_routing_command = self._routing_last_command
             self._routing_include_distance = False
+            self._routing_next_command = far_cmd_int
         else:
             self._current_routing_command = far_cmd_int
             self._routing_include_distance = far_cmd_int != 4
             self._routing_dist_to_waypoint = dist
+            self._routing_next_command = next_cmd_int
 
     def _load_speed_limit_map(self, map_name: str) -> bool:
         """Load the precomputed speed-limit cKDTree for ``map_name``; return True on success."""
@@ -2852,11 +2893,11 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             "commentary_text": commentary_text,
             "expert_action": expert_action,
             "scene_context": scene_context,
-            "routing_command": (
-                f"{ROUTING_COMMAND_TEXT.get(self._current_routing_command, 'follow the road')}"
-                f" in {self._routing_dist_to_waypoint} meter."
-                if self._routing_include_distance
-                else f"{ROUTING_COMMAND_TEXT.get(self._current_routing_command, 'follow the road')}."
+            "routing_command": format_routing_command(
+                self._current_routing_command,
+                self._routing_next_command,
+                dist_m=self._routing_dist_to_waypoint,
+                include_distance=self._routing_include_distance,
             ),
             # Constant per episode: the full ordered list of routing commands over the route
             # (see :func:`_summarize_route_commands`). Lets downstream consumers show the

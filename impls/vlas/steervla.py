@@ -620,17 +620,48 @@ def unformat_steervla_cot_prompt(text: str) -> str:
     return stripped
 
 
+# Seconds between two SimLingo dataset frames. Measured from the RLDS itself: per-step ego
+# displacement / speed has median 0.2500 s over 711 sampled steps, and the first
+# ``future_10_xy_delta_t`` waypoint gives the same figure. It is also what
+# ``steervla_simlingo_control`` already assumes for the chunk it decodes
+# (``data_save_freq=5 / carla_fps=20``). One CARLA *env* step is 1/20 s, five times finer.
+SIMLINGO_FRAME_DT = 0.25
+
+# Indices into the raw CARLA ego-state vector (``carla_utils`` STATE_DIM layout). Index 11 is
+# ``avel.z`` from ``carla.Actor.get_angular_velocity()``, i.e. the yaw *rate* in deg/s.
+_CARLA_IDX_YAW_RATE_DPS = 11
+_CARLA_IDX_SPEED = 15
+
+
+def carla_yaw_rate_to_simlingo_course(yaw_rate_dps: float) -> float:
+    """Yaw rate (deg/s) -> the per-frame heading delta SimLingo calls ``local_course`` (deg).
+
+    The SimLingo loader fills proprio dim 1 from ``observation/ego_hist[..., 1]``, which is
+    ``global_course[t] - global_course[t-1]`` — a heading *change* over one 0.25 s dataset frame,
+    not a heading. Feeding CARLA's absolute ``rot.yaw`` there (as this did until 2026-08-21) put a
+    near-uniform ±180 deg value into a slot whose training distribution is p1 −18.3, p99 +23.4 deg.
+
+    Scaling the instantaneous yaw rate to one dataset frame reproduces that distribution closely:
+    measured over 1200 stored CARLA samples, ``avel.z * 0.25`` lands at p1 −16.7, p99 +25.2 deg.
+    A finite difference of ``rot.yaw`` over the last five env steps would be the more literal
+    equivalent, but it needs cross-step memory the offline HL replay path does not have, and this
+    form recomputes correctly from every ``state`` vector already written to disk.
+    """
+    return float(yaw_rate_dps) * SIMLINGO_FRAME_DT
+
+
 def carla_state_vec_to_steervla_state(
     carla_vec: np.ndarray,
     *,
     include_ego_history: bool,
     proprio_norm: bool,
 ) -> np.ndarray:
-    """Map CARLA ego+command vector (``carla_utils.STATE_DIM``-dim) to padded proprio; uses indices 5 and 15."""
+    """Map CARLA ego+command vector (``carla_utils.STATE_DIM``-dim) to padded proprio; uses indices 11 and 15."""
     flat_sv = np.asarray(carla_vec, dtype=np.float32).reshape(-1)
-    speed = float(flat_sv[15])
-    yaw_deg = float(flat_sv[5])
-    raw_pair = np.array([speed, yaw_deg], dtype=np.float32)
+    speed = float(flat_sv[_CARLA_IDX_SPEED])
+    # Heading *delta* per SimLingo frame, not the absolute yaw -- see the function above.
+    course_deg = carla_yaw_rate_to_simlingo_course(flat_sv[_CARLA_IDX_YAW_RATE_DPS])
+    raw_pair = np.array([speed, course_deg], dtype=np.float32)
     normalized = sv_policy.normalize_ego_state(
         raw_pair,
         include_ego_history=include_ego_history,
@@ -2114,6 +2145,11 @@ class SteerVLAActor:
             "pool": e.get("pool", "online"),
             "label": e.get("label"),
             "credit_source": e.get("credit_source", ""),
+            # Carried through from the scanned entry purely for the batch dump. The staleness
+            # window itself filters *entries* (``_filter_stale_entries`` at scan time), which
+            # already have this -- but without propagating it here the dumped batch reports every
+            # row as -1 ("unversioned"), which reads as if the sliding window were inert.
+            "policy_version": int(e.get("policy_version", -1)),
         }
 
     def _load_hl_batch(self, batch_size: int):
@@ -2634,6 +2670,17 @@ class SteerVLAActor:
                         "prompt": prompts[i],
                         "subtask": subtasks[i],
                         "reasoning": reasonings[i],
+                        # Carried so the corrective composition of each batch stays reconstructable
+                        # offline. The BAD/GOOD and precursor/direct split is printed to stdout only
+                        # ONCE per process (``_hl_replay_logged_once``), which is fine for a solo run
+                        # but leaves a pooled trainer -- whose rounds are minutes apart and whose
+                        # whole point is the corrective bias -- with no way to check that
+                        # ``hl_online_bad_fraction`` / ``hl_online_precursor_fraction`` are actually
+                        # being met as the pool grows. These two fields make that computable from
+                        # hl_update_batches.jsonl without adding per-update log spam.
+                        "label": (records[i].get("label") or None),
+                        "credit_source": (records[i].get("credit_source") or None),
+                        "policy_version": int(records[i].get("policy_version", -1)),
                         "supervise_fast": bool(records[i].get("supervise_fast", False)),
                         "action_supervision": bool(records[i].get("action_supervision", False)),
                     }

@@ -21,12 +21,37 @@ from leaderboard.autoagents.autonomous_agent import AutonomousAgent, Track
 
 
 RGB_FRONT_CAMERA_TAG = "rgb_front"
-# CARLA renders at viz resolution; ``carla_utils`` downscales to policy resolution.
-VIZ_CAMERA_HEIGHT = 288
-VIZ_CAMERA_WIDTH = 512
+# Raised 2026-08-20 to SimLingo's camera RESOLUTION (1024x512) because traffic lights were only a
+# few pixels across in the window video the Gemini CAST coach reviews, then completed 2026-08-21 to
+# SimLingo's FULL camera -- ``fov``/``x``/``z`` in :meth:`ObservationOnlyAgent.sensors` now match
+# ``simlingo_obs.py`` (fov=110, x=-1.5, z=2.0) as well. The two agents therefore render the same
+# view; they differ only in that this one downscales a policy copy.
+#
+# Why the extrinsics had to follow the resolution: the SteerVLA checkpoint is fine-tuned on SimLingo
+# frames, so every pixel it has ever seen came from that mount. Matching 1024x512 while keeping
+# fov=90 at (0.7, 1.6) produced a correctly-shaped frame of the wrong scene -- narrower, further
+# forward, lower. ``fov`` is HORIZONTAL in CARLA, so at 2:1 the vertical field of view goes from
+# ~53.1 deg (fov 90) to ~71.1 deg (fov 110); overhead traffic lights sit high in frame and that is
+# most of what the extra vertical view buys.
+#
+# This changes the observation distribution for everything downstream, not just the VLA: replay
+# buffers, critic checkpoints and CAST videos collected before 2026-08-21 came from the old mount.
+#
+# ONE resize for the VLA, NONE for the VLM:
+#   * VLM (Gemini CAST coach) reads ``image_viz``, which ``rgb_viz_from_leaderboard_dict`` leaves
+#     untouched whenever the sensor already renders at ``VIZ_IMAGE_SHAPE_HWC`` -- so it sees the
+#     native 1024x512 frame with no resampling at all.
+#   * VLA (Pi0-CoT) reads ``image``, which is ``IMAGE_SHAPE_HWC`` == the model's own 224x224 input.
+#     ``downscale_rgb_for_policy`` performs that single squeeze straight from the native frame, and
+#     ``vlas.steervla._resize_hl_image`` then becomes a no-op (already 224x224). Previously this was
+#     TWO lossy steps (native -> 256x144 -> stretched 224x224); collapsing them keeps small, thin
+#     objects far better, which is the whole point of the resolution bump.
+VIZ_CAMERA_HEIGHT = 512
+VIZ_CAMERA_WIDTH = 1024
 VIZ_IMAGE_SHAPE_HWC = (VIZ_CAMERA_HEIGHT, VIZ_CAMERA_WIDTH, 3)
-CAMERA_HEIGHT = 144
-CAMERA_WIDTH = 256
+# == vlas.steervla._HL_IMAGE_HW. Keep these two in sync: the point is that no second resize happens.
+CAMERA_HEIGHT = 224
+CAMERA_WIDTH = 224
 IMAGE_SHAPE_HWC = (CAMERA_HEIGHT, CAMERA_WIDTH, 3)
 
 
@@ -50,11 +75,13 @@ class ObservationOnlyAgent(AutonomousAgent):
             {
                 "type": "sensor.camera.rgb",
                 "id": RGB_FRONT_CAMERA_TAG,
-                "x": 0.7, "y": 0.0, "z": 1.6,
+                # SimLingo's training camera pose (GlobalConfig.camera_pos_0), mirrored from
+                # ``simlingo_obs.py``. Keep the two in sync -- see the header comment.
+                "x": -1.5, "y": 0.0, "z": 2.0,
                 "roll": 0.0, "pitch": 0.0, "yaw": 0.0,
                 "width": VIZ_CAMERA_WIDTH,
                 "height": VIZ_CAMERA_HEIGHT,
-                "fov": 90,
+                "fov": 110,
             },
             {"type": "sensor.other.gnss", "id": "gps",
              "x": 0.7, "y": 0.0, "z": 1.6},
