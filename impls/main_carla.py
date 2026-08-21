@@ -1558,12 +1558,7 @@ def _annotate_full_frame(
 
 
 def _episode_video(frames: list[np.ndarray], fps: float):
-    """Stack captured frames into a W&B video (T, C, H, W); None if empty.
-
-    Frame heights vary within a rollout because the annotation panel grows with its line count
-    (e.g. GRPO's ~9-line candidate HUD vs a 1-line warmup/scoring-failed banner), so zero-pad every
-    frame to the batch max H/W before stacking rather than crashing at episode end on ``np.stack``.
-    """
+    """Stack captured frames into a W&B video (T, C, H, W); None if empty."""
     if not frames:
         return None
     hmax = max(f.shape[0] for f in frames)
@@ -4869,6 +4864,14 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
     video_every = max(1, int(config.get("episode_video_every", 2)))
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, "train.csv"))
 
+    select_mode = str(grpo.get("select_mode", "argmax"))
+    select_rng = np.random.default_rng(FLAGS.seed)  # only used when select_mode == "random"
+    # No-learning diagnostic: score + execute as usual but skip the HL gradient step, to isolate
+    # whether behavior changes come from updates or from inference (temperature/selection).
+    updates_enabled = bool(config.get("enable_updates", True))
+    if not updates_enabled:
+        print("[grpo] enable_updates=False: scoring + selection only, no HL updates.", flush=True)
+
     base_model = getattr(steervla_actor, "model", None)
     base_noise_dim = int(base_model.action_horizon) * int(base_model.action_dim) if base_model is not None else 40
     rng = jax.random.PRNGKey(FLAGS.seed)
@@ -4900,14 +4903,18 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
     def _do_update(step_tag: int) -> None:
         nonlocal pooled, pooled_adv, score_stats, winner_scores, inject_wins, states_since_update, update_idx
         nonlocal score_fail_count
-        if not pooled:
+        # Nothing pooled (updates on) or no scored states (updates off) -> nothing to flush.
+        if not score_stats:
             return
-        uinfo = steervla_actor.update_hl_grpo(
-            pooled, np.asarray(pooled_adv, dtype=np.float32),
-            beta=beta_kl, num_epochs=num_epochs, global_step=step_tag,
-        )
+        if updates_enabled:
+            uinfo = steervla_actor.update_hl_grpo(
+                pooled, np.asarray(pooled_adv, dtype=np.float32),
+                beta=beta_kl, num_epochs=num_epochs, global_step=step_tag,
+            )
+            metrics = {f"grpo/{k}": float(v) for k, v in uinfo.items()}
+        else:
+            metrics = {}
         all_scores = np.concatenate(score_stats) if score_stats else np.zeros((1,), dtype=np.float32)
-        metrics = {f"grpo/{k}": float(v) for k, v in uinfo.items()}
         metrics.update({
             "grpo/update": float(update_idx),
             "grpo/beta_kl": beta_kl,
@@ -4979,11 +4986,18 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
                 print("[grpo] VLM scoring failed after retries; driving base chunk (state not pooled).", flush=True)
                 scored, scoring_failed, score_fail_count = False, True, score_fail_count + 1
         if scored:
-            adv = (scores - scores.mean()) / (scores.std() + adv_eps)
-            pooled.extend(recs)
-            pooled_adv.extend(float(a) for a in adv)
+            if updates_enabled:
+                adv = (scores - scores.mean()) / (scores.std() + adv_eps)
+                pooled.extend(recs)
+                pooled_adv.extend(float(a) for a in adv)
             score_stats.append(scores)
-            winner = int(np.argmax(scores))
+            # Which candidate is EXECUTED (pooling/advantages/updates use all K regardless).
+            if select_mode == "random":
+                winner = int(select_rng.integers(n_cand))
+            elif select_mode == "first":
+                winner = 0
+            else:
+                winner = int(np.argmax(scores))
             winner_scores.append(float(scores[winner]))
             inject_wins.append(1.0 if (inject_stop and winner == 0) else 0.0)
             states_since_update += 1
@@ -5078,11 +5092,13 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
             steervla_actor.reset_action_cache()
 
         if states_since_update >= update_every:
-            _do_update(step)
-        if ckpt_every_steps > 0 and step % ckpt_every_steps == 0:
+            _do_update(step)  # flushes score logs; skips the gradient step when updates disabled
+        if updates_enabled and ckpt_every_steps > 0 and step % ckpt_every_steps == 0:
             steervla_actor.save_checkpoint(ckpt_root, step)
 
     _do_update(total_steps)
+    if not updates_enabled:
+        return
     try:
         steervla_actor.save_checkpoint(ckpt_root, total_steps)  # final export
     except Exception as exc:  # noqa: BLE001

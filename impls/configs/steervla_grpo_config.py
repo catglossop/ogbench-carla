@@ -60,6 +60,9 @@ def get_config():
             # Drive the GREEDY base (cot_temperature=0, no scoring/pooling/updates) for the first N env
             # steps to log an in-run base baseline before GRPO exploration begins. 0 = off.
             warmup_steps=0,
+            # Which scored candidate to EXECUTE (pooling/advantages/updates are unaffected): "argmax"
+            # (VLM-best, default), "random" (diagnostic: isolates selection bias), or "first".
+            select_mode="argmax",
             # Candidate CoTs sampled + VLM-scored per decision state (all K scored in one call); >=2.
             group_size=8,
             # Candidate sampling temperature; >0 for diversity (greedy -> zero-variance scores).
