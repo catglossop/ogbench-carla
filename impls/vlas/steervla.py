@@ -1596,9 +1596,9 @@ class SteerVLAActor:
             params, device = restore_openpi_params_on_single_gpu(
                 params_dir=params_dir, training_gpu_rank=training_gpu_rank
             )
-        self.model = self.train_cfg.model.load(params)
-        self._jax_device = device
-        self._hl_jax_device = device  # no HL update in inference-only mode; keep them aligned.
+            self.model = self.train_cfg.model.load(params)
+            self._jax_device = device
+            self._hl_jax_device = device  # no HL update in inference-only mode; keep them aligned.
 
         self.tokenizer = CoTPaligemmaTokenizer(
             max_prompt_len=model_cfg.max_token_len,
