@@ -1598,7 +1598,7 @@ class SteerVLAActor:
             )
         self.model = self.train_cfg.model.load(params)
         self._jax_device = device
-            self._hl_jax_device = device  # no HL update in inference-only mode; keep them aligned.
+        self._hl_jax_device = device  # no HL update in inference-only mode; keep them aligned.
 
         self.tokenizer = CoTPaligemmaTokenizer(
             max_prompt_len=model_cfg.max_token_len,
@@ -4042,8 +4042,8 @@ class SteerVLAActor:
         """
         if self._recompute_prefix_from_obs:
             prefix_out, prefix_mask = self._prefix_from_obs(raw, include_fast=True)
-        out = np.asarray(jax.device_get(prefix_out), dtype=np.float32)
-        mask = np.asarray(jax.device_get(prefix_mask), dtype=bool)
+            out = np.asarray(jax.device_get(prefix_out), dtype=np.float32)
+            mask = np.asarray(jax.device_get(prefix_mask), dtype=bool)
             return out, mask
         self._require_prefix_cache("pi prefix tokens")
         row = int(self._prefix_cache_row)
@@ -4666,7 +4666,7 @@ class SteerVLAActor:
             fig, (ax_score, ax_xy) = plt.subplots(1, 2, figsize=(13, 5))
 
             if np.all(np.isnan(t_context_arr)):
-            ax_score.scatter(range(n), scores_arr, alpha=0.75, label="candidates")
+                ax_score.scatter(range(n), scores_arr, alpha=0.75, label="candidates")
             else:
                 # Color by context noise level: makes it obvious when the score spread is driven by
                 # t_context rather than by the action noise this sweep is nominally searching over.
