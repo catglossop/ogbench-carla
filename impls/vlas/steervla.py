@@ -5090,6 +5090,7 @@ class SteerVLAActor:
 
         decode_bs = min(n, int(self.action_decode_batch_size))
         traj_parts: list[np.ndarray] = []
+        norm_parts: list[np.ndarray] = []
         for start in range(0, n, decode_bs):
             end = min(start + decode_bs, n)
             chunk_rng = jax.random.fold_in(rng_act, start)
@@ -5105,14 +5106,22 @@ class SteerVLAActor:
                 **t_context_kw,
             )
             jax.block_until_ready(traj)
+            norm_parts.append(
+                np.asarray(
+                    jax.device_get(traj[:, : int(self.action_horizon), : int(self.action_dim)]),
+                    dtype=np.float32,
+                ).reshape(end - start, -1)
+            )
             traj_np = self._postprocess_action_trajectory(
                 traj, observation_state=jax.tree.map(lambda x: x[start:end], obs_jax.state)
             )
             traj_parts.append(np.asarray(traj_np, dtype=np.float32))
         actions_flat = np.concatenate(traj_parts, axis=0).reshape(n, -1)
+        actions_norm = np.concatenate(norm_parts, axis=0).reshape(n, -1)
 
         return {
             "actions": actions_flat,
+            "actions_normalized": actions_norm,
             "subtask_texts": subtask_texts,
             "reasoning_texts": reasoning_texts,
             "cot_out": cot_out,

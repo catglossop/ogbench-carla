@@ -4309,7 +4309,9 @@ def run_online_residual(
         otf_mode -> N diverse CoT samples; else one base tiled to N."""
         if otf_mode:
             cands = steervla_actor.sample_candidates(n_cand, temperature=cot_temp, rng=key)
-            chunks = np.asarray(cands["actions"], dtype=np.float32).reshape(n_cand, -1)
+            chunks = np.asarray(
+                cands.get("actions_normalized", cands["actions"]), dtype=np.float32
+            ).reshape(n_cand, -1)
             base_cands = np.stack(
                 [np.asarray(_agent_base_action(o, chunks[i]), dtype=np.float32) for i in range(n_cand)],
                 axis=0,
@@ -4835,7 +4837,11 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
     from coaches.cast_relabel import build_candidate_score_prompt, parse_candidate_scores
 
     grpo = config.get("grpo") or {}
-    n_cand = max(2, int(grpo.get("group_size", 8)))
+    # No-learning diagnostic: score + execute as usual but skip the HL gradient step, to isolate
+    # whether behavior changes come from updates or from inference (temperature/selection).
+    updates_enabled = bool(config.get("enable_updates", True))
+    # GRPO training needs >=2 candidates for non-zero advantages; a no-learning diagnostic may use 1.
+    n_cand = max(1 if not updates_enabled else 2, int(grpo.get("group_size", 8)))
     score_temp = float(grpo.get("score_temperature", 1.0))
     beta_kl = float(grpo.get("beta_kl", 0.01))
     num_epochs = int(grpo.get("num_update_steps", 1))
@@ -4866,11 +4872,8 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
 
     select_mode = str(grpo.get("select_mode", "argmax"))
     select_rng = np.random.default_rng(FLAGS.seed)  # only used when select_mode == "random"
-    # No-learning diagnostic: score + execute as usual but skip the HL gradient step, to isolate
-    # whether behavior changes come from updates or from inference (temperature/selection).
-    updates_enabled = bool(config.get("enable_updates", True))
     if not updates_enabled:
-        print("[grpo] enable_updates=False: scoring + selection only, no HL updates.", flush=True)
+        print(f"[grpo] enable_updates=False: scoring + selection only, no HL updates (n_cand={n_cand}).", flush=True)
 
     base_model = getattr(steervla_actor, "model", None)
     base_noise_dim = int(base_model.action_horizon) * int(base_model.action_dim) if base_model is not None else 40
@@ -4950,7 +4953,10 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
             cands = steervla_actor.sample_candidates(n_cand, temperature=score_temp, raw=obs, rng=ck)
             subtasks = list(cands["subtask_texts"])
             reasonings = list(cands["reasoning_texts"])
-            chunks = np.asarray(cands["actions"], dtype=np.float32).reshape(n_cand, -1)
+            # Execute the RAW normalized chunk (env applies denormalize_actions)
+            chunks = np.asarray(
+                cands.get("actions_normalized", cands["actions"]), dtype=np.float32
+            ).reshape(n_cand, -1)
             recs = steervla_actor.grpo_records_from_candidates(cands, obs)
             if inject_stop:
                 # Swap candidate 0 for a canned stop: zero chunk (car brakes) + stop CoT record.
