@@ -101,6 +101,10 @@ ACTOR_CONFIG=""
 GRPO_WARMUP=""
 # GRPO-only: executed-candidate selection (argmax|random|first). Empty -> config default (argmax).
 GRPO_SELECT=""
+# GRPO-only: candidates sampled+scored per state. Empty -> config default. 1 = single-sample (no selection).
+GRPO_GROUP_SIZE=""
+# GRPO-only: candidate CoT sampling temperature. Empty -> config default. Low (even 0) = near-greedy BoN.
+GRPO_SCORE_TEMP=""
 # Override config.steervla.cot_temperature (e.g. 1.0 to sample the base CoT). Empty -> config default.
 COT_TEMPERATURE=""
 # Crash supervisor: relaunch main_carla (resuming from checkpoint) after a CARLA native
@@ -170,6 +174,8 @@ Options:
   --actor-config NAME       Override config.steervla.actor_config (match the ckpt's model).
   --grpo-warmup N           GRPO only: drive the greedy base for N steps before scoring/updates.
   --grpo-select MODE        GRPO only: executed candidate = argmax|random|first. Default: argmax.
+  --grpo-group-size N       GRPO only: candidates sampled/scored per state (1 = single-sample).
+  --grpo-score-temp T       GRPO only: candidate CoT sampling temperature (low/0 = near-greedy BoN).
   --cot-temperature T       Override config.steervla.cot_temperature (e.g. 1.0 to sample base CoTs).
 
   --pretrained-critic PATH  Path to a pretrained critic .pkl from pretrain_critic.py.
@@ -274,6 +280,8 @@ while [[ $# -gt 0 ]]; do
     --actor-config|--actor_config) ACTOR_CONFIG="$2"; shift 2 ;;
     --grpo-warmup|--grpo_warmup) GRPO_WARMUP="$2"; shift 2 ;;
     --grpo-select|--grpo_select) GRPO_SELECT="$2"; shift 2 ;;
+    --grpo-group-size|--grpo_group_size) GRPO_GROUP_SIZE="$2"; shift 2 ;;
+    --grpo-score-temp|--grpo_score_temp) GRPO_SCORE_TEMP="$2"; shift 2 ;;
     --cot-temperature|--cot_temperature) COT_TEMPERATURE="$2"; shift 2 ;;
     --pretrained-critic|--pretrained_critic) PRETRAINED_CRITIC="$2"; shift 2 ;;
     --qgf-critic-ckpt|--qgf_critic_ckpt) QGF_CRITIC_CKPT="$2"; shift 2 ;;
@@ -459,6 +467,12 @@ def get_config():
     _GRPO_SELECT = "${GRPO_SELECT}"
     if _GRPO_SELECT != "" and "grpo" in config:
         config.grpo.select_mode = _GRPO_SELECT
+    _GRPO_GROUP_SIZE = "${GRPO_GROUP_SIZE}"
+    if _GRPO_GROUP_SIZE != "" and "grpo" in config:
+        config.grpo.group_size = int(_GRPO_GROUP_SIZE)
+    _GRPO_SCORE_TEMP = "${GRPO_SCORE_TEMP}"
+    if _GRPO_SCORE_TEMP != "" and "grpo" in config:
+        config.grpo.score_temperature = float(_GRPO_SCORE_TEMP)
     config.enable_updates = ${ENABLE_UPDATES^}
     config.critic_feedback_mode = "${CRITIC_FEEDBACK_MODE}"
     config.online_training_mode = "${TRAIN_MODE}"
@@ -531,7 +545,7 @@ export PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla:${ROOT_DIR}/simlingo-rebuttal${
 
 echo "[run_carla.sh] agent_config=${BASE_AGENT_CFG}${STEERVLA_CKPT:+ steervla_checkpoint=${STEERVLA_CKPT}}${ACTOR_CONFIG:+ actor_config=${ACTOR_CONFIG}}"
 echo "[run_carla.sh] enable_updates=${ENABLE_UPDATES} base_only=${BASE_ONLY:-<config default>} state_encoder=${STATE_ENCODER:-<config default>}${RLT_CHECKPOINT:+ rlt_checkpoint=${RLT_CHECKPOINT}}"
-echo "[run_carla.sh] hl_gpu_rank=${HL_TRAIN_GPU_RANK:-<config>} max_retries=${MAX_RETRIES}${GRPO_WARMUP:+ grpo_warmup=${GRPO_WARMUP}}${GRPO_SELECT:+ grpo_select=${GRPO_SELECT}}${COT_TEMPERATURE:+ cot_temperature=${COT_TEMPERATURE}}"
+echo "[run_carla.sh] hl_gpu_rank=${HL_TRAIN_GPU_RANK:-<config>} max_retries=${MAX_RETRIES}${GRPO_WARMUP:+ grpo_warmup=${GRPO_WARMUP}}${GRPO_SELECT:+ grpo_select=${GRPO_SELECT}}${GRPO_GROUP_SIZE:+ grpo_group_size=${GRPO_GROUP_SIZE}}${GRPO_SCORE_TEMP:+ grpo_score_temp=${GRPO_SCORE_TEMP}}${COT_TEMPERATURE:+ cot_temperature=${COT_TEMPERATURE}}"
 echo "[run_carla.sh] hl_ckpt_dir=${HL_CKPT_DIR:-<config>} hl_ckpt_every=${HL_CKPT_EVERY:-<config>} hl_ckpt_keep_last=${HL_CKPT_KEEP_LAST:-<config>}"
 
 # Stable run name so save_dir + the W&B run id survive restarts (the supervisor resumes,
