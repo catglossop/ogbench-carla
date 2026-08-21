@@ -16,5 +16,6 @@ simulation_results*
 md_results/
 batch_examples/
 wandb/
+leaderboard_runs/
 # Generated temp configs + carla_job.sh bookkeeping/logs (see CLAUDE.md).
 .run_carla/

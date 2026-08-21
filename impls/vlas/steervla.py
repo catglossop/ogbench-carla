@@ -1706,10 +1706,10 @@ class SteerVLAActor:
                 self.model.sample_actions_with_prefix,
                 static_argnames=(
                     "num_steps",
-                    "image_keys",
-                ),
-            )
-
+                "image_keys",
+            ),
+        )
+        
         # Jitted pooled-prefix embedding for the per-step policy_embed path; the
         # eager _build_frozen_prefix_cache costs ~5 s/step (see _frozen_prefix_embed_forward).
         self._prefix_embed_fn = nnx_utils.module_jit(
@@ -4424,13 +4424,13 @@ class SteerVLAActor:
         )
         noise_jax = jax.device_put(noise_jax, self._jax_device)
         rng_cot, rng_act = jax.random.split(rng)
-
+        
         # Either sample or reuse the CoT
         _cot_t0 = time.time()
         cot_out = self._sample_or_reuse_cot(rng_cot, obs_jax, batch_size)
         jax.block_until_ready(cot_out["tokenized_reasoning"])
         print(f"[DEBUG - steervla] CoT time: {time.time() - _cot_t0:.3f} seconds")
-
+        
         reason_tokens = cot_out["tokenized_reasoning"]
         reason_mask = cot_out["tokenized_reasoning_mask"]
         reason_valid = reason_tokens[reason_mask.astype(bool)]
@@ -4527,13 +4527,13 @@ class SteerVLAActor:
             traj = self._qgf_guided_denoise(obs_full, noise_full, batch_size)
         else:
             traj = self._sample_actions_cached(
-                rng_act,
-                obs_full,
-                noise=noise_full,
-                num_steps=int(self.sample_actions_num_steps),
-                image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+            rng_act,
+            obs_full,
+            noise=noise_full,
+            num_steps=int(self.sample_actions_num_steps),
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
                 **t_context_kw,
-            )
+        )
         jax.block_until_ready(traj)
         sample_actions_time = time.time() - sample_actions_time
 
@@ -4920,7 +4920,7 @@ class SteerVLAActor:
             # Cache-hit path still corresponds to a real env step with a fresh `raw_obs_holder["obs"]`.
             # Re-stash the currently reused CoT so replay capture for this step remains aligned.
             if (
-                batch_size == 1 
+                batch_size == 1
                 and self._cached_cot is not None
                 and self.raw_obs_holder is not None
                 and isinstance(self.raw_obs_holder.get("obs"), dict)
@@ -5137,6 +5137,7 @@ class SteerVLAActor:
 
         decode_bs = min(n, int(self.action_decode_batch_size))
         traj_parts: list[np.ndarray] = []
+        norm_parts: list[np.ndarray] = []
         for start in range(0, n, decode_bs):
             end = min(start + decode_bs, n)
             chunk_rng = jax.random.fold_in(rng_act, start)
@@ -5152,14 +5153,22 @@ class SteerVLAActor:
                 **t_context_kw,
             )
             jax.block_until_ready(traj)
+            norm_parts.append(
+                np.asarray(
+                    jax.device_get(traj[:, : int(self.action_horizon), : int(self.action_dim)]),
+                    dtype=np.float32,
+                ).reshape(end - start, -1)
+            )
             traj_np = self._postprocess_action_trajectory(
                 traj, observation_state=jax.tree.map(lambda x: x[start:end], obs_jax.state)
             )
             traj_parts.append(np.asarray(traj_np, dtype=np.float32))
         actions_flat = np.concatenate(traj_parts, axis=0).reshape(n, -1)
+        actions_norm = np.concatenate(norm_parts, axis=0).reshape(n, -1)
 
         return {
             "actions": actions_flat,
+            "actions_normalized": actions_norm,
             "subtask_texts": subtask_texts,
             "reasoning_texts": reasoning_texts,
             "cot_out": cot_out,

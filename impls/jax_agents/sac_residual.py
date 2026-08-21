@@ -191,6 +191,41 @@ class SACResidualAgent(flax.struct.PyTreeNode):
         alpha = self.network.select("alpha")()
         actor_loss = (alpha * log_probs - q).mean()
 
+        # O4 actor-side tether (offline-RL constraint ladder); additive, default off -> V0. V3 gate
+        # relaxes the tether where editing beats the base (adv>0), stop-grad breaking the res->gate loop.
+        scaled_res = scale * residual
+        bc_beta = self.config["residual_bc_beta"]
+        kl_beta = self.config["residual_kl_beta"]
+        tether_info: dict[str, Any] = {}
+        if bc_beta > 0.0 or kl_beta > 0.0:
+            if self.config["residual_adv_gate"]:
+                q_base = jnp.min(self.network.select("critic")(z, None, actions=batch["base_actions"]), axis=0)
+                gate = jax.nn.sigmoid(jax.lax.stop_gradient(q - q_base) / self.config["residual_adv_gate_temp"])
+                keep = 1.0 - gate
+                tether_info["adv_gate_mean"] = gate.mean()
+            else:
+                keep = jnp.ones_like(log_probs)
+            # V1 TD3+BC L2 penalty, Q-normalized (beta_eff = beta / mean|Q|) so beta transfers across routes.
+            if bc_beta > 0.0:
+                beta_eff = bc_beta
+                if self.config["residual_bc_normalize"]:
+                    beta_eff = bc_beta / (jax.lax.stop_gradient(jnp.abs(q).mean()) + 1e-6)
+                bc_pen = (keep * jnp.mean(jnp.square(scaled_res), axis=-1)).mean()
+                actor_loss = actor_loss + beta_eff * bc_pen
+                tether_info["bc_penalty"] = bc_pen
+                tether_info["bc_beta_eff"] = jnp.asarray(beta_eff, dtype=jnp.float32)
+            # V2 KL(pi_res || N(0, sigma0^2 I)) on the pre-tanh Gaussian (closed-form diagonal KL).
+            if kl_beta > 0.0:
+                base_dist = dist.distribution
+                mu, sig = base_dist.mean(), base_dist.stddev()
+                sig0 = self.config["residual_kl_sigma0"]
+                kl = jnp.sum(
+                    jnp.log(sig0) - jnp.log(sig) + (sig**2 + mu**2) / (2.0 * sig0**2) - 0.5, axis=-1
+                )
+                kl_pen = (keep * kl).mean()
+                actor_loss = actor_loss + kl_beta * kl_pen
+                tether_info["kl_to_prior"] = kl.mean()
+
         grad_alpha = self.network.select("alpha")(params=grad_params)
         entropy = -jax.lax.stop_gradient(log_probs).mean()
         alpha_loss = (grad_alpha * (entropy - self.config["target_entropy"])).mean()
@@ -201,7 +236,8 @@ class SACResidualAgent(flax.struct.PyTreeNode):
             "alpha": alpha,
             "entropy": -log_probs.mean(),
             "residual_scale": jnp.mean(scale),
-            "residual_abs_mean": jnp.abs(scale * residual).mean(),
+            "residual_abs_mean": jnp.abs(scaled_res).mean(),
+            **tether_info,
         }
 
     @jax.jit
@@ -330,6 +366,15 @@ class SACResidualAgent(flax.struct.PyTreeNode):
         if use_state_head:
             network.params["modules_target_state_head"] = network.params["modules_state_head"]
 
+        # O4 ladder is an ablation: at most one tether (V1 XOR V2), V3 only modulates an active tether.
+        bc_beta = float(config.get("residual_bc_beta", 0.0))
+        kl_beta = float(config.get("residual_kl_beta", 0.0))
+        adv_gate = bool(config.get("residual_adv_gate", False))
+        if bc_beta > 0.0 and kl_beta > 0.0:
+            raise ValueError("Enable at most one of residual_bc_beta (V1) / residual_kl_beta (V2).")
+        if adv_gate and bc_beta <= 0.0 and kl_beta <= 0.0:
+            raise ValueError("residual_adv_gate (V3) needs an active tether (residual_bc_beta or residual_kl_beta > 0).")
+
         agent_config = dict(
             discount=float(config["discount"]),
             tau=float(config["tau"]),
@@ -338,6 +383,13 @@ class SACResidualAgent(flax.struct.PyTreeNode):
             expo=bool(config.get("expo", True)),
             otf_td_backup=bool(config.get("otf_td_backup", True)),
             use_state_head=bool(use_state_head),
+            # O4 actor-side offline-RL tether (constraint ladder); all default off -> V0 behavior.
+            residual_bc_beta=bc_beta,
+            residual_bc_normalize=bool(config.get("residual_bc_normalize", True)),
+            residual_kl_beta=kl_beta,
+            residual_kl_sigma0=float(config.get("residual_kl_sigma0", 1.0)),
+            residual_adv_gate=adv_gate,
+            residual_adv_gate_temp=float(config.get("residual_adv_gate_temp", 1.0)),
         )
         return cls(rng=rng, network=network, config=flax.core.FrozenDict(agent_config))
 
@@ -371,6 +423,14 @@ def get_config():
             target_entropy_multiplier=0.5,
             residual_warmup_steps=2000,
             residual_ramp_steps=3000,
+            # O4 actor-side tether ladder (default off = V0). V1 L2 penalty (beta, Q-normalized);
+            # V2 KL to N(0, sigma0^2 I); V3 gate relaxes V1/V2 where Q(base+res) > Q(base).
+            residual_bc_beta=0.0,
+            residual_bc_normalize=True,
+            residual_kl_beta=0.0,
+            residual_kl_sigma0=1.0,
+            residual_adv_gate=False,
+            residual_adv_gate_temp=1.0,
             expo=False,
             best_of_n=8,
             vla_cot_temperature=1.0,
