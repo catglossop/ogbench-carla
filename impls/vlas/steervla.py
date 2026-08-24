@@ -3754,7 +3754,11 @@ class SteerVLAActor:
             print(f"[reanchor] inactive: {reason}", flush=True)
 
     def _reanchor_route_to_current_pose(
-        self, out_flat: np.ndarray, base_flat: np.ndarray
+        self,
+        out_flat: np.ndarray,
+        base_flat: np.ndarray,
+        *,
+        query_pose: np.ndarray | None = None,
     ) -> np.ndarray:
         """Re-express a replayed chunk's route waypoints in the ego's *current* body frame.
 
@@ -3796,7 +3800,9 @@ class SteerVLAActor:
             self._reanchor_disabled(f"output_action_format={self.output_action_format!r} is not an xy route format")
             return out_flat
         pose_now = self._current_ego_pose()
-        pose_query = self._cached_action_pose
+        # Best-of-N selectors hold chunks outside the actor's normal cache and pass the pose
+        # captured when their chosen chunk was sampled. Ordinary caching uses the saved pose.
+        pose_query = self._cached_action_pose if query_pose is None else query_pose
         if pose_now is None or pose_query is None:
             self._reanchor_disabled("no ego pose available from raw_obs_holder['obs']['state']")
             return out_flat
@@ -3856,6 +3862,27 @@ class SteerVLAActor:
             flush=True,
         )
         return out.reshape(out.shape[0], horizon * adim)
+
+    def replay_action_chunk_from_pose(
+        self, action: np.ndarray, query_pose: np.ndarray | None, env_step: int
+    ) -> np.ndarray:
+        """Replay an externally held chunk with the same semantics as the actor cache.
+
+        ``env_step`` counts 20 Hz CARLA ticks since sampling. Chunk rows are 4 Hz, so time-indexed
+        columns advance only every ``env_steps_per_chunk_row`` ticks. Route columns are always
+        re-anchored from the original path to measured ego pose, avoiding double-counted progress.
+        """
+        flat = np.asarray(action, dtype=np.float32)
+        expected = int(self.action_horizon) * int(self.action_dim)
+        one_dimensional = flat.ndim == 1
+        if one_dimensional:
+            flat = flat[None]
+        if flat.ndim != 2 or flat.shape[-1] != expected:
+            return np.asarray(action, dtype=np.float32)
+        row = max(0, int(env_step)) // int(self.env_steps_per_chunk_row)
+        out = self._shift_cached_action_chunk(flat, row)
+        out = self._reanchor_route_to_current_pose(out, flat, query_pose=query_pose)
+        return out[0] if one_dimensional else out
 
     def _next_cached_action(self, batch_size: int) -> jnp.ndarray | None:
         """Serve one env action from the cached chunk, re-anchored to the ego's *actual* progress.

@@ -41,10 +41,12 @@ sys.modules.setdefault("carla", types.ModuleType("carla")).VehicleControl = obje
 from ogbench.carla.steervla_simlingo_control import SimlingoStyleWaypointDecoder
 
 _METHODS = (
+    "_shift_cached_action_chunk",
     "_ego_pose_from_state",
     "_current_ego_pose",
     "_reanchor_disabled",
     "_reanchor_route_to_current_pose",
+    "replay_action_chunk_from_pose",
 )
 H, D = 10, 4
 FORMAT = "DELTA_XY_T_DELTA_XY_SPACE"
@@ -68,6 +70,7 @@ def _load_actor_stub():
         _ROUTE_XY_FORMATS = frozenset({"delta_xy_t_delta_xy_space"})
         reanchor_cached_chunk = True
         action_horizon, action_dim = H, D
+        env_steps_per_chunk_row = 5
         output_action_format = FORMAT
         _reanchor_disabled_reason = None
         last_reanchor: ClassVar[dict] = {}
@@ -219,7 +222,24 @@ def test_hold_stays_closed_loop(radius: float = 30.0, speed: float = 10.0, dt: f
     print("\n[ok] re-anchored replay keeps the lateral loop closed; un-re-anchored replay is blind")
 
 
+def test_external_replay_uses_env_tick_rate() -> None:
+    """BoN replay holds a policy row for five CARLA ticks while re-anchoring its route."""
+    chunk = np.arange(H * D, dtype=np.float32).reshape(H, D)
+    flat = chunk.reshape(-1)
+    pose = np.array([10.0, 20.0, 0.0])
+    actor = _make_actor(pose, _state_vec(pose[:2], pose[2], 4.0), reanchor=True)
+    with contextlib.redirect_stdout(io.StringIO()):
+        tick_1 = actor.replay_action_chunk_from_pose(flat, pose, 1).reshape(H, D)
+        tick_4 = actor.replay_action_chunk_from_pose(flat, pose, 4).reshape(H, D)
+        tick_5 = actor.replay_action_chunk_from_pose(flat, pose, 5).reshape(H, D)
+    assert np.array_equal(tick_1, chunk)
+    assert np.array_equal(tick_4, chunk)
+    assert np.array_equal(tick_5[:, :2], np.vstack([chunk[1:, :2], chunk[-1:, :2]]))
+    print("[ok] external BoN replay advances one policy row per five environment ticks")
+
+
 if __name__ == "__main__":
     test_transform_matches_world_frame()
     test_hold_stays_closed_loop()
+    test_external_replay_uses_env_tick_rate()
     print("\nAll checks passed.")

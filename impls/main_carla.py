@@ -2326,14 +2326,17 @@ def run_online_carla(
     # on every env step.
     _gemini_rollout_chunk: list = [None]  # flat np.ndarray (ah*ad,) selected by the last Gemini call
     _gemini_rollout_step: list = [0]  # steps of _gemini_rollout_chunk already executed
+    _gemini_rollout_pose: list = [None]
     _qwen_rollout_chunk: list = [None]
     _qwen_rollout_step: list = [0]
+    _qwen_rollout_pose: list = [None]
     _qwen_online_window: list[dict | None] = [None]
     _qwen_route_id = str(FLAGS.qwen_online_route_id or FLAGS.route or "online")
     # --bon_critic_rollout_chunk state: same idea as the Gemini rollout state above, but
     # for the critic-scored best-of-N paths (--bon_critic_ckpt / --bon_online_critic).
     _bon_rollout_chunk: list = [None]  # flat np.ndarray (ah*ad,) selected by the last critic score
     _bon_rollout_step: list = [0]  # steps of _bon_rollout_chunk already executed
+    _bon_rollout_pose: list = [None]
     trajectory_dir = os.path.join(FLAGS.save_dir, "trajectories")
     os.makedirs(trajectory_dir, exist_ok=True)
 
@@ -3142,26 +3145,19 @@ def run_online_carla(
         )
         return jax.numpy.asarray(chunks_np), utility, best_idx
 
-    def _shift_flat_chunk(flat: np.ndarray, step: int) -> np.ndarray:
-        """Shift a flat (ah*ad,) action chunk forward by ``step`` timesteps, padding the
-        tail by repeating the last waypoint. Mirrors
-        SteerVLAActor._shift_cached_action_chunk (steervla.py) so --bon_gemini_rollout_chunk
-        executes the remaining steps of a Gemini-selected chunk the same way the VLA's own
-        actions_per_model_query cache would.
-        """
-        ah = int(_steervla_exec_cfg["action_horizon"])
-        ad = int(_steervla_exec_cfg["action_dim"])
-        if step <= 0:
-            return flat
-        chunk = flat.reshape(ah, ad)
-        shifted = np.zeros_like(chunk)
-        keep = max(0, ah - step)
-        if keep > 0:
-            shifted[:keep, :] = chunk[step: step + keep, :]
-            shifted[keep:, :] = shifted[keep - 1: keep, :]
-        else:
-            shifted[:, :] = chunk[-1:, :]
-        return shifted.reshape(ah * ad)
+    def _current_chunk_pose() -> np.ndarray | None:
+        return None if steervla_actor is None else steervla_actor._current_ego_pose()
+
+    def _replay_flat_chunk(
+        flat: np.ndarray, env_step: int, query_pose: np.ndarray | None
+    ) -> np.ndarray:
+        """Replay a held BoN chunk at the policy rate and re-anchor it to measured ego pose."""
+        if steervla_actor is None:
+            raise RuntimeError("BoN chunk replay requires a SteerVLA actor for pose re-anchoring")
+        return np.asarray(
+            steervla_actor.replay_action_chunk_from_pose(flat, query_pose, env_step),
+            dtype=np.float32,
+        )
 
     last_update_info = None
     def _bon_selected_to_action(best_chunk, subkey):
@@ -3228,7 +3224,9 @@ def run_online_carla(
                 ):
                     # Chunk still in flight: execute the next shifted step of the last
                     # critic-selected chunk instead of re-sampling candidates / re-scoring.
-                    shifted = _shift_flat_chunk(_bon_rollout_chunk[0], _bon_rollout_step[0])
+                    shifted = _replay_flat_chunk(
+                        _bon_rollout_chunk[0], _bon_rollout_step[0], _bon_rollout_pose[0]
+                    )
                     _bon_rollout_step[0] += 1
                     best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
                     _last_vla_chunk_holder[0] = shifted
@@ -3239,6 +3237,7 @@ def run_online_carla(
                 if FLAGS.bon_critic_rollout_chunk:
                     _bon_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
                     _bon_rollout_step[0] = 1  # step 0 was just returned by the fresh score
+                    _bon_rollout_pose[0] = _current_chunk_pose()
                 return _bon_selected_to_action(best_chunk, subkey)
             if _gemini_selector is not None and getattr(agent, "vla_sample_fn", None) is not None:
                 _ah = int(_steervla_exec_cfg["action_horizon"]) if _steervla_exec_cfg is not None else 1
@@ -3251,7 +3250,9 @@ def run_online_carla(
                     # Gemini-selected chunk instead of re-sampling candidates / re-querying
                     # Gemini. Mirrors actions_per_model_query caching in steervla.py, but
                     # applied at the best-of-N selection level.
-                    shifted = _shift_flat_chunk(_gemini_rollout_chunk[0], _gemini_rollout_step[0])
+                    shifted = _replay_flat_chunk(
+                        _gemini_rollout_chunk[0], _gemini_rollout_step[0], _gemini_rollout_pose[0]
+                    )
                     _gemini_rollout_step[0] += 1
                     best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
                     _last_vla_chunk_holder[0] = shifted
@@ -3262,11 +3263,14 @@ def run_online_carla(
                 if FLAGS.bon_gemini_rollout_chunk:
                     _gemini_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
                     _gemini_rollout_step[0] = 1  # step 0 was just returned by the fresh query
+                    _gemini_rollout_pose[0] = _current_chunk_pose()
                 return _bon_selected_to_action(best_chunk, subkey)
             if _qwen_selector is not None and getattr(agent, "vla_sample_fn", None) is not None:
                 cadence = max(1, int(FLAGS.bon_qwen_cadence))
                 if _qwen_rollout_chunk[0] is not None and _qwen_rollout_step[0] < cadence:
-                    shifted = _shift_flat_chunk(_qwen_rollout_chunk[0], _qwen_rollout_step[0])
+                    shifted = _replay_flat_chunk(
+                        _qwen_rollout_chunk[0], _qwen_rollout_step[0], _qwen_rollout_pose[0]
+                    )
                     _qwen_rollout_step[0] += 1
                     best_chunk = jax.numpy.asarray(shifted[None])
                     _last_vla_chunk_holder[0] = shifted
@@ -3277,6 +3281,7 @@ def run_online_carla(
                 _last_vla_chunk_holder[0] = selected
                 _qwen_rollout_chunk[0] = selected
                 _qwen_rollout_step[0] = 1
+                _qwen_rollout_pose[0] = _current_chunk_pose()
                 return _bon_selected_to_action(best_chunk, subkey)
             if _bon_online and getattr(agent, "vla_sample_fn", None) is not None:
                 _ah = int(_steervla_exec_cfg["action_horizon"]) if _steervla_exec_cfg is not None else 1
@@ -3290,7 +3295,9 @@ def run_online_carla(
                     # Note the online critic keeps training on collected transitions regardless
                     # (see update_with_vla() below) -- this only affects action *selection*
                     # cadence, not the Bellman backup.
-                    shifted = _shift_flat_chunk(_bon_rollout_chunk[0], _bon_rollout_step[0])
+                    shifted = _replay_flat_chunk(
+                        _bon_rollout_chunk[0], _bon_rollout_step[0], _bon_rollout_pose[0]
+                    )
                     _bon_rollout_step[0] += 1
                     best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
                     _last_vla_chunk_holder[0] = shifted
@@ -3319,6 +3326,7 @@ def run_online_carla(
                 if FLAGS.bon_critic_rollout_chunk:
                     _bon_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
                     _bon_rollout_step[0] = 1  # step 0 was just returned by the fresh score
+                    _bon_rollout_pose[0] = _current_chunk_pose()
                 return _bon_selected_to_action(best_chunk, subkey)
             if _online_training_mode in {"sac_residual", "dagger_residual"} and hasattr(agent, "sample_actions_sac_residual"):
                 noise = jax.random.normal(subkey, (1, agent._flat_noise_dim()))
@@ -4214,11 +4222,14 @@ def run_online_carla(
                     reset_vla_cache()
             _gemini_rollout_chunk[0] = None
             _gemini_rollout_step[0] = 0
+            _gemini_rollout_pose[0] = None
             _qwen_rollout_chunk[0] = None
             _qwen_rollout_step[0] = 0
+            _qwen_rollout_pose[0] = None
             _qwen_online_window[0] = None
             _bon_rollout_chunk[0] = None
             _bon_rollout_step[0] = 0
+            _bon_rollout_pose[0] = None
             if _residual_2d:
                 # Fresh PID state for the new episode (the controllers integrate error).
                 _accel_steer_decoder = _make_accel_steer_decoder()
