@@ -65,11 +65,7 @@ crash_stuck_steps: 20
 crash_stuck_penalty: -5.0
 
 # Force a new episode after this many env steps (0 = no limit).
-<<<<<<< HEAD
-max_episode_steps: 4000
-=======
 max_episode_steps: 2000
->>>>>>> 166cf12 (resolve merge conflict)
 
 # Per-step reward shaping (defaults in carla_utils.py).
 # Dense progress = weight * Δroute% / 100; whole-route reward = weight.
