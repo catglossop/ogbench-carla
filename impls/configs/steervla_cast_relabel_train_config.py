@@ -33,6 +33,16 @@ def get_config():
     config.steervla.hl_update_batch_size = 2
     config.steervla.hl_update_num_steps = 1
 
+    # Policy checkpoints for later inference. This is the config that actually *trains* the
+    # backbone, so it is the one where checkpointing matters: params-only exports to
+    # ``<hl_checkpoint_dir>/<step>/params``, redeployable with load_trainable_params=False.
+    # Overridable per run via run_carla.sh's --hl-ckpt-dir / --hl-ckpt-every / --hl-ckpt-keep-last.
+    config.steervla.hl_checkpoint_every_steps = 2000
+    # Empty -> <save_dir>/checkpoints, alongside videos/ and trajectories/. Set an absolute path
+    # to collect every run's checkpoints under one root instead (mind the ~10 GB each).
+    config.steervla.hl_checkpoint_dir = ""
+    config.steervla.hl_checkpoint_keep_last = 3
+
     # (2) Persist BAD/relabeled chunks as high-level (VLM-backbone) samples.
     config.cast_relabel.store_hl_dataset = True
     # Keep the training dataset separate from a plain observer run's artifacts.

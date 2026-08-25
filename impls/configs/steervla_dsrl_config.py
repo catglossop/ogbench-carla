@@ -60,9 +60,9 @@ def get_config():
     # aaa4c7a; off by default so real runs optimise the env reward. cast_relabel inherits this.
     config.debug_task = False
     # Rollout-only: best-of-N random VLA noises minimizing first-step speed delta_xy.
-    config.debug_noise = False
+    config.debug_noise = True
     config.debug_noise_samples = 8
-    config.debug_noise_log_every_n_steps = 10
+    config.debug_noise_log_every_n_steps = 1
     # When debug_noise=True: if True, execute the slowest candidate; if False, log only and use actor noise.
     config.use_best_noise = False
     config.image_log_curr_interval = 10
@@ -161,12 +161,23 @@ def get_config():
             use_pi_action_chunk_for_env=True,
             action_horizon=10,
             action_dim=4,
-            # Query Pi0-CoT once, then execute this many rows from the returned action chunk
-            # before querying again. Set to 1 to query every env step.
-            actions_per_model_query=1,
+            # Query Pi0-CoT once, then serve this many **env steps** from the returned action chunk
+            # before querying again. Set to 1 to query every env step. NOTE: env steps are 20 Hz
+            # CARLA ticks while chunk rows are 4 Hz waypoints, so the cached chunk only advances one
+            # row per ``env_steps_per_chunk_row`` (=5) env steps -- 5 here means "hold one chunk for
+            # 5 ticks (0.25 s) and re-query", i.e. plan at the 4 Hz policy rate the model was trained
+            # at, rather than re-planning every tick. See SteerVLAActor._next_cached_action.
+            actions_per_model_query=5,
+            # Transform the replayed chunk's route waypoints into the ego's current body frame on
+            # every held tick. Without it the lateral PID is open-loop for the whole hold: the
+            # decoder assumes the ego sits exactly at the pose the chunk was sampled from, so any
+            # cross-track or heading error the ego accumulates is invisible until the next model
+            # query. Set False to reproduce the old behaviour when A/B-ing
+            # ``actions_per_model_query``. No effect when that is 1.
+            reanchor_cached_chunk=True,
             # Reuse sampled CoT reasoning/subtask for this many env actions before sampling
-            # CoT again. With actions_per_model_query=5, this reuses CoT across two action chunks.
-            actions_per_cot=1,
+            # CoT again. Matching actions_per_model_query refreshes the CoT and the chunk together.
+            actions_per_cot=5,
             output_action_format="DELTA_XY_T_DELTA_XY_SPACE",
             sample_actions_num_steps=10, # default is 10
             # When set, skip sample_cot and teacher-force CoT like inspect_outputs.ipynb.

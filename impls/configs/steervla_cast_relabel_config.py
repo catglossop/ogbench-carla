@@ -35,7 +35,7 @@ def get_config():
     config.language_feedback.expert_mode = "none"
     config.training_gpu_rank = 0
     config.siglip_device = "cuda:0"
-    config.batch_size = 32
+    config.batch_size = 64
     config.warmup_steps = 50
     
     config.enable_updates = True
@@ -52,6 +52,12 @@ def get_config():
     config.cast_relabel = ml_collections.ConfigDict(
         dict(
             enabled=True,
+            # Which copy of the labeling prompts to run.
+            #   1 = coaches/cast_relabel.py + coaches/vlm_feedback.py      (stable)
+            #   2 = coaches/cast_relabel_v2.py + coaches/vlm_feedback_v2.py (scratch, for iterating
+            #       on the GOOD/BAD review + subtask prompts). v2 is not imported at all unless
+            #       this is 2, so editing it cannot perturb a run that did not opt in.
+            prompt_version=1,
             # Log annotated debug videos (per-chunk GOOD/BAD + suggested subtasks) to wandb.
             debug=True,
             debug_task=False,
@@ -68,6 +74,19 @@ def get_config():
             # Video encoding (kept consistent with main_carla's rollout video sampling).
             video_fps=10.0,
             video_frame_stride=2,
+            # Attach an env-reward + route-progress plot (vs video time, with chunk boundaries and
+            # collisions marked) to the window review call alongside the video. These two signals
+            # are the ones the per-timestamp block keeps at full density -- speed and the control
+            # channels are thinned to every 2nd timestamp -- so the plot is where their shape over
+            # the window is actually legible. Set False for a video-and-text-only review.
+            include_plots_in_prompt=True,
+            # Cross-window correction memory: a bounded record of the longitudinal changes earlier
+            # windows already made ("stop -> accelerate: 7x"), injected into BOTH the review and
+            # the credit prompt so successive windows don't reverse each other and the HL dataset
+            # doesn't end up teaching both directions of the same decision. This is the whole
+            # rendered block's word budget -- it is pruned oldest-note-first and, if still over,
+            # summarized by the coach. Persisted to cast_relabel/correction_memory.json. 0 = off.
+            correction_memory_words=300,
             save_artifacts=True,
             # Persist every BAD/relabeled chunk as a SteerVLA high-level (VLM-backbone) training
             # sample in the steervla_hl_dataset_format schema (image + ego state + prompt +
@@ -118,6 +137,15 @@ def get_config():
             hl_update_batch_size=64,
             hl_update_every=5,
             hl_update_num_steps=2,
+            # Flat LR for the HL optimizer, replacing the pretraining schedule. The actor_config ships
+            # a warmup_cosine_decay (warmup 1000 steps -> peak 2e-5, decaying over 200k), and
+            # init_train_state starts the restored TrainState back at step=0, so that warmup restarts
+            # here: an 8k-env-step run only reaches ~1.6k gradient steps, spending most of the run at a
+            # near-zero LR (~2e-8 on the first update) and only reaching peak at the very end. That
+            # makes early and late updates incomparable and interacts badly with how heavily the small
+            # online pool is re-sampled. A flat LR trains the whole run in one regime instead.
+            # Set to None (or drop the key) to fall back to the actor_config's schedule.
+            hl_lr=1e-5,
             # Freeze the memory-heavy pretrained subtrees for the HL (VLM-backbone) update so its
             # grad + Adam(mu/nu) buffers fit. The HL step supervises only the CoT/subtask targets
             # (action loss masked), so the SigLIP vision tower (``.*img.*``) and the tied Gemma token
@@ -167,8 +195,23 @@ def get_config():
                 dict(name="simlingo_dataset_all_img512_1116", weight=0.2),
                 dict(name="simplified_reasoning_dataset", weight=0.1),
             ],
+            # Policy checkpointing during the run, for later *inference* (not for resuming
+            # training): every ``hl_checkpoint_every_steps`` env steps — and once more at exit —
+            # the HL-fine-tuned backbone is exported to ``<hl_checkpoint_dir>/<step>/params`` as a
+            # params-only OpenPI checkpoint (no optimizer state). Redeploy one frozen with
+            #   steervla.checkpoint="<hl_checkpoint_dir>/<step>", load_trainable_params=False
+            # (same ``actor_config``). See SteerVLAActor.save_checkpoint.
+            #
+            # Only fires when the HL update is actually running (``enable_updates_bc_hl`` AND
+            # ``load_trainable_params``) — in a rollout-only run the weights never change, so
+            # there is nothing to checkpoint and main_carla says so at startup.
+            #
+            # 0 disables. Empty dir -> ``<save_dir>/checkpoints`` (next to videos/ and trajectories/).
             hl_checkpoint_every_steps=2000,
             hl_checkpoint_dir="",
+            # Each checkpoint is ~10 GB, so 2000-step spacing over a 20k-step run is ~100 GB.
+            # Keep only the newest N step dirs (pruned after each successful write); 0 = keep all.
+            hl_checkpoint_keep_last=3,
             # Local OpenPI inference (ignored when actor_url is set):
             # actor_config="pi05_steervla_cot_simplified_reasoning",
             actor_config="pi05_steervla_cot_simplified_reasoning_no_ego_history",
@@ -188,10 +231,14 @@ def get_config():
             use_pi_action_chunk_for_env=True,
             action_horizon=10,
             action_dim=4,
-            # Query Pi0-CoT once, then execute this many rows before re-querying (1 = every step).
-            actions_per_model_query=1,
+            # Query Pi0-CoT once, then serve this many **env steps** from the chunk before re-querying
+            # (1 = every step). Env steps are 20 Hz CARLA ticks, chunk rows are 4 Hz waypoints, so the
+            # chunk advances one row per ``env_steps_per_chunk_row`` (=5) env steps: 5 here = hold one
+            # chunk for 0.25 s and re-plan, matching the model's training policy rate.
+            actions_per_model_query=5,
             # Reuse sampled CoT reasoning/subtask for this many env actions before re-sampling CoT.
-            actions_per_cot=1,
+            # Matched to actions_per_model_query so the CoT and the chunk refresh on the same step.
+            actions_per_cot=5,
             output_action_format="DELTA_XY_T_DELTA_XY_SPACE",
             sample_actions_num_steps=10,
             # Decode action chunks in small micro-batches (CoT stays batched). Large

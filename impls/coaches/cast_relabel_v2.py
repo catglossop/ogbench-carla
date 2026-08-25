@@ -1,42 +1,22 @@
-"""CAST relabel: window rollout -> VLM review -> per-chunk credit -> suggested subtasks.
+"""CAST relabel **v2** -- prompt-iteration copy of ``cast_relabel.py``.
 
-This mirrors :mod:`coaches.action_chunk_feedback` but changes the *output* from
-corrective steering commentary to **suggested subtasks** for each action chunk, with
-an explicit credit-assignment step in between.
+Byte-identical to v1 at creation time apart from importing ``vlm_feedback_v2``. It exists so the
+labeling prompts can be edited and A/B'd against v1 without touching a running experiment: select
+it per-run with ``cast_relabel.prompt_version = 2`` (see ``impls/main_carla.py``), leave it at 1 and
+nothing here is imported at all.
 
-Pipeline (see ``OnlineCastRelabelSession`` for the online wiring):
+PROMPTS TO ITERATE ON (this file):
+  * ``build_credit_relabel_prompt``  -- step 3+4: maps the coach's GOOD/BAD events onto individual
+    action chunks and asks for corrected subtasks + a fresh reasoning trace. This is where you say
+    what a good subtask looks like.
+  * ``SEED_SUBTASKS``               -- the open-vocabulary seed list shown to the VLM. Note it is
+    dense with "remains stopped ... at the red traffic light" phrasings but says nothing about
+    WHERE to stop, which is a plausible contributor to stopping short of the stop line.
+  * ``build_debug_task_prompt``     -- only used when ``cast_relabel.debug_task`` is set.
 
-1. Roll the agent out for a window of env steps (rounded to whole action chunks; a
-   window can be anything from one action chunk up to a whole episode).
-2. A VLM reviews the *entire window* video and returns what the agent did **well**
-   (``GOOD``) and **poorly** (``BAD``) as timestamped events (``coach.analyze``).
-3. **Credit assignment** — a second VLM call maps those GOOD/BAD moments onto the
-   specific action chunks in the window. Credit is *causal*, not merely temporal: a chunk is
-   BAD either because a BAD event overlaps it (``credit_source="direct"``) or because it is
-   part of the lead-up that made a later BAD event hard to avoid (``credit_source="precursor"``),
-   so the corrected subtask can pre-empt the failure rather than only react to it.
-4. For each chunk, the VLM suggests several subtasks that would improve the behavior,
-   seeded (open-vocab) by :data:`SEED_SUBTASKS`, **and** (for chunks whose subtask it
-   changes) a fresh chain-of-thought reasoning trace that justifies the corrected subtask.
-
-Consumption:
-
-- **Artifacts + wandb** — each window is written to a ``cast_relabel.json`` and, when
-  ``debug`` is enabled, an annotated video (original subtask + waypoints/actions already
-  drawn upstream, plus per-chunk GOOD/BAD labels and suggested subtasks) is logged to W&B.
-- **High-level (VLM backbone) dataset** — every BAD/relabeled chunk is written out as a SteerVLA
-  *high-level* training sample (image + ego state + prompt + corrected subtask + new reasoning
-  trace + the executed action chunk with ``action_loss_mask`` all-``False``). When
-  ``store_good_chunks`` is set (default), GOOD and unlabeled chunks are also stored, but with the
-  **original** subtask/reasoning the model produced (reinforcing good behavior rather than
-  correcting it) instead of a VLM-suggested target.
-  This mirrors OpenPI's ``steervla_hl_datasets`` / ``steervla_hl_dataset_format`` path (see
-  ``openpi.training.steervla_rlds_dataset``), where ``action_supervision=False`` zeroes the
-  action-flow loss so only the CoT/VLM backbone is supervised. These samples are consumed
-  online: ``SteerVLAActor.update_hl`` (``impls/vlas/steervla.py``) loads them, tokenizes the
-  subtask/reasoning as CoT targets with ``action_loss_mask`` all-``False``, and runs an OpenPI
-  gradient step on the trainable SteerVLA train state (``steervla.load_trainable_params``). It is
-  driven from ``DSRLAgent.update_with_vla(..., run_hl=True)`` (gated by ``enable_updates_bc_hl``).
+The window-review prompt (step 2, "what happened in this video") lives in ``vlm_feedback_v2.py``
+:func:`build_coaching_prompt` -- that is the one that decides whether a traffic light is noticed at
+all, and its state read correctly.
 """
 
 from __future__ import annotations
@@ -82,7 +62,7 @@ def _shrink_frames_for_saving(frames, max_width: int = _SAVED_VIDEO_MAX_WIDTH):
         return [cv2.resize(_np.asarray(f), new_wh, interpolation=cv2.INTER_AREA) for f in frames]
     except Exception:  # noqa: BLE001 - never cost the video.
         return frames
-from coaches.vlm_feedback import CoachEvent, create_coach
+from coaches.vlm_feedback_v2 import CoachEvent, create_coach
 
 # Default number of subtask suggestions produced per chunk that needs improvement.
 DEFAULT_NUM_SUBTASK_SUGGESTIONS = 3

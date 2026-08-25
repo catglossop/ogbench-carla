@@ -143,8 +143,20 @@ flags.DEFINE_bool(
     "then switch to the PDM-Lite expert for the remainder of the episode.",
 )
 
-# flags.DEFINE_string("save_dir", "/raid/users/celine/carla_exps", "Save directory.")
-flags.DEFINE_string("save_dir", "/home/celinet/carla_exps", "Save directory.")
+# Run artifacts root; the run's own dir is <save_dir>/<project>/<run_group>/<exp_name>, holding
+# videos/, trajectories/, checkpoints/, cast_relabel/ and flags.json.
+# The previous default (/home/celinet/carla_exps) pointed at a home directory that does not exist
+# on this box, so any launch that did not pass --save_dir died at startup with PermissionError
+# before CARLA even connected. Overridable per run with --save_dir, or globally with
+# OGBENCH_SAVE_DIR for a machine whose scratch lives somewhere else.
+flags.DEFINE_string(
+    "save_dir",
+    os.environ.get(
+        "OGBENCH_SAVE_DIR",
+        os.path.join("/raid/users", os.environ.get("USER", "unknown"), "carla_exps"),
+    ),
+    "Save directory.",
+)
 flags.DEFINE_string("restore_path", None, "Restore path for JAX agents.")
 flags.DEFINE_integer("restore_epoch", None, "Restore epoch.")
 flags.DEFINE_string(
@@ -207,6 +219,23 @@ flags.DEFINE_bool(
 flags.DEFINE_string(
     "gemini_model", "gemini-3.6-flash",
     "Gemini model used for --bon_gemini_select.",
+)
+flags.DEFINE_bool("bon_qwen_select", False, "Select candidates with a local Qwen service.")
+flags.DEFINE_string("qwen_bon_url", "http://127.0.0.1:18765", "Qwen BoN service URL.")
+flags.DEFINE_integer("bon_qwen_cadence", 5, "Environment steps per fixed candidate set.")
+flags.DEFINE_bool(
+    "qwen_online_train", False,
+    "After each Qwen selection window, submit the executed projected trajectory and causal "
+    "collision/goal/offroad/traffic/progress targets to the Qwen service's LoRA trainer.",
+)
+flags.DEFINE_integer(
+    "qwen_online_warmup_episodes", 2,
+    "Number of complete rollout episodes that use Qwen scoring but submit no Qwen LoRA updates.",
+)
+flags.DEFINE_string(
+    "qwen_online_route_id", None,
+    "Optional isolated Qwen adapter/training identity. Defaults to --route. Set this when "
+    "running multiple experiments on the same route so their online LoRA updates do not mix.",
 )
 flags.DEFINE_bool(
     "bon_gemini_rollout_chunk", False,
@@ -661,6 +690,103 @@ def _list_routes_and_exit() -> None:
             f"{e.source:<12} {e.scenario_name:<48} {e.file_name:<32} "
             f"{e.route_id:<10} {e.town:<10} {e.scenario_type}"
         )
+
+
+class CastPoolWatcher:
+    """Worker-side half of a pooled CAST run: hot-reload the newest policy the trainer publishes.
+
+    Polls the shared checkpoint dir every ``check_every`` env steps (a stat of a few directories,
+    so it is cheap enough to sit in the rollout loop) and, when a strictly newer *published* version
+    appears, restores it into the live actor mid-episode.
+
+    Reloading mid-episode means one episode's trajectory can span two policy versions. That is why
+    :class:`coaches.cast_relabel.OnlineCastRelabelSession` stamps ``policy_version`` per chunk rather
+    than per window -- the trainer's staleness filter then ages out supervision by the version that
+    actually produced it, not by when the window happened to flush.
+
+    The load takes tens of seconds with no ``world.tick()``, so the leaderboard watchdogs are paused
+    across it exactly as the wrapper does for long VLA inference; otherwise a reload would look like
+    a hung agent and kill the episode.
+    """
+
+    def __init__(self, *, checkpoint_dir, actor, cast_session, check_every: int = 50):
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.actor = actor
+        self.cast_session = cast_session
+        self.check_every = max(1, int(check_every))
+        self.version = 0
+        self.reloads = 0
+
+    def maybe_reload(self, env, step: int) -> bool:
+        """Called once per env step; returns True if a new policy version was loaded."""
+        if step % self.check_every != 0:
+            return False
+        from cast_pool import discover_latest_version
+
+        found = discover_latest_version(self.checkpoint_dir, min_version=self.version)
+        if found is None:
+            return False
+        version, version_dir = found
+        print(f"[cast_pool.worker] new policy version {version} published; hot-reloading.", flush=True)
+        # Same off-tick guard the CAST window review uses for its blocking Gemini calls.
+        pause = getattr(env, "pause_for_vla_inference", None)
+        resume = getattr(env, "resume_after_vla_inference", None)
+        if pause is not None:
+            pause()
+        try:
+            ok = self.actor.reload_params_from_checkpoint(version_dir)
+        finally:
+            if resume is not None:
+                resume()
+        if not ok:
+            return False  # keep self.version so the next poll retries this same version.
+        self.version = version
+        self.reloads += 1
+        if self.cast_session is not None:
+            # From here on, samples this worker produces are attributed to the new version.
+            self.cast_session.policy_version = version
+        return True
+
+
+def _maybe_build_cast_pool_watcher(agent_config, cast_session, steervla_actor):
+    """Wire this process as a pooled-run rollout worker, or return None for a solo run.
+
+    Enforces the two invariants a pooled worker must satisfy: it writes into the shared pool (which
+    ``cast_relabel.hl_dataset_root`` already handles, namespaced by run tag), and it takes **no**
+    gradient steps of its own -- all training is centralized in ``impls/train_hl_pooled.py`` so every
+    route trains one policy instead of drifting into N.
+    """
+    pool_cfg = agent_config.get("cast_pool")
+    if pool_cfg is None or not bool(pool_cfg.get("enabled", False)):
+        return None
+    if str(pool_cfg.get("role", "worker")).strip().lower() != "worker":
+        return None
+    ckpt_dir = str(pool_cfg.get("checkpoint_dir", "") or "").strip()
+    if not ckpt_dir:
+        print("[cast_pool.worker] cast_pool.enabled but checkpoint_dir is empty; no hot-reload.", flush=True)
+        return None
+    if steervla_actor is None:
+        return None
+    if getattr(steervla_actor, "load_trainable_params", False):
+        print(
+            "[cast_pool.worker] WARNING: this worker loaded a trainable actor. A pooled worker "
+            "should run load_trainable_params=False (the trainer owns the only train state), and "
+            "hot-reload is refused for a trainable actor.",
+            flush=True,
+        )
+        return None
+    watcher = CastPoolWatcher(
+        checkpoint_dir=ckpt_dir,
+        actor=steervla_actor,
+        cast_session=cast_session,
+        check_every=int(pool_cfg.get("worker_check_every_steps", 50)),
+    )
+    print(
+        f"[cast_pool.worker] pooled mode: watching {ckpt_dir} every "
+        f"{watcher.check_every} env steps; samples -> {getattr(cast_session, 'hl_dataset_dir', '?')}",
+        flush=True,
+    )
+    return watcher
 
 
 def _steervla_action_execution_cfg(steervla_cfg) -> dict[str, Any] | None:
@@ -1373,8 +1499,16 @@ def _annotate_text_panel(
         def _clip(txt: str, n: int = 120) -> str:
             return txt if len(txt) <= n else (txt[: n - 3] + "...")
 
-        lines = []
-        if hud:
+        white = (255, 255, 255)
+        lines: list[str] = []
+        colors: list[tuple] = []  # per-line BGR; parallel to ``lines``
+        if hud and hud.get("lines"):
+            # Generic header lines (GRPO overlay): rendered verbatim, with optional per-line colors.
+            hud_lines = [str(x) for x in hud["lines"]]
+            hud_colors = hud.get("line_colors") or [white] * len(hud_lines)
+            lines.extend(hud_lines)
+            colors.extend(hud_colors[i] if i < len(hud_colors) and hud_colors[i] else white for i in range(len(hud_lines)))
+        elif hud:
             lines.append(
                 f"Action base={hud.get('base', '-')} residual={hud.get('residual', '-')} "
                 f"final={hud.get('final', '-')} scale={hud.get('scale', '-')}"
@@ -1392,13 +1526,23 @@ def _annotate_text_panel(
             f"Reasoning: {_clip(reasoning)}",
             f"Subtask: {_clip(subtask)}",
         ]
+        colors += [white] * (len(lines) - len(colors))  # remaining lines default white
+
+        def _fit(txt: str) -> str:
+            """Shrink ``txt`` (with an ellipsis) until it fits the panel width; avoids right-edge cutoff."""
+            if not txt or cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0][0] <= w - 8:
+                return txt
+            while txt and cv2.getTextSize(txt + "...", cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0][0] > w - 8:
+                txt = txt[:-1]
+            return txt + "..."
+
         panel_h = max(72, line_h * (len(lines) + 1))
         annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
         annotated[:h, :, :] = annotated_top
         cv2.line(annotated, (0, h), (w - 1, h), (255, 255, 255), 1)
         y = h + line_h
-        for line in lines:
-            cv2.putText(annotated, line, (4, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
+        for line, color in zip(lines, colors):
+            cv2.putText(annotated, _fit(line), (4, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1, cv2.LINE_AA)
             y += line_h
         return annotated
     except Exception:
@@ -1435,11 +1579,46 @@ def _annotate_full_frame(
     return out
 
 
+# Longest edge for video kept only for humans to look at (W&B panels, local .mp4 dumps). The camera
+# now renders at 1024x512 and the CAST debug overlay doubles frame width on top of that, so an
+# un-downscaled episode video is ~2048px wide -- megabytes per episode, uploaded every time, for a
+# panel nobody inspects at full size. This does NOT touch the frames handed to a model: the Gemini
+# CAST coach still uploads its window at the native sensor resolution (see
+# ``coaches/cast_relabel.py``'s ``write_frames_to_mp4``), and the VLA reads ``obs["image"]``.
+_SAVED_VIDEO_MAX_WIDTH = 512
+
+
+def _shrink_frames_for_saving(frames: list[np.ndarray], max_width: int = _SAVED_VIDEO_MAX_WIDTH):
+    """Downscale frames for logging/saving only. Aspect-preserving; no-op if already small."""
+    if not frames:
+        return frames
+    h, w = np.asarray(frames[0]).shape[:2]
+    if w <= max_width:
+        return frames
+    scale = max_width / float(w)
+    new_wh = (max_width, max(1, int(round(h * scale))))
+    try:
+        import cv2
+
+        return [cv2.resize(np.asarray(f), new_wh, interpolation=cv2.INTER_AREA) for f in frames]
+    except Exception:  # noqa: BLE001 - a failed shrink must never cost the video.
+        return frames
+
+
 def _episode_video(frames: list[np.ndarray], fps: float):
     """Stack captured frames into a W&B video (T, C, H, W); None if empty."""
     if not frames:
         return None
-    video = np.stack(frames, axis=0)
+    hmax = max(f.shape[0] for f in frames)
+    wmax = max(f.shape[1] for f in frames)
+    if any(f.shape[0] != hmax or f.shape[1] != wmax for f in frames):
+        padded = []
+        for f in frames:
+            buf = np.zeros((hmax, wmax, f.shape[2]), dtype=f.dtype)
+            buf[: f.shape[0], : f.shape[1], :] = f
+            padded.append(buf)
+        frames = padded
+    video = np.stack(_shrink_frames_for_saving(frames), axis=0)
     if video.ndim == 4:
         video = np.transpose(video, (0, 3, 1, 2))
     return wandb.Video(video, fps=fps, format="mp4")
@@ -1500,6 +1679,52 @@ def _log_episode_end(
     wandb.log(rollout_log, step=step)
     train_logger.log(rollout_log, step=step)
     frames.clear()
+
+
+# Per-episode rollout columns to aggregate (first present wins; the residual and DSRL loops
+# name a few differently), so the aggregator works for either.
+_EVAL_COLS = {
+    "return": ("rollout/episode_return",),
+    "driving_score": ("rollout/driving_score",),
+    "route_progress_pct": ("rollout/final_route_progress_pct", "rollout/episode_route_progress_pct"),
+    "success": ("rollout/success", "rollout/final_step_success"),
+    "collisions": ("rollout/episode_collision_events",),
+    "episode_length": ("rollout/episode_length", "rollout/episode_steps"),
+}
+
+
+def _write_eval_summary(save_dir: str, *, route: str, seed: int) -> Optional[dict]:
+    """Aggregate per-episode rollout rows in train.csv -> eval_summary.json + wandb.summary."""
+    import csv as _csv
+
+    path = os.path.join(save_dir, "train.csv")
+    if not os.path.exists(path):
+        return None
+    vals: dict[str, list[float]] = {m: [] for m in _EVAL_COLS}
+    n = 0
+    with open(path, newline="") as f:
+        for row in _csv.DictReader(f):
+            if not row.get("rollout/episodes"):  # only per-episode rows carry this
+                continue
+            n += 1
+            for m, cols in _EVAL_COLS.items():
+                v = next((row[c] for c in cols if row.get(c)), "")
+                if v:
+                    vals[m].append(float(v))
+    if n == 0:
+        return None
+    stats = {m: {"mean": float(np.mean(v)), "std": float(np.std(v))} for m, v in vals.items() if v}
+    summary = {"route": route, "seed": int(seed), "n_episodes": n, **stats}
+    with open(os.path.join(save_dir, "eval_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print(
+        f"[eval] {route} seed={seed} n={n}: "
+        + ", ".join(f"{m}={s['mean']:.3f}+/-{s['std']:.3f}" for m, s in stats.items()),
+        flush=True,
+    )
+    if wandb.run is not None:
+        wandb.summary.update({f"eval/{m}_mean": s["mean"] for m, s in stats.items()})
+    return summary
 
 
 # --------------------------------------------------------------------------- #
@@ -1563,24 +1788,60 @@ def run_online_carla(
     hl_updates_on = enable_updates and enable_updates_bc_hl
     any_updates_on = rl_updates_on or bc_updates_on or hl_updates_on
 
+    # A chunk replayed from SteerVLAActor's cache ignores the noise argument entirely (see
+    # ``SteerVLAActor.__call__``), so with ``actions_per_model_query=k`` the DSRL noise actor only
+    # shapes 1 in k executed actions while its loss assumes it shaped all of them. The action
+    # expert cannot be re-run cheaply on the held steps -- a new observation needs a fresh prefix
+    # forward, which is the expensive part -- so this is a genuine trade of on-policy fidelity for
+    # throughput, not a bug to paper over. Surface it rather than letting it silently halve the
+    # apparent effect of ``enable_updates_rl``.
+    _apmq = int((agent_config.get("steervla") or {}).get("actions_per_model_query", 1))
+    if rl_updates_on and _apmq > 1:
+        print(
+            f"[main_carla] WARNING: actions_per_model_query={_apmq} with RL updates enabled -- the "
+            f"noise actor influences only ~{100.0 / _apmq:.0f}% of executed actions (the rest are "
+            "replayed from the chunk cache, which ignores the sampled noise). Watch "
+            "``vla/action_cached``; set actions_per_model_query=1 for a fully on-policy DSRL run.",
+            flush=True,
+        )
+
     # Export the HL-fine-tuned SteerVLA backbone as a redeployable params-only checkpoint every
     # ``hl_checkpoint_every_steps`` env steps and at exit. Only when the HL update is actually running.
     _steervla_cfg = agent_config.get("steervla", None)
     _hl_ckpt_every = int(_steervla_cfg.get("hl_checkpoint_every_steps", 0)) if _steervla_cfg is not None else 0
     _hl_ckpt_dir = str(_steervla_cfg.get("hl_checkpoint_dir", "") or "") if _steervla_cfg is not None else ""
+    # Retain only the newest N step dirs (0 = keep every one). Each is ~10 GB.
+    _hl_ckpt_keep = int(_steervla_cfg.get("hl_checkpoint_keep_last", 0)) if _steervla_cfg is not None else 0
     _hl_ckpt_on = (
         hl_updates_on
         and _hl_ckpt_every > 0
         and steervla_actor is not None
         and bool(getattr(steervla_actor, "load_trainable_params", False))
     )
+    if _hl_ckpt_on:
+        print(
+            f"[main_carla] SteerVLA policy checkpoints -> "
+            f"{_hl_ckpt_dir or os.path.join(FLAGS.save_dir, 'checkpoints')} "
+            f"every {_hl_ckpt_every} env steps (+ at exit), "
+            f"keep_last={_hl_ckpt_keep or 'all'} (~10 GB each, params-only/inference).",
+            flush=True,
+        )
+    elif _hl_ckpt_every > 0:
+        # A configured interval that will never fire is worth one line: the usual cause is a
+        # rollout-only run, where the weights never change so there is nothing to checkpoint.
+        print(
+            f"[main_carla] SteerVLA policy checkpointing configured (every {_hl_ckpt_every} steps) "
+            f"but inactive: hl_updates={hl_updates_on}, trainable_actor="
+            f"{steervla_actor is not None and bool(getattr(steervla_actor, 'load_trainable_params', False))}.",
+            flush=True,
+        )
 
     def _save_steervla_ckpt(step_tag: int, *, final: bool = False) -> None:
         if not _hl_ckpt_on or (not final and step_tag % _hl_ckpt_every != 0):
             return
-        out_root = _hl_ckpt_dir or os.path.join(FLAGS.save_dir, "steervla_hl_ckpt")
+        out_root = _hl_ckpt_dir or os.path.join(FLAGS.save_dir, "checkpoints")
         try:
-            steervla_actor.save_checkpoint(out_root, int(step_tag))
+            steervla_actor.save_checkpoint(out_root, int(step_tag), keep_last=_hl_ckpt_keep)
         except Exception as exc:  # noqa: BLE001 - checkpoint export must never kill training.
             import traceback
 
@@ -1701,6 +1962,19 @@ def run_online_carla(
         print(
             f"[main_carla] Best-of-N action selection enabled with Gemini: "
             f"model={FLAGS.gemini_model} N={_bon_n}",
+            flush=True,
+        )
+
+    _qwen_selector = None
+    if FLAGS.bon_qwen_select:
+        if FLAGS.bon_critic_ckpt or FLAGS.bon_gemini_select:
+            raise ValueError("--bon_qwen_select is incompatible with frozen-critic or Gemini selection.")
+        from qwen_bon_selector import QwenActionSelector
+
+        _qwen_selector = QwenActionSelector(FLAGS.qwen_bon_url)
+        print(
+            f"[main_carla] Qwen rejection-sampling BoN enabled: url={FLAGS.qwen_bon_url} "
+            f"N={_bon_n} cadence={FLAGS.bon_qwen_cadence} online_critic={_bon_online}",
             flush=True,
         )
 
@@ -1840,10 +2114,27 @@ def run_online_carla(
     _cast_relabel: OnlineCastRelabelSession | None = None
     cast_cfg = agent_config.get("cast_relabel")
     if cast_cfg is not None and bool(cast_cfg.get("enabled", False)):
-        _cast_relabel = OnlineCastRelabelSession(
+        # ``cast_relabel.prompt_version`` selects which copy of the labeling prompts to run.
+        # 1 (default) = coaches/cast_relabel.py + coaches/vlm_feedback.py -- the stable pair.
+        # 2           = coaches/cast_relabel_v2.py + coaches/vlm_feedback_v2.py -- the scratch pair
+        #               for prompt iteration. Nothing in v2 is imported unless this is set to 2, so
+        #               editing those files cannot perturb a run that did not opt in.
+        _cast_cls = OnlineCastRelabelSession
+        _prompt_version = int(cast_cfg.get("prompt_version", 1) or 1)
+        if _prompt_version == 2:
+            from coaches.cast_relabel_v2 import OnlineCastRelabelSession as _CastV2
+
+            _cast_cls = _CastV2
+            print("[cast_relabel] prompt_version=2 -> using cast_relabel_v2 + vlm_feedback_v2", flush=True)
+        elif _prompt_version != 1:
+            raise ValueError(f"cast_relabel.prompt_version must be 1 or 2, got {_prompt_version}")
+        _cast_relabel = _cast_cls(
             cast_cfg,
             save_dir=FLAGS.save_dir,
             action_chunk_steps=int(agent_config.get("action_horizon", 10)),
+            # Only used when ``cast_relabel.hl_dataset_root`` points several runs at one shared
+            # corpus (offline collection): it namespaces this run's window dirs under that root.
+            run_tag=exp_name,
         )
         print(
             f"[main_carla] CAST relabel enabled (provider={_cast_relabel.provider}, "
@@ -1862,6 +2153,11 @@ def run_online_carla(
                 flush=True,
             )
         capture_rollout_video = True
+
+    # Pooled CAST run: this process is one of N rollout workers feeding a shared sample pool that a
+    # separate trainer consumes (impls/train_hl_pooled.py). The worker takes no gradient steps -- it
+    # only produces relabeled samples and hot-reloads whatever policy version the trainer publishes.
+    _cast_pool_watcher = _maybe_build_cast_pool_watcher(agent_config, _cast_relabel, steervla_actor)
     _online_training_mode = str(agent_config.get("online_training_mode", "rl")).strip().lower()
     _lang_dim = critic_language_dim(agent_config)
     _bon_viz_interval = int(agent_config.get("bon_viz_interval", 0))
@@ -2030,10 +2326,17 @@ def run_online_carla(
     # on every env step.
     _gemini_rollout_chunk: list = [None]  # flat np.ndarray (ah*ad,) selected by the last Gemini call
     _gemini_rollout_step: list = [0]  # steps of _gemini_rollout_chunk already executed
+    _gemini_rollout_pose: list = [None]
+    _qwen_rollout_chunk: list = [None]
+    _qwen_rollout_step: list = [0]
+    _qwen_rollout_pose: list = [None]
+    _qwen_online_window: list[dict | None] = [None]
+    _qwen_route_id = str(FLAGS.qwen_online_route_id or FLAGS.route or "online")
     # --bon_critic_rollout_chunk state: same idea as the Gemini rollout state above, but
     # for the critic-scored best-of-N paths (--bon_critic_ckpt / --bon_online_critic).
     _bon_rollout_chunk: list = [None]  # flat np.ndarray (ah*ad,) selected by the last critic score
     _bon_rollout_step: list = [0]  # steps of _bon_rollout_chunk already executed
+    _bon_rollout_pose: list = [None]
     trajectory_dir = os.path.join(FLAGS.save_dir, "trajectories")
     os.makedirs(trajectory_dir, exist_ok=True)
 
@@ -2062,6 +2365,10 @@ def run_online_carla(
             route_command_plan=(
                 obs_raw.get("route_command_plan") if isinstance(obs_raw, dict) else None
             ),
+            # ``route_name`` above is the current routing *command* (scene context for the VLM
+            # prompt), not the scenario. The stored HL samples need the real route so a corpus
+            # merged across routes can be split/weighted by it.
+            route_id=str(FLAGS.route or "?"),
         )
 
     # Video annotation for this loop (routing-commands / cast_relabel): candidates panel,
@@ -2303,9 +2610,9 @@ def run_online_carla(
         frame: np.ndarray, candidates: dict, target_points: np.ndarray | None = None,
     ) -> np.ndarray:
         """Project every best-of-N candidate's predicted waypoints onto ``frame`` in a
-        distinct color, then append a text panel below listing each candidate's Q value
-        + subtask (color swatch matching its projected path), with the selected
-        candidate highlighted. ``candidates`` is a
+        distinct color, then append a text panel below listing each candidate's Q value,
+        subtask, and (for Qwen) individual category probabilities/expected progress plus
+        rejection status. The selected candidate is highlighted. ``candidates`` is a
         ``{"q_vals": [...], "best_idx": int, "subtasks": [...], "chunks": (N, D)}``
         dict, see ``_bon_last_candidates``."""
         base = np.array(frame, copy=True)
@@ -2316,6 +2623,8 @@ def run_online_carla(
             q_vals = candidates.get("q_vals") or []
             best_idx = candidates.get("best_idx", -1)
             subtasks = candidates.get("subtasks") or []
+            qwen_scores = candidates.get("qwen_scores") or []
+            accepted = candidates.get("accepted") or []
             chunks = candidates.get("chunks")
             n = len(q_vals)
             if n == 0:
@@ -2339,7 +2648,9 @@ def run_online_carla(
             h, w = base.shape[:2]
             font_scale = 0.26
             line_h = 13
-            panel_h = max(20, line_h * (n + 1))
+            has_term_scores = len(qwen_scores) == n
+            lines_per_candidate = 2 if has_term_scores else 1
+            panel_h = max(20, line_h * (n * lines_per_candidate + 1))
             annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
             annotated[:h, :, :] = base
             cv2.line(annotated, (0, h), (w - 1, h), (255, 255, 255), 1)
@@ -2363,6 +2674,27 @@ def run_online_carla(
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1, cv2.LINE_AA,
                 )
                 y += line_h
+                if has_term_scores:
+                    scores = qwen_scores[i]
+                    accepted_text = (
+                        "ACCEPT" if i < len(accepted) and bool(accepted[i]) else "REJECT"
+                    )
+                    score_line = (
+                        f"              {accepted_text}  "
+                        f"P(crash)={float(scores['crash']):.3f}  "
+                        f"P(goal)={float(scores['goal']):.3f}  "
+                        f"P(offroad)={float(scores['offroad']):.3f}  "
+                        f"P(traffic)={float(scores['traffic_violation']):.3f}  "
+                        f"E(progress)={float(scores['progress']):.3f}"
+                    )
+                    status_color = (
+                        (120, 255, 120) if accepted_text == "ACCEPT" else (120, 120, 255)
+                    )
+                    cv2.putText(
+                        annotated, score_line, (12, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        font_scale, status_color, 1, cv2.LINE_AA,
+                    )
+                    y += line_h
             return annotated
         except Exception:
             return base
@@ -2502,6 +2834,9 @@ def run_online_carla(
     ) -> None:
         import cv2  # type: ignore
 
+        # Local .mp4 dumps are for eyeballing, so shrink them like the W&B copies. The per-frame
+        # PNG dump below is written from the same shrunk frames, keeping the two consistent.
+        frames = _shrink_frames_for_saving(frames)
         h, w = frames[0].shape[:2]
         tag = f"ep{ep_idx:04d}{suffix}"
         path = str(_video_dir / f"{tag}.mp4")
@@ -2760,26 +3095,69 @@ def run_online_carla(
         chunks = jax.numpy.asarray(chunks_np)
         return chunks, scores, best_idx
 
-    def _shift_flat_chunk(flat: np.ndarray, step: int) -> np.ndarray:
-        """Shift a flat (ah*ad,) action chunk forward by ``step`` timesteps, padding the
-        tail by repeating the last waypoint. Mirrors
-        SteerVLAActor._shift_cached_action_chunk (steervla.py) so --bon_gemini_rollout_chunk
-        executes the remaining steps of a Gemini-selected chunk the same way the VLA's own
-        actions_per_model_query cache would.
-        """
-        ah = int(_steervla_exec_cfg["action_horizon"])
-        ad = int(_steervla_exec_cfg["action_dim"])
-        if step <= 0:
-            return flat
-        chunk = flat.reshape(ah, ad)
-        shifted = np.zeros_like(chunk)
-        keep = max(0, ah - step)
-        if keep > 0:
-            shifted[:keep, :] = chunk[step: step + keep, :]
-            shifted[keep:, :] = shifted[keep - 1: keep, :]
-        else:
-            shifted[:, :] = chunk[-1:, :]
-        return shifted.reshape(ah * ad)
+    def _score_candidates_with_qwen(rng_key):
+        """Sample each candidate exactly once and score it with the local Qwen service."""
+        chunks_np, candidate_subtasks = _sample_diverse_candidates(rng_key, _bon_n)
+        base_frame = _as_video_frame(_viz_image_from_raw(obs_raw))
+        routing_command = str(obs_raw.get("routing_command") or "follow the route")
+        state_vec = np.asarray(obs_raw.get("state", []), dtype=np.float32).reshape(-1)
+        speed = float(state_vec[15]) if state_vec.size > 15 else 0.0
+        result = _qwen_selector.select_candidate(
+            base_frame,
+            chunks_np,
+            candidate_subtasks,
+            routing_command,
+            speed,
+            _qwen_route_id,
+        )
+        best_idx = int(result["choice"])
+        utility = np.asarray(result["utility"], dtype=np.float32)
+        _bon_last_q_best[0] = float(utility[best_idx])
+        _bon_last_q_mean[0] = float(utility.mean())
+        _bon_last_candidates[0] = {
+            "q_vals": utility.tolist(),
+            "best_idx": best_idx,
+            "subtasks": candidate_subtasks,
+            "chunks": chunks_np,
+            "qwen_scores": result["scores"],
+            "accepted": result["accepted"],
+        }
+        if FLAGS.qwen_online_train:
+            _qwen_online_window[0] = {
+                "frame": np.asarray(base_frame, dtype=np.uint8),
+                "action": np.asarray(chunks_np[best_idx], dtype=np.float32),
+                "subtask": str(candidate_subtasks[best_idx]),
+                "routing_command": routing_command,
+                "speed": speed,
+                "route": _qwen_route_id,
+                "timestep": int(step),
+                "steps": 0,
+                "crash": 0.0,
+                "goal": 0.0,
+                "offroad": 0.0,
+                "traffic_violation": 0.0,
+                "progress": 0.0,
+            }
+        print(
+            f"[QWEN-BON] step={step} routing={routing_command!r} choice={best_idx} "
+            f"accepted={result['accepted']} utility={utility.round(4).tolist()}",
+            flush=True,
+        )
+        return jax.numpy.asarray(chunks_np), utility, best_idx
+
+    def _current_chunk_pose() -> np.ndarray | None:
+        return None if steervla_actor is None else steervla_actor._current_ego_pose()
+
+    def _replay_flat_chunk(
+        flat: np.ndarray, env_step: int, query_pose: np.ndarray | None
+    ) -> np.ndarray:
+        """Replay a held BoN chunk at the policy rate and re-anchor it to measured ego pose."""
+        if steervla_actor is None:
+            raise RuntimeError("BoN chunk replay requires a SteerVLA actor for pose re-anchoring")
+        return np.asarray(
+            steervla_actor.replay_action_chunk_from_pose(flat, query_pose, env_step),
+            dtype=np.float32,
+        )
 
     last_update_info = None
     def _bon_selected_to_action(best_chunk, subkey):
@@ -2846,7 +3224,9 @@ def run_online_carla(
                 ):
                     # Chunk still in flight: execute the next shifted step of the last
                     # critic-selected chunk instead of re-sampling candidates / re-scoring.
-                    shifted = _shift_flat_chunk(_bon_rollout_chunk[0], _bon_rollout_step[0])
+                    shifted = _replay_flat_chunk(
+                        _bon_rollout_chunk[0], _bon_rollout_step[0], _bon_rollout_pose[0]
+                    )
                     _bon_rollout_step[0] += 1
                     best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
                     _last_vla_chunk_holder[0] = shifted
@@ -2857,6 +3237,7 @@ def run_online_carla(
                 if FLAGS.bon_critic_rollout_chunk:
                     _bon_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
                     _bon_rollout_step[0] = 1  # step 0 was just returned by the fresh score
+                    _bon_rollout_pose[0] = _current_chunk_pose()
                 return _bon_selected_to_action(best_chunk, subkey)
             if _gemini_selector is not None and getattr(agent, "vla_sample_fn", None) is not None:
                 _ah = int(_steervla_exec_cfg["action_horizon"]) if _steervla_exec_cfg is not None else 1
@@ -2869,7 +3250,9 @@ def run_online_carla(
                     # Gemini-selected chunk instead of re-sampling candidates / re-querying
                     # Gemini. Mirrors actions_per_model_query caching in steervla.py, but
                     # applied at the best-of-N selection level.
-                    shifted = _shift_flat_chunk(_gemini_rollout_chunk[0], _gemini_rollout_step[0])
+                    shifted = _replay_flat_chunk(
+                        _gemini_rollout_chunk[0], _gemini_rollout_step[0], _gemini_rollout_pose[0]
+                    )
                     _gemini_rollout_step[0] += 1
                     best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
                     _last_vla_chunk_holder[0] = shifted
@@ -2880,6 +3263,25 @@ def run_online_carla(
                 if FLAGS.bon_gemini_rollout_chunk:
                     _gemini_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
                     _gemini_rollout_step[0] = 1  # step 0 was just returned by the fresh query
+                    _gemini_rollout_pose[0] = _current_chunk_pose()
+                return _bon_selected_to_action(best_chunk, subkey)
+            if _qwen_selector is not None and getattr(agent, "vla_sample_fn", None) is not None:
+                cadence = max(1, int(FLAGS.bon_qwen_cadence))
+                if _qwen_rollout_chunk[0] is not None and _qwen_rollout_step[0] < cadence:
+                    shifted = _replay_flat_chunk(
+                        _qwen_rollout_chunk[0], _qwen_rollout_step[0], _qwen_rollout_pose[0]
+                    )
+                    _qwen_rollout_step[0] += 1
+                    best_chunk = jax.numpy.asarray(shifted[None])
+                    _last_vla_chunk_holder[0] = shifted
+                    return _bon_selected_to_action(best_chunk, subkey)
+                chunks, _scores, best_idx = _score_candidates_with_qwen(subkey)
+                best_chunk = chunks[best_idx][None]
+                selected = np.asarray(best_chunk[0], dtype=np.float32)
+                _last_vla_chunk_holder[0] = selected
+                _qwen_rollout_chunk[0] = selected
+                _qwen_rollout_step[0] = 1
+                _qwen_rollout_pose[0] = _current_chunk_pose()
                 return _bon_selected_to_action(best_chunk, subkey)
             if _bon_online and getattr(agent, "vla_sample_fn", None) is not None:
                 _ah = int(_steervla_exec_cfg["action_horizon"]) if _steervla_exec_cfg is not None else 1
@@ -2893,7 +3295,9 @@ def run_online_carla(
                     # Note the online critic keeps training on collected transitions regardless
                     # (see update_with_vla() below) -- this only affects action *selection*
                     # cadence, not the Bellman backup.
-                    shifted = _shift_flat_chunk(_bon_rollout_chunk[0], _bon_rollout_step[0])
+                    shifted = _replay_flat_chunk(
+                        _bon_rollout_chunk[0], _bon_rollout_step[0], _bon_rollout_pose[0]
+                    )
                     _bon_rollout_step[0] += 1
                     best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
                     _last_vla_chunk_holder[0] = shifted
@@ -2922,6 +3326,7 @@ def run_online_carla(
                 if FLAGS.bon_critic_rollout_chunk:
                     _bon_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
                     _bon_rollout_step[0] = 1  # step 0 was just returned by the fresh score
+                    _bon_rollout_pose[0] = _current_chunk_pose()
                 return _bon_selected_to_action(best_chunk, subkey)
             if _online_training_mode in {"sac_residual", "dagger_residual"} and hasattr(agent, "sample_actions_sac_residual"):
                 noise = jax.random.normal(subkey, (1, agent._flat_noise_dim()))
@@ -3374,6 +3779,52 @@ def run_online_carla(
         traffic_violation_delta = max(0, traffic_violation_count - prev_traffic_violation_count)
         episode_traffic_violations += traffic_violation_delta
         prev_traffic_violation_count = traffic_violation_count
+        if FLAGS.qwen_online_train and _qwen_online_window[0] is not None:
+            _window = _qwen_online_window[0]
+            _window["steps"] += 1
+            _window["crash"] = max(_window["crash"], float(collision_delta > 0))
+            _window["offroad"] = max(
+                _window["offroad"], float(float(info.get("outside_route_delta", 0.0)) > 0.0)
+            )
+            _window["traffic_violation"] = max(
+                _window["traffic_violation"], float(traffic_violation_delta > 0)
+            )
+            _window["progress"] = min(
+                1.0,
+                _window["progress"] + max(0.0, float(info.get("route_progress_delta", 0.0))) / 100.0,
+            )
+            _window["goal"] = max(
+                _window["goal"],
+                float(bool(done) and float(info.get("route_progress_pct", 0.0)) >= 99.5),
+            )
+            if _window["steps"] >= max(1, int(FLAGS.bon_qwen_cadence)) or done:
+                _targets = {
+                    term: float(_window[term])
+                    for term in ("crash", "goal", "offroad", "traffic_violation", "progress")
+                }
+                if episode_count < max(0, int(FLAGS.qwen_online_warmup_episodes)):
+                    print(
+                        f"[QWEN-ONLINE] warmup episode={episode_count} step={step}; "
+                        f"targets={_targets} not submitted",
+                        flush=True,
+                    )
+                else:
+                    try:
+                        _train_result = _qwen_selector.train_candidate(
+                            _window["frame"], _window["action"], _window["subtask"],
+                            _window["routing_command"], _window["speed"], _targets,
+                            _window["route"], _window["timestep"],
+                        )
+                        print(
+                            f"[QWEN-ONLINE] episode={episode_count} step={step} targets={_targets} "
+                            f"samples={_train_result.get('samples')} "
+                            f"updates={_train_result.get('updates')} "
+                            f"updated={_train_result.get('updated')}",
+                            flush=True,
+                        )
+                    except Exception as exc:  # keep driving if an online update fails
+                        print(f"[QWEN-ONLINE] update failed at step={step}: {exc!r}", flush=True)
+                _qwen_online_window[0] = None
         if traffic_violation_delta > 0:
             print(
                 f"[main_carla] TRAFFIC VIOLATION at step {step}: "
@@ -3501,6 +3952,11 @@ def run_online_carla(
                 subtask=_cast_step_record["subtask"],
                 reasoning=_cast_step_record["reasoning"],
                 action_chunk=replay_action,
+                # Bare routing instruction (no "The current speed is X m/s. " prefix): the offline
+                # RLDS converter stores it verbatim as the dataset's ``routing_command`` field and
+                # lets the OpenPI loader rebuild the prompt from it exactly as the actor did.
+                routing_command=_format_text_field(cot_obs_raw, "routing_command"),
+                global_step=step,
             )
             # A mid-route window review makes blocking Gemini calls (video upload + two
             # model queries) that can exceed the CARLA leaderboard watchdog timeout. Pause
@@ -3517,6 +3973,16 @@ def run_online_carla(
                 finally:
                     if _pause_offtick and hasattr(env, "resume_after_vla_inference"):
                         env.resume_after_vla_inference()
+
+        # Pooled run: pick up a newly published policy version mid-episode (see CastPoolWatcher).
+        if _cast_pool_watcher is not None and _cast_pool_watcher.maybe_reload(env, step):
+            wandb.log(
+                {
+                    "cast_pool/worker_policy_version": _cast_pool_watcher.version,
+                    "cast_pool/worker_reloads": _cast_pool_watcher.reloads,
+                },
+                step=step,
+            )
 
         if (
             log_images
@@ -3617,6 +4083,22 @@ def run_online_carla(
                 f"env_step={t_step_end - t_step_start:.3f}s log={t_log_end - t_log_start:.3f}s",
                 flush=True,
             )
+        # Controller / chunk-replay diagnostics. ``pid/heading_error`` is the one to watch when
+        # tuning ``actions_per_model_query``: a stale (un-re-anchored) chunk pins it to a constant
+        # between model queries, i.e. the lateral loop is open. ``vla/action_cached`` is the
+        # fraction of executed actions replayed from the chunk cache -- on those steps the DSRL
+        # noise actor's output is ignored.
+        _pid_debug = info.get("pid_debug")
+        if isinstance(_pid_debug, dict):
+            for _k, _v in _pid_debug.items():
+                step_wb[f"pid/{_k}"] = float(_v)
+        if steervla_actor is not None:
+            _cached = bool(getattr(steervla_actor, "last_action_was_cached", False))
+            step_wb["vla/action_cached"] = float(_cached)
+            _reanchor = getattr(steervla_actor, "last_reanchor", None)
+            if _cached and isinstance(_reanchor, dict):
+                for _k, _v in _reanchor.items():
+                    step_wb[f"reanchor/{_k}"] = float(_v)
         step_wb["training/in_expo_warmup"] = float(in_expo_warmup)
         step_wb["training/enable_updates"] = float(enable_updates)
         step_wb["training/rl_updates_on"] = float(rl_updates_on)
@@ -3740,8 +4222,14 @@ def run_online_carla(
                     reset_vla_cache()
             _gemini_rollout_chunk[0] = None
             _gemini_rollout_step[0] = 0
+            _gemini_rollout_pose[0] = None
+            _qwen_rollout_chunk[0] = None
+            _qwen_rollout_step[0] = 0
+            _qwen_rollout_pose[0] = None
+            _qwen_online_window[0] = None
             _bon_rollout_chunk[0] = None
             _bon_rollout_step[0] = 0
+            _bon_rollout_pose[0] = None
             if _residual_2d:
                 # Fresh PID state for the new episode (the controllers integrate error).
                 _accel_steer_decoder = _make_accel_steer_decoder()
@@ -3763,6 +4251,9 @@ def run_online_carla(
                 _cast_relabel.begin_episode(
                     episode_count=episode_count,
                     route_name=done_route,
+                    # ``done_route`` is the env's own scenario name (info["route"]); fall back to
+                    # the launched route if the leaderboard did not report one.
+                    route_id=str(done_route if done_route != "?" else (FLAGS.route or "?")),
                 )
             _sync_steervla_debug_noise_context(done_route)
             episode_collision_count = 0
@@ -4050,7 +4541,9 @@ def run_online_residual(
         otf_mode -> N diverse CoT samples; else one base tiled to N."""
         if otf_mode:
             cands = steervla_actor.sample_candidates(n_cand, temperature=cot_temp, rng=key)
-            chunks = np.asarray(cands["actions"], dtype=np.float32).reshape(n_cand, -1)
+            chunks = np.asarray(
+                cands.get("actions_normalized", cands["actions"]), dtype=np.float32
+            ).reshape(n_cand, -1)
             base_cands = np.stack(
                 [np.asarray(_agent_base_action(o, chunks[i]), dtype=np.float32) for i in range(n_cand)],
                 axis=0,
@@ -4324,6 +4817,8 @@ def run_online_residual(
                     debug_task=debug_task, debug_return=debug_return,
                 )
                 episode_count += 1
+                if 0 < FLAGS.max_episodes <= episode_count:
+                    break  # bounded eval: stop after exactly --max_episodes episodes
                 episode_return = 0.0
                 debug_return = 0.0
                 episode_steps = 0
@@ -4445,6 +4940,11 @@ def _run_residual_entry(config):
     if exec_cfg is not None:
         extra_carla["steervla_action_execution"] = exec_cfg
 
+    if FLAGS.eval_only:
+        # Deterministic eval: greedy CoT + traffic seed tied to --seed (set before actor/env build).
+        extra_carla["traffic_manager_seed"] = int(FLAGS.seed)
+        steervla_cfg["cot_temperature"] = 0.0
+
     # Bring CARLA up before JAX initializes its thread pool (forking afterwards can deadlock
     # the UE4 RenderThread). The reset below starts the simulator.
     env = _make_carla_env(carla_yaml, FLAGS.route, extra_carla_config=extra_carla or None)
@@ -4544,6 +5044,367 @@ def _run_residual_entry(config):
             episode_count_start=episode_count_start,
             buffer=resumed_buffer,
         )
+        if FLAGS.eval_only:
+            _write_eval_summary(FLAGS.save_dir, route=str(FLAGS.route), seed=int(FLAGS.seed))
+    finally:
+        try:
+            env.close()
+        except Exception:
+            pass
+        wandb.finish()
+
+
+def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, *, raw_holder, exec_cfg):
+    """GRPO on the SteerVLA high-level (CoT/subtask) policy, scored by a VLM critic (action expert frozen).
+
+    At each scored decision state the actor samples ``group_size`` candidate CoTs for the current
+    observation (one batched forward); the VLM critic scores each candidate subtask in [0, 1] given the
+    current frame + env-reward context (speed / route progress / cumulative + last-step reward). The
+    scores form the group: advantage ``A_k=(s_k-mean)/std``. The K candidate CoTs are recorded with
+    those advantages, and the argmax-score candidate's action chunk is executed to advance the episode.
+    Records accumulate across ``update_every_states`` scored states, then :meth:`update_hl_grpo` takes
+    the (minibatched) policy-gradient step with a KL penalty to a frozen reference. Runs until the
+    ``online_steps`` env-step budget is spent.
+    """
+    from coaches.cast_relabel import build_candidate_score_prompt, parse_candidate_scores
+
+    grpo = config.get("grpo") or {}
+    # No-learning diagnostic: score + execute as usual but skip the HL gradient step, to isolate
+    # whether behavior changes come from updates or from inference (temperature/selection).
+    updates_enabled = bool(config.get("enable_updates", True))
+    # GRPO training needs >=2 candidates for non-zero advantages; a no-learning diagnostic may use 1.
+    n_cand = max(1 if not updates_enabled else 2, int(grpo.get("group_size", 8)))
+    score_temp = float(grpo.get("score_temperature", 1.0))
+    beta_kl = float(grpo.get("beta_kl", 0.01))
+    num_epochs = int(grpo.get("num_update_steps", 1))
+    score_every = max(1, int(grpo.get("score_every", 1)))  # env steps between scored decision states
+    update_every = max(1, int(grpo.get("update_every_states", 4)))  # scored states pooled per update
+    adv_eps = float(grpo.get("advantage_eps", 1e-6))
+    vlm_retries = max(1, int(grpo.get("vlm_score_retries", 3)))
+    ckpt_every_steps = int(grpo.get("checkpoint_every_steps", 2000))
+    warmup_steps = max(0, int(grpo.get("warmup_steps", 0)))
+    ckpt_root = os.path.join(FLAGS.save_dir, "steervla_hl_ckpt")
+    routing_command = str((config.get("steervla") or {}).get("routing_command", "Follow the route."))
+
+    # Debug stop task: env reward -> -ego_speed (surfaced to the VLM) and the scoring objective flips to
+    # "prefer stopping". inject_stop_candidate swaps one candidate for a canned stop CoT + zero chunk.
+    debug_task = bool(grpo.get("debug_task", False))
+    inject_stop = bool(grpo.get("inject_stop_candidate", False))
+    stop_reasoning = str(grpo.get("stop_reasoning", "The vehicle must come to a stop."))
+    stop_subtask = str(grpo.get("stop_subtask", "The vehicle comes to a complete stop and remains stationary."))
+    score_objective = (
+        "how much it reduces speed and brings the vehicle to a complete stop (reward = -speed; a fully "
+        "stopped vehicle scores highest)" if debug_task else None
+    )
+
+    log_video = bool(config.get("log_episode_video", True))
+    video_fps = float(config.get("episode_video_fps", 10.0))
+    video_every = max(1, int(config.get("episode_video_every", 2)))
+    train_logger = CsvLogger(os.path.join(FLAGS.save_dir, "train.csv"))
+
+    select_mode = str(grpo.get("select_mode", "argmax"))
+    select_rng = np.random.default_rng(FLAGS.seed)  # only used when select_mode == "random"
+    if not updates_enabled:
+        print(f"[grpo] enable_updates=False: scoring + selection only, no HL updates (n_cand={n_cand}).", flush=True)
+
+    base_model = getattr(steervla_actor, "model", None)
+    base_noise_dim = int(base_model.action_horizon) * int(base_model.action_dim) if base_model is not None else 40
+    rng = jax.random.PRNGKey(FLAGS.seed)
+    total_steps = int(FLAGS.online_steps)
+
+    # Warmup drives the greedy base (cot_temperature=0) so the in-run baseline matches the eval base;
+    # GRPO's scored candidates sample at score_temperature regardless, so this only affects the base path.
+    base_cot_temp = float(getattr(steervla_actor, "cot_temperature", 0.0))
+    if warmup_steps > 0:
+        steervla_actor.cot_temperature = 0.0
+        print(f"[grpo] warmup: greedy base for {warmup_steps} steps before scoring/updates.", flush=True)
+
+    pooled: list[dict] = []
+    pooled_adv: list[float] = []
+    score_stats: list[np.ndarray] = []
+    winner_scores: list[float] = []  # top score picked per scored state (for update metrics)
+    inject_wins: list[float] = []    # 1.0 when the injected stop candidate won, else 0.0
+    score_fail_count = 0             # scored states whose VLM scoring failed all retries (drove base)
+    states_since_update = 0
+    update_idx = 0
+
+    obs = obs_raw
+    info: dict[str, Any] = {}
+    steervla_actor.reset_action_cache()
+    episode_return, episode_steps, episode_count, last_reward = 0.0, 0, 0, 0.0
+    episode_speed_sum = 0.0
+    frames: list[np.ndarray] = []
+
+    def _do_update(step_tag: int) -> None:
+        nonlocal pooled, pooled_adv, score_stats, winner_scores, inject_wins, states_since_update, update_idx
+        nonlocal score_fail_count
+        # Nothing pooled (updates on) or no scored states (updates off) -> nothing to flush.
+        if not score_stats:
+            return
+        if updates_enabled:
+            uinfo = steervla_actor.update_hl_grpo(
+                pooled, np.asarray(pooled_adv, dtype=np.float32),
+                beta=beta_kl, num_epochs=num_epochs, global_step=step_tag,
+            )
+            metrics = {f"grpo/{k}": float(v) for k, v in uinfo.items()}
+        else:
+            metrics = {}
+        all_scores = np.concatenate(score_stats) if score_stats else np.zeros((1,), dtype=np.float32)
+        metrics.update({
+            "grpo/update": float(update_idx),
+            "grpo/beta_kl": beta_kl,
+            "grpo/n_states": float(states_since_update),
+            "grpo/score_mean": float(all_scores.mean()),
+            "grpo/score_std": float(all_scores.std()),
+            "grpo/winner_score_mean": float(np.mean(winner_scores)) if winner_scores else 0.0,
+            # Scored states in this window whose VLM scoring failed all retries (drove the base chunk
+            # instead, and were not pooled); a persistent nonzero value means the critic is unreliable.
+            "grpo/score_failures": float(score_fail_count),
+        })
+        if inject_stop:
+            metrics["grpo/inject_stop_won_frac"] = float(np.mean(inject_wins)) if inject_wins else 0.0
+        wandb.log(metrics, step=step_tag)
+        train_logger.log({k: v for k, v in metrics.items() if np.isscalar(v)}, step=step_tag)
+        pooled, pooled_adv, score_stats, winner_scores, inject_wins, states_since_update = [], [], [], [], [], 0
+        score_fail_count = 0
+        update_idx += 1
+
+    for step in tqdm.tqdm(range(1, total_steps + 1), dynamic_ncols=True):
+        raw_holder["obs"] = obs
+        if warmup_steps > 0 and step == warmup_steps + 1:
+            steervla_actor.cot_temperature = base_cot_temp  # end warmup -> restore CoT sampling
+            print(f"[grpo] warmup complete at step {warmup_steps}; GRPO scoring/updates begin.", flush=True)
+        hud = None
+        win_reasoning = win_subtask = None
+        scoring_failed = False
+        in_warmup = step <= warmup_steps
+        scored = (not in_warmup) and (step % score_every == 0)
+        if scored:
+            # Sample K candidate CoTs, VLM-score them, record them with advantages; execute the top one.
+            rng, ck = jax.random.split(rng)
+            cands = steervla_actor.sample_candidates(n_cand, temperature=score_temp, raw=obs, rng=ck)
+            subtasks = list(cands["subtask_texts"])
+            reasonings = list(cands["reasoning_texts"])
+            # Execute the RAW normalized chunk (env applies denormalize_actions)
+            chunks = np.asarray(
+                cands.get("actions_normalized", cands["actions"]), dtype=np.float32
+            ).reshape(n_cand, -1)
+            recs = steervla_actor.grpo_records_from_candidates(cands, obs)
+            if inject_stop:
+                # Swap candidate 0 for a canned stop: zero chunk (car brakes) + stop CoT record.
+                chunks[0] = 0.0
+                subtasks[0] = stop_subtask
+                reasonings[0] = stop_reasoning
+                recs[0] = steervla_actor.grpo_stop_record(obs, reasoning=stop_reasoning, subtask=stop_subtask)
+            context = {
+                "routing_command": routing_command,
+                "current_speed_mps": round(float(_ego_speed_mps(obs)), 2),
+                "route_progress_pct": round(float(info.get("route_progress_pct", 0.0)), 2),
+                "episode_return_so_far": round(episode_return, 3),
+                "last_step_reward": round(last_reward, 3),
+                "episode_step": episode_steps,
+            }
+            frame = _viz_image_from_raw(obs)
+            if frame is None:
+                frame = obs.get("image")
+            prompt = build_candidate_score_prompt(context, subtasks, objective=score_objective)
+            # The VLM occasionally returns malformed JSON (worsening as the HL policy degrades and its
+            # CoTs garble); retry, then skip the state so one bad reply can't kill a multi-thousand-step run.
+            scores = None
+            for attempt in range(vlm_retries):
+                try:
+                    scores = np.asarray(
+                        parse_candidate_scores(coach.complete_image_text(frame, prompt), num=n_cand),
+                        dtype=np.float32,
+                    )
+                    break
+                except Exception as exc:  # noqa: BLE001 - transient VLM/JSON errors are retried below.
+                    print(f"[grpo] VLM scoring attempt {attempt + 1}/{vlm_retries} failed: {exc}", flush=True)
+            if scores is None:
+                print("[grpo] VLM scoring failed after retries; driving base chunk (state not pooled).", flush=True)
+                scored, scoring_failed, score_fail_count = False, True, score_fail_count + 1
+        if scored:
+            if updates_enabled:
+                adv = (scores - scores.mean()) / (scores.std() + adv_eps)
+                pooled.extend(recs)
+                pooled_adv.extend(float(a) for a in adv)
+            score_stats.append(scores)
+            # Which candidate is EXECUTED (pooling/advantages/updates use all K regardless).
+            if select_mode == "random":
+                winner = int(select_rng.integers(n_cand))
+            elif select_mode == "first":
+                winner = 0
+            else:
+                winner = int(np.argmax(scores))
+            winner_scores.append(float(scores[winner]))
+            inject_wins.append(1.0 if (inject_stop and winner == 0) else 0.0)
+            states_since_update += 1
+            action = chunks[winner]
+            win_reasoning, win_subtask = reasonings[winner], subtasks[winner]
+            # HUD: one line per candidate (score + subtask); the executed winner is drawn in green
+            # ('>' marker + WIN tag), the injected stop candidate in cyan.
+            hud_lines = [f"step={episode_steps} ret={episode_return:+.1f} win=c{winner}"]
+            hud_colors: list[tuple] = [(255, 255, 255)]
+            for i in range(n_cand):
+                is_win = i == winner
+                is_stop = inject_stop and i == 0
+                hud_lines.append(
+                    f"{'>' if is_win else ' '}c{i} s={scores[i]:.2f}"
+                    f"{' STOP' if is_stop else ''} {subtasks[i][:40]}{'  <-WIN' if is_win else ''}"
+                )
+                hud_colors.append((0, 255, 0) if is_win else ((255, 255, 0) if is_stop else (255, 255, 255)))
+            hud = {"lines": hud_lines, "line_colors": hud_colors}
+        else:
+            rng, nk = jax.random.split(rng)
+            action = _base_chunk(
+                vla_sample_fn, raw_holder, obs, jax.random.normal(nk, (1, base_noise_dim), dtype=jnp.float32)
+            )
+            if scoring_failed:
+                # Explicit red banner so the fallback is obvious in the rollout video (also grpo/score_failures).
+                red = (0, 0, 255)
+                hud = {
+                    "lines": [
+                        f"step={episode_steps} ret={episode_return:+.1f} SCORING FAILED",
+                        "default action = base policy chunk (state not pooled)",
+                    ],
+                    "line_colors": [red, red],
+                }
+            elif in_warmup:
+                hud = {
+                    "lines": [f"step={episode_steps} ret={episode_return:+.1f} WARMUP base (greedy)"],
+                    "line_colors": [(0, 200, 255)],
+                }
+
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        if isinstance(next_obs, dict) and win_subtask is not None:
+            # Surface the executed candidate's CoT so the video panel's Reasoning/Subtask populate.
+            next_obs["reasoning_text"], next_obs["subtask_text"] = win_reasoning, win_subtask
+        speed = float(_ego_speed_mps(next_obs))
+        # Debug stop task: optimize -speed instead of the env reward (surfaced to the VLM via context).
+        reward_used = -speed if debug_task else float(reward)
+        episode_return += reward_used
+        episode_steps += 1
+        episode_speed_sum += speed
+        last_reward = reward_used
+        done = bool(terminated or truncated)
+        if log_video:
+            _maybe_capture_frame(
+                frames, next_obs, reward_used, episode_steps=episode_steps, done=done,
+                log_video=log_video, video_every=video_every,
+                action_flat=action, exec_cfg=exec_cfg, steervla_actor=steervla_actor, hud=hud,
+            )
+        obs = next_obs
+
+        if done:
+            # Full rollout logging (success / route progress / collisions / termination / video); in debug
+            # mode episode_return is the -speed objective and is logged under debug/episode_return.
+            _log_episode_end(
+                info,
+                episode_return=episode_return,
+                episode_steps=episode_steps,
+                episode_index=episode_count,
+                frames=frames,
+                log_video=log_video,
+                video_fps=video_fps,
+                step=step,
+                train_logger=train_logger,
+                collision_events=int(info.get("collision_count", 0)),
+                debug_task=debug_task,
+                debug_return=episode_return,
+            )
+            grpo_ep = {
+                "grpo/episode": float(episode_count),
+                "grpo/episode_mean_speed_mps": episode_speed_sum / max(episode_steps, 1),
+            }
+            wandb.log(grpo_ep, step=step)
+            train_logger.log(grpo_ep, step=step)
+            print(
+                f"[grpo] episode {episode_count}: return={episode_return:.3f} steps={episode_steps} "
+                f"mean_speed={episode_speed_sum / max(episode_steps, 1):.3f} (env_step {step}/{total_steps})",
+                flush=True,
+            )
+            episode_count += 1
+            episode_return, episode_steps, last_reward, episode_speed_sum = 0.0, 0, 0.0, 0.0
+            frames = []
+            obs, info = env.reset(seed=FLAGS.seed + episode_count)
+            steervla_actor.reset_action_cache()
+
+        if states_since_update >= update_every:
+            _do_update(step)  # flushes score logs; skips the gradient step when updates disabled
+        if updates_enabled and ckpt_every_steps > 0 and step % ckpt_every_steps == 0:
+            steervla_actor.save_checkpoint(ckpt_root, step)
+
+    _do_update(total_steps)
+    if not updates_enabled:
+        return
+    try:
+        steervla_actor.save_checkpoint(ckpt_root, total_steps)  # final export
+    except Exception as exc:  # noqa: BLE001
+        print(f"[grpo] final checkpoint save failed (non-fatal): {exc}", flush=True)
+
+
+def _run_grpo_entry(config):
+    """GRPO-on-HL-policy online CARLA entry (frozen SteerVLA base + action expert; only CoT trained)."""
+    if FLAGS.route is None:
+        raise ValueError("--route is required (see --list_routes=true).")
+
+    steervla_cfg = config.get("steervla", None)
+    if steervla_cfg is None or not steervla_cfg.get("enabled"):
+        raise ValueError("config.steervla.enabled must be true: GRPO trains the HL policy of a base VLA.")
+    if not bool(steervla_cfg.get("load_trainable_params", False)):
+        raise ValueError("GRPO needs steervla.load_trainable_params=true to update the HL backbone.")
+
+    wandb_mode = _resolve_wandb_mode()
+    # Match the residual scheme: <route>-<mode>-sd###_<ts>, where <mode> encodes the GRPO variant.
+    grpo_cfg = config.get("grpo") or {}
+    mode_parts = ["grpo"]
+    if bool(grpo_cfg.get("debug_task", False)):
+        mode_parts.append("dbg")
+    if bool(grpo_cfg.get("inject_stop_candidate", False)):
+        mode_parts.append("inject")
+    mode_tag = "-".join(mode_parts)
+    route_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", str(FLAGS.route)).strip("-")
+    exp_name = FLAGS.exp_name or f"{route_tag}-{mode_tag}-{get_exp_name(FLAGS.seed)}"
+    wandb_id = re.sub(r"[^A-Za-z0-9_-]+", "-", exp_name).strip("-")[:128] or None
+    setup_wandb(
+        project="OGBench-CARLA-GRPO", group=FLAGS.run_group, name=exp_name, mode=wandb_mode,
+        id=wandb_id, resume=("allow" if FLAGS.resume else None),
+    )
+    FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
+    os.makedirs(FLAGS.save_dir, exist_ok=True)
+    with open(os.path.join(FLAGS.save_dir, "flags.json"), "w") as f:
+        json.dump(get_flag_dict(), f)
+
+    carla_yaml, extra_carla, exec_cfg = _resolve_carla_env_config(config)
+    env = _make_carla_env(carla_yaml, FLAGS.route, extra_carla_config=extra_carla)
+    try:
+        random.seed(FLAGS.seed)
+        np.random.seed(FLAGS.seed)
+        obs, _info = env.reset(seed=FLAGS.seed)
+        if not isinstance(obs, dict) or "state" not in obs or "image" not in obs:
+            raise ValueError("CARLA env must return a Dict obs with 'state' and 'image'.")
+
+        raw_holder: dict = {"obs": obs}
+        from vlas.steervla import create_steervla_pi0_cot_sample_fn
+
+        vla_sample_fn, steervla_actor = create_steervla_pi0_cot_sample_fn(
+            steervla_cfg, raw_holder, training_gpu_rank=int(config.get("training_gpu_rank", -1))
+        )
+        _configure_jax_training_device(int(config.get("training_gpu_rank", -1)))
+
+        # VLM critic: reuse the coach the DSRL/CAST path uses (provider/model from the vlm_coach block).
+        from coaches.vlm_feedback import create_coach
+
+        vlm_cfg = config.get("vlm_coach") or {}
+        coach = create_coach(
+            str(vlm_cfg.get("provider", "gemini")),
+            model=str(vlm_cfg.get("gemini_model", "gemini-2.0-flash")),
+        )
+
+        run_online_grpo(
+            env, steervla_actor, vla_sample_fn, coach, config, obs,
+            raw_holder=raw_holder, exec_cfg=exec_cfg,
+        )
     finally:
         try:
             env.close()
@@ -4558,7 +5419,9 @@ def main(_):
         return
 
     config = FLAGS.agent
-    if str(config.get("agent_name", "")) == "sac_residual":
+    if str(config.get("online_training_mode", "")).strip().lower() == "grpo_hl":
+        _run_grpo_entry(config)
+    elif str(config.get("agent_name", "")) == "sac_residual":
         _run_residual_entry(config)
     else:
         _run_dsrl_entry(config)
@@ -4667,6 +5530,8 @@ def _run_dsrl_entry(config):
             siglip_encoder=session.siglip_encoder,
             siglip_include_prompt_subtask=session.siglip_include_prompt_subtask,
         )
+        if FLAGS.eval_only:
+            _write_eval_summary(FLAGS.save_dir, route=str(FLAGS.route), seed=int(FLAGS.seed))
     finally:
         try:
             env.close()

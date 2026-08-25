@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 # Machine-specific: override by exporting CARLA_ROOT (see ogbench/carla/README.md,
 # "Machine-specific settings"). We warn rather than silently substituting a path from
 # somebody else's box, which only produces a confusing import error later.
-export CARLA_ROOT="${CARLA_ROOT:-/home/carla/carla-0-9-16}"
+export CARLA_ROOT="${CARLA_ROOT:-/raid/users/${USER}/carla}"
 CARLA_ROOT="${CARLA_ROOT%/}"  # strip trailing slash
 export CARLA_ROOT
 if [[ ! -d "$CARLA_ROOT" ]]; then
@@ -22,6 +22,15 @@ SAVE_BUFFER="true"
 EXPERT_DEBUG="false"
 EXPERT_RECOVER_DEBUG="false"
 WANDB_MODE="${WANDB_MODE:-online}"
+
+# Keep model/checkpoint caches and run artifacts off the home filesystem. Each can still
+# be overridden explicitly by the caller.
+export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-/raid/users/${USER}/openpi}"
+export HF_HOME="${HF_HOME:-/raid/users/${USER}/huggingface}"
+export TORCH_HOME="${TORCH_HOME:-/raid/users/${USER}/cache/torch}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/raid/users/${USER}/cache/xdg}"
+export OGBENCH_SAVE_DIR="${OGBENCH_SAVE_DIR:-/raid/users/${USER}/carla_exps}"
+mkdir -p "$OPENPI_DATA_HOME" "$HF_HOME" "$TORCH_HOME" "$XDG_CACHE_HOME" "$OGBENCH_SAVE_DIR"
 
 TRAIN_GPU_RANK="2"
 SIM_GPU_RANK=""  # defaults to TRAIN_GPU_RANK below
@@ -60,6 +69,11 @@ PID_CREEP_THROTTLE=""
 BON_GEMINI_SELECT="false"
 GEMINI_MODEL=""
 BON_GEMINI_ROLLOUT_CHUNK="false"
+BON_QWEN_SELECT="false"
+QWEN_BON_URL="http://127.0.0.1:18765"
+BON_QWEN_CADENCE="5"
+QWEN_ONLINE_TRAIN="false"
+QWEN_ONLINE_WARMUP_EPISODES="2"
 MAX_EPISODES=""
 TERMINATE_ON_COLLISION="false"
 EXPERT_CONTROLLER=""
@@ -87,10 +101,26 @@ FAIL2DRIVE_CARLA_ROOT="${FAIL2DRIVE_CARLA_ROOT:-}"
 # --- from dev (master + surya/rl-token + cast_relabel) ---
 # Empty -> leave the base config's steervla.hl_training_gpu_rank untouched.
 HL_TRAIN_GPU_RANK=""
+HL_CKPT_DIR=""
+HL_CKPT_EVERY=""
+HL_CKPT_KEEP_LAST=""
 ENABLE_UPDATES="true"
 BASE_ONLY=""
 STATE_ENCODER=""
 RLT_CHECKPOINT=""
+# Override the frozen base policy: e.g. deploy a relabelled Stage-1 ckpt. Empty -> config default.
+STEERVLA_CKPT=""
+ACTOR_CONFIG=""
+# GRPO-only: greedy-base warmup steps before scoring/updates begin. Empty -> config default (0).
+GRPO_WARMUP=""
+# GRPO-only: executed-candidate selection (argmax|random|first). Empty -> config default (argmax).
+GRPO_SELECT=""
+# GRPO-only: candidates sampled+scored per state. Empty -> config default. 1 = single-sample (no selection).
+GRPO_GROUP_SIZE=""
+# GRPO-only: candidate CoT sampling temperature. Empty -> config default. Low (even 0) = near-greedy BoN.
+GRPO_SCORE_TEMP=""
+# Override config.steervla.cot_temperature (e.g. 1.0 to sample the base CoT). Empty -> config default.
+COT_TEMPERATURE=""
 # Crash supervisor: relaunch main_carla (resuming from checkpoint) after a CARLA native
 # crash (SIGSEGV/SIGABRT, exit code >=128). 0 disables the retry loop.
 MAX_RETRIES="${MAX_RETRIES:-50}"
@@ -134,7 +164,7 @@ Options:
                               expert-lang  -> language on expert action
                             Default: delta
 
-  --train-mode MODE         rl|dagger|sac_residual|dagger_residual. Default: sac_residual
+  --train-mode MODE         rl|dagger|sac_residual|dagger_residual|grpo_hl. Default: dagger
 
   --include-proprio BOOL    true|false. Include ego-state vector as explicit input to residual
                             actor and critic (residual_append_state). Default: false
@@ -142,6 +172,10 @@ Options:
   --discount FLOAT          RL discount factor (gamma). Default: 0.99
 
   --hl-gpu N                JAX GPU rank for the isolated HL (VLM-backbone) update.
+  --hl-ckpt-dir PATH        Where to write params-only SteerVLA policy checkpoints for later
+                            inference. Default: <save_dir>/steervla_hl_ckpt.
+  --hl-ckpt-every N         Checkpoint every N env steps (plus once at exit). 0 disables.
+  --hl-ckpt-keep-last N     Retain only the newest N checkpoints (~10 GB each). 0 = keep all.
   --enable-updates BOOL     true|false. false = rollout/buffer only. Default: true
   --base-only BOOL          true|false. Roll out the frozen base policy only (no RL).
   --state-encoder NAME      pi_prefix|pi_prefix_groups|siglip_pool|rl_token (residual stack).
@@ -150,6 +184,13 @@ Options:
 
   --agent-config PATH       Base agent config. Default: impls/configs/pi0_residual_sac_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
+  --steervla-checkpoint PATH  Override config.steervla.checkpoint (deploy a relabelled ckpt).
+  --actor-config NAME       Override config.steervla.actor_config (match the ckpt's model).
+  --grpo-warmup N           GRPO only: drive the greedy base for N steps before scoring/updates.
+  --grpo-select MODE        GRPO only: executed candidate = argmax|random|first. Default: argmax.
+  --grpo-group-size N       GRPO only: candidates sampled/scored per state (1 = single-sample).
+  --grpo-score-temp T       GRPO only: candidate CoT sampling temperature (low/0 = near-greedy BoN).
+  --cot-temperature T       Override config.steervla.cot_temperature (e.g. 1.0 to sample base CoTs).
 
   --pretrained-critic PATH  Path to a pretrained critic .pkl from pretrain_critic.py.
                             Injects obs_encoder + critic params before online training begins.
@@ -239,6 +280,9 @@ while [[ $# -gt 0 ]]; do
     --include-proprio) INCLUDE_PROPRIO="$2"; shift 2 ;;
     --discount) DISCOUNT="$2"; shift 2 ;;
     --hl-gpu) HL_TRAIN_GPU_RANK="$2"; shift 2 ;;
+    --hl-ckpt-dir|--hl_ckpt_dir) HL_CKPT_DIR="$2"; shift 2 ;;
+    --hl-ckpt-every|--hl_ckpt_every) HL_CKPT_EVERY="$2"; shift 2 ;;
+    --hl-ckpt-keep-last|--hl_ckpt_keep_last) HL_CKPT_KEEP_LAST="$2"; shift 2 ;;
     --enable-updates) ENABLE_UPDATES="$2"; shift 2 ;;
     --base-only) BASE_ONLY="$2"; shift 2 ;;
     --state-encoder) STATE_ENCODER="$2"; shift 2 ;;
@@ -246,6 +290,13 @@ while [[ $# -gt 0 ]]; do
     --max-retries) MAX_RETRIES="$2"; shift 2 ;;
     --agent-config) BASE_AGENT_CFG="$2"; shift 2 ;;
     --carla-config) BASE_CARLA_CFG="$2"; shift 2 ;;
+    --steervla-checkpoint|--steervla_checkpoint) STEERVLA_CKPT="$2"; shift 2 ;;
+    --actor-config|--actor_config) ACTOR_CONFIG="$2"; shift 2 ;;
+    --grpo-warmup|--grpo_warmup) GRPO_WARMUP="$2"; shift 2 ;;
+    --grpo-select|--grpo_select) GRPO_SELECT="$2"; shift 2 ;;
+    --grpo-group-size|--grpo_group_size) GRPO_GROUP_SIZE="$2"; shift 2 ;;
+    --grpo-score-temp|--grpo_score_temp) GRPO_SCORE_TEMP="$2"; shift 2 ;;
+    --cot-temperature|--cot_temperature) COT_TEMPERATURE="$2"; shift 2 ;;
     --pretrained-critic|--pretrained_critic) PRETRAINED_CRITIC="$2"; shift 2 ;;
     --qgf-critic-ckpt|--qgf_critic_ckpt) QGF_CRITIC_CKPT="$2"; shift 2 ;;
     --qgf-guidance-weight|--qgf_guidance_weight) QGF_GUIDANCE_WEIGHT="$2"; shift 2 ;;
@@ -264,6 +315,11 @@ while [[ $# -gt 0 ]]; do
     --bon-gemini-select|--bon_gemini_select) BON_GEMINI_SELECT="$2"; shift 2 ;;
     --gemini-model|--gemini_model) GEMINI_MODEL="$2"; shift 2 ;;
     --bon-gemini-rollout-chunk|--bon_gemini_rollout_chunk) BON_GEMINI_ROLLOUT_CHUNK="$2"; shift 2 ;;
+    --bon-qwen-select|--bon_qwen_select) BON_QWEN_SELECT="$2"; shift 2 ;;
+    --qwen-bon-url|--qwen_bon_url) QWEN_BON_URL="$2"; shift 2 ;;
+    --bon-qwen-cadence|--bon_qwen_cadence) BON_QWEN_CADENCE="$2"; shift 2 ;;
+    --qwen-online-train|--qwen_online_train) QWEN_ONLINE_TRAIN="$2"; shift 2 ;;
+    --qwen-online-warmup-episodes|--qwen_online_warmup_episodes) QWEN_ONLINE_WARMUP_EPISODES="$2"; shift 2 ;;
     --max-episodes|--max_episodes) MAX_EPISODES="$2"; shift 2 ;;
     --terminate-on-collision|--terminate_on_collision) TERMINATE_ON_COLLISION="$2"; shift 2 ;;
     --expert-controller|--expert_controller) EXPERT_CONTROLLER="$2"; shift 2 ;;
@@ -299,10 +355,10 @@ case "$CRITIC_MODE" in
 esac
 
 case "$TRAIN_MODE" in
-  rl|dagger|sac_residual|dagger_residual) ;;
+  rl|dagger|sac_residual|dagger_residual|grpo_hl) ;;
   *)
     echo "Invalid --train-mode: $TRAIN_MODE" >&2
-    echo "Expected one of: rl, dagger, sac_residual, dagger_residual" >&2
+    echo "Expected one of: rl, dagger, sac_residual, dagger_residual, grpo_hl" >&2
     exit 2
     ;;
 esac
@@ -403,6 +459,39 @@ def get_config():
     if _HL_GPU != "" and "steervla" in config:
         # Isolate the HL (VLM-backbone) update on its own GPU. See steervla_cast_relabel_config.py.
         config.steervla.hl_training_gpu_rank = int(_HL_GPU)
+    # Policy checkpointing for later inference (params-only). Empty -> keep the config's value.
+    _HL_CKPT_DIR = r"${HL_CKPT_DIR}"
+    _HL_CKPT_EVERY = "${HL_CKPT_EVERY}"
+    _HL_CKPT_KEEP = "${HL_CKPT_KEEP_LAST}"
+    # Base-policy overrides (e.g. deploy a relabelled Stage-1 ckpt). Empty -> keep config value.
+    _STEERVLA_CKPT = r"${STEERVLA_CKPT}"
+    _ACTOR_CONFIG = r"${ACTOR_CONFIG}"
+    _COT_TEMP = "${COT_TEMPERATURE}"
+    if "steervla" in config:
+        if _STEERVLA_CKPT != "":
+            config.steervla.checkpoint = _STEERVLA_CKPT
+        if _ACTOR_CONFIG != "":
+            config.steervla.actor_config = _ACTOR_CONFIG
+        if _COT_TEMP != "":
+            config.steervla.cot_temperature = float(_COT_TEMP)
+        if _HL_CKPT_DIR != "":
+            config.steervla.hl_checkpoint_dir = _HL_CKPT_DIR
+        if _HL_CKPT_EVERY != "":
+            config.steervla.hl_checkpoint_every_steps = int(_HL_CKPT_EVERY)
+        if _HL_CKPT_KEEP != "":
+            config.steervla.hl_checkpoint_keep_last = int(_HL_CKPT_KEEP)
+    _GRPO_WARMUP = "${GRPO_WARMUP}"
+    if _GRPO_WARMUP != "" and "grpo" in config:
+        config.grpo.warmup_steps = int(_GRPO_WARMUP)
+    _GRPO_SELECT = "${GRPO_SELECT}"
+    if _GRPO_SELECT != "" and "grpo" in config:
+        config.grpo.select_mode = _GRPO_SELECT
+    _GRPO_GROUP_SIZE = "${GRPO_GROUP_SIZE}"
+    if _GRPO_GROUP_SIZE != "" and "grpo" in config:
+        config.grpo.group_size = int(_GRPO_GROUP_SIZE)
+    _GRPO_SCORE_TEMP = "${GRPO_SCORE_TEMP}"
+    if _GRPO_SCORE_TEMP != "" and "grpo" in config:
+        config.grpo.score_temperature = float(_GRPO_SCORE_TEMP)
     config.enable_updates = ${ENABLE_UPDATES^}
     config.critic_feedback_mode = "${CRITIC_FEEDBACK_MODE}"
     config.online_training_mode = "${TRAIN_MODE}"
@@ -416,7 +505,7 @@ def get_config():
     ${STATE_ENCODER_LINE}
     ${RLT_CHECKPOINT_LINE}
     ${BASE_ONLY_LINE}
-$( [[ -n "$BON_CRITIC_CKPT" || "$BON_ONLINE_CRITIC" == "true" || "$BON_GEMINI_SELECT" == "true" ]] && \
+$( [[ -n "$BON_CRITIC_CKPT" || "$BON_ONLINE_CRITIC" == "true" || "$BON_GEMINI_SELECT" == "true" || "$BON_QWEN_SELECT" == "true" ]] && \
    echo "    config.steervla.cot_temperature = ${BON_COT_TEMPERATURE}" )
     return config
 EOF
@@ -473,9 +562,10 @@ echo "[run_carla.sh] save_video_local=${SAVE_VIDEO_LOCAL}"
 # loop below, so a one-shot `VAR=... cmd` prefix here would only have applied to the next echo.
 export PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla:${ROOT_DIR}/simlingo-rebuttal${PYTHONPATH:+:$PYTHONPATH}"
 
-echo "[run_carla.sh] agent_config=${BASE_AGENT_CFG}"
+echo "[run_carla.sh] agent_config=${BASE_AGENT_CFG}${STEERVLA_CKPT:+ steervla_checkpoint=${STEERVLA_CKPT}}${ACTOR_CONFIG:+ actor_config=${ACTOR_CONFIG}}"
 echo "[run_carla.sh] enable_updates=${ENABLE_UPDATES} base_only=${BASE_ONLY:-<config default>} state_encoder=${STATE_ENCODER:-<config default>}${RLT_CHECKPOINT:+ rlt_checkpoint=${RLT_CHECKPOINT}}"
-echo "[run_carla.sh] hl_gpu_rank=${HL_TRAIN_GPU_RANK:-<config>} max_retries=${MAX_RETRIES}"
+echo "[run_carla.sh] hl_gpu_rank=${HL_TRAIN_GPU_RANK:-<config>} max_retries=${MAX_RETRIES}${GRPO_WARMUP:+ grpo_warmup=${GRPO_WARMUP}}${GRPO_SELECT:+ grpo_select=${GRPO_SELECT}}${GRPO_GROUP_SIZE:+ grpo_group_size=${GRPO_GROUP_SIZE}}${GRPO_SCORE_TEMP:+ grpo_score_temp=${GRPO_SCORE_TEMP}}${COT_TEMPERATURE:+ cot_temperature=${COT_TEMPERATURE}}"
+echo "[run_carla.sh] hl_ckpt_dir=${HL_CKPT_DIR:-<config>} hl_ckpt_every=${HL_CKPT_EVERY:-<config>} hl_ckpt_keep_last=${HL_CKPT_KEEP_LAST:-<config>}"
 
 # Stable run name so save_dir + the W&B run id survive restarts (the supervisor resumes,
 # it does not fork a new run).
@@ -519,6 +609,11 @@ while :; do
     --bon_gemini_select="${BON_GEMINI_SELECT}" \
     ${GEMINI_MODEL:+--gemini_model="${GEMINI_MODEL}"} \
     --bon_gemini_rollout_chunk="${BON_GEMINI_ROLLOUT_CHUNK}" \
+    --bon_qwen_select="${BON_QWEN_SELECT}" \
+    --qwen_bon_url="${QWEN_BON_URL}" \
+    --bon_qwen_cadence="${BON_QWEN_CADENCE}" \
+    --qwen_online_train="${QWEN_ONLINE_TRAIN}" \
+    --qwen_online_warmup_episodes="${QWEN_ONLINE_WARMUP_EPISODES}" \
     ${MAX_EPISODES:+--max_episodes="${MAX_EPISODES}"} \
     --terminate_on_collision="${TERMINATE_ON_COLLISION}" \
     --save_video_local="${SAVE_VIDEO_LOCAL}" \

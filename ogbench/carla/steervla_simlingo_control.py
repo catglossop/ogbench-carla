@@ -31,6 +31,58 @@ EGO_STATE_IDX_SPEED = 15
 ActionInputSpace = Literal["normalized", "policy_output"]
 
 
+def _denormalize_actions_local(
+    actions: np.ndarray,
+    action_dim: int,
+    output_action_format: str | None = None,
+) -> np.ndarray:
+    """Mirror of ``openpi.visualizing.steervla_visualization.denormalize_actions``.
+
+    openpi requires Python >= 3.11, but when CARLA runs in the 0.9.15 subprocess
+    (``CARLA_0915_ROOT``) this module is imported under Python 3.10, where openpi
+    cannot be installed. The scaling is pure numpy with no norm stats, so it is
+    mirrored here. openpi stays the source of truth and is preferred when
+    importable — keep the two in sync if the RLDS normalization changes.
+    """
+    actions = actions[..., :action_dim]
+
+    if output_action_format in (
+        "delta_speed_t_delta_course_t_delta_course_space",
+        "DELTA_SPEED_T_DELTA_COURSE_T_DELTA_COURSE_SPACE",
+    ):
+        out = np.empty_like(actions)
+        out[..., 0] = actions[..., 0] * 10.0
+        out[..., 1] = actions[..., 1] * 180.0
+        out[..., 2] = actions[..., 2] * 180.0
+        return out
+
+    if output_action_format in (
+        "delta_xy_t_delta_xy_space",
+        "DELTA_XY_T_DELTA_XY_SPACE",
+    ):
+        out = np.empty_like(actions)
+        out[..., :2] = actions[..., :2] * 7.0
+        out[..., 2:] = actions[..., 2:]
+        return out
+
+    if output_action_format in (
+        "delta_xy_t_delta_course_space",
+        "DELTA_XY_T_DELTA_COURSE_SPACE",
+    ):
+        out = np.empty_like(actions)
+        out[..., :2] = actions[..., :2] * 7.0
+        out[..., 2] = actions[..., 2] * 180.0
+        return out
+
+    # Default nuScenes format: [delta_speed/10, course/180, ...]
+    out = np.empty_like(actions)
+    out[..., 0] = actions[..., 0] * 10.0
+    out[..., 1] = actions[..., 1] * 180.0
+    if action_dim > 2:
+        out[..., 2:] = actions[..., 2:] * 15.0
+    return out
+
+
 def _denormalize_action_chunk(
     chunks: np.ndarray,
     *,
@@ -42,11 +94,8 @@ def _denormalize_action_chunk(
         return np.asarray(chunks[..., :action_dim], dtype=np.float64)
     try:
         from openpi.visualizing.steervla_visualization import denormalize_actions
-    except ImportError as exc:
-        raise ImportError(
-            "action_input_space='normalized' requires openpi with "
-            "openpi.visualizing.steervla_visualization.denormalize_actions"
-        ) from exc
+    except ImportError:
+        denormalize_actions = _denormalize_actions_local
     ad = min(action_dim, int(np.asarray(chunks).shape[-1]))
     return np.asarray(
         denormalize_actions(np.asarray(chunks, dtype=np.float32), ad, output_action_format),
@@ -134,6 +183,13 @@ class SimlingoStyleWaypointDecoder:
         self._stuck_counter = 0
         self._force_move = 0
 
+        # Scalars from the most recent ``control_pid`` call, surfaced through the env's ``info``
+        # dict as ``pid_debug`` so a run can be diagnosed without parsing the ``[RC-PID]`` prints.
+        # ``heading_error`` is the one that exposes a stale (un-re-anchored) cached chunk: it pins
+        # to a constant for the whole hold, because this decoder is handed only the ego *speed*
+        # besides the waypoints and so cannot see the ego drifting off the plan.
+        self.last_debug: dict[str, float] = {}
+
     def control_pid(
         self,
         route_waypoints: np.ndarray,
@@ -195,6 +251,19 @@ class SimlingoStyleWaypointDecoder:
             # building forward momentum, so clamp steer small while forcing through.
             steer = float(np.clip(steer, -0.05, 0.05))
         print(f"[RC-PID] Steer: {steer:.4f}  Throttle: {throttle:.4f}  Brake: {brake}", flush=True)
+
+        self.last_debug = {
+            "steer": float(steer),
+            "throttle": float(throttle),
+            "brake": float(brake),
+            "desired_speed": float(desired_speed),
+            "speed": float(speed),
+            "speed_error": float(desired_speed - speed),
+            "heading_error": float(self.turn_controller.last_heading_error),
+            "lookahead_m": float(self.turn_controller.last_lookahead_m),
+            "route_len_m": float(0.1 * route_interp.shape[0]),
+            "forcing_move": float(forcing_move),
+        }
 
         return steer, throttle, brake
 

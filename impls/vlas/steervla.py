@@ -80,7 +80,7 @@ CARLA_STEERVLA_IMAGE_KEYS: tuple[str, ...] = ("base_0_rgb",)
 # ``<OPENPI_DATA_HOME>/<netloc>/<path>``. Point the cache at NFS so large GCS
 # checkpoints are shared across hosts/users instead of filling each box's home dir;
 # the on-disk layout under it is unchanged.
-STEERVLA_CACHE_DIR = "/raid/users/cglossop/openpi"
+STEERVLA_CACHE_DIR = os.path.join("/raid/users", os.environ.get("USER", "unknown"), "openpi")
 
 
 def _ensure_openpi_cache_dir() -> None:
@@ -409,6 +409,85 @@ def _openpi_hl_train_step(
     return new_state, info
 
 
+def _cot_ce_per_example(model, rng, observation, actions) -> jnp.ndarray:
+    """Per-example CoT cross-entropy ``(B,)`` = ``-logπ(cot | state)`` of the teacher-forced tokens.
+
+    With the batch's ``action_loss_mask`` all-``False`` the flow loss is zero, so this is purely the
+    reasoning+subtask CE — the same quantity the HL BC step trains, just kept per-example.
+    """
+    if hasattr(model, "compute_loss_with_aux"):
+        chunked_loss, _ = model.compute_loss_with_aux(rng, observation, actions, train=True)
+    else:
+        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+    ce = jnp.asarray(chunked_loss)
+    return ce.reshape(ce.shape[0], -1).mean(axis=-1) if ce.ndim > 1 else ce
+
+
+def _openpi_hl_grpo_step(
+    config: openpi_train_config.TrainConfig,
+    rng: jax.Array,
+    state: training_utils.TrainState,
+    ref_params,
+    batch: tuple[_openpi_model.Observation, jnp.ndarray],
+    advantages: jnp.ndarray,
+    beta: jnp.ndarray,
+):
+    """One GRPO gradient step on the HL (CoT/subtask) policy; the action expert is never modified.
+
+    Trajectory-level GRPO: ``advantages`` is one group-relative scalar per example (every CoT sampled
+    in a rollout shares its episode advantage). Since CoT CE is ``-logπ(cot)``, the policy-gradient
+    surrogate is ``mean(A · ce_theta)`` (minimizing it raises ``logπ`` for positive-advantage samples),
+    and the KL(πθ‖π_ref) penalty uses Schulman's k3 estimator from the per-example log-ratio against the
+    frozen ``ref_params``. Grads are filtered to ``config.trainable_filter`` (same freeze story as the BC
+    step); the action-expert params never enter the CoT CE, so they receive no gradient regardless.
+    """
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
+    ref_model = nnx.merge(state.model_def, ref_params)
+    ref_model.eval()
+
+    observation, actions = batch
+    train_rng = jax.random.fold_in(rng, state.step)
+    # Reference log-prob is a constant (frozen params, forward-only): compute outside the grad path so
+    # XLA keeps no backward activations for it and no gradient can flow into the reference.
+    ce_ref = jax.lax.stop_gradient(_cot_ce_per_example(ref_model, train_rng, observation, actions))
+
+    def loss_fn(model, rng, observation, actions):
+        ce_theta = _cot_ce_per_example(model, rng, observation, actions)
+        pg_loss = jnp.mean(advantages * ce_theta)
+        log_ratio = ce_ref - ce_theta  # logπθ - logπ_ref
+        kl = jnp.mean(jnp.exp(-log_ratio) + log_ratio - 1.0)  # k3 KL(πθ‖π_ref) >= 0
+        loss = pg_loss + beta * kl
+        return loss, {"pg_loss": pg_loss, "kl": kl, "ce_theta": jnp.mean(ce_theta), "ce_ref": jnp.mean(ce_ref)}
+
+    diff_state = nnx.DiffState(0, config.trainable_filter)
+    (loss, aux), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
+
+    params = state.params.filter(config.trainable_filter)
+    updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+
+    nnx.update(model, new_params)
+    new_params = nnx.state(model)
+
+    new_state = dataclasses.replace(state, step=state.step + 1, params=new_params, opt_state=new_opt_state)
+    if state.ema_decay is not None:
+        new_state = dataclasses.replace(
+            new_state,
+            ema_params=jax.tree.map(
+                lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new,
+                state.ema_params,
+                new_params,
+            ),
+        )
+
+    info = {"loss": loss, "grad_norm": optax.global_norm(grads), "mean_adv": jnp.mean(advantages)}
+    info.update(aux)
+    return new_state, info
+
+
 @dataclasses.dataclass(frozen=True)
 class _SliceActionDim(openpi_transforms.DataTransformFn):
     """Slice env action dims on the last axis (safe for ``(H, D)`` and ``(B, H, D)``)."""
@@ -541,17 +620,48 @@ def unformat_steervla_cot_prompt(text: str) -> str:
     return stripped
 
 
+# Seconds between two SimLingo dataset frames. Measured from the RLDS itself: per-step ego
+# displacement / speed has median 0.2500 s over 711 sampled steps, and the first
+# ``future_10_xy_delta_t`` waypoint gives the same figure. It is also what
+# ``steervla_simlingo_control`` already assumes for the chunk it decodes
+# (``data_save_freq=5 / carla_fps=20``). One CARLA *env* step is 1/20 s, five times finer.
+SIMLINGO_FRAME_DT = 0.25
+
+# Indices into the raw CARLA ego-state vector (``carla_utils`` STATE_DIM layout). Index 11 is
+# ``avel.z`` from ``carla.Actor.get_angular_velocity()``, i.e. the yaw *rate* in deg/s.
+_CARLA_IDX_YAW_RATE_DPS = 11
+_CARLA_IDX_SPEED = 15
+
+
+def carla_yaw_rate_to_simlingo_course(yaw_rate_dps: float) -> float:
+    """Yaw rate (deg/s) -> the per-frame heading delta SimLingo calls ``local_course`` (deg).
+
+    The SimLingo loader fills proprio dim 1 from ``observation/ego_hist[..., 1]``, which is
+    ``global_course[t] - global_course[t-1]`` — a heading *change* over one 0.25 s dataset frame,
+    not a heading. Feeding CARLA's absolute ``rot.yaw`` there (as this did until 2026-08-21) put a
+    near-uniform ±180 deg value into a slot whose training distribution is p1 −18.3, p99 +23.4 deg.
+
+    Scaling the instantaneous yaw rate to one dataset frame reproduces that distribution closely:
+    measured over 1200 stored CARLA samples, ``avel.z * 0.25`` lands at p1 −16.7, p99 +25.2 deg.
+    A finite difference of ``rot.yaw`` over the last five env steps would be the more literal
+    equivalent, but it needs cross-step memory the offline HL replay path does not have, and this
+    form recomputes correctly from every ``state`` vector already written to disk.
+    """
+    return float(yaw_rate_dps) * SIMLINGO_FRAME_DT
+
+
 def carla_state_vec_to_steervla_state(
     carla_vec: np.ndarray,
     *,
     include_ego_history: bool,
     proprio_norm: bool,
 ) -> np.ndarray:
-    """Map CARLA ego+command vector (``carla_utils.STATE_DIM``-dim) to padded proprio; uses indices 5 and 15."""
+    """Map CARLA ego+command vector (``carla_utils.STATE_DIM``-dim) to padded proprio; uses indices 11 and 15."""
     flat_sv = np.asarray(carla_vec, dtype=np.float32).reshape(-1)
-    speed = float(flat_sv[15])
-    yaw_deg = float(flat_sv[5])
-    raw_pair = np.array([speed, yaw_deg], dtype=np.float32)
+    speed = float(flat_sv[_CARLA_IDX_SPEED])
+    # Heading *delta* per SimLingo frame, not the absolute yaw -- see the function above.
+    course_deg = carla_yaw_rate_to_simlingo_course(flat_sv[_CARLA_IDX_YAW_RATE_DPS])
+    raw_pair = np.array([speed, course_deg], dtype=np.float32)
     normalized = sv_policy.normalize_ego_state(
         raw_pair,
         include_ego_history=include_ego_history,
@@ -1142,6 +1252,8 @@ class SteerVLAActor:
         action_dim: int = 4,
         actions_per_model_query: int = 1,
         actions_per_cot: int = 1,
+        env_steps_per_chunk_row: int = 5,
+        reanchor_cached_chunk: bool = True,
         sample_actions_num_steps: int = 10,
         action_decode_batch_size: int = 2,
         training_gpu_rank: int = -1,
@@ -1151,6 +1263,7 @@ class SteerVLAActor:
         hl_update_every: int = 1,
         hl_update_batch_size: int = 2,
         hl_update_num_steps: int = 1,
+        hl_lr: float | None = None,
         hl_freeze_regexes: list[str] | None = None,
         hl_replay_root: str | Path | None = None,
         hl_replay_pools: list[dict] | None = None,
@@ -1158,6 +1271,7 @@ class SteerVLAActor:
         hl_online_bad_fraction: float = -1.0,
         hl_online_precursor_fraction: float = -1.0,
         hl_min_online_samples: int = 1,
+        hl_keep_last_rounds: int = 0,
         hl_log_batch_tokens: bool = True,
         return_normalized_action_chunk: bool = False,
         fixed_subtask_text: Optional[str] = None,
@@ -1191,6 +1305,10 @@ class SteerVLAActor:
         self.hl_update_every = max(1, int(hl_update_every))
         self.hl_update_batch_size = max(1, int(hl_update_batch_size))
         self.hl_update_num_steps = max(1, int(hl_update_num_steps))
+        # Flat LR override for the HL optimizer. The pretraining actor_config ships a warmup->1e-4
+        # cosine schedule (tuned for from-scratch BC); RL fine-tuning wants a small constant rate, so
+        # when set this replaces the schedule with a flat ``hl_lr`` (no warmup ramp). None = keep config.
+        self.hl_lr: float | None = float(hl_lr) if hl_lr else None
         # Optional regexes of param paths to FREEZE in the trainable state (e.g. the SigLIP vision
         # tower and the tied token embedder), so their grad + Adam buffers are dropped and the HL
         # update fits. Applied in :meth:`setup` before the train state is built. None = full fine-tune.
@@ -1224,6 +1342,8 @@ class SteerVLAActor:
         # of the batch from the offline replay pools (and, if those can't cover it either, by resampling
         # what's available). Set to 0 to allow replay-only updates before any online sample lands.
         self.hl_min_online_samples = max(0, int(hl_min_online_samples))
+        # Pooled training: keep only samples from the last N policy versions (0 = keep everything).
+        self.hl_keep_last_rounds = max(0, int(hl_keep_last_rounds))
         # Decode every HL batch's tokens back to text right before the gradient step consumes them
         # (:meth:`_dump_hl_batch_tokens`). Cheap (one host transfer + sentencepiece decode per update)
         # and the only place tokenization damage — truncated reasoning, empty segments, masked
@@ -1234,6 +1354,8 @@ class SteerVLAActor:
         self._hl_replay_logged_once = False
         self._hl_replay_missing_warned = False
         self._hl_train_step = None
+        self._hl_grpo_step = None
+        self._hl_ref_params = None
         self._hl_update_calls = 0
         # Diagnostics for :meth:`update_hl`, whose skip paths are otherwise silent (it returns
         # ``{}``), which makes an absent ``vla_hl/batch_text`` table impossible to explain.
@@ -1269,6 +1391,13 @@ class SteerVLAActor:
         self.action_dim = int(action_dim)
         self.actions_per_model_query = max(1, int(actions_per_model_query))
         self.actions_per_cot = max(1, int(actions_per_cot))
+        # Env steps per chunk row: CARLA ticks at ``carla_fps`` (20) and one env step is one tick,
+        # but a chunk row is a waypoint at the model's ``policy_fps`` (4). See _next_cached_action.
+        self.env_steps_per_chunk_row = max(1, int(env_steps_per_chunk_row))
+        # Transform a replayed chunk's route waypoints into the ego's *current* body frame before
+        # serving it. Only meaningful when ``actions_per_model_query > 1``. See
+        # :meth:`_reanchor_route_to_current_pose`; set False to reproduce the old open-loop replay.
+        self.reanchor_cached_chunk = bool(reanchor_cached_chunk)
         self.sample_actions_num_steps = int(sample_actions_num_steps)
         self.action_decode_batch_size = max(1, int(action_decode_batch_size))
         self.return_normalized_action_chunk = bool(return_normalized_action_chunk)
@@ -1312,6 +1441,13 @@ class SteerVLAActor:
         self._call_counter = 0
         self._cached_action_chunk: np.ndarray | None = None
         self._cached_action_step = 0
+        # Ego pose (world x, y, yaw_rad) the cached chunk was sampled from, and the diagnostics
+        # from the last re-anchor. ``last_action_was_cached`` lets the caller tell a replayed
+        # action from a fresh model query (the noise argument is ignored on replayed steps).
+        self._cached_action_pose: np.ndarray | None = None
+        self._reanchor_disabled_reason: str | None = None
+        self.last_reanchor: dict[str, float] = {}
+        self.last_action_was_cached: bool = False
         self._cached_cot: dict[str, Any] | None = None
         self._cached_cot_actions_used = 0
         # Pooled prefix embedding cache (DSRL / residual state encoders). Both are read
@@ -1373,6 +1509,9 @@ class SteerVLAActor:
 
     def setup(self, *, training_gpu_rank: int = -1) -> None:
         """Remote: ping ``/get_info``. Local: restore checkpoint and build Pi0-CoT module."""
+        # Remembered so :meth:`reload_params_from_checkpoint` can restore a later checkpoint onto the
+        # same single device this actor was placed on.
+        self._reload_gpu_rank = int(training_gpu_rank)
         if self._remote is not None:
             self._remote.get_info()
             return
@@ -1420,6 +1559,16 @@ class SteerVLAActor:
                 freeze_filter=nnx.Any(self.train_cfg.freeze_filter, *extra),
             )
             print(f"[steervla] extra freeze regexes for trainable state: {self.hl_freeze_regexes}", flush=True)
+
+        if self.load_trainable_params and self.hl_lr:
+            # Flat constant LR (warmup_steps=0, peak == decay) instead of the pretraining warmup-cosine.
+            self.train_cfg = dataclasses.replace(
+                self.train_cfg,
+                lr_schedule=_optimizer.CosineDecaySchedule(
+                    warmup_steps=0, peak_lr=self.hl_lr, decay_steps=10**9, decay_lr=self.hl_lr
+                ),
+            )
+            print(f"[steervla] HL optimizer LR overridden to flat {self.hl_lr:g}", flush=True)
 
         if self.load_trainable_params:
             # Full trainable state (optimizer + opt_state + freeze/trainable filters), pinned to one
@@ -1509,6 +1658,17 @@ class SteerVLAActor:
                 functools.partial(_openpi_hl_train_step, self.train_cfg),
                 donate_argnums=(1,),
             )
+            # GRPO (HL policy) step: same donate/static convention as above. Snapshot the loaded params
+            # as the frozen KL reference. Must be a real buffer copy (jnp.copy), not an identity map:
+            # the step donates the train state, so a shared buffer would be freed after the first update
+            # and corrupt the reference. Both are used only by ``update_hl_grpo``.
+            self._hl_grpo_step = jax.jit(
+                functools.partial(_openpi_hl_grpo_step, self.train_cfg),
+                donate_argnums=(1,),
+            )
+            self._hl_ref_params = jax.tree.map(
+                lambda x: jnp.copy(x) if isinstance(x, jax.Array) else x, self._train_state.params
+            )
             if self._train_rng is None:
                 self._train_rng = jax.random.key(0)
 
@@ -1546,10 +1706,10 @@ class SteerVLAActor:
                 self.model.sample_actions_with_prefix,
                 static_argnames=(
                     "num_steps",
-                    "image_keys",
-                ),
-            )
-
+                "image_keys",
+            ),
+        )
+        
         # Jitted pooled-prefix embedding for the per-step policy_embed path; the
         # eager _build_frozen_prefix_cache costs ~5 s/step (see _frozen_prefix_embed_forward).
         self._prefix_embed_fn = nnx_utils.module_jit(
@@ -1665,6 +1825,65 @@ class SteerVLAActor:
         self._build_sample_wrappers()
         self._weights_dirty = False
 
+    def reload_params_from_checkpoint(self, checkpoint_dir: str | Path) -> bool:
+        """Swap in a params-only checkpoint **in place**, without rebuilding the actor.
+
+        This is the worker half of a pooled CAST run (:mod:`cast_pool`): the trainer publishes a new
+        params-only export and every rollout worker hot-reloads it mid-episode, so all routes keep
+        driving the newest policy without a CARLA restart. ``checkpoint_dir`` is the version dir --
+        the same thing ``steervla.checkpoint`` accepts -- and must contain ``params/``.
+
+        Only valid for a **local, inference-only** actor. A trainable actor owns an optimizer state
+        that a params-only restore would silently desynchronize from its params, so reloading one is
+        refused; that process is the trainer, and it updates its own weights through ``update_hl``.
+
+        Rebuilding the sample wrappers is required, not optional: ``module_jit`` snapshots the
+        weights, so without :meth:`_build_sample_wrappers` the new params would never reach
+        inference. The action/CoT caches are dropped for the same reason -- a chunk sampled by the
+        previous policy must not go on being executed by the new one.
+
+        Returns True on success. On failure the previous weights are left untouched (the model is
+        only rebound after the restore returns), so a torn read costs one round's freshness rather
+        than the run.
+        """
+        if self._remote is not None:
+            print("[steervla.reload_params] skipped: actor is remote.", flush=True)
+            return False
+        if self.load_trainable_params:
+            print(
+                "[steervla.reload_params] skipped: actor is trainable (its opt_state would desync); "
+                "only inference-only rollout workers hot-reload.",
+                flush=True,
+            )
+            return False
+        params_dir = Path(checkpoint_dir) / "params"
+        if not params_dir.is_dir():
+            print(f"[steervla.reload_params] no params/ under {checkpoint_dir}; keeping current weights.", flush=True)
+            return False
+        t0 = time.time()
+        try:
+            params, device = restore_openpi_params_on_single_gpu(
+                params_dir=params_dir, training_gpu_rank=self._reload_gpu_rank
+            )
+            model = self.train_cfg.model.load(params)
+        except Exception as exc:  # noqa: BLE001 - a failed reload must never kill the rollout.
+            print(
+                f"[steervla.reload_params] FAILED to load {params_dir} ({exc}); keeping current weights.",
+                flush=True,
+            )
+            return False
+        self.model = model
+        self._jax_device = device
+        self._hl_jax_device = device
+        self._build_sample_wrappers()
+        self.reset_action_cache()
+        print(
+            f"[steervla.reload_params] loaded {checkpoint_dir} in {time.time() - t0:.1f}s "
+            "(sample wrappers rebuilt, action/CoT cache cleared).",
+            flush=True,
+        )
+        return True
+
     # ------------------------------------------------------------------
     # High-level (VLM-backbone) online update from the cast_relabel HL dataset
     # ------------------------------------------------------------------
@@ -1707,15 +1926,28 @@ class SteerVLAActor:
         """List all samples in one pool, tagging each with the pool's supervision flags.
 
         The online cast_relabel dir keeps a ``hl_samples.json`` per window subdir; an extracted replay
-        pool keeps a single ``hl_samples.json`` at its root — both globs are checked. ``action_supervision``
+        pool keeps a single ``hl_samples.json`` at its root — both globs are checked. A **pooled** run
+        (``impls/cast_pool.py``) adds a third depth, ``<pool_root>/<worker>/<window>/``, so several
+        rollout workers can write one shared corpus that the trainer reads whole. ``action_supervision``
         / ``supervise_fast`` / ``state_format`` come from the manifest (defaults match the online
         ``steervla_hl_dataset_format``: no flow, per-sample FAST, raw CARLA state).
+
+        Window dirs still being written carry the ``cast_pool.TMP_PREFIX`` and are skipped, so a
+        half-written manifest is never scanned.
         """
         entries: list[dict[str, Any]] = []
         root = pool.get("dir")
         if root is None or not Path(root).is_dir():
             return entries
-        manifests = sorted(Path(root).glob("hl_samples.json")) + sorted(Path(root).glob("*/hl_samples.json"))
+        root = Path(root)
+        manifests = (
+            sorted(root.glob("hl_samples.json"))
+            + sorted(root.glob("*/hl_samples.json"))
+            + sorted(root.glob("*/*/hl_samples.json"))
+        )
+        manifests = [
+            m for m in manifests if not any(p.name.startswith(".tmp-") for p in m.relative_to(root).parents)
+        ]
         for manifest_path in manifests:
             try:
                 manifest = json.loads(manifest_path.read_text())
@@ -1746,9 +1978,37 @@ class SteerVLAActor:
                         "supervise_fast": pool_fast,
                         "state_format": state_format,
                         "pool": pool.get("name", "online"),
+                        # Which policy version produced this sample (pooled runs; see
+                        # impls/cast_pool.py). -1 for pools that predate the field or for the
+                        # offline replay pools, which are version-less and never age out.
+                        # NOTE: version 0 (the pre-round base policy) is a real version — read it
+                        # with an explicit None check, not ``or -1``, which would make 0 unversioned
+                        # and thus permanently exempt from the staleness filter.
+                        "policy_version": (
+                            -1 if s.get("policy_version") is None else int(s["policy_version"])
+                        ),
                     }
                 )
         return entries
+
+    def _filter_stale_entries(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop online samples produced more than ``hl_keep_last_rounds`` policy versions ago.
+
+        Pooled training swaps the policy every round, so an old sample supervises a backbone that no
+        longer produces the behavior it was correcting. Keeping a sliding window of versions bounds
+        both that staleness and how many times any one sample can be re-drawn. Version ``-1``
+        (unversioned pools, including every offline replay pool) is always kept -- those are
+        pretraining data, not on-policy corrections.
+        """
+        keep = int(self.hl_keep_last_rounds)
+        if keep <= 0:
+            return entries
+        versions = [int(e.get("policy_version", -1)) for e in entries]
+        newest = max((v for v in versions if v >= 0), default=-1)
+        if newest < 0:
+            return entries  # nothing versioned; nothing to age out.
+        floor = newest - keep + 1
+        return [e for e in entries if int(e.get("policy_version", -1)) < 0 or int(e["policy_version"]) >= floor]
 
     @staticmethod
     def _largest_remainder(total: int, fracs: list[float]) -> list[int]:
@@ -1885,6 +2145,11 @@ class SteerVLAActor:
             "pool": e.get("pool", "online"),
             "label": e.get("label"),
             "credit_source": e.get("credit_source", ""),
+            # Carried through from the scanned entry purely for the batch dump. The staleness
+            # window itself filters *entries* (``_filter_stale_entries`` at scan time), which
+            # already have this -- but without propagating it here the dumped batch reports every
+            # row as -1 ("unversioned"), which reads as if the sliding window were inert.
+            "policy_version": int(e.get("policy_version", -1)),
         }
 
     def _load_hl_batch(self, batch_size: int):
@@ -1902,7 +2167,7 @@ class SteerVLAActor:
         if not pools:
             self._hl_pool_size = 0
             return None
-        scanned = [{"pool": p, "entries": self._scan_pool(p)} for p in pools]
+        scanned = [{"pool": p, "entries": self._filter_stale_entries(self._scan_pool(p))} for p in pools]
         # Warn once if replay pools were configured but none resolved on disk (extraction not run).
         if self._hl_replay_pool_specs and not getattr(self, "_hl_replay_missing_warned", False):
             replay_have = any(
@@ -2085,12 +2350,20 @@ class SteerVLAActor:
             state_norm = self._normalize_state_batch(state_pad)[0]
             state_for_model = pad_to_dim(state_norm, model_action_dim)
 
-            rea_tok, rea_mask = self.tokenizer.tokenize_reasoning(
-                str(rec.get("reasoning", "")).strip() or "Follow the route."
-            )
-            sub_tok, sub_mask = self.tokenizer.tokenize_subtask(
-                str(rec.get("subtask", "")).strip() or "Follow the route."
-            )
+            # GRPO records carry the exact sampled token ids. Text records
+            # (cast_relabel / replay pools) tokenize their reasoning/subtask strings as before.
+            if "reasoning_ids" in rec:
+                rea_tok, rea_mask = rec["reasoning_ids"], rec["reasoning_mask"]
+            else:
+                rea_tok, rea_mask = self.tokenizer.tokenize_reasoning(
+                    str(rec.get("reasoning", "")).strip() or "Follow the route."
+                )
+            if "subtask_ids" in rec:
+                sub_tok, sub_mask = rec["subtask_ids"], rec["subtask_mask"]
+            else:
+                sub_tok, sub_mask = self.tokenizer.tokenize_subtask(
+                    str(rec.get("subtask", "")).strip() or "Follow the route."
+                )
 
             img_batch.append(_resize_hl_image(rec["image"]))
             state_batch.append(np.asarray(state_for_model, dtype=np.float32))
@@ -2397,6 +2670,17 @@ class SteerVLAActor:
                         "prompt": prompts[i],
                         "subtask": subtasks[i],
                         "reasoning": reasonings[i],
+                        # Carried so the corrective composition of each batch stays reconstructable
+                        # offline. The BAD/GOOD and precursor/direct split is printed to stdout only
+                        # ONCE per process (``_hl_replay_logged_once``), which is fine for a solo run
+                        # but leaves a pooled trainer -- whose rounds are minutes apart and whose
+                        # whole point is the corrective bias -- with no way to check that
+                        # ``hl_online_bad_fraction`` / ``hl_online_precursor_fraction`` are actually
+                        # being met as the pool grows. These two fields make that computable from
+                        # hl_update_batches.jsonl without adding per-update log spam.
+                        "label": (records[i].get("label") or None),
+                        "credit_source": (records[i].get("credit_source") or None),
+                        "policy_version": int(records[i].get("policy_version", -1)),
                         "supervise_fast": bool(records[i].get("supervise_fast", False)),
                         "action_supervision": bool(records[i].get("action_supervision", False)),
                     }
@@ -2753,7 +3037,67 @@ class SteerVLAActor:
 
         return out
 
-    def save_checkpoint(self, out_root: str | Path, step: int) -> Path | None:
+    def update_hl_grpo(
+        self,
+        records: list[dict[str, Any]],
+        advantages: np.ndarray,
+        *,
+        beta: float,
+        num_epochs: int = 1,
+        global_step: int | None = None,
+    ) -> dict[str, float]:
+        """GRPO gradient steps on the HL policy over a pooled group of CoT samples.
+
+        ``records`` is the pooled candidate CoTs across scored states (schema from
+        :meth:`grpo_records_from_candidates`); ``advantages`` is the aligned per-record group-relative
+        advantage (the K candidates of one scored state share that state's normalized VLM scores). The
+        pool can exceed one forward, so it is shuffled and processed in ``hl_update_batch_size`` minibatches
+        (remainder dropped, or padded by repetition when the pool is smaller than one minibatch) for
+        ``num_epochs`` passes.
+        Updates ``self._train_state`` in place and marks the inference weights dirty. No-op unless the
+        actor was loaded trainable and has a frozen reference.
+        """
+        if self._remote is not None or self._train_state is None or self._hl_grpo_step is None:
+            return self._hl_skip("GRPO update needs a local trainable actor (load_trainable_params=True)")
+        records = list(records)
+        advantages = np.asarray(advantages, dtype=np.float32).reshape(-1)
+        if not records or advantages.shape[0] != len(records):
+            return self._hl_skip("GRPO update got no records or mismatched advantages")
+
+        mb = int(self.hl_update_batch_size)
+        n = len(records)
+        rng_np = np.random.default_rng(int(global_step or 0))
+        beta_arr = jnp.asarray(float(beta), dtype=jnp.float32)
+        infos: list[dict[str, Any]] = []
+        for _ in range(max(1, int(num_epochs))):
+            order = rng_np.permutation(n)
+            if n >= mb:
+                batches = [order[i : i + mb] for i in range(0, n - mb + 1, mb)]  # drop remainder
+            else:
+                batches = [np.resize(order, mb)]  # pad the whole (small) group up to one minibatch
+            for idx in batches:
+                sub_records = [records[i] for i in idx]
+                sub_adv = jnp.asarray(advantages[idx], dtype=jnp.float32)
+                observation, actions = self._build_hl_observation_batch(sub_records)
+                self._train_rng, step_rng = jax.random.split(self._train_rng)
+                self._train_state, info = self._hl_grpo_step(
+                    step_rng, self._train_state, self._hl_ref_params, (observation, actions), sub_adv, beta_arr
+                )
+                infos.append(info)
+        self._weights_dirty = True
+
+        out: dict[str, float] = {}
+        if infos:
+            for k in infos[-1]:
+                try:
+                    out[str(k)] = float(np.mean([float(jax.device_get(i[k])) for i in infos]))
+                except Exception:
+                    continue
+        out["n_samples"] = float(n)
+        out["n_minibatches"] = float(len(infos))
+        return out
+
+    def save_checkpoint(self, out_root: str | Path, step: int, *, keep_last: int = 0) -> Path | None:
         """Export the (HL-fine-tuned) backbone as a redeployable, params-only OpenPI checkpoint.
 
         Writes ``<out_root>/<step>/params`` in the layout :meth:`setup` loads, so it can be redeployed
@@ -2762,6 +3106,11 @@ class SteerVLAActor:
         like :func:`openpi.training.checkpoints.save_state` (no optimizer state). Norm stats are not
         copied — this stack runs norm-off by default; to redeploy with ``STEERVLA_ENABLE_OPENPI_NORM=1``
         also copy the source checkpoint's ``assets/``. No-op for a remote/non-trainable actor.
+
+        ``keep_last`` > 0 prunes older step directories under ``out_root`` after a successful write,
+        retaining only the newest ``keep_last``. Each checkpoint is ~10 GB, so an un-pruned run at
+        ``hl_checkpoint_every_steps=2000`` over 20k env steps leaves ~100 GB behind; the pruning is
+        deliberately post-write so a failed save can never delete a good earlier checkpoint.
         """
         if self._remote is not None or self._train_state is None:
             print("[steervla.save_checkpoint] skipped: actor is remote or not loaded trainable.", flush=True)
@@ -2774,7 +3123,29 @@ class SteerVLAActor:
         with ocp.PyTreeCheckpointer() as ckptr:
             ckptr.save(params_dir, args=ocp.args.PyTreeSave({"params": params}), force=True)
         print(f"[steervla.save_checkpoint] wrote params-only checkpoint -> {params_dir.parent}", flush=True)
+        if int(keep_last) > 0:
+            self._prune_checkpoints(out_root, keep_last=int(keep_last))
         return params_dir.parent
+
+    @staticmethod
+    def _prune_checkpoints(out_root: str | Path, *, keep_last: int) -> None:
+        """Delete all but the ``keep_last`` newest numeric step dirs under ``out_root``.
+
+        Best-effort: a pruning failure must never take down a training run, and a partially-removed
+        directory is no worse than the disk pressure it was trying to relieve.
+        """
+        import shutil
+
+        try:
+            root = Path(out_root)
+            steps = sorted(
+                (int(p.name) for p in root.iterdir() if p.is_dir() and p.name.isdigit()),
+            )
+            for stale in steps[: max(0, len(steps) - int(keep_last))]:
+                shutil.rmtree(root / str(stale), ignore_errors=True)
+                print(f"[steervla.save_checkpoint] pruned old checkpoint {root / str(stale)}", flush=True)
+        except Exception as exc:  # noqa: BLE001 - pruning is best-effort.
+            print(f"[steervla.save_checkpoint] checkpoint pruning failed (non-fatal): {exc}", flush=True)
 
     def setup_qgf(
         self,
@@ -3340,15 +3711,212 @@ class SteerVLAActor:
             shifted[:, keep:, :] = shifted[:, keep - 1: keep, :]
         return shifted.reshape(flat.shape[0], expected)
 
+    # Indices into the CARLA gym ``obs["state"]`` vector built by
+    # ``ogbench/carla/carla_utils.py :: _ego_state_vector``: world x, y and yaw (degrees).
+    _EGO_STATE_IDX_X = 0
+    _EGO_STATE_IDX_Y = 1
+    _EGO_STATE_IDX_YAW_DEG = 5
+
+    # Output formats whose trailing two action columns are ego-frame xy route deltas, i.e. the
+    # ones a rigid SE(2) transform is valid for. The ``*_delta_course_space`` formats store a
+    # heading angle in that slot instead, and rotating it as if it were a point is meaningless.
+    _ROUTE_XY_FORMATS = frozenset({"delta_xy_t_delta_xy_space"})
+
+    def _ego_pose_from_state(self, state: Any) -> np.ndarray | None:
+        """``(x, y, yaw_rad)`` in CARLA world coords from an ``obs["state"]`` vector, else None."""
+        if state is None:
+            return None
+        s = np.asarray(state, dtype=np.float64).reshape(-1)
+        if s.size <= self._EGO_STATE_IDX_YAW_DEG:
+            return None
+        x = float(s[self._EGO_STATE_IDX_X])
+        y = float(s[self._EGO_STATE_IDX_Y])
+        yaw = float(np.deg2rad(s[self._EGO_STATE_IDX_YAW_DEG]))
+        if not np.isfinite((x, y, yaw)).all():
+            return None
+        if x == 0.0 and y == 0.0:
+            # ``_get_state_vector`` returns all-zeros before the ego actor exists.
+            return None
+        return np.array([x, y, yaw], dtype=np.float64)
+
+    def _current_ego_pose(self) -> np.ndarray | None:
+        if self.raw_obs_holder is None:
+            return None
+        raw = self.raw_obs_holder.get("obs")
+        if not isinstance(raw, dict):
+            return None
+        return self._ego_pose_from_state(raw.get("state"))
+
+    def _reanchor_disabled(self, reason: str) -> None:
+        """Log the first reason re-anchoring is inactive, then stay quiet."""
+        if self._reanchor_disabled_reason is None:
+            self._reanchor_disabled_reason = reason
+            print(f"[reanchor] inactive: {reason}", flush=True)
+
+    def _reanchor_route_to_current_pose(
+        self,
+        out_flat: np.ndarray,
+        base_flat: np.ndarray,
+        *,
+        query_pose: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Re-express a replayed chunk's route waypoints in the ego's *current* body frame.
+
+        The route columns are ego-frame xy deltas along a **spatial** path anchored at the pose the
+        chunk was sampled from. Serving that chunk verbatim for ``actions_per_model_query`` ticks
+        leaves the lateral controller open-loop: ``LateralPIDController`` derives its heading error
+        purely from these waypoints (``ogbench/carla/steervla_simlingo_control.py`` passes it only
+        the ego *speed* besides the chunk), and ``interpolate_waypoints`` re-zeroes arc length at
+        the plan's first point. The decoder therefore *assumes* the ego is sitting exactly at the
+        pose the chunk was sampled from, and re-issues the steering appropriate to that pose for
+        the whole hold. Any cross-track or heading error the ego accumulates in between is
+        invisible until the next model query -- which is precisely the error a controller exists
+        to remove. Measured on a 30 m-radius arc at 10 m/s over a 5-tick hold
+        (``test_reanchor_cached_chunk.py``): with 0.4 m of lateral drift the un-re-anchored steer
+        stays pinned at 0.152 while the re-anchored one corrects to -0.109; with 4 deg of yaw lag
+        it stays at 0.152 versus 0.320. When the ego tracks the plan exactly the two agree, as
+        they should.
+
+        Fix: rigid SE(2) transform of the cumulative waypoints into the current body frame, drop
+        the points now behind the ego, and re-derive the deltas. This is the continuous analogue of
+        :meth:`_shift_cached_action_chunk`'s integer row shift, driven by the ego's *measured*
+        progress instead of by assuming it tracked the plan exactly.
+
+        The speed columns are deliberately left untouched. The PID reads them as
+        ``|wp[2] - wp[0]| * 2`` -- a displacement magnitude over a fixed 0.5 s window -- which is
+        invariant under rotation and translation. That channel is time-indexed, so only the
+        whole-row shift can advance it, and it stays closed-loop anyway via the fresh ego speed.
+        """
+        if not self.reanchor_cached_chunk:
+            self._reanchor_disabled("reanchor_cached_chunk=False")
+            return out_flat
+        horizon = int(self.action_horizon)
+        adim = int(self.action_dim)
+        if adim < 4:
+            self._reanchor_disabled(f"action_dim={adim} has no xy route columns")
+            return out_flat
+        fmt = str(self.output_action_format or "").strip().lower()
+        if fmt not in self._ROUTE_XY_FORMATS:
+            self._reanchor_disabled(f"output_action_format={self.output_action_format!r} is not an xy route format")
+            return out_flat
+        pose_now = self._current_ego_pose()
+        # Best-of-N selectors hold chunks outside the actor's normal cache and pass the pose
+        # captured when their chosen chunk was sampled. Ordinary caching uses the saved pose.
+        pose_query = self._cached_action_pose if query_pose is None else query_pose
+        if pose_now is None or pose_query is None:
+            self._reanchor_disabled("no ego pose available from raw_obs_holder['obs']['state']")
+            return out_flat
+
+        # Old ego origin expressed in the current ego frame, using the same world->ego convention
+        # as ``carla_utils._compute_target_point_ego`` (x forward): t = R(yaw_now)^T (o_old - o_now).
+        d_world = pose_query[:2] - pose_now[:2]
+        cy, sy = float(np.cos(pose_now[2])), float(np.sin(pose_now[2]))
+        t = np.array(
+            [d_world[0] * cy + d_world[1] * sy, -d_world[0] * sy + d_world[1] * cy],
+            dtype=np.float64,
+        )
+        dyaw_raw = float(pose_now[2] - pose_query[2])
+        dyaw = float(np.arctan2(np.sin(dyaw_raw), np.cos(dyaw_raw)))
+        if float(np.hypot(t[0], t[1])) < 1e-3 and abs(dyaw) < 1e-4:
+            # Ego has not moved since the query -- the cached frame *is* the current frame.
+            self.last_reanchor = {"dx_m": 0.0, "dy_m": 0.0, "dyaw_deg": 0.0, "dropped": 0.0, "padded": 0.0}
+            return out_flat
+
+        base = np.asarray(base_flat, dtype=np.float64).reshape(-1, horizon, adim)[0]
+        # Cumulative route points in the query-time ego frame; pts[0] is the query origin itself.
+        pts = np.cumsum(
+            np.concatenate([np.zeros((1, 2), dtype=np.float64), base[:, 2:4]], axis=0), axis=0
+        )
+        c, s = float(np.cos(-dyaw)), float(np.sin(-dyaw))
+        rot = np.array([[c, -s], [s, c]], dtype=np.float64)
+        pts_now = pts @ rot.T + t
+
+        ahead = np.flatnonzero(pts_now[:, 0] > 1e-3)
+        if ahead.size == 0:
+            # Whole plan is behind the ego (it overran the chunk); nothing sane to steer toward.
+            self._reanchor_disabled("cached route fully behind the ego")
+            return out_flat
+        kept = pts_now[int(ahead[0]) :][:horizon]
+        new_deltas = np.diff(
+            np.concatenate([np.zeros((1, 2), dtype=np.float64), kept], axis=0), axis=0
+        )
+        padded = horizon - new_deltas.shape[0]
+        if padded > 0:
+            # Same tail convention as _shift_cached_action_chunk: extend along the last delta.
+            new_deltas = np.concatenate(
+                [new_deltas, np.repeat(new_deltas[-1:], padded, axis=0)], axis=0
+            )
+
+        out = np.array(out_flat, dtype=np.float32).reshape(-1, horizon, adim)
+        out[:, :, 2:4] = new_deltas.astype(np.float32)[None]
+        self.last_reanchor = {
+            "dx_m": float(t[0]),
+            "dy_m": float(t[1]),
+            "dyaw_deg": float(np.degrees(dyaw)),
+            "dropped": float(int(ahead[0])),
+            "padded": float(max(padded, 0)),
+        }
+        print(
+            f"[reanchor] ego moved dx={t[0]:+.3f} dy={t[1]:+.3f} m dyaw={np.degrees(dyaw):+.2f} deg "
+            f"-> dropped {int(ahead[0])} route pts, padded {max(padded, 0)}",
+            flush=True,
+        )
+        return out.reshape(out.shape[0], horizon * adim)
+
+    def replay_action_chunk_from_pose(
+        self, action: np.ndarray, query_pose: np.ndarray | None, env_step: int
+    ) -> np.ndarray:
+        """Replay an externally held chunk with the same semantics as the actor cache.
+
+        ``env_step`` counts 20 Hz CARLA ticks since sampling. Chunk rows are 4 Hz, so time-indexed
+        columns advance only every ``env_steps_per_chunk_row`` ticks. Route columns are always
+        re-anchored from the original path to measured ego pose, avoiding double-counted progress.
+        """
+        flat = np.asarray(action, dtype=np.float32)
+        expected = int(self.action_horizon) * int(self.action_dim)
+        one_dimensional = flat.ndim == 1
+        if one_dimensional:
+            flat = flat[None]
+        if flat.ndim != 2 or flat.shape[-1] != expected:
+            return np.asarray(action, dtype=np.float32)
+        row = max(0, int(env_step)) // int(self.env_steps_per_chunk_row)
+        out = self._shift_cached_action_chunk(flat, row)
+        out = self._reanchor_route_to_current_pose(out, flat, query_pose=query_pose)
+        return out[0] if one_dimensional else out
+
     def _next_cached_action(self, batch_size: int) -> jnp.ndarray | None:
+        """Serve one env action from the cached chunk, re-anchored to the ego's *actual* progress.
+
+        ``actions_per_model_query`` counts **env steps**, not chunk rows. The two are not the same
+        rate: a chunk row is a waypoint at the policy rate the model was trained at (4 Hz for the
+        SimLingo/SteerVLA data, i.e. 0.25 s apart), while a CARLA env step is a single 20 Hz tick
+        (0.05 s) -- ``env_steps_per_chunk_row`` (= ``carla_fps // policy_fps`` = 5) is the ratio.
+        So the plan may only be shifted forward one row every ``env_steps_per_chunk_row`` env steps;
+        shifting once per env step would replay the model's trajectory 5x too fast (the longitudinal
+        PID would read the speed target ~1 s into the plan after only 0.2 s of sim, braking early and
+        over-throttling out of a stop). Holding the chunk for the intervening ticks and re-running the
+        PID against the fresh ego speed is exactly what ``simlingo/team_code/agent_steervla.py`` does
+        between VLM queries; the env re-decodes the chunk with a fresh state vector on every step.
+
+        Holding the chunk is not enough on its own, though: the env only feeds the decoder a fresh
+        ego *speed*, so the lateral loop would be open-loop for the whole hold. The route waypoints
+        are therefore re-anchored to the ego's current pose on every replayed step -- see
+        :meth:`_reanchor_route_to_current_pose`.
+        """
         if self.actions_per_model_query <= 1 or batch_size != 1 or self._cached_action_chunk is None:
             return None
-        max_cached_steps = min(self.actions_per_model_query, int(self.action_horizon))
+        rows_per_query = int(self.action_horizon) * self.env_steps_per_chunk_row
+        max_cached_steps = min(self.actions_per_model_query, rows_per_query)
         if self._cached_action_step >= max_cached_steps:
             self._cached_action_chunk = None
             self._cached_action_step = 0
             return None
-        out = self._shift_cached_action_chunk(self._cached_action_chunk, self._cached_action_step)
+        row = self._cached_action_step // self.env_steps_per_chunk_row
+        # Time-indexed shift for the speed columns, pose-based re-anchor for the route columns.
+        # The re-anchor reads the *unshifted* chunk: it accounts for all progress since the query
+        # continuously, so the integer row shift would double-count it on the route channel.
+        out = self._shift_cached_action_chunk(self._cached_action_chunk, row)
+        out = self._reanchor_route_to_current_pose(out, self._cached_action_chunk)
         self._cached_action_step += 1
         return jnp.asarray(out)
 
@@ -3356,6 +3924,8 @@ class SteerVLAActor:
         if self.actions_per_model_query <= 1 or batch_size != 1:
             return
         self._cached_action_chunk = np.asarray(jax.device_get(action), dtype=np.float32)
+        # Pose this chunk's ego-frame waypoints are anchored at, for _reanchor_route_to_current_pose.
+        self._cached_action_pose = self._current_ego_pose()
         # Step 0 was just returned from the fresh model query.
         self._cached_action_step = 1
 
@@ -3640,6 +4210,58 @@ class SteerVLAActor:
         self._last_cot_out = cot_out
         return cot_out
 
+    def _grpo_scene_fields(self, raw: dict[str, Any]) -> tuple[np.ndarray, str, np.ndarray]:
+        """Shared (state, prompt, image) for GRPO HL records built from a raw CARLA obs."""
+        state_vec = np.asarray(raw["state"], dtype=np.float32).reshape(-1)
+        speed = float(state_vec[15]) if state_vec.shape[0] > 15 else 0.0
+        prompt = routing_instruction_prompt(routing_command=self.routing_command, current_speed_mps=speed)
+        return state_vec, prompt, np.asarray(raw["image"])
+
+    def grpo_records_from_candidates(
+        self, cands: dict[str, Any], raw: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """K per-candidate HL records for :meth:`update_hl_grpo`, from a :meth:`sample_candidates` batch.
+
+        Each record carries the sampled reasoning/subtask token ids for that candidate plus the shared scene.
+        Schema matches _build_hl_observation_batch (action loss + FAST masked off: HL-only supervision).
+        """
+        cot = cands["cot_out"]
+        rea = np.asarray(jax.device_get(cot["tokenized_reasoning"]), dtype=np.int32)
+        rea_mask = np.asarray(jax.device_get(cot["tokenized_reasoning_mask"]), dtype=bool)
+        sub = np.asarray(jax.device_get(cot["tokenized_subtask"]), dtype=np.int32)
+        sub_mask = np.asarray(jax.device_get(cot["tokenized_subtask_mask"]), dtype=bool)
+        state_vec, prompt, image = self._grpo_scene_fields(raw)
+        return [
+            {
+                "state": state_vec,
+                "state_format": "carla_raw",
+                "prompt": prompt,
+                "image": image,
+                "reasoning_ids": rea[k],
+                "reasoning_mask": rea_mask[k],
+                "subtask_ids": sub[k],
+                "subtask_mask": sub_mask[k],
+                "action_supervision": False,
+                "supervise_fast": False,
+            }
+            for k in range(rea.shape[0])
+        ]
+
+    def grpo_stop_record(self, raw: dict[str, Any], *, reasoning: str, subtask: str) -> dict[str, Any]:
+        """Canned text-based HL record (debug stop-injection); the CoT is tokenized from the given
+        reasoning/subtask text by _build_hl_observation_batch (no ``*_ids``)."""
+        state_vec, prompt, image = self._grpo_scene_fields(raw)
+        return {
+            "state": state_vec,
+            "state_format": "carla_raw",
+            "prompt": prompt,
+            "image": image,
+            "reasoning": str(reasoning),
+            "subtask": str(subtask),
+            "action_supervision": False,
+            "supervise_fast": False,
+        }
+
     def _mark_action_served(self, batch_size: int) -> None:
         if self._cot_cache_enabled(batch_size) and self._cached_cot is not None:
             self._cached_cot_actions_used += 1
@@ -3647,6 +4269,8 @@ class SteerVLAActor:
     def reset_action_cache(self) -> None:
         self._cached_action_chunk = None
         self._cached_action_step = 0
+        self._cached_action_pose = None
+        self.last_reanchor = {}
         self._cached_cot = None
         self._cached_cot_actions_used = 0
         self._last_cot_out = None
@@ -3827,13 +4451,13 @@ class SteerVLAActor:
         )
         noise_jax = jax.device_put(noise_jax, self._jax_device)
         rng_cot, rng_act = jax.random.split(rng)
-
+        
         # Either sample or reuse the CoT
         _cot_t0 = time.time()
         cot_out = self._sample_or_reuse_cot(rng_cot, obs_jax, batch_size)
         jax.block_until_ready(cot_out["tokenized_reasoning"])
         print(f"[DEBUG - steervla] CoT time: {time.time() - _cot_t0:.3f} seconds")
-
+        
         reason_tokens = cot_out["tokenized_reasoning"]
         reason_mask = cot_out["tokenized_reasoning_mask"]
         reason_valid = reason_tokens[reason_mask.astype(bool)]
@@ -3880,22 +4504,40 @@ class SteerVLAActor:
             self._cached_policy_embed_obs_id = obs_id
             print(f"[DEBUG - steervla] Prefix embed time: {time.time() - _prefix_t0:.3f} seconds")
 
-        # Prepare noise for inference
+        # Prepare noise for inference.
+        #
+        # Two flat noise conventions exist in this stack:
+        #   MODEL layout  action_horizon * model.action_dim   (Pi0 latent width; DSRL noise actor)
+        #   ENV   layout  action_horizon * self.action_dim    (real driving dims only)
+        # They are checked in that order; on a collision the model layout wins.
         batch_size = obs_jax.state.shape[0]
         model_ah = int(self.model.action_horizon)
         model_ad = int(self.model.action_dim)
-        cfg_ah = min(int(self.action_horizon), model_ah)
-        cfg_ad = min(int(self.action_dim), model_ad)
+        env_ah = int(self.action_horizon)
+        env_ad = int(self.action_dim)
+        model_flat = model_ah * model_ad
+        env_flat = env_ah * env_ad
         noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
         if noise_jax.ndim == 3:
+            # Already (B, H, D); follow the caller's shape instead of truncating to env dims.
+            cfg_ah = min(int(noise_jax.shape[1]), model_ah)
+            cfg_ad = min(int(noise_jax.shape[2]), model_ad)
             noise_chunk = noise_jax[:, :cfg_ah, :cfg_ad]
-        elif int(noise_jax.shape[-1]) == int(self.action_horizon) * int(self.action_dim):
-            noise_chunk = noise_jax.reshape(batch_size, int(self.action_horizon), int(self.action_dim))[
-                :, :cfg_ah, :cfg_ad
-            ]
+        elif int(noise_jax.shape[-1]) == model_flat:
+            # MODEL layout, e.g. the DSRL noise actor (``actor_action_dim * action_horizon``).
+            cfg_ah, cfg_ad = model_ah, model_ad
+            noise_chunk = noise_jax.reshape(batch_size, model_ah, model_ad)
+        elif int(noise_jax.shape[-1]) == env_flat:
+            # ENV layout: noise on the real driving dims only.
+            cfg_ah, cfg_ad = min(env_ah, model_ah), min(env_ad, model_ad)
+            noise_chunk = noise_jax.reshape(batch_size, env_ah, env_ad)[:, :cfg_ah, :cfg_ad]
         else:
-            noise_chunk = noise_jax[:, None, :cfg_ad]
-            cfg_ah = 1
+            raise ValueError(
+                f"SteerVLAActor received noise of shape {tuple(noise_jax.shape)}. Expected 3-D "
+                f"(batch, horizon, dim), or a flat width of {model_flat} (model layout "
+                f"{model_ah}x{model_ad}) or {env_flat} (env layout {env_ah}x{env_ad}). Silently "
+                f"zero-filling the flow initialization is not safe."
+            )
         noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(noise_chunk)
         
         # Context noise level (CSP). Derived with fold_in so the CoT/action rng streams above are
@@ -3912,13 +4554,13 @@ class SteerVLAActor:
             traj = self._qgf_guided_denoise(obs_full, noise_full, batch_size)
         else:
             traj = self._sample_actions_cached(
-                rng_act,
-                obs_full,
-                noise=noise_full,
-                num_steps=int(self.sample_actions_num_steps),
-                image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+            rng_act,
+            obs_full,
+            noise=noise_full,
+            num_steps=int(self.sample_actions_num_steps),
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
                 **t_context_kw,
-            )
+        )
         jax.block_until_ready(traj)
         sample_actions_time = time.time() - sample_actions_time
 
@@ -4297,11 +4939,15 @@ class SteerVLAActor:
         """
         batch_size = int(noise_jax.shape[0])
         cached = self._next_cached_action(batch_size)
+        # A replayed chunk ignores ``noise_jax`` entirely: with ``actions_per_model_query=k`` the
+        # noise actor only influences 1 in k executed actions. main_carla logs this as
+        # ``vla/action_cached`` so an RL run's true on-policy fraction is visible.
+        self.last_action_was_cached = cached is not None
         if cached is not None:
             # Cache-hit path still corresponds to a real env step with a fresh `raw_obs_holder["obs"]`.
             # Re-stash the currently reused CoT so replay capture for this step remains aligned.
             if (
-                batch_size == 1 
+                batch_size == 1
                 and self._cached_cot is not None
                 and self.raw_obs_holder is not None
                 and isinstance(self.raw_obs_holder.get("obs"), dict)
@@ -4347,7 +4993,13 @@ class SteerVLAActor:
         self._call_counter += 1
         rng = jax.random.PRNGKey(self._call_counter)
         rng_noise, rng_act = jax.random.split(rng)
-        noise_jax = jax.random.normal(rng_noise, (1, self.model.action_dim), dtype=jnp.float32)
+        # Full model-layout noise, matching Pi0CoT._denoise's own default
+        # ``normal(rng, (batch, action_horizon, action_dim))``.
+        noise_jax = jax.random.normal(
+            rng_noise,
+            (1, int(self.model.action_horizon), int(self.model.action_dim)),
+            dtype=jnp.float32,
+        )
         noise_jax = noise_jax * jnp.asarray(self.noise_scale, dtype=jnp.float32)
         actions = self._forward_pi0(1, noise_jax, raw=state, rng=rng_act, force_accel_steer=True)
         self._mark_action_served(1)
@@ -4512,6 +5164,7 @@ class SteerVLAActor:
 
         decode_bs = min(n, int(self.action_decode_batch_size))
         traj_parts: list[np.ndarray] = []
+        norm_parts: list[np.ndarray] = []
         for start in range(0, n, decode_bs):
             end = min(start + decode_bs, n)
             chunk_rng = jax.random.fold_in(rng_act, start)
@@ -4527,14 +5180,22 @@ class SteerVLAActor:
                 **t_context_kw,
             )
             jax.block_until_ready(traj)
+            norm_parts.append(
+                np.asarray(
+                    jax.device_get(traj[:, : int(self.action_horizon), : int(self.action_dim)]),
+                    dtype=np.float32,
+                ).reshape(end - start, -1)
+            )
             traj_np = self._postprocess_action_trajectory(
                 traj, observation_state=jax.tree.map(lambda x: x[start:end], obs_jax.state)
             )
             traj_parts.append(np.asarray(traj_np, dtype=np.float32))
         actions_flat = np.concatenate(traj_parts, axis=0).reshape(n, -1)
+        actions_norm = np.concatenate(norm_parts, axis=0).reshape(n, -1)
 
         return {
             "actions": actions_flat,
+            "actions_normalized": actions_norm,
             "subtask_texts": subtask_texts,
             "reasoning_texts": reasoning_texts,
             "cot_out": cot_out,
@@ -4583,6 +5244,8 @@ def create_steervla_pi0_cot_sample_fn(
         action_dim=int(steervla_cfg.get("action_dim", 4)),
         actions_per_model_query=int(steervla_cfg.get("actions_per_model_query", 1)),
         actions_per_cot=int(steervla_cfg.get("actions_per_cot", 1)),
+        env_steps_per_chunk_row=int(steervla_cfg.get("env_steps_per_chunk_row", 5)),
+        reanchor_cached_chunk=bool(steervla_cfg.get("reanchor_cached_chunk", True)),
         sample_actions_num_steps=int(steervla_cfg.get("sample_actions_num_steps", 10)),
         action_decode_batch_size=int(steervla_cfg.get("action_decode_batch_size", 2)),
         training_gpu_rank=int(srank),
@@ -4592,6 +5255,7 @@ def create_steervla_pi0_cot_sample_fn(
         hl_update_every=int(steervla_cfg.get("hl_update_every", 1)),
         hl_update_batch_size=int(steervla_cfg.get("hl_update_batch_size", 2)),
         hl_update_num_steps=int(steervla_cfg.get("hl_update_num_steps", 1)),
+        hl_lr=steervla_cfg.get("hl_lr"),
         hl_freeze_regexes=steervla_cfg.get("hl_freeze_regexes"),
         # HL replay pools (pretraining-data stabilization). See extract_hl_replay.py.
         hl_replay_root=steervla_cfg.get("hl_replay_root"),
@@ -4600,6 +5264,7 @@ def create_steervla_pi0_cot_sample_fn(
         hl_online_bad_fraction=float(steervla_cfg.get("hl_online_bad_fraction", -1.0)),
         hl_online_precursor_fraction=float(steervla_cfg.get("hl_online_precursor_fraction", -1.0)),
         hl_min_online_samples=int(steervla_cfg.get("hl_min_online_samples", 1)),
+        hl_keep_last_rounds=int(steervla_cfg.get("hl_keep_last_rounds", 0)),
         hl_log_batch_tokens=bool(steervla_cfg.get("hl_log_batch_tokens", True)),
         return_normalized_action_chunk=bool(steervla_cfg.get("use_pi_action_chunk_for_env", True)),
         fixed_subtask_text=steervla_cfg.get("fixed_subtask_text"),
