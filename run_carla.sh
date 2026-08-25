@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 # Machine-specific: override by exporting CARLA_ROOT (see ogbench/carla/README.md,
 # "Machine-specific settings"). We warn rather than silently substituting a path from
 # somebody else's box, which only produces a confusing import error later.
-export CARLA_ROOT="${CARLA_ROOT:-/home/carla/carla-0-9-16}"
+export CARLA_ROOT="${CARLA_ROOT:-/raid/users/${USER}/carla}"
 CARLA_ROOT="${CARLA_ROOT%/}"  # strip trailing slash
 export CARLA_ROOT
 if [[ ! -d "$CARLA_ROOT" ]]; then
@@ -22,6 +22,15 @@ SAVE_BUFFER="true"
 EXPERT_DEBUG="false"
 EXPERT_RECOVER_DEBUG="false"
 WANDB_MODE="${WANDB_MODE:-online}"
+
+# Keep model/checkpoint caches and run artifacts off the home filesystem. Each can still
+# be overridden explicitly by the caller.
+export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-/raid/users/${USER}/openpi}"
+export HF_HOME="${HF_HOME:-/raid/users/${USER}/huggingface}"
+export TORCH_HOME="${TORCH_HOME:-/raid/users/${USER}/cache/torch}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/raid/users/${USER}/cache/xdg}"
+export OGBENCH_SAVE_DIR="${OGBENCH_SAVE_DIR:-/raid/users/${USER}/carla_exps}"
+mkdir -p "$OPENPI_DATA_HOME" "$HF_HOME" "$TORCH_HOME" "$XDG_CACHE_HOME" "$OGBENCH_SAVE_DIR"
 
 TRAIN_GPU_RANK="2"
 SIM_GPU_RANK=""  # defaults to TRAIN_GPU_RANK below
@@ -60,6 +69,11 @@ PID_CREEP_THROTTLE=""
 BON_GEMINI_SELECT="false"
 GEMINI_MODEL=""
 BON_GEMINI_ROLLOUT_CHUNK="false"
+BON_QWEN_SELECT="false"
+QWEN_BON_URL="http://127.0.0.1:18765"
+BON_QWEN_CADENCE="5"
+QWEN_ONLINE_TRAIN="false"
+QWEN_ONLINE_WARMUP_EPISODES="2"
 MAX_EPISODES=""
 TERMINATE_ON_COLLISION="false"
 EXPERT_CONTROLLER=""
@@ -301,6 +315,11 @@ while [[ $# -gt 0 ]]; do
     --bon-gemini-select|--bon_gemini_select) BON_GEMINI_SELECT="$2"; shift 2 ;;
     --gemini-model|--gemini_model) GEMINI_MODEL="$2"; shift 2 ;;
     --bon-gemini-rollout-chunk|--bon_gemini_rollout_chunk) BON_GEMINI_ROLLOUT_CHUNK="$2"; shift 2 ;;
+    --bon-qwen-select|--bon_qwen_select) BON_QWEN_SELECT="$2"; shift 2 ;;
+    --qwen-bon-url|--qwen_bon_url) QWEN_BON_URL="$2"; shift 2 ;;
+    --bon-qwen-cadence|--bon_qwen_cadence) BON_QWEN_CADENCE="$2"; shift 2 ;;
+    --qwen-online-train|--qwen_online_train) QWEN_ONLINE_TRAIN="$2"; shift 2 ;;
+    --qwen-online-warmup-episodes|--qwen_online_warmup_episodes) QWEN_ONLINE_WARMUP_EPISODES="$2"; shift 2 ;;
     --max-episodes|--max_episodes) MAX_EPISODES="$2"; shift 2 ;;
     --terminate-on-collision|--terminate_on_collision) TERMINATE_ON_COLLISION="$2"; shift 2 ;;
     --expert-controller|--expert_controller) EXPERT_CONTROLLER="$2"; shift 2 ;;
@@ -486,7 +505,7 @@ def get_config():
     ${STATE_ENCODER_LINE}
     ${RLT_CHECKPOINT_LINE}
     ${BASE_ONLY_LINE}
-$( [[ -n "$BON_CRITIC_CKPT" || "$BON_ONLINE_CRITIC" == "true" || "$BON_GEMINI_SELECT" == "true" ]] && \
+$( [[ -n "$BON_CRITIC_CKPT" || "$BON_ONLINE_CRITIC" == "true" || "$BON_GEMINI_SELECT" == "true" || "$BON_QWEN_SELECT" == "true" ]] && \
    echo "    config.steervla.cot_temperature = ${BON_COT_TEMPERATURE}" )
     return config
 EOF
@@ -590,6 +609,11 @@ while :; do
     --bon_gemini_select="${BON_GEMINI_SELECT}" \
     ${GEMINI_MODEL:+--gemini_model="${GEMINI_MODEL}"} \
     --bon_gemini_rollout_chunk="${BON_GEMINI_ROLLOUT_CHUNK}" \
+    --bon_qwen_select="${BON_QWEN_SELECT}" \
+    --qwen_bon_url="${QWEN_BON_URL}" \
+    --bon_qwen_cadence="${BON_QWEN_CADENCE}" \
+    --qwen_online_train="${QWEN_ONLINE_TRAIN}" \
+    --qwen_online_warmup_episodes="${QWEN_ONLINE_WARMUP_EPISODES}" \
     ${MAX_EPISODES:+--max_episodes="${MAX_EPISODES}"} \
     --terminate_on_collision="${TERMINATE_ON_COLLISION}" \
     --save_video_local="${SAVE_VIDEO_LOCAL}" \

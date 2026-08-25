@@ -657,6 +657,10 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
             os.path.join(self.carla_path, "CarlaUE4.sh"),
             "-RenderOffScreen",
             "-nosound",
+            # Busy shared hosts can stall UE4's render thread for more than the
+            # Linux default of 60 s during initial world/shader setup.  Let that
+            # startup finish instead of crashing the simulator watchdog.
+            "-g.TimeoutForBlockOnRenderFence=300000",
             f"-carla-rpc-port={rpc_port}",
             f"-graphicsadapter={sim_gpu_rank}",
         ]
@@ -719,10 +723,10 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
         attempts = 0
         num_max_restarts = 20
         client_timeout = args.timeout if args.timeout else self.client_timeout
-        # Use a short per-attempt timeout during setup so the retry loop can
-        # cycle on a slow/unready CARLA server instead of blocking for
-        # client_timeout (7200s) on the first attempt.
-        _setup_attempt_timeout = 30.0
+        # World/shader setup can exceed a minute on a busy shared host. Match
+        # the extended render-fence watchdog so we do not abandon the first
+        # request and stack repeated setup RPCs while UE4 is still rendering.
+        _setup_attempt_timeout = 300.0
         while attempts < num_max_restarts:
             try:
                 client = carla.Client(args.host, rpc_port)

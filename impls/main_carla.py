@@ -150,7 +150,12 @@ flags.DEFINE_bool(
 # before CARLA even connected. Overridable per run with --save_dir, or globally with
 # OGBENCH_SAVE_DIR for a machine whose scratch lives somewhere else.
 flags.DEFINE_string(
-    "save_dir", os.environ.get("OGBENCH_SAVE_DIR", "/raid/users/cglossop/exps"), "Save directory."
+    "save_dir",
+    os.environ.get(
+        "OGBENCH_SAVE_DIR",
+        os.path.join("/raid/users", os.environ.get("USER", "unknown"), "carla_exps"),
+    ),
+    "Save directory.",
 )
 flags.DEFINE_string("restore_path", None, "Restore path for JAX agents.")
 flags.DEFINE_integer("restore_epoch", None, "Restore epoch.")
@@ -214,6 +219,23 @@ flags.DEFINE_bool(
 flags.DEFINE_string(
     "gemini_model", "gemini-3.6-flash",
     "Gemini model used for --bon_gemini_select.",
+)
+flags.DEFINE_bool("bon_qwen_select", False, "Select candidates with a local Qwen service.")
+flags.DEFINE_string("qwen_bon_url", "http://127.0.0.1:18765", "Qwen BoN service URL.")
+flags.DEFINE_integer("bon_qwen_cadence", 5, "Environment steps per fixed candidate set.")
+flags.DEFINE_bool(
+    "qwen_online_train", False,
+    "After each Qwen selection window, submit the executed projected trajectory and causal "
+    "collision/goal/offroad/traffic/progress targets to the Qwen service's LoRA trainer.",
+)
+flags.DEFINE_integer(
+    "qwen_online_warmup_episodes", 2,
+    "Number of complete rollout episodes that use Qwen scoring but submit no Qwen LoRA updates.",
+)
+flags.DEFINE_string(
+    "qwen_online_route_id", None,
+    "Optional isolated Qwen adapter/training identity. Defaults to --route. Set this when "
+    "running multiple experiments on the same route so their online LoRA updates do not mix.",
 )
 flags.DEFINE_bool(
     "bon_gemini_rollout_chunk", False,
@@ -1943,6 +1965,19 @@ def run_online_carla(
             flush=True,
         )
 
+    _qwen_selector = None
+    if FLAGS.bon_qwen_select:
+        if FLAGS.bon_critic_ckpt or FLAGS.bon_gemini_select:
+            raise ValueError("--bon_qwen_select is incompatible with frozen-critic or Gemini selection.")
+        from qwen_bon_selector import QwenActionSelector
+
+        _qwen_selector = QwenActionSelector(FLAGS.qwen_bon_url)
+        print(
+            f"[main_carla] Qwen rejection-sampling BoN enabled: url={FLAGS.qwen_bon_url} "
+            f"N={_bon_n} cadence={FLAGS.bon_qwen_cadence} online_critic={_bon_online}",
+            flush=True,
+        )
+
     _bon_last_q_best: list[float] = [0.0]
     _bon_last_q_mean: list[float] = [0.0]
     _bon_last_candidates: list[dict | None] = [None]  # {"q_vals", "best_idx", "subtasks"}
@@ -2291,10 +2326,17 @@ def run_online_carla(
     # on every env step.
     _gemini_rollout_chunk: list = [None]  # flat np.ndarray (ah*ad,) selected by the last Gemini call
     _gemini_rollout_step: list = [0]  # steps of _gemini_rollout_chunk already executed
+    _gemini_rollout_pose: list = [None]
+    _qwen_rollout_chunk: list = [None]
+    _qwen_rollout_step: list = [0]
+    _qwen_rollout_pose: list = [None]
+    _qwen_online_window: list[dict | None] = [None]
+    _qwen_route_id = str(FLAGS.qwen_online_route_id or FLAGS.route or "online")
     # --bon_critic_rollout_chunk state: same idea as the Gemini rollout state above, but
     # for the critic-scored best-of-N paths (--bon_critic_ckpt / --bon_online_critic).
     _bon_rollout_chunk: list = [None]  # flat np.ndarray (ah*ad,) selected by the last critic score
     _bon_rollout_step: list = [0]  # steps of _bon_rollout_chunk already executed
+    _bon_rollout_pose: list = [None]
     trajectory_dir = os.path.join(FLAGS.save_dir, "trajectories")
     os.makedirs(trajectory_dir, exist_ok=True)
 
@@ -2568,9 +2610,9 @@ def run_online_carla(
         frame: np.ndarray, candidates: dict, target_points: np.ndarray | None = None,
     ) -> np.ndarray:
         """Project every best-of-N candidate's predicted waypoints onto ``frame`` in a
-        distinct color, then append a text panel below listing each candidate's Q value
-        + subtask (color swatch matching its projected path), with the selected
-        candidate highlighted. ``candidates`` is a
+        distinct color, then append a text panel below listing each candidate's Q value,
+        subtask, and (for Qwen) individual category probabilities/expected progress plus
+        rejection status. The selected candidate is highlighted. ``candidates`` is a
         ``{"q_vals": [...], "best_idx": int, "subtasks": [...], "chunks": (N, D)}``
         dict, see ``_bon_last_candidates``."""
         base = np.array(frame, copy=True)
@@ -2581,6 +2623,8 @@ def run_online_carla(
             q_vals = candidates.get("q_vals") or []
             best_idx = candidates.get("best_idx", -1)
             subtasks = candidates.get("subtasks") or []
+            qwen_scores = candidates.get("qwen_scores") or []
+            accepted = candidates.get("accepted") or []
             chunks = candidates.get("chunks")
             n = len(q_vals)
             if n == 0:
@@ -2604,7 +2648,9 @@ def run_online_carla(
             h, w = base.shape[:2]
             font_scale = 0.26
             line_h = 13
-            panel_h = max(20, line_h * (n + 1))
+            has_term_scores = len(qwen_scores) == n
+            lines_per_candidate = 2 if has_term_scores else 1
+            panel_h = max(20, line_h * (n * lines_per_candidate + 1))
             annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
             annotated[:h, :, :] = base
             cv2.line(annotated, (0, h), (w - 1, h), (255, 255, 255), 1)
@@ -2628,6 +2674,27 @@ def run_online_carla(
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1, cv2.LINE_AA,
                 )
                 y += line_h
+                if has_term_scores:
+                    scores = qwen_scores[i]
+                    accepted_text = (
+                        "ACCEPT" if i < len(accepted) and bool(accepted[i]) else "REJECT"
+                    )
+                    score_line = (
+                        f"              {accepted_text}  "
+                        f"P(crash)={float(scores['crash']):.3f}  "
+                        f"P(goal)={float(scores['goal']):.3f}  "
+                        f"P(offroad)={float(scores['offroad']):.3f}  "
+                        f"P(traffic)={float(scores['traffic_violation']):.3f}  "
+                        f"E(progress)={float(scores['progress']):.3f}"
+                    )
+                    status_color = (
+                        (120, 255, 120) if accepted_text == "ACCEPT" else (120, 120, 255)
+                    )
+                    cv2.putText(
+                        annotated, score_line, (12, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        font_scale, status_color, 1, cv2.LINE_AA,
+                    )
+                    y += line_h
             return annotated
         except Exception:
             return base
@@ -3028,26 +3095,69 @@ def run_online_carla(
         chunks = jax.numpy.asarray(chunks_np)
         return chunks, scores, best_idx
 
-    def _shift_flat_chunk(flat: np.ndarray, step: int) -> np.ndarray:
-        """Shift a flat (ah*ad,) action chunk forward by ``step`` timesteps, padding the
-        tail by repeating the last waypoint. Mirrors
-        SteerVLAActor._shift_cached_action_chunk (steervla.py) so --bon_gemini_rollout_chunk
-        executes the remaining steps of a Gemini-selected chunk the same way the VLA's own
-        actions_per_model_query cache would.
-        """
-        ah = int(_steervla_exec_cfg["action_horizon"])
-        ad = int(_steervla_exec_cfg["action_dim"])
-        if step <= 0:
-            return flat
-        chunk = flat.reshape(ah, ad)
-        shifted = np.zeros_like(chunk)
-        keep = max(0, ah - step)
-        if keep > 0:
-            shifted[:keep, :] = chunk[step: step + keep, :]
-            shifted[keep:, :] = shifted[keep - 1: keep, :]
-        else:
-            shifted[:, :] = chunk[-1:, :]
-        return shifted.reshape(ah * ad)
+    def _score_candidates_with_qwen(rng_key):
+        """Sample each candidate exactly once and score it with the local Qwen service."""
+        chunks_np, candidate_subtasks = _sample_diverse_candidates(rng_key, _bon_n)
+        base_frame = _as_video_frame(_viz_image_from_raw(obs_raw))
+        routing_command = str(obs_raw.get("routing_command") or "follow the route")
+        state_vec = np.asarray(obs_raw.get("state", []), dtype=np.float32).reshape(-1)
+        speed = float(state_vec[15]) if state_vec.size > 15 else 0.0
+        result = _qwen_selector.select_candidate(
+            base_frame,
+            chunks_np,
+            candidate_subtasks,
+            routing_command,
+            speed,
+            _qwen_route_id,
+        )
+        best_idx = int(result["choice"])
+        utility = np.asarray(result["utility"], dtype=np.float32)
+        _bon_last_q_best[0] = float(utility[best_idx])
+        _bon_last_q_mean[0] = float(utility.mean())
+        _bon_last_candidates[0] = {
+            "q_vals": utility.tolist(),
+            "best_idx": best_idx,
+            "subtasks": candidate_subtasks,
+            "chunks": chunks_np,
+            "qwen_scores": result["scores"],
+            "accepted": result["accepted"],
+        }
+        if FLAGS.qwen_online_train:
+            _qwen_online_window[0] = {
+                "frame": np.asarray(base_frame, dtype=np.uint8),
+                "action": np.asarray(chunks_np[best_idx], dtype=np.float32),
+                "subtask": str(candidate_subtasks[best_idx]),
+                "routing_command": routing_command,
+                "speed": speed,
+                "route": _qwen_route_id,
+                "timestep": int(step),
+                "steps": 0,
+                "crash": 0.0,
+                "goal": 0.0,
+                "offroad": 0.0,
+                "traffic_violation": 0.0,
+                "progress": 0.0,
+            }
+        print(
+            f"[QWEN-BON] step={step} routing={routing_command!r} choice={best_idx} "
+            f"accepted={result['accepted']} utility={utility.round(4).tolist()}",
+            flush=True,
+        )
+        return jax.numpy.asarray(chunks_np), utility, best_idx
+
+    def _current_chunk_pose() -> np.ndarray | None:
+        return None if steervla_actor is None else steervla_actor._current_ego_pose()
+
+    def _replay_flat_chunk(
+        flat: np.ndarray, env_step: int, query_pose: np.ndarray | None
+    ) -> np.ndarray:
+        """Replay a held BoN chunk at the policy rate and re-anchor it to measured ego pose."""
+        if steervla_actor is None:
+            raise RuntimeError("BoN chunk replay requires a SteerVLA actor for pose re-anchoring")
+        return np.asarray(
+            steervla_actor.replay_action_chunk_from_pose(flat, query_pose, env_step),
+            dtype=np.float32,
+        )
 
     last_update_info = None
     def _bon_selected_to_action(best_chunk, subkey):
@@ -3114,7 +3224,9 @@ def run_online_carla(
                 ):
                     # Chunk still in flight: execute the next shifted step of the last
                     # critic-selected chunk instead of re-sampling candidates / re-scoring.
-                    shifted = _shift_flat_chunk(_bon_rollout_chunk[0], _bon_rollout_step[0])
+                    shifted = _replay_flat_chunk(
+                        _bon_rollout_chunk[0], _bon_rollout_step[0], _bon_rollout_pose[0]
+                    )
                     _bon_rollout_step[0] += 1
                     best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
                     _last_vla_chunk_holder[0] = shifted
@@ -3125,6 +3237,7 @@ def run_online_carla(
                 if FLAGS.bon_critic_rollout_chunk:
                     _bon_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
                     _bon_rollout_step[0] = 1  # step 0 was just returned by the fresh score
+                    _bon_rollout_pose[0] = _current_chunk_pose()
                 return _bon_selected_to_action(best_chunk, subkey)
             if _gemini_selector is not None and getattr(agent, "vla_sample_fn", None) is not None:
                 _ah = int(_steervla_exec_cfg["action_horizon"]) if _steervla_exec_cfg is not None else 1
@@ -3137,7 +3250,9 @@ def run_online_carla(
                     # Gemini-selected chunk instead of re-sampling candidates / re-querying
                     # Gemini. Mirrors actions_per_model_query caching in steervla.py, but
                     # applied at the best-of-N selection level.
-                    shifted = _shift_flat_chunk(_gemini_rollout_chunk[0], _gemini_rollout_step[0])
+                    shifted = _replay_flat_chunk(
+                        _gemini_rollout_chunk[0], _gemini_rollout_step[0], _gemini_rollout_pose[0]
+                    )
                     _gemini_rollout_step[0] += 1
                     best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
                     _last_vla_chunk_holder[0] = shifted
@@ -3148,6 +3263,25 @@ def run_online_carla(
                 if FLAGS.bon_gemini_rollout_chunk:
                     _gemini_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
                     _gemini_rollout_step[0] = 1  # step 0 was just returned by the fresh query
+                    _gemini_rollout_pose[0] = _current_chunk_pose()
+                return _bon_selected_to_action(best_chunk, subkey)
+            if _qwen_selector is not None and getattr(agent, "vla_sample_fn", None) is not None:
+                cadence = max(1, int(FLAGS.bon_qwen_cadence))
+                if _qwen_rollout_chunk[0] is not None and _qwen_rollout_step[0] < cadence:
+                    shifted = _replay_flat_chunk(
+                        _qwen_rollout_chunk[0], _qwen_rollout_step[0], _qwen_rollout_pose[0]
+                    )
+                    _qwen_rollout_step[0] += 1
+                    best_chunk = jax.numpy.asarray(shifted[None])
+                    _last_vla_chunk_holder[0] = shifted
+                    return _bon_selected_to_action(best_chunk, subkey)
+                chunks, _scores, best_idx = _score_candidates_with_qwen(subkey)
+                best_chunk = chunks[best_idx][None]
+                selected = np.asarray(best_chunk[0], dtype=np.float32)
+                _last_vla_chunk_holder[0] = selected
+                _qwen_rollout_chunk[0] = selected
+                _qwen_rollout_step[0] = 1
+                _qwen_rollout_pose[0] = _current_chunk_pose()
                 return _bon_selected_to_action(best_chunk, subkey)
             if _bon_online and getattr(agent, "vla_sample_fn", None) is not None:
                 _ah = int(_steervla_exec_cfg["action_horizon"]) if _steervla_exec_cfg is not None else 1
@@ -3161,7 +3295,9 @@ def run_online_carla(
                     # Note the online critic keeps training on collected transitions regardless
                     # (see update_with_vla() below) -- this only affects action *selection*
                     # cadence, not the Bellman backup.
-                    shifted = _shift_flat_chunk(_bon_rollout_chunk[0], _bon_rollout_step[0])
+                    shifted = _replay_flat_chunk(
+                        _bon_rollout_chunk[0], _bon_rollout_step[0], _bon_rollout_pose[0]
+                    )
                     _bon_rollout_step[0] += 1
                     best_chunk = jax.numpy.asarray(shifted[None])  # (1, 40)
                     _last_vla_chunk_holder[0] = shifted
@@ -3190,6 +3326,7 @@ def run_online_carla(
                 if FLAGS.bon_critic_rollout_chunk:
                     _bon_rollout_chunk[0] = np.asarray(best_chunk[0], dtype=np.float32)
                     _bon_rollout_step[0] = 1  # step 0 was just returned by the fresh score
+                    _bon_rollout_pose[0] = _current_chunk_pose()
                 return _bon_selected_to_action(best_chunk, subkey)
             if _online_training_mode in {"sac_residual", "dagger_residual"} and hasattr(agent, "sample_actions_sac_residual"):
                 noise = jax.random.normal(subkey, (1, agent._flat_noise_dim()))
@@ -3642,6 +3779,52 @@ def run_online_carla(
         traffic_violation_delta = max(0, traffic_violation_count - prev_traffic_violation_count)
         episode_traffic_violations += traffic_violation_delta
         prev_traffic_violation_count = traffic_violation_count
+        if FLAGS.qwen_online_train and _qwen_online_window[0] is not None:
+            _window = _qwen_online_window[0]
+            _window["steps"] += 1
+            _window["crash"] = max(_window["crash"], float(collision_delta > 0))
+            _window["offroad"] = max(
+                _window["offroad"], float(float(info.get("outside_route_delta", 0.0)) > 0.0)
+            )
+            _window["traffic_violation"] = max(
+                _window["traffic_violation"], float(traffic_violation_delta > 0)
+            )
+            _window["progress"] = min(
+                1.0,
+                _window["progress"] + max(0.0, float(info.get("route_progress_delta", 0.0))) / 100.0,
+            )
+            _window["goal"] = max(
+                _window["goal"],
+                float(bool(done) and float(info.get("route_progress_pct", 0.0)) >= 99.5),
+            )
+            if _window["steps"] >= max(1, int(FLAGS.bon_qwen_cadence)) or done:
+                _targets = {
+                    term: float(_window[term])
+                    for term in ("crash", "goal", "offroad", "traffic_violation", "progress")
+                }
+                if episode_count < max(0, int(FLAGS.qwen_online_warmup_episodes)):
+                    print(
+                        f"[QWEN-ONLINE] warmup episode={episode_count} step={step}; "
+                        f"targets={_targets} not submitted",
+                        flush=True,
+                    )
+                else:
+                    try:
+                        _train_result = _qwen_selector.train_candidate(
+                            _window["frame"], _window["action"], _window["subtask"],
+                            _window["routing_command"], _window["speed"], _targets,
+                            _window["route"], _window["timestep"],
+                        )
+                        print(
+                            f"[QWEN-ONLINE] episode={episode_count} step={step} targets={_targets} "
+                            f"samples={_train_result.get('samples')} "
+                            f"updates={_train_result.get('updates')} "
+                            f"updated={_train_result.get('updated')}",
+                            flush=True,
+                        )
+                    except Exception as exc:  # keep driving if an online update fails
+                        print(f"[QWEN-ONLINE] update failed at step={step}: {exc!r}", flush=True)
+                _qwen_online_window[0] = None
         if traffic_violation_delta > 0:
             print(
                 f"[main_carla] TRAFFIC VIOLATION at step {step}: "
@@ -4039,8 +4222,14 @@ def run_online_carla(
                     reset_vla_cache()
             _gemini_rollout_chunk[0] = None
             _gemini_rollout_step[0] = 0
+            _gemini_rollout_pose[0] = None
+            _qwen_rollout_chunk[0] = None
+            _qwen_rollout_step[0] = 0
+            _qwen_rollout_pose[0] = None
+            _qwen_online_window[0] = None
             _bon_rollout_chunk[0] = None
             _bon_rollout_step[0] = 0
+            _bon_rollout_pose[0] = None
             if _residual_2d:
                 # Fresh PID state for the new episode (the controllers integrate error).
                 _accel_steer_decoder = _make_accel_steer_decoder()
