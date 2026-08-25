@@ -4287,12 +4287,14 @@ class SteerVLAActor:
         noise: jax.Array,
         num_steps: int,
         image_keys: tuple[str, ...],
+        t_context: jax.Array | None = None,
     ) -> jax.Array:
         """Drop-in for ``self._sample_actions`` that caches the frozen prefix when available.
 
         With ``sample_actions_with_prefix`` the returned prefix is stashed (stop-gradient) for
         pi_prefix / rl_token reuse; otherwise the cache is cleared and the plain sampler runs.
         """
+        t_context_kw = {} if t_context is None else {"t_context": t_context}
         if self._prefix_reuse:
             traj, prefix_out, prefix_mask = self._sample_actions_with_prefix(
                 rng,
@@ -4300,6 +4302,7 @@ class SteerVLAActor:
                 noise=noise,
                 num_steps=num_steps,
                 image_keys=image_keys,
+                **t_context_kw,
             )
             self._last_prefix_out = jax.lax.stop_gradient(prefix_out)
             self._last_prefix_mask = prefix_mask
@@ -4316,6 +4319,7 @@ class SteerVLAActor:
             noise=noise,
             num_steps=num_steps,
             image_keys=image_keys,
+            **t_context_kw,
         )
 
     def _require_prefix_cache(self, what: str) -> None:
@@ -5165,13 +5169,22 @@ class SteerVLAActor:
         decode_bs = min(n, int(self.action_decode_batch_size))
         traj_parts: list[np.ndarray] = []
         norm_parts: list[np.ndarray] = []
+        # EXPO's pi_prefix / rl_token encoders need one cached prefix row per
+        # candidate. Do not call the plain sampler here: it leaves the prior
+        # batch-1 rollout cache alive, so row 0 looks valid at the warmup
+        # boundary while rows 1..N-1 are empty and cannot be stacked.
+        prefix_out_parts: list[jax.Array] = []
+        prefix_mask_parts: list[jax.Array] = []
         for start in range(0, n, decode_bs):
             end = min(start + decode_bs, n)
             chunk_rng = jax.random.fold_in(rng_act, start)
             chunk_obs = jax.tree.map(lambda x: x[start:end], obs_full)
             chunk_noise = noise_full[start:end]
             t_context_kw = {} if t_context is None else {"t_context": t_context[start:end]}
-            traj = self._sample_actions(
+            # The cached variant uses OpenPI's prefix-returning forward when
+            # available and keeps the feature cache required by the residual
+            # state encoders.
+            traj = self._sample_actions_cached(
                 chunk_rng,
                 chunk_obs,
                 noise=chunk_noise,
@@ -5180,6 +5193,9 @@ class SteerVLAActor:
                 **t_context_kw,
             )
             jax.block_until_ready(traj)
+            if self._last_prefix_out is not None and self._last_prefix_mask is not None:
+                prefix_out_parts.append(self._last_prefix_out)
+                prefix_mask_parts.append(self._last_prefix_mask)
             norm_parts.append(
                 np.asarray(
                     jax.device_get(traj[:, : int(self.action_horizon), : int(self.action_dim)]),
@@ -5192,6 +5208,13 @@ class SteerVLAActor:
             traj_parts.append(np.asarray(traj_np, dtype=np.float32))
         actions_flat = np.concatenate(traj_parts, axis=0).reshape(n, -1)
         actions_norm = np.concatenate(norm_parts, axis=0).reshape(n, -1)
+        # ``_sample_actions_cached`` updates the cache per decoder microbatch;
+        # restore the full candidate batch so EXPO can select row i's matching
+        # prefix feature after this method returns.
+        if prefix_out_parts:
+            self._last_prefix_out = jnp.concatenate(prefix_out_parts, axis=0)
+            self._last_prefix_mask = jnp.concatenate(prefix_mask_parts, axis=0)
+            self._prefix_cache_row = 0
 
         return {
             "actions": actions_flat,

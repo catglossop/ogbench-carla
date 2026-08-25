@@ -1368,6 +1368,77 @@ def _final_step_reward_log(info: dict) -> dict[str, float]:
 # --------------------------------------------------------------------------- #
 
 
+def _video_overlay_scale(frame_width: int) -> float:
+    """Scale HUD typography for frames that will be saved at video width.
+
+    Annotation happens before :func:`_shrink_frames_for_saving`. Keeping a
+    fixed pixel font therefore made a 0.26 OpenCV font effectively 0.13 after
+    a 1024px camera frame was reduced to the 512px video width. Render the
+    overlay at the inverse scale so its saved size stays legible.
+    """
+    return max(1.0, float(frame_width) / float(_SAVED_VIDEO_MAX_WIDTH))
+
+
+def _clean_overlay_text(value: Any) -> str:
+    """Make decoded CoT fields human-readable in rollout videos."""
+    try:
+        from vlas.steervla import strip_cot_sentinels
+
+        return strip_cot_sentinels(value)
+    except Exception:
+        # Keep annotation best-effort even when the VLA module is unavailable.
+        return re.sub(r"<loc\d+>", "", str(value or "")).strip(" ;")
+
+
+def _wrap_overlay_lines(
+    lines: list[str],
+    colors: list[tuple],
+    *,
+    frame_width: int,
+    font_scale: float,
+    thickness: int,
+) -> tuple[list[str], list[tuple]]:
+    """Wrap HUD text to the frame width instead of discarding its right edge."""
+    import cv2  # type: ignore
+
+    max_width = max(16, int(frame_width) - 8)
+
+    def _fits(text: str) -> bool:
+        return cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0][0] <= max_width
+
+    wrapped_lines: list[str] = []
+    wrapped_colors: list[tuple] = []
+    for line, color in zip(lines, colors):
+        words = str(line).split()
+        if not words:
+            wrapped_lines.append("")
+            wrapped_colors.append(color)
+            continue
+        current = ""
+        for word in words:
+            candidate = word if not current else f"{current} {word}"
+            if _fits(candidate):
+                current = candidate
+                continue
+            if current:
+                wrapped_lines.append(current)
+                wrapped_colors.append(color)
+                current = ""
+            # Usually tokens fit. Split exceptionally long tokens rather than ellipsizing them.
+            while word and not _fits(word):
+                end = 1
+                while end < len(word) and _fits(word[: end + 1]):
+                    end += 1
+                wrapped_lines.append(word[:end])
+                wrapped_colors.append(color)
+                word = word[end:]
+            current = word
+        if current:
+            wrapped_lines.append(current)
+            wrapped_colors.append(color)
+    return wrapped_lines, wrapped_colors
+
+
 def _viz_image_from_raw(raw) -> Optional[np.ndarray]:
     """High-res camera frame for the rollout video (prefers ``image_viz``, falls back to ``image``)."""
     if isinstance(raw, dict):
@@ -1391,11 +1462,14 @@ def _draw_corner_badge(
     try:
         import cv2  # type: ignore
 
-        font_scale, thickness, pad = 0.38, 1, 4
+        overlay_scale = _video_overlay_scale(annotated.shape[1])
+        font_scale = 0.48 * overlay_scale
+        thickness = max(1, int(round(overlay_scale)))
+        pad = max(4, int(round(6 * overlay_scale)))
         (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
         bw, bh = tw + 2 * pad, th + baseline + 2 * pad
         x0 = max(6, annotated.shape[1] - 6 - bw) if corner == "tr" else 6
-        y0 = 6 + 16 * int(row)
+        y0 = 6 + int(round((bh + 6) * int(row)))
         x1, y1 = x0 + bw, y0 + bh
         cv2.rectangle(annotated, (x0, y0), (x1, y1), bg, thickness=-1)
         cv2.rectangle(annotated, (x0, y0), (x1, y1), (255, 255, 255), thickness=1)
@@ -1463,10 +1537,18 @@ def _annotate_text_panel(
         import cv2  # type: ignore
 
         h, w = base.shape[:2]
-        font_scale, line_h = 0.26, 13
+        overlay_scale = _video_overlay_scale(w)
+        font_scale = 0.48 * overlay_scale
+        thickness = max(1, int(round(overlay_scale)))
+        line_h = max(22, int(round(26 * overlay_scale)))
         annotated_top = _draw_corner_badge(base, f"r={reward:+.3f}", corner="tl")
 
-        prompt = str(raw.get("openpi_prompt_text") or "").strip() if isinstance(raw, dict) else ""
+        # ``openpi_prompt_text`` is already the full serialized model input
+        # ("Prompt: ...;State: ..."). Showing it under another "Prompt:"
+        # label created the confusing Prompt: Prompt:... line in videos.
+        prompt = ""
+        if isinstance(raw, dict):
+            prompt = str(raw.get("openpi_prompt_raw_text") or raw.get("routing_command") or "").strip()
         if not prompt and isinstance(raw, dict):
             from vlas.steervla import (
                 carla_state_vec_to_steervla_state,
@@ -1488,16 +1570,17 @@ def _annotate_text_panel(
                 state_pad,
                 state_dim=steervla_prompt_state_dim(include_ego_history=include_hist),
             )
-        reasoning = _format_text_field(raw, "reasoning_text") or _format_text_field(raw, "reasoning")
-        subtask = _format_text_field(raw, "subtask_text") or _format_text_field(raw, "subtask")
+        reasoning = _clean_overlay_text(
+            _format_text_field(raw, "reasoning_text") or _format_text_field(raw, "reasoning")
+        )
+        subtask = _clean_overlay_text(
+            _format_text_field(raw, "subtask_text") or _format_text_field(raw, "subtask")
+        )
         expert_action_str = ""
         if isinstance(raw, dict) and raw.get("expert_action") is not None:
             ea = np.asarray(raw["expert_action"], dtype=np.float32).reshape(-1)
             first = ea[:4] if ea.size >= 4 else ea
             expert_action_str = " ".join(f"{v:.3f}" for v in first)
-
-        def _clip(txt: str, n: int = 120) -> str:
-            return txt if len(txt) <= n else (txt[: n - 3] + "...")
 
         white = (255, 255, 255)
         lines: list[str] = []
@@ -1509,40 +1592,34 @@ def _annotate_text_panel(
             lines.extend(hud_lines)
             colors.extend(hud_colors[i] if i < len(hud_colors) and hud_colors[i] else white for i in range(len(hud_lines)))
         elif hud:
-            lines.append(
-                f"Action base={hud.get('base', '-')} residual={hud.get('residual', '-')} "
-                f"final={hud.get('final', '-')} scale={hud.get('scale', '-')}"
-            )
-            lines.append(
+            # Keep each control field intact; the general wrapper below handles narrow videos.
+            lines.extend([
+                f"Action base={hud.get('base', '-')} residual={hud.get('residual', '-')}",
+                f"final={hud.get('final', '-')} scale={hud.get('scale', '-')}",
                 f"progress={float(hud.get('progress', 0.0)):.1f}% step={int(hud.get('ep_step', 0))} "
-                f"return={float(hud.get('ep_return', 0.0)):+.1f}"
-            )
+                f"return={float(hud.get('ep_return', 0.0)):+.1f}",
+            ])
         if critic_text:
-            lines.append(f"Expert: {_clip(critic_text)}")
+            lines.append(f"Expert: {critic_text}")
         if expert_action_str:
             lines.append(f"ExpertAct[0]: {expert_action_str}")
         lines += [
-            f"Prompt: {_clip(prompt)}",
-            f"Reasoning: {_clip(reasoning)}",
-            f"Subtask: {_clip(subtask)}",
+            f"Prompt: {prompt}",
+            f"Reasoning: {reasoning}",
+            f"Subtask: {subtask}",
         ]
         colors += [white] * (len(lines) - len(colors))  # remaining lines default white
 
-        def _fit(txt: str) -> str:
-            """Shrink ``txt`` (with an ellipsis) until it fits the panel width; avoids right-edge cutoff."""
-            if not txt or cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0][0] <= w - 8:
-                return txt
-            while txt and cv2.getTextSize(txt + "...", cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0][0] > w - 8:
-                txt = txt[:-1]
-            return txt + "..."
-
+        lines, colors = _wrap_overlay_lines(
+            lines, colors, frame_width=w, font_scale=font_scale, thickness=thickness
+        )
         panel_h = max(72, line_h * (len(lines) + 1))
         annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
         annotated[:h, :, :] = annotated_top
         cv2.line(annotated, (0, h), (w - 1, h), (255, 255, 255), 1)
         y = h + line_h
         for line, color in zip(lines, colors):
-            cv2.putText(annotated, _fit(line), (4, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1, cv2.LINE_AA)
+            cv2.putText(annotated, line, (4, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_AA)
             y += line_h
         return annotated
     except Exception:
@@ -2458,9 +2535,10 @@ def run_online_carla(
             import cv2  # type: ignore
 
             label = f"r={reward_value:+.3f}"
-            font_scale = 0.38
-            thickness = 1
-            pad = 4
+            overlay_scale = _video_overlay_scale(annotated.shape[1])
+            font_scale = 0.48 * overlay_scale
+            thickness = max(1, int(round(overlay_scale)))
+            pad = max(4, int(round(6 * overlay_scale)))
             (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
             x0, y0 = 6, 6
             x1 = x0 + tw + 2 * pad
@@ -2531,13 +2609,10 @@ def run_online_carla(
             import cv2  # type: ignore
 
             h, w = base.shape[:2]
-            font_scale = 0.26
-            line_h = 13
-            n_extra = 1 if (base_action is not None or composed_action is not None) else 0
-            panel_h = max(72, line_h * (6 + n_extra))
-            annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
-            annotated[:h, :, :] = _annotate_reward_corner(base, reward_value)
-            cv2.line(annotated, (0, h), (w - 1, h), (255, 255, 255), 1)
+            overlay_scale = _video_overlay_scale(w)
+            font_scale = 0.48 * overlay_scale
+            thickness = max(1, int(round(overlay_scale)))
+            line_h = max(22, int(round(26 * overlay_scale)))
 
             state = np.asarray(raw.get("state", []), dtype=np.float32).reshape(-1) if isinstance(raw, dict) else np.zeros((0,), dtype=np.float32)
             speed = float(state[_EGO_STATE_IDX_SPEED]) if state.size > _EGO_STATE_IDX_SPEED else 0.0
@@ -2545,8 +2620,12 @@ def run_online_carla(
             if isinstance(raw, dict):
                 routing = str(raw.get("routing_command", "") or "").strip()
             prompt = f"spd={speed:.2f}m/s {routing or 'Follow the route.'}"
-            reasoning = _format_text_field(raw, "reasoning_text") or _format_text_field(raw, "reasoning")
-            subtask = _format_text_field(raw, "subtask_text") or _format_text_field(raw, "subtask")
+            reasoning = _clean_overlay_text(
+                _format_text_field(raw, "reasoning_text") or _format_text_field(raw, "reasoning")
+            )
+            subtask = _clean_overlay_text(
+                _format_text_field(raw, "subtask_text") or _format_text_field(raw, "subtask")
+            )
             expert_action_str = ""
             if isinstance(raw, dict):
                 ea = raw.get("expert_action")
@@ -2555,9 +2634,6 @@ def run_online_carla(
                     first = ea[:4] if ea.size >= 4 else ea
                     expert_action_str = " ".join(f"{v:.3f}" for v in first)
 
-            def _clip_text(txt: str, max_chars: int = 120) -> str:
-                return txt if len(txt) <= max_chars else (txt[: max_chars - 3] + "...")
-
             def _fmt_action(arr: np.ndarray | None) -> str:
                 if arr is None:
                     return "?"
@@ -2565,23 +2641,34 @@ def run_online_carla(
                 return " ".join(f"{v:+.3f}" for v in a[:min(a.size, 6)])
 
             if critic_mode == "expert_action":
-                _critic_line = f"CriticIn[exp+valid]: {_clip_text(critic_text) if critic_text else '?'}"
+                _critic_line = f"CriticIn[exp+valid]: {critic_text if critic_text else '?'}"
             elif critic_mode == "action_delta":
-                _critic_line = f"CriticIn[delta]: {_clip_text(critic_text) if critic_text else '?'}"
+                _critic_line = f"CriticIn[delta]: {critic_text if critic_text else '?'}"
             else:
-                _critic_line = f"Expert: {_clip_text(critic_text) if critic_text else '?'}"
+                _critic_line = f"Expert: {critic_text if critic_text else '?'}"
             lines = [
                 _critic_line,
                 f"ExpertAct[0]: {expert_action_str or '?'}",
-                f"Prompt: {_clip_text(prompt)}",
-                f"Reasoning: {_clip_text(reasoning)}",
-                f"Subtask: {_clip_text(subtask)}",
+                f"Prompt: {prompt}",
+                f"Reasoning: {reasoning}",
+                f"Subtask: {subtask}",
             ]
             if base_action is not None or composed_action is not None:
                 res_np = (np.asarray(composed_action) - np.asarray(base_action)) if (base_action is not None and composed_action is not None) else None
                 lines.append(
                     f"Base: {_fmt_action(base_action)}  Res: {_fmt_action(res_np)}  Comp: {_fmt_action(composed_action)}"
                 )
+            lines, _ = _wrap_overlay_lines(
+                lines,
+                [(255, 255, 255)] * len(lines),
+                frame_width=w,
+                font_scale=font_scale,
+                thickness=thickness,
+            )
+            panel_h = max(72, line_h * (len(lines) + 1))
+            annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
+            annotated[:h, :, :] = _annotate_reward_corner(base, reward_value)
+            cv2.line(annotated, (0, h), (w - 1, h), (255, 255, 255), 1)
             y = h + line_h
             for line in lines:
                 cv2.putText(
@@ -2591,7 +2678,7 @@ def run_online_carla(
                     cv2.FONT_HERSHEY_SIMPLEX,
                     font_scale,
                     (255, 255, 255),
-                    1,
+                    thickness,
                     cv2.LINE_AA,
                 )
                 y += line_h
@@ -2609,12 +2696,7 @@ def run_online_carla(
     def _annotate_candidates_panel(
         frame: np.ndarray, candidates: dict, target_points: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Project every best-of-N candidate's predicted waypoints onto ``frame`` in a
-        distinct color, then append a text panel below listing each candidate's Q value,
-        subtask, and (for Qwen) individual category probabilities/expected progress plus
-        rejection status. The selected candidate is highlighted. ``candidates`` is a
-        ``{"q_vals": [...], "best_idx": int, "subtasks": [...], "chunks": (N, D)}``
-        dict, see ``_bon_last_candidates``."""
+        """Project best-of-N candidates and render a fully wrapped candidate legend."""
         base = np.array(frame, copy=True)
         try:
             import cv2  # type: ignore
@@ -2646,55 +2728,67 @@ def run_online_carla(
                     )
 
             h, w = base.shape[:2]
-            font_scale = 0.26
-            line_h = 13
-            has_term_scores = len(qwen_scores) == n
-            lines_per_candidate = 2 if has_term_scores else 1
-            panel_h = max(20, line_h * (n * lines_per_candidate + 1))
-            annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
-            annotated[:h, :, :] = base
-            cv2.line(annotated, (0, h), (w - 1, h), (255, 255, 255), 1)
+            overlay_scale = _video_overlay_scale(w)
+            font_scale = 0.48 * overlay_scale
+            thickness = max(1, int(round(overlay_scale)))
+            line_h = max(22, int(round(26 * overlay_scale)))
+            white, heading = (255, 255, 255), (200, 200, 200)
+            rendered: list[tuple[str, tuple, tuple | None]] = []
 
-            y = h + line_h
-            cv2.putText(
-                annotated, "Best-of-N candidates:", (4, y),
-                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (200, 200, 200), 1, cv2.LINE_AA,
-            )
-            y += line_h
+            def _append_wrapped(text: str, color: tuple, swatch: tuple | None = None) -> None:
+                wrapped, _ = _wrap_overlay_lines(
+                    [text], [color], frame_width=w, font_scale=font_scale, thickness=thickness
+                )
+                for j, line in enumerate(wrapped):
+                    rendered.append((line, color, swatch if j == 0 else None))
+
+            _append_wrapped("Best-of-N candidates:", heading)
+            has_term_scores = len(qwen_scores) == n
             for i in range(n):
                 selected = i == best_idx
-                subtask = subtasks[i] if i < len(subtasks) else "?"
-                subtask = subtask if len(subtask) <= 90 else subtask[:87] + "..."
-                marker = "[SELECTED] " if selected else "            "
-                cv2.rectangle(annotated, (4, y - 8), (12, y), colors[i], thickness=-1)
-                line = f"  {marker}cand {i}: Q={q_vals[i]:+.3f}  {subtask}"
-                color = (80, 255, 80) if selected else (255, 255, 255)
-                cv2.putText(
-                    annotated, line, (12, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1, cv2.LINE_AA,
+                subtask = str(subtasks[i]) if i < len(subtasks) else "?"
+                marker = "[SELECTED] " if selected else ""
+                text_color = (80, 255, 80) if selected else white
+                _append_wrapped(
+                    f"{marker}cand {i}: Q={q_vals[i]:+.3f}  {subtask}",
+                    text_color,
+                    colors[i],
                 )
-                y += line_h
                 if has_term_scores:
                     scores = qwen_scores[i]
-                    accepted_text = (
-                        "ACCEPT" if i < len(accepted) and bool(accepted[i]) else "REJECT"
-                    )
+                    accepted_text = "ACCEPT" if i < len(accepted) and bool(accepted[i]) else "REJECT"
                     score_line = (
-                        f"              {accepted_text}  "
-                        f"P(crash)={float(scores['crash']):.3f}  "
+                        f"{accepted_text}  P(crash)={float(scores['crash']):.3f}  "
                         f"P(goal)={float(scores['goal']):.3f}  "
                         f"P(offroad)={float(scores['offroad']):.3f}  "
                         f"P(traffic)={float(scores['traffic_violation']):.3f}  "
                         f"E(progress)={float(scores['progress']):.3f}"
                     )
-                    status_color = (
-                        (120, 255, 120) if accepted_text == "ACCEPT" else (120, 120, 255)
+                    status_color = (120, 255, 120) if accepted_text == "ACCEPT" else (120, 120, 255)
+                    _append_wrapped(score_line, status_color)
+
+            panel_h = max(72, line_h * (len(rendered) + 1))
+            annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
+            annotated[:h, :, :] = base
+            cv2.line(annotated, (0, h), (w - 1, h), (255, 255, 255), 1)
+            y = h + line_h
+            swatch_size = max(8, int(round(10 * overlay_scale)))
+            for line, color, swatch in rendered:
+                x = 4
+                if swatch is not None:
+                    cv2.rectangle(
+                        annotated,
+                        (4, y - swatch_size),
+                        (4 + swatch_size, y),
+                        swatch,
+                        thickness=-1,
                     )
-                    cv2.putText(
-                        annotated, score_line, (12, y), cv2.FONT_HERSHEY_SIMPLEX,
-                        font_scale, status_color, 1, cv2.LINE_AA,
-                    )
-                    y += line_h
+                    x += swatch_size + 4
+                cv2.putText(
+                    annotated, line, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale, color, thickness, cv2.LINE_AA,
+                )
+                y += line_h
             return annotated
         except Exception:
             return base
@@ -2819,7 +2913,10 @@ def run_online_carla(
             return
         if FLAGS.save_video_local:
             _save_local_video(frames, episode_count, suffix=video_suffix)
-        video = np.stack(frames, axis=0)
+        # Keep W&B and local files on the same 512px presentation size. The
+        # frames were annotated at a compensating scale above, so this preserves
+        # readable text while avoiding oversized uploads.
+        video = np.stack(_shrink_frames_for_saving(frames), axis=0)
         if video.ndim == 4:
             # W&B expects (T, C, H, W) for videos.
             video = np.transpose(video, (0, 3, 1, 2))
