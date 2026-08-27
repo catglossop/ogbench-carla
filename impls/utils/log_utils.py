@@ -77,6 +77,27 @@ def get_flag_dict():
     return flag_dict
 
 
+def _wandb_settings(**kwargs):
+    """Build ``wandb.Settings`` with only the keys this wandb version accepts.
+
+    ``Settings`` is a pydantic model that forbids extra inputs, and its field names churn
+    across releases (``start_method`` gone in 0.19+, ``_disable_stats`` renamed to
+    ``x_disable_stats``). Passing a retired key raises ``ValidationError`` at init and kills
+    the run before CARLA even starts, so filter against the live schema instead of pinning.
+    """
+    fields = getattr(wandb.Settings, "model_fields", None)
+    if fields is None:  # pre-pydantic wandb; pass through unchanged.
+        return wandb.Settings(**kwargs)
+    accepted = {k: v for k, v in kwargs.items() if k in fields}
+    dropped = sorted(set(kwargs) - set(accepted))
+    if dropped:
+        print(
+            f"[log_utils] wandb {wandb.__version__} does not accept {dropped}; dropped.",
+            flush=True,
+        )
+    return wandb.Settings(**accepted)
+
+
 def setup_wandb(
     entity=None,
     project='project',
@@ -102,9 +123,14 @@ def setup_wandb(
         group=group,
         dir=wandb_output_dir,
         name=name,
-        settings=wandb.Settings(
+        settings=_wandb_settings(
+            # Dropped in wandb >= 0.19 (threading is the only mode now); harmless to ask for
+            # on older versions, so it is filtered rather than removed.
             start_method='thread',
+            # System-stats collection. Renamed ``_disable_stats`` -> ``x_disable_stats``;
+            # both spellings are offered and the unsupported one is filtered out.
             _disable_stats=False,
+            x_disable_stats=False,
             code_dir=str(Path(__file__).resolve().parent.parent.parent),
         ),
         mode=mode,

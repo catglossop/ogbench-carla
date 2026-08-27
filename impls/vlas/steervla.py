@@ -43,6 +43,7 @@ import types as _types
 from pathlib import Path
 from typing import Any, Callable, Dict, MutableMapping, Optional
 
+from etils import epath
 import flax.nnx as nnx
 import flax.traverse_util as traverse_util
 import jax
@@ -503,33 +504,78 @@ class _SliceActionDim(openpi_transforms.DataTransformFn):
         }
 
 
+def checkpoint_norm_stats_path(checkpoint_dir: Path | str, asset_id: str) -> epath.Path:
+    """Where OpenPI writes a checkpoint's norm stats: ``<ckpt>/assets/<asset_id>/norm_stats.json``.
+
+    ``epath`` so an un-downloaded ``gs://`` checkpoint root can be probed too.
+    """
+    return epath.Path(str(checkpoint_dir)) / "assets" / str(asset_id) / "norm_stats.json"
+
+
+def resolve_openpi_norm_enabled(checkpoint_dir: Path | str, asset_id: str) -> tuple[bool, epath.Path]:
+    """Decide whether to apply the checkpoint's OpenPI ``Normalize``/``Unnormalize``.
+
+    Default is **auto**: on iff the checkpoint actually ships norm stats at
+    ``assets/<asset_id>/norm_stats.json``. Checkpoints trained with ``skip_norm_stats=True``
+    (the older ``pi05_steervla_cot_*`` runs) do not write that file and stay norm-off, so the
+    fixed ``denormalize_actions`` scaling alone remains their correct decode. Checkpoints
+    trained *with* norm stats (``pi05_steervla_cot_simplified_reasoning_norm*``) predict in the
+    quantile-normalized space, so ``Unnormalize`` is mandatory before that fixed scaling --
+    without it the raw [-1, 1] output is multiplied by 7 directly and desired speed comes out
+    several times too large.
+
+    ``STEERVLA_ENABLE_OPENPI_NORM`` overrides the probe: ``1`` forces it on (and then a missing
+    norm_stats.json is a hard error), ``0`` forces it off.
+    """
+    path = checkpoint_norm_stats_path(checkpoint_dir, asset_id)
+    override = os.environ.get("STEERVLA_ENABLE_OPENPI_NORM")
+    if override is not None and override.strip() != "":
+        forced = override.strip().lower() in ("1", "true", "yes", "y", "on")
+        print(
+            f"[steervla] STEERVLA_ENABLE_OPENPI_NORM={override!r}: forcing OpenPI norm stats "
+            f"{'ON' if forced else 'OFF'} (checkpoint norm_stats present: {path.exists()}).",
+            flush=True,
+        )
+        return forced, path
+    present = bool(path.exists())
+    print(
+        f"[steervla] OpenPI norm stats {'FOUND' if present else 'not found'} at {path} -> "
+        f"Normalize/Unnormalize {'ENABLED' if present else 'disabled'}.",
+        flush=True,
+    )
+    return present, path
+
+
 def build_openpi_policy_transforms(
     train_cfg: openpi_train_config.TrainConfig,
     checkpoint_dir: Path,
 ):
-    """Input/output transforms matching :func:`impls.vlas.steervla_server._build_steervla_openpi_policy`."""
+    """Input/output transforms matching :func:`impls.vlas.steervla_server._build_steervla_openpi_policy`.
+
+    Returns ``(data_config, input_transform, output_transform, norm_stats)``. ``norm_stats`` is
+    ``None`` when this checkpoint has none (or the env var forced norm off); callers use it to
+    tell "identity transform" apart from "real Unnormalize", which matters on the raw-chunk
+    rollout path (see ``SteerVLAActor.sample_actions``).
+    """
     data_factory = train_cfg.data
     data_config = data_factory.create(train_cfg.assets_dirs, train_cfg.model)
     if data_config.asset_id is None:
         raise ValueError("TrainConfig data requires asset_id to load norm stats.")
     env_action_dim = int(getattr(data_factory, "action_dim", 4))
-    # Checkpoint norm-stats Normalize/Unnormalize must stay DISABLED for this checkpoint
-    # (matches origin/master 8d10a05, where they are commented out): the model predicts
-    # raw RLDS-scaled actions, so the fixed *7 physical scaling alone is the correct
-    # decode (offline A/B 2026-06-11, /tmp/cmp + logs/norm_ab_f2d: with norm OFF the
-    # speed-waypoint deltas track ego speed — 1.24 m at 5 m/s = maintain; with norm ON,
-    # Unnormalize biases every prediction to the dataset-mean ~2.5 m → desired_speed
-    # ~10 m/s regardless of state, so the car cannot express a stop and runs red lights).
-    # Set STEERVLA_ENABLE_OPENPI_NORM=1 to re-enable for A/B testing.
-    disable_norm = os.environ.get("STEERVLA_ENABLE_OPENPI_NORM", "0") != "1"
-    if not disable_norm:
-        print("[steervla] STEERVLA_ENABLE_OPENPI_NORM=1: applying Normalize/Unnormalize", flush=True)
-    norm_stats = None if disable_norm else openpi_checkpoints.load_norm_stats(
-        checkpoint_dir / "assets", data_config.asset_id
+    enable_norm, norm_path = resolve_openpi_norm_enabled(checkpoint_dir, data_config.asset_id)
+    if enable_norm and not norm_path.exists():
+        raise FileNotFoundError(
+            f"STEERVLA_ENABLE_OPENPI_NORM forces OpenPI norm stats on, but {norm_path} does not "
+            f"exist. Unset the variable to auto-detect, or set it to 0."
+        )
+    norm_stats = (
+        openpi_checkpoints.load_norm_stats(epath.Path(str(checkpoint_dir)) / "assets", data_config.asset_id)
+        if enable_norm
+        else None
     )
     input_transform = openpi_transforms.compose(
         []
-        if disable_norm
+        if norm_stats is None
         else [
             openpi_transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
         ]
@@ -539,13 +585,13 @@ def build_openpi_policy_transforms(
             *data_config.model_transforms.outputs,
             *(
                 []
-                if disable_norm
+                if norm_stats is None
                 else [openpi_transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm)]
             ),
             _SliceActionDim(action_dim=env_action_dim),
         ]
     )
-    return data_config, input_transform, output_transform
+    return data_config, input_transform, output_transform, norm_stats
 
 
 def steervla_physical_denormalize_actions(
@@ -1496,6 +1542,10 @@ class SteerVLAActor:
         self._data_config: Any = None
         self._input_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None
         self._output_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+        # Checkpoint norm stats, or None when this checkpoint ships none / they are forced off.
+        # Distinct from ``_output_transform is None``: that transform is always callable (it also
+        # slices to the env action dim), so it cannot tell "identity" from "real Unnormalize".
+        self._openpi_norm_stats: Any = None
 
         if actor_url is not None:
             self._remote = RemoteActor(
@@ -1639,10 +1689,16 @@ class SteerVLAActor:
             use_fast_tokens=bool(getattr(model_cfg, "use_fast_tokens", False)),
         )
         self.model_cfg = model_cfg
-        self._data_config, self._input_transform, self._output_transform = build_openpi_policy_transforms(
+        (
+            self._data_config,
+            self._input_transform,
+            self._output_transform,
+            self._openpi_norm_stats,
+        ) = build_openpi_policy_transforms(
             self.train_cfg,
             ckpt_root,
         )
+        self._align_proprio_layout_with_checkpoint()
         self._build_sample_wrappers()
 
         if self.load_trainable_params and self._train_state is not None:
@@ -1673,6 +1729,57 @@ class SteerVLAActor:
                 self._train_rng = jax.random.key(0)
 
         self._local_ready = True
+
+    def _align_proprio_layout_with_checkpoint(self) -> None:
+        """Cross-check the proprio layout against the checkpoint's own TrainConfig.
+
+        ``proprio_norm`` / ``include_ego_history`` come from the agent config
+        (``config.steervla``) but are properties of the *checkpoint*: they set the units and
+        width of the state vector the model was trained on. A mismatch is silent -- the model
+        still runs, it just reads a state in units it never saw.
+
+        With norm stats this is not merely a mismatch, it breaks ``Normalize``: the stats are
+        computed on the post-``SteerVLAInputs`` state, and the ``*_norm*`` configs use
+        ``proprio_norm=False``, so theirs are in raw m/s and degrees (q99 = [20.2, 179.9]).
+        Handing them the /20, /180 variant quantile-normalizes a [0, 1] speed against a [0, 20]
+        range and pins every state near -1. So there the checkpoint's value is *enforced*.
+
+        Without norm stats the tokenized state is the only consumer and the legacy agent-config
+        value is left alone -- this only warns. (``config.steervla.proprio_norm=True`` disagrees
+        with every ``pi05_steervla_cot_simplified_reasoning*`` config, which is worth fixing, but
+        flipping it would change how the existing checkpoints drive and is a separate call.)
+        """
+        dc = self._data_config
+        if dc is None:
+            return
+        enforce = self._openpi_norm_stats is not None
+        pairs = (
+            ("proprio_norm", "steervla_proprio_norm"),
+            ("include_ego_history", "steervla_include_ego_history"),
+        )
+        for attr, dc_key in pairs:
+            want = getattr(dc, dc_key, None)
+            if want is None:
+                continue
+            have = bool(getattr(self, attr))
+            if bool(want) == have:
+                continue
+            action = (
+                f"norm stats are active, so using the checkpoint's value ({bool(want)})"
+                if enforce
+                else f"keeping the agent-config value ({have}); no norm stats to invalidate"
+            )
+            print(
+                f"[steervla] WARNING: config.steervla.{attr}={have} disagrees with "
+                f"{self.actor_config}'s {dc_key}={bool(want)} -- {action}.",
+                flush=True,
+            )
+            if enforce:
+                setattr(self, attr, bool(want))
+        if enforce:
+            self.prompt_state_dim = steervla_prompt_state_dim(
+                include_ego_history=self.include_ego_history
+            )
 
     def _build_sample_wrappers(self) -> None:
         """(Re)build the jitted inference kernels bound to the current ``self.model``.
@@ -2344,11 +2451,14 @@ class SteerVLAActor:
             # any stored prompt that already carries it (datasets written before the producer was
             # fixed) rather than double-wrapping into a prefix format the model never sees.
             prompt_text = unformat_steervla_cot_prompt(rec.get("prompt", "")) or self.routing_command
-            tok_ids, tok_mask = self.tokenizer.tokenize_prompt(
-                prompt_text, state_pad, state_dim=self.prompt_state_dim
-            )
             state_norm = self._normalize_state_batch(state_pad)[0]
             state_for_model = pad_to_dim(state_norm, model_action_dim)
+            # Post-Normalize proprio, matching ``TokenizeCoTPrompt``'s position in the OpenPI
+            # training pipeline (see ``build_observation_batch_numpy``). Identity when this
+            # checkpoint has no norm stats.
+            tok_ids, tok_mask = self.tokenizer.tokenize_prompt(
+                prompt_text, state_norm, state_dim=self.prompt_state_dim
+            )
 
             # GRPO records carry the exact sampled token ids. Text records
             # (cast_relabel / replay pools) tokenize their reasoning/subtask strings as before.
@@ -3252,13 +3362,22 @@ class SteerVLAActor:
             traj_np = full
         return traj_np
 
-    def _postprocess_action_trajectory(
+    def _openpi_unnormalize_trajectory(
         self,
         trajectory: np.ndarray | jax.Array,
         *,
         observation_state: np.ndarray | jax.Array,
     ) -> np.ndarray:
-        """Undo OpenPI norm stats, then apply fixed SteerVLA action scaling (meters / degrees)."""
+        """Undo *only* the checkpoint's OpenPI norm stats, leaving RLDS action units.
+
+        The result is what ``ogbench/carla`` calls the ``"normalized"`` action space: the RLDS
+        encoding (delta-xy in units of 7 m, etc.) before ``denormalize_actions`` scales it to
+        meters/degrees. That fixed scaling is applied downstream -- by the env for chunk
+        execution, or by :meth:`_postprocess_action_trajectory` for physical outputs -- so it
+        must not happen here.
+
+        No-op (beyond reshape + action-dim slice) when this checkpoint has no norm stats.
+        """
         traj_np = self._reshape_model_trajectory(np.asarray(jax.device_get(trajectory), dtype=np.float32))
         state_np = self._state_for_transform(observation_state)
         if state_np.ndim == 1:
@@ -3269,7 +3388,16 @@ class SteerVLAActor:
         if self._output_transform is not None:
             out = self._output_transform({"actions": traj_np, "state": state_np})
             traj_np = np.asarray(out["actions"], dtype=np.float32)
+        return traj_np
 
+    def _postprocess_action_trajectory(
+        self,
+        trajectory: np.ndarray | jax.Array,
+        *,
+        observation_state: np.ndarray | jax.Array,
+    ) -> np.ndarray:
+        """Undo OpenPI norm stats, then apply fixed SteerVLA action scaling (meters / degrees)."""
+        traj_np = self._openpi_unnormalize_trajectory(trajectory, observation_state=observation_state)
         traj_np = steervla_physical_denormalize_actions(
             traj_np,
             action_dim=int(self.action_dim),
@@ -3450,9 +3578,16 @@ class SteerVLAActor:
         state_norm = self._normalize_state_batch(state_pad)[0]
         state_for_model = pad_to_dim(state_norm, model_action_dim)
         state_batch = np.tile(state_for_model[None], (batch_size, 1))
+        # Tokenize the *normalized* proprio, not the raw one. OpenPI orders the training
+        # pipeline data_transforms -> Normalize -> model_transforms, and ``TokenizeCoTPrompt``
+        # lives in model_transforms, so the state string the model was trained on is
+        # post-Normalize. ``CoTPaligemmaTokenizer.tokenize_prompt`` digitizes against fixed
+        # [-1, 1] bins, so feeding raw units to a norm-stats checkpoint saturates every speed
+        # >= 1 m/s to token 255. Identity when this checkpoint has no norm stats.
+        state_prompt = state_norm
         formatted_prompt = format_steervla_cot_prompt(
             prompt_text,
-            state_pad,
+            state_prompt,
             state_dim=self.prompt_state_dim,
         )
         if isinstance(raw, dict):
@@ -3466,7 +3601,7 @@ class SteerVLAActor:
         assert self.tokenizer is not None
         tok_ids, tok_mask = self.tokenizer.tokenize_prompt(
             prompt_text,
-            state_pad,
+            state_prompt,
             state_dim=self.prompt_state_dim,
         )
 
@@ -4580,10 +4715,20 @@ class SteerVLAActor:
         traj_np = self._postprocess_action_trajectory(traj, observation_state=obs_jax.state)
 
         if self.return_normalized_action_chunk and not force_accel_steer:
-            # Residual RL operates in the model's normalized action space, so return the
-            # raw sampled chunk (env applies denormalize_actions via action_input_space),
-            # rather than the physically-postprocessed trajectory.
-            chunk = traj[:, : int(self.action_horizon), : int(self.action_dim)]
+            # Residual RL operates in the model's normalized action space, so return the chunk
+            # *before* the fixed physical scaling (the env applies ``denormalize_actions`` itself
+            # via ``action_input_space="normalized"``), rather than ``traj_np``.
+            #
+            # "Normalized" here means the RLDS action encoding, NOT the model's raw output. When
+            # the checkpoint ships norm stats the model predicts in the quantile-normalized space
+            # ([-1, 1] against q01/q99), so ``Unnormalize`` still has to run to get back to RLDS
+            # units -- otherwise the env multiplies a [-1, 1] value by 7 and desired speed comes
+            # out several times too large. ``_openpi_unnormalize_trajectory`` is a plain reshape
+            # + dim-slice for checkpoints without norm stats, so the legacy path is unchanged.
+            chunk = np.asarray(
+                self._openpi_unnormalize_trajectory(traj, observation_state=obs_jax.state),
+                dtype=np.float32,
+            )[:, : int(self.action_horizon), : int(self.action_dim)]
             flat = chunk.reshape(batch_size, -1)
             expected = int(self.action_horizon) * int(self.action_dim)
             if flat.shape[-1] != expected:
@@ -5180,15 +5325,16 @@ class SteerVLAActor:
                 **t_context_kw,
             )
             jax.block_until_ready(traj)
+            chunk_state = jax.tree.map(lambda x: x[start:end], obs_jax.state)
+            # RLDS action units (post-``Unnormalize``, pre-``denormalize_actions``) -- the space
+            # the env calls ``"normalized"``. Must not be the raw model output: a norm-stats
+            # checkpoint predicts in the quantile-normalized space. Identity when there are none.
             norm_parts.append(
-                np.asarray(
-                    jax.device_get(traj[:, : int(self.action_horizon), : int(self.action_dim)]),
-                    dtype=np.float32,
-                ).reshape(end - start, -1)
+                self._openpi_unnormalize_trajectory(traj, observation_state=chunk_state)[
+                    :, : int(self.action_horizon), : int(self.action_dim)
+                ].reshape(end - start, -1)
             )
-            traj_np = self._postprocess_action_trajectory(
-                traj, observation_state=jax.tree.map(lambda x: x[start:end], obs_jax.state)
-            )
+            traj_np = self._postprocess_action_trajectory(traj, observation_state=chunk_state)
             traj_parts.append(np.asarray(traj_np, dtype=np.float32))
         actions_flat = np.concatenate(traj_parts, axis=0).reshape(n, -1)
         actions_norm = np.concatenate(norm_parts, axis=0).reshape(n, -1)

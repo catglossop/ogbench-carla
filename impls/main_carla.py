@@ -806,10 +806,11 @@ def _steervla_action_execution_cfg(steervla_cfg) -> dict[str, Any] | None:
     # * **remote** (``steervla.actor_url`` set): steervla_server.py calls
     #   ``steervla_physical_denormalize_actions`` before returning, so the chunk on the wire is
     #   already physical -> ``policy_output`` (env must not scale again).
-    # * **local**: SteerVLAActor returns the raw model output. OpenPI Normalize/Unnormalize are
-    #   deliberately disabled for these checkpoints (see ``impls/vlas/steervla.py``:
-    #   ``STEERVLA_ENABLE_OPENPI_NORM``), and the rollout ``sample_actions`` path does *not*
-    #   denormalize, so the env has to -> ``normalized``.
+    # * **local**: SteerVLAActor returns the chunk in RLDS action units -- it applies OpenPI
+    #   ``Unnormalize`` when the checkpoint ships norm stats (auto-detected from
+    #   ``assets/<asset_id>/norm_stats.json``; see ``impls/vlas/steervla.py``:
+    #   ``resolve_openpi_norm_enabled`` / ``STEERVLA_ENABLE_OPENPI_NORM``) but never the fixed
+    #   scaling, so the env has to -> ``normalized``.
     #
     # ``residual`` is NOT the discriminator: every local entrypoint gets the same raw chunk from
     # the same ``vla_sample_fn``. Keying on it left DSRL / cast_relabel / best_of_n on

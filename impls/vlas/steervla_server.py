@@ -60,6 +60,7 @@ if __package__ in (None, ""):
     from steervla import (
         CARLA_STEERVLA_IMAGE_KEYS,
         resize_stretch_np,
+        resolve_openpi_norm_enabled,
         restore_openpi_params_on_single_gpu,
         steervla_physical_denormalize_actions,
     )
@@ -67,6 +68,7 @@ else:
     from .steervla import (
         CARLA_STEERVLA_IMAGE_KEYS,
         resize_stretch_np,
+        resolve_openpi_norm_enabled,
         restore_openpi_params_on_single_gpu,
         steervla_physical_denormalize_actions,
     )
@@ -266,7 +268,17 @@ def _build_steervla_openpi_policy(cfg: dict[str, Any]) -> openpi_policy.Policy:
     data_config = train_cfg.data.create(train_cfg.assets_dirs, train_cfg.model)
     if data_config.asset_id is None:
         raise ValueError("TrainConfig data requires asset_id to load norm stats for the policy.")
-    norm_stats = openpi_checkpoints.load_norm_stats(ckpt_root / "assets", data_config.asset_id)
+    # Auto-detect, exactly as the local ``SteerVLAActor`` does, so the two entrypoints decode a
+    # given checkpoint the same way. ``Normalize``/``Unnormalize`` with ``norm_stats=None`` are
+    # no-ops, so the transform lists below stay unconditional.
+    enable_norm, norm_path = resolve_openpi_norm_enabled(ckpt_root, data_config.asset_id)
+    if enable_norm and not norm_path.exists():
+        raise FileNotFoundError(
+            f"STEERVLA_ENABLE_OPENPI_NORM forces OpenPI norm stats on, but {norm_path} does not exist."
+        )
+    norm_stats = (
+        openpi_checkpoints.load_norm_stats(ckpt_root / "assets", data_config.asset_id) if enable_norm else None
+    )
 
     repack = openpi_transforms.Group()
     sample_kwargs = {
