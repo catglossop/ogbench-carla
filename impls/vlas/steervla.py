@@ -1303,13 +1303,17 @@ class SteerVLAActor:
         traj_np = self._postprocess_action_trajectory(traj, observation_state=obs_jax.state)
 
         if self.return_normalized_action_chunk and not force_accel_steer:
-            flat = traj_np.reshape(batch_size, -1)
+            # Residual RL operates in the model's normalized action space, so return the
+            # raw sampled chunk (env applies denormalize_actions via action_input_space),
+            # rather than the physically-postprocessed trajectory.
+            chunk = traj[:, : int(self.action_horizon), : int(self.action_dim)]
+            flat = chunk.reshape(batch_size, -1)
             expected = int(self.action_horizon) * int(self.action_dim)
             if flat.shape[-1] != expected:
                 raise ValueError(
                     f"SteerVLA action chunk has length {flat.shape[-1]}, expected "
                     f"{expected} (= {self.action_horizon} x {self.action_dim}). "
-                    f"Postprocessed trajectory shape: {tuple(traj_np.shape)}."
+                    f"Sampled trajectory shape: {tuple(traj.shape)}."
                 )
             return jax.device_put(jnp.asarray(flat, dtype=jnp.float32), self._jax_device)
 

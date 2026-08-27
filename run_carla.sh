@@ -18,14 +18,18 @@ SIM_GPU_RANK="3"
 RENDER_ADAPTER=""
 CARLA_HOST="localhost"
 CARLA_PORT="2020"
-CARLA_STREAMING_2PORT="0"
+CARLA_STREAMING_PORT="0"
 TM_PORT="8020"
 X_DISPLAY_NUM=""
 
-CRITIC_MODE="delta"
-TRAIN_MODE="dagger"
+ENABLE_UPDATES="true"
+BASE_ONLY="false"
 
-BASE_AGENT_CFG="impls/configs/steervla_dsrl_config.py"
+# Crash supervisor: relaunch main_carla (resuming from checkpoint) after a CARLA native
+# crash (SIGSEGV/SIGABRT, exit code >=128). 0 disables the retry loop.
+MAX_RETRIES="${MAX_RETRIES:-50}"
+
+BASE_AGENT_CFG="impls/configs/steervla_residual_config.py"
 BASE_CARLA_CFG="impls/configs/carla_config.yaml"
 
 # Fail2Drive's custom static props (brickwall, walkingkid, ampel, autobahn,
@@ -68,27 +72,21 @@ Options:
   --tm-port PORT            Traffic manager port. Default: 8020
   --x-display-num N         Xvfb display number. Default: derived from carla port
 
-  --critic-mode MODE        one of:
-                              none         -> no extra critic info
-                              delta        -> numeric action delta
-                              delta-lang   -> language on expert-agent delta
-                              expert-lang  -> language on expert action
-                            Default: delta
+  --enable-updates BOOL     true|false. false = rollout/buffer only (no RL updates). Default: true
+  --base-only BOOL          true|false. true = roll out the frozen base policy only (no RL). Default: false
 
-  --train-mode MODE         rl|dagger. Default: rl
-
-  --agent-config PATH       Base agent config. Default: impls/configs/steervla_dsrl_config.py
+  --agent-config PATH       Base agent config. Default: impls/configs/steervla_residual_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
   --fail2drive-carla-root PATH
                             Override CARLA install used for Fail2Drive routes.
                             Default: \$FAIL2DRIVE_CARLA_ROOT or /home/carla/f2d_carla
+  --max-retries N           Auto-restart+resume this many times after a CARLA crash. Default: 50 (0 disables)
   -h, --help                Show this help
 
 Examples:
-  bash run_carla.sh --critic-mode delta-lang --train-gpu 0 --sim-gpu 4
+  bash run_carla.sh --train-gpu 0 --sim-gpu 4 --route parking-cut-in-001
   bash run_carla.sh --route parking-cut-in-001 --carla-port 2002 --carla-streaming-port 2003 --tm-port 8002 --x-display-num 12
-  bash run_carla.sh --critic-mode none --expert-debug true --save-buffer false
-  bash run_carla.sh --train-mode dagger --critic-mode delta-lang
+  bash run_carla.sh --enable-updates false --save-buffer true   # rollout-only data collection
 EOF
 }
 
@@ -110,11 +108,12 @@ while [[ $# -gt 0 ]]; do
     --carla-streaming-port) CARLA_STREAMING_PORT="$2"; shift 2 ;;
     --tm-port) TM_PORT="$2"; shift 2 ;;
     --x-display-num) X_DISPLAY_NUM="$2"; shift 2 ;;
-    --critic-mode) CRITIC_MODE="$2"; shift 2 ;;
-    --train-mode) TRAIN_MODE="$2"; shift 2 ;;
+    --enable-updates) ENABLE_UPDATES="$2"; shift 2 ;;
+    --base-only) BASE_ONLY="$2"; shift 2 ;;
     --agent-config) BASE_AGENT_CFG="$2"; shift 2 ;;
     --carla-config) BASE_CARLA_CFG="$2"; shift 2 ;;
     --fail2drive-carla-root) FAIL2DRIVE_CARLA_ROOT="$2"; shift 2 ;;
+    --max-retries) MAX_RETRIES="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; EXTRA_ARGS+=("$@"); break ;;
     *)
@@ -125,23 +124,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-case "$CRITIC_MODE" in
-  none) CRITIC_FEEDBACK_MODE="none" ;;
-  delta) CRITIC_FEEDBACK_MODE="action_delta" ;;
-  delta-lang) CRITIC_FEEDBACK_MODE="delta_commentary_bow" ;;
-  expert-lang) CRITIC_FEEDBACK_MODE="commentary_bow" ;;
+case "$ENABLE_UPDATES" in
+  true|false) ;;
   *)
-    echo "Invalid --critic-mode: $CRITIC_MODE" >&2
-    echo "Expected one of: none, delta, delta-lang, expert-lang" >&2
+    echo "Invalid --enable-updates: $ENABLE_UPDATES (expected true|false)" >&2
     exit 2
     ;;
 esac
 
-case "$TRAIN_MODE" in
-  rl|dagger) ;;
+case "$BASE_ONLY" in
+  true|false) ;;
   *)
-    echo "Invalid --train-mode: $TRAIN_MODE" >&2
-    echo "Expected one of: rl, dagger" >&2
+    echo "Invalid --base-only: $BASE_ONLY (expected true|false)" >&2
     exit 2
     ;;
 esac
@@ -176,10 +170,8 @@ _BASE_GET_CONFIG = runpy.run_path(str(_BASE_PATH))["get_config"]
 def get_config():
     config = _BASE_GET_CONFIG()
     config.training_gpu_rank = ${TRAIN_GPU_RANK}
-    config.critic_feedback_mode = "${CRITIC_FEEDBACK_MODE}"
-    config.online_training_mode = "${TRAIN_MODE}"
-    if config.critic_feedback_mode == "none":
-        config.language_label_dim = 0
+    config.enable_updates = ${ENABLE_UPDATES^}
+    config.base_only = ${BASE_ONLY^}
     return config
 EOF
 
@@ -216,23 +208,50 @@ if [[ "$ROUTE_SOURCE" == "fail2drive" && -n "$FAIL2DRIVE_CARLA_ROOT" ]]; then
   fi
 fi
 
+# Stable run name so save_dir + the W&B id survive restarts (the supervisor resumes, not forks).
+EXP_NAME="${ROUTE//[^A-Za-z0-9._-]/-}-sd${SEED}-$(date +%Y%m%d_%H%M%S)"
+
 echo "[run_carla.sh] route=${ROUTE} (source=${ROUTE_SOURCE:-?})"
-echo "[run_carla.sh] train_mode=${TRAIN_MODE}"
-echo "[run_carla.sh] critic_mode=${CRITIC_FEEDBACK_MODE}"
+echo "[run_carla.sh] enable_updates=${ENABLE_UPDATES} base_only=${BASE_ONLY}"
 echo "[run_carla.sh] train_gpu_rank=${TRAIN_GPU_RANK} render_adapter=${SIM_GPU_RANK}"
 echo "[run_carla.sh] carla_host=${CARLA_HOST} carla_port=${CARLA_PORT} streaming_port=${CARLA_STREAMING_PORT} tm_port=${TM_PORT} x_display=:${X_DISPLAY_NUM}"
-echo "[run_carla.sh] expert_debug=${EXPERT_DEBUG} expert_recover_debug=${EXPERT_RECOVER_DEBUG} save_buffer=${SAVE_BUFFER} online_steps=${ONLINE_STEPS}"
+echo "[run_carla.sh] expert_debug=${EXPERT_DEBUG} expert_recover_debug=${EXPERT_RECOVER_DEBUG} save_buffer=${SAVE_BUFFER} online_steps=${ONLINE_STEPS} exp_name=${EXP_NAME} max_retries=${MAX_RETRIES}"
 echo "[run_carla.sh] temp agent config: ${AGENT_CFG_TMP}"
 echo "[run_carla.sh] temp carla config: ${CARLA_CFG_TMP}"
 
-WANDB_MODE="${WANDB_MODE}" uv run python impls/main_carla.py \
-  --agent="${AGENT_CFG_TMP}" \
-  --carla_config="${CARLA_CFG_TMP}" \
-  --route="${ROUTE}" \
-  --online_steps="${ONLINE_STEPS}" \
-  --save_buffer="${SAVE_BUFFER}" \
-  --seed="${SEED}" \
-  --run_group="${RUN_GROUP}" \
-  --expert_debug="${EXPERT_DEBUG}" \
-  --expert_recover_debug="${EXPERT_RECOVER_DEBUG}" \
-  "${EXTRA_ARGS[@]}"
+# Supervisor loop: CARLA's in-process leaderboard periodically segfaults on long runs (kills python
+# outright, uncatchable). On a crash-signal exit (>=128, excluding SIGINT) we kill orphaned
+# CARLA/Xvfb and relaunch with --resume (restores agent + buffer + step from the last checkpoint).
+attempt=0
+RESUME_FLAG="false"
+while :; do
+  set +e
+  WANDB_MODE="${WANDB_MODE}" uv run python impls/main_carla.py \
+    --agent="${AGENT_CFG_TMP}" \
+    --carla_config="${CARLA_CFG_TMP}" \
+    --route="${ROUTE}" \
+    --online_steps="${ONLINE_STEPS}" \
+    --save_buffer="${SAVE_BUFFER}" \
+    --seed="${SEED}" \
+    --run_group="${RUN_GROUP}" \
+    --exp_name="${EXP_NAME}" \
+    --resume="${RESUME_FLAG}" \
+    --expert_debug="${EXPERT_DEBUG}" \
+    --expert_recover_debug="${EXPERT_RECOVER_DEBUG}" \
+    --save_interval=5000 \
+    "${EXTRA_ARGS[@]}"
+  CODE=$?
+  set -e
+  [[ $CODE -eq 0 ]] && { echo "[run_carla.sh] completed (exit 0)."; break; }
+  [[ $CODE -eq 130 ]] && exit 130  # SIGINT
+  attempt=$((attempt + 1))
+  if [[ $CODE -lt 128 || "$MAX_RETRIES" -le 0 || $attempt -gt "$MAX_RETRIES" ]]; then
+    echo "[run_carla.sh] exit ${CODE}; not restarting (attempt ${attempt}/${MAX_RETRIES})."
+    exit "$CODE"
+  fi
+  echo "[run_carla.sh] crash (exit ${CODE}); cleanup + resume (attempt ${attempt}/${MAX_RETRIES})."
+  pkill -9 -f "CarlaUE4.*-carla-rpc-port=${CARLA_PORT}" 2>/dev/null || true
+  pkill -9 -f "Xvfb :${X_DISPLAY_NUM} " 2>/dev/null || true
+  sleep 8
+  RESUME_FLAG="true"
+done

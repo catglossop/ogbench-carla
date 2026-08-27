@@ -1190,7 +1190,9 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             try:
                 from ogbench.carla.steervla_simlingo_control import SimlingoStyleWaypointDecoder
 
-                self._steervla_decoder = SimlingoStyleWaypointDecoder()
+                self._steervla_decoder = SimlingoStyleWaypointDecoder(
+                    brake_speed=float(exec_raw.get("brake_speed", 0.1)),
+                )
             except ImportError as e:
                 raise ImportError(
                     "SteerVLA waypoint decoding failed to load dependencies "
