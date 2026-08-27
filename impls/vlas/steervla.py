@@ -48,7 +48,6 @@ import optax
 import os
 
 from openpi.models import model as _openpi_model
-from openpi.models import pi0 as _openpi_pi0
 from openpi.models.pi0_config import Pi0CoTConfig
 from openpi.models.tokenizer import CoTPaligemmaTokenizer
 from openpi.policies import steervla_policy as sv_policy
@@ -694,6 +693,21 @@ class SteerVLAActor:
         self._cached_action_step = 0
         self._cached_cot: dict[str, Any] | None = None
         self._cached_cot_actions_used = 0
+        # Latest CoT output (reasoning/subtask/FAST tokens) the base policy sampled,
+        # needed by the RLT state encoder to reproduce the prefix the policy acted on.
+        self._last_cot_out: dict[str, Any] | None = None
+
+        # Frozen prefix cached by _sample_actions_cached so pi_prefix / rl_token reuse it instead of
+        # a second PaliGemma forward. out: f32[B, M, D], mask: bool[B, M] (B = N for EXPO else 1);
+        # _prefix_cache_row picks the row, _last_prefix_n_fast = trailing FAST cols pi_prefix drops.
+        self._prefix_reuse: bool = False
+        self._last_prefix_out: jax.Array | None = None
+        self._last_prefix_mask: jax.Array | None = None
+        self._last_prefix_n_fast: int = 0
+        self._prefix_cache_row: int = 0
+        # Black-image sanity check: when set, the prefix encoders ignore the cache and run a fresh
+        # prefix forward from the (blacked) obs they are handed, so the feature reflects that image.
+        self._recompute_prefix_from_obs: bool = False
 
         self.train_cfg = None
         self.model = None
@@ -786,7 +800,19 @@ class SteerVLAActor:
                 "image_keys",
             ),
         )
-        
+
+        # Jit sample_actions_with_prefix when the installed openpi has it, so base-chunk sampling
+        # caches the frozen prefix for the pi_prefix / rl_token encoders.
+        self._prefix_reuse = hasattr(self.model, "sample_actions_with_prefix")
+        if self._prefix_reuse:
+            self._sample_actions_with_prefix = nnx_utils.module_jit(
+                self.model.sample_actions_with_prefix,
+                static_argnames=(
+                    "num_steps",
+                    "image_keys",
+                ),
+            )
+
         self._local_ready = True
 
     def _state_for_transform(self, state: np.ndarray | jax.Array) -> np.ndarray:
@@ -897,36 +923,112 @@ class SteerVLAActor:
     #     cot_out = self._sample_or_reuse_cot(rng, openpi_observation, batch_size)
     #     obs_full = _merge_cot_output_into_observation(openpi_observation, cot_out)
         
-    #     # Construct the noise
-    #     model_ah = int(self.model.action_horizon)
-    #     model_ad = int(self.model.action_dim)
-    #     cfg_ah = min(int(self.action_horizon), model_ah)
-    #     cfg_ad = min(int(self.action_dim), model_ad)
-    #     noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
-    #     if input_noise.ndim == 3:
-    #         noise_chunk = input_noise[:, :cfg_ah, :cfg_ad]
-    #     elif int(input_noise.shape[-1]) == int(self.action_horizon) * int(self.action_dim):
-    #         noise_chunk = input_noise.reshape(batch_size, int(self.action_horizon), int(self.action_dim))[:, :cfg_ah, :cfg_ad]
-    #     else:
-    #         noise_chunk = input_noise[:, None, :cfg_ad]
-    #         write_ah = 1
-    #     noise_full = noise_full.at[:, :write_ah, :cfg_ad].set(noise_chunk)
+        # Construct the noise
+        model_ah = int(self.model.action_horizon)
+        model_ad = int(self.model.action_dim)
+        cfg_ah = min(int(self.action_horizon), model_ah)
+        cfg_ad = min(int(self.action_dim), model_ad)
+        noise_full = jnp.zeros((batch_size, model_ah, model_ad), dtype=jnp.float32)
+        write_ah = cfg_ah
+        if input_noise.ndim == 3:
+            noise_chunk = input_noise[:, :cfg_ah, :cfg_ad]
+        elif int(input_noise.shape[-1]) == int(self.action_horizon) * int(self.action_dim):
+            noise_chunk = input_noise.reshape(batch_size, int(self.action_horizon), int(self.action_dim))[:, :cfg_ah, :cfg_ad]
+        else:
+            noise_chunk = input_noise[:, None, :cfg_ad]
+            write_ah = 1
+        noise_full = noise_full.at[:, :write_ah, :cfg_ad].set(noise_chunk)
         
-    #     traj = self._sample_actions(
-    #         rng,
-    #         obs_full,
-    #         noise=noise_full,
-    #         image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-    #         num_steps=int(self.sample_actions_num_steps),
-    #     )
-    #     traj_np = self._postprocess_action_trajectory(
-    #         traj,
-    #         observation_state=openpi_observation.state,
-    #     )
-    #     target_dim = int(self.action_dim)
-    #     first_step = traj_np[:, 0, :target_dim]
-    #     out = jnp.asarray(first_step, dtype=jnp.float32)
-    #     return out
+        # Sample the actions
+        traj = self._sample_actions_cached(
+            rng,
+            obs_full,
+            noise=noise_full,
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+            num_steps=int(self.sample_actions_num_steps),
+        )
+        traj_np = self._postprocess_action_trajectory(
+            traj,
+            observation_state=openpi_observation.state,
+        )
+        target_dim = int(self.action_dim)
+        first_step = traj_np[:, 0, :target_dim]
+        out = jnp.asarray(first_step, dtype=jnp.float32)
+        return out
+
+    def sample_candidates(
+        self,
+        n: int,
+        *,
+        temperature: float,
+        raw: Optional[Dict[str, Any]] = None,
+        rng: jax.Array | None = None,
+    ) -> dict[str, Any]:
+        """Best-of-N / EXPO: sample ``n`` CoTs at ``temperature`` (one batched forward), decode a
+        chunk per candidate. Diversity comes from the CoTs/subtasks, not the flow noise.
+
+        Returns ``actions`` (n, action_horizon * action_dim), ``subtask_texts`` (per candidate),
+        and the batched ``cot_out`` (row i = candidate i's tokens, overlaid via ``_last_cot_out``).
+        """
+        assert (
+            self.model is not None and self._jax_device is not None and self.tokenizer is not None
+        ), "sample_candidates requires a local SteerVLAActor (checkpoint loaded)."
+        n = max(1, int(n))
+        if rng is None:
+            self._call_counter += 1
+            rng = jax.random.PRNGKey(self._call_counter)
+        else:
+            rng = jax.random.fold_in(jnp.asarray(rng), self._call_counter)
+        rng_cot, rng_act, rng_noise = jax.random.split(rng, 3)
+
+        obs_np_struct = self.build_observation_batch_numpy(n, raw=raw)
+        obs_jax = jax.tree.map(
+            lambda x: jax.device_put(jnp.asarray(x), self._jax_device), obs_np_struct
+        )
+
+        # n diverse CoTs in one batched call (temperature gives independent per-row samples).
+        cot_out = self._sample_cot(
+            rng_cot,
+            obs_jax,
+            temperature=float(temperature),
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+
+        subtask_tokens = np.asarray(jax.device_get(cot_out["tokenized_subtask"]), dtype=np.int32)
+        subtask_mask = np.asarray(jax.device_get(cot_out["tokenized_subtask_mask"]), dtype=bool)
+        subtask_texts = [
+            self.tokenizer._tokenizer.decode(subtask_tokens[i][subtask_mask[i]].tolist()) for i in range(n)
+        ]
+
+        obs_full = _merge_cot_output_into_observation(obs_jax, cot_out)
+
+        # One N(0, I) flow seed per candidate (cfg region only), as flow_sample does.
+        model_ah = int(self.model.action_horizon)
+        model_ad = int(self.model.action_dim)
+        cfg_ah = min(int(self.action_horizon), model_ah)
+        cfg_ad = min(int(self.action_dim), model_ad)
+        noise_chunk = jax.random.normal(rng_noise, (n, cfg_ah, cfg_ad), dtype=jnp.float32)
+        noise_full = jnp.zeros((n, model_ah, model_ad), dtype=jnp.float32)
+        noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(
+            jax.device_put(noise_chunk, self._jax_device)
+        )
+
+        traj = self._sample_actions_cached(
+            rng_act,
+            obs_full,
+            noise=noise_full,
+            num_steps=int(self.sample_actions_num_steps),
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+        jax.block_until_ready(traj)
+        traj_np = self._postprocess_action_trajectory(traj, observation_state=obs_jax.state)
+        actions_flat = np.asarray(traj_np, dtype=np.float32).reshape(n, -1)
+
+        return {
+            "actions": actions_flat,
+            "subtask_texts": subtask_texts,
+            "cot_out": cot_out,
+        }
 
     def _routing_for_raw(self, raw: Dict[str, Any]) -> str:
         rc = raw.get("routing_command")
@@ -1160,6 +1262,157 @@ class SteerVLAActor:
             )
         return out
 
+    def _preprocess_observation_on_device(
+        self,
+        observation: _openpi_model.Observation,
+    ) -> _openpi_model.Observation:
+        """Device-put an obs, overlay the last sampled CoT, and run OpenPI eval preprocessing.
+
+        Shared prefix input for :meth:`encode_prefix_features` and :meth:`encode_prefix_tokens`, so
+        both see the reasoning/subtask (and FAST) tokens the base policy actually acted on rather
+        than the zeroed placeholders in a fresh observation.
+        """
+        obs_jax = jax.tree.map(
+            lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
+            observation,
+        )
+        if self._last_cot_out is not None:
+            obs_jax = _merge_cot_output_into_observation(obs_jax, self._last_cot_out)
+        return _openpi_model.preprocess_observation(
+            None, obs_jax, train=False, image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+
+    @staticmethod
+    def _mean_pool_prefix(prefix_out: jax.Array, prefix_mask: jax.Array) -> jax.Array:
+        """Mask-weighted mean over the token axis -> one frozen feature per batch row."""
+        m = prefix_mask.astype(prefix_out.dtype)
+        denom = jnp.maximum(m.sum(axis=1, keepdims=True), 1.0)
+        return jax.lax.stop_gradient(jnp.sum(prefix_out * m[..., None], axis=1) / denom)
+
+    def _prefix_from_obs(self, raw: Dict[str, Any], *, include_fast: bool) -> tuple[jax.Array, jax.Array]:
+        """Fresh CoT + prefix from ``raw`` alone: sample a new CoT from this image + prompt and run the
+        prefix on it, as if the base VLM had seen only ``raw``. Bypasses the cache and the real rollout's
+        sampled CoT, so no real-image info (not even via CoT text) leaks in, and does not mutate the
+        rollout's CoT/prefix state. Black-image sanity check only.
+
+        Runs the same jitted path as a normal base step (``_sample_cot`` + ``_sample_actions_with_prefix``,
+        which preprocesses internally), so it is as fast as the normal pass; the sampled action is dropped.
+        """
+        if self._remote is not None or self.model is None or self._jax_device is None:
+            raise RuntimeError("Prefix recompute requires a local SteerVLA model.")
+        if not self._prefix_reuse:
+            raise RuntimeError("Black-image recompute needs openpi with sample_actions_with_prefix.")
+        obs_jax = jax.tree.map(
+            lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
+            self.build_observation_batch_numpy(1, raw=raw),
+        )
+        cot_out = self._sample_cot(
+            jax.random.PRNGKey(0),
+            obs_jax,
+            temperature=float(self.cot_temperature),
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+        obs_full = _merge_cot_output_into_observation(obs_jax, cot_out)
+        noise = jnp.zeros((1, int(self.model.action_horizon), int(self.model.action_dim)), dtype=jnp.float32)
+        _traj, prefix_out, prefix_mask = self._sample_actions_with_prefix(
+            jax.random.PRNGKey(0),
+            obs_full,
+            noise=noise,
+            num_steps=int(self.sample_actions_num_steps),
+            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+        )
+        if not include_fast and _model_uses_fast_tokens(self.model_cfg):
+            keep = prefix_mask.shape[1] - int(self.model_cfg.max_fast_len)
+            prefix_out, prefix_mask = prefix_out[:, :keep], prefix_mask[:, :keep]
+        return prefix_out, prefix_mask
+
+    def encode_prefix_features(
+        self,
+        raw: Dict[str, Any],
+    ) -> jax.Array:
+        """Frozen, mean-pooled prefix feature over ``[image, prompt, reasoning, subtask]``.
+
+        Reuses the prefix cached by ``sample_actions_with_prefix`` (row ``_prefix_cache_row``,
+        trailing FAST columns dropped), so call only after the base chunk for ``raw`` has been
+        sampled -- an empty cache raises.
+        """
+        if self._recompute_prefix_from_obs:
+            return self._mean_pool_prefix(*self._prefix_from_obs(raw, include_fast=False))
+        self._require_prefix_cache("pi prefix features")
+        row = int(self._prefix_cache_row)
+        keep = self._last_prefix_mask.shape[1] - int(self._last_prefix_n_fast)
+        return self._mean_pool_prefix(
+            self._last_prefix_out[row : row + 1, :keep],
+            self._last_prefix_mask[row : row + 1, :keep],
+        )
+
+    def _group_pool(self, prefix_out: jax.Array, prefix_mask: jax.Array) -> jax.Array:
+        """Masked-mean each of ``[image, prompt, reasoning, subtask]`` separately; concat -> [B, 4D].
+
+        ``prefix_out`` must be the non-FAST prefix (order ``[img, prompt, reasoning, subtask]``). Text
+        span lengths come from model_cfg (padded); the image span is inferred from the remainder, so
+        this works for any image tokenization.
+        """
+        cfg = self.model_cfg
+        n_prompt, n_reasoning, n_subtask = int(cfg.max_token_len), int(cfg.max_reasoning_len), int(cfg.max_subtask_len)
+        m = prefix_out.shape[1]
+        n_img = m - (n_prompt + n_reasoning + n_subtask)
+        bounds = (
+            (0, n_img),
+            (n_img, n_img + n_prompt),
+            (n_img + n_prompt, n_img + n_prompt + n_reasoning),
+            (n_img + n_prompt + n_reasoning, m),
+        )
+        pools = []
+        for s, e in bounds:
+            seg, msk = prefix_out[:, s:e], prefix_mask[:, s:e].astype(prefix_out.dtype)
+            denom = jnp.maximum(msk.sum(axis=1, keepdims=True), 1.0)
+            pools.append(jnp.sum(seg * msk[..., None], axis=1) / denom)
+        return jax.lax.stop_gradient(jnp.concatenate(pools, axis=-1))
+
+    def encode_prefix_group_features(self, raw: Dict[str, Any]) -> jax.Array:
+        """Per-group mean-pooled prefix feature: concat of masked-mean over ``[image, prompt, reasoning,
+        subtask]`` -> f32[1, 4*D]. Same CoT / cache semantics as :meth:`encode_prefix_features`, but keeps
+        the four groups separate so a trained (ideally nonlinear) state head can weight them.
+        """
+        if self._recompute_prefix_from_obs:
+            return self._group_pool(*self._prefix_from_obs(raw, include_fast=False))
+        self._require_prefix_cache("pi prefix features")
+        row = int(self._prefix_cache_row)
+        keep = self._last_prefix_mask.shape[1] - int(self._last_prefix_n_fast)
+        return self._group_pool(
+            self._last_prefix_out[row : row + 1, :keep],
+            self._last_prefix_mask[row : row + 1, :keep],
+        )
+
+    def encode_prefix_tokens(
+        self,
+        raw: Dict[str, Any],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return the *un-pooled* SteerVLA prefix tokens for the RLT state encoder.
+
+        Mirrors the offline RL-Token embedding dump (``dump_rl_token_embeddings.py``) exactly so a
+        separately trained autoencoder sees the same token layout it was trained on: image + prompt +
+        reasoning + subtask + FAST tokens (order ``[base-cam vision, prompt, reasoning, subtask, fast]``;
+        CARLA has a single camera so there are no wrist-cam tokens to drop), *without* the mean-pool that
+        :meth:`encode_prefix_features` applies.
+
+        Reuses the prefix cached by ``sample_actions_with_prefix`` (row ``_prefix_cache_row``), so call
+        only after the base chunk for ``raw`` has been sampled -- an empty cache raises.
+
+        Returns ``(prefix_out f32[1, M, D], prefix_mask bool[1, M])``.
+        """
+        if self._recompute_prefix_from_obs:
+            prefix_out, prefix_mask = self._prefix_from_obs(raw, include_fast=True)
+            out = np.asarray(jax.device_get(prefix_out), dtype=np.float32)
+            mask = np.asarray(jax.device_get(prefix_mask), dtype=bool)
+            return out, mask
+        self._require_prefix_cache("pi prefix tokens")
+        row = int(self._prefix_cache_row)
+        out = np.asarray(jax.device_get(self._last_prefix_out[row : row + 1]), dtype=np.float32)
+        mask = np.asarray(jax.device_get(self._last_prefix_mask[row : row + 1]), dtype=bool)
+        return out, mask
+
     def _sample_or_reuse_cot(
         self,
         rng: jax.Array,
@@ -1167,15 +1420,18 @@ class SteerVLAActor:
         batch_size: int,
     ) -> dict[str, Any]:
         if self._uses_fixed_cot():
-            return self._build_fixed_cot_out(
+            cot_out = self._build_fixed_cot_out(
                 batch_size,
                 ref_array=obs_jax.tokenized_prompt,
             )
+            self._last_cot_out = cot_out
+            return cot_out
         if (
             self._cot_cache_enabled(batch_size)
             and self._cached_cot is not None
             and self._cached_cot_actions_used < self.actions_per_cot
         ):
+            self._last_cot_out = self._cached_cot
             return self._cached_cot
         cot_out = self._sample_cot(
             rng,
@@ -1186,6 +1442,7 @@ class SteerVLAActor:
         if self._cot_cache_enabled(batch_size):
             self._cached_cot = dict(cot_out)
             self._cached_cot_actions_used = 0
+        self._last_cot_out = cot_out
         return cot_out
 
     def _mark_action_served(self, batch_size: int) -> None:
@@ -1197,6 +1454,62 @@ class SteerVLAActor:
         self._cached_action_step = 0
         self._cached_cot = None
         self._cached_cot_actions_used = 0
+        self._last_cot_out = None
+        self._last_prefix_out = None
+        self._last_prefix_mask = None
+        self._last_prefix_n_fast = 0
+        self._prefix_cache_row = 0
+
+    def _sample_actions_cached(
+        self,
+        rng: jax.Array,
+        obs_full: _openpi_model.Observation,
+        *,
+        noise: jax.Array,
+        num_steps: int,
+        image_keys: tuple[str, ...],
+    ) -> jax.Array:
+        """Drop-in for ``self._sample_actions`` that caches the frozen prefix when available.
+
+        With ``sample_actions_with_prefix`` the returned prefix is stashed (stop-gradient) for
+        pi_prefix / rl_token reuse; otherwise the cache is cleared and the plain sampler runs.
+        """
+        if self._prefix_reuse:
+            traj, prefix_out, prefix_mask = self._sample_actions_with_prefix(
+                rng,
+                obs_full,
+                noise=noise,
+                num_steps=num_steps,
+                image_keys=image_keys,
+            )
+            self._last_prefix_out = jax.lax.stop_gradient(prefix_out)
+            self._last_prefix_mask = prefix_mask
+            self._last_prefix_n_fast = (
+                int(self.model_cfg.max_fast_len) if _model_uses_fast_tokens(self.model_cfg) else 0
+            )
+            return traj
+        self._last_prefix_out = None
+        self._last_prefix_mask = None
+        self._last_prefix_n_fast = 0
+        return self._sample_actions(
+            rng,
+            obs_full,
+            noise=noise,
+            num_steps=num_steps,
+            image_keys=image_keys,
+        )
+
+    def _require_prefix_cache(self, what: str) -> None:
+        """Guard the prefix encoders: local model up, and the base prefix already cached this step."""
+        if self._remote is not None:
+            raise RuntimeError(f"{what} are not available in remote SteerVLAActor mode.")
+        if self.model is None or self._jax_device is None:
+            raise RuntimeError("Local SteerVLA model is not initialized.")
+        if self._last_prefix_out is None:
+            raise RuntimeError(
+                f"{what} require the cached prefix; sample the base chunk before encoding "
+                "(needs openpi with sample_actions_with_prefix)."
+            )
 
     def _forward_pi0(
         self,
@@ -1289,7 +1602,7 @@ class SteerVLAActor:
         
         # Sample the actions
         sample_actions_time = time.time()
-        traj = self._sample_actions(
+        traj = self._sample_actions_cached(
             rng_act,
             obs_full,
             noise=noise_full,
@@ -1303,13 +1616,17 @@ class SteerVLAActor:
         traj_np = self._postprocess_action_trajectory(traj, observation_state=obs_jax.state)
 
         if self.return_normalized_action_chunk and not force_accel_steer:
-            flat = traj_np.reshape(batch_size, -1)
+            # Residual RL operates in the model's normalized action space, so return the
+            # raw sampled chunk (env applies denormalize_actions via action_input_space),
+            # rather than the physically-postprocessed trajectory.
+            chunk = traj[:, : int(self.action_horizon), : int(self.action_dim)]
+            flat = chunk.reshape(batch_size, -1)
             expected = int(self.action_horizon) * int(self.action_dim)
             if flat.shape[-1] != expected:
                 raise ValueError(
                     f"SteerVLA action chunk has length {flat.shape[-1]}, expected "
                     f"{expected} (= {self.action_horizon} x {self.action_dim}). "
-                    f"Postprocessed trajectory shape: {tuple(traj_np.shape)}."
+                    f"Sampled trajectory shape: {tuple(traj.shape)}."
                 )
             return jax.device_put(jnp.asarray(flat, dtype=jnp.float32), self._jax_device)
 
