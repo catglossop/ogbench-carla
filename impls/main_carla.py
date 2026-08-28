@@ -277,10 +277,10 @@ flags.DEFINE_bool(
 
 flags.DEFINE_bool(
     "bon_include_brake_candidate", False,
-    "When best-of-N is active (--bon_critic_ckpt or --bon_online_critic), append one "
+    "When best-of-N is active (including Qwen selection), append one "
     "extra synthetic all-zero (full-stop) action chunk to the N sampled candidates each "
-    "step, so the critic always has the option to brake regardless of what the pi0 base "
-    "policy actually sampled. Shown in candidate logging as '[synthetic] full brake'.",
+    "step, so the selector always has the option to brake regardless of what the pi0 base "
+    "policy actually sampled.",
 )
 
 flags.DEFINE_float(
@@ -3008,7 +3008,9 @@ def run_online_carla(
         """
         brake_chunk = np.zeros((1,) + chunks_np.shape[1:], dtype=chunks_np.dtype)
         chunks_np = np.concatenate([chunks_np, brake_chunk], axis=0)
-        candidate_subtasks = candidate_subtasks + ["[synthetic] full brake"]
+        candidate_subtasks = candidate_subtasks + [
+            "The vehicle smoothly decelerates to a stop, normally following the route."
+        ]
         return chunks_np, candidate_subtasks
 
     def _sample_diverse_candidates(subkey, n: int) -> tuple[np.ndarray, list[str]]:
@@ -3196,6 +3198,10 @@ def run_online_carla(
     def _score_candidates_with_qwen(rng_key):
         """Sample each candidate exactly once and score it with the local Qwen service."""
         chunks_np, candidate_subtasks = _sample_diverse_candidates(rng_key, _bon_n)
+        if FLAGS.bon_include_brake_candidate:
+            chunks_np, candidate_subtasks = _append_brake_candidate(
+                chunks_np, candidate_subtasks
+            )
         base_frame = _as_video_frame(_viz_image_from_raw(obs_raw))
         routing_command = str(obs_raw.get("routing_command") or "follow the route")
         state_vec = np.asarray(obs_raw.get("state", []), dtype=np.float32).reshape(-1)
@@ -3235,6 +3241,10 @@ def run_online_carla(
                 "offroad": 0.0,
                 "traffic_violation": 0.0,
                 "progress": 0.0,
+                "progress_meters": 0.0,
+                "last_xy": state_vec[:2].astype(np.float64).copy()
+                if state_vec.size >= 2
+                else None,
             }
         print(
             f"[QWEN-BON] step={step} routing={routing_command!r} choice={best_idx} "
@@ -3887,10 +3897,16 @@ def run_online_carla(
             _window["traffic_violation"] = max(
                 _window["traffic_violation"], float(traffic_violation_delta > 0)
             )
-            _window["progress"] = min(
-                1.0,
-                _window["progress"] + max(0.0, float(info.get("route_progress_delta", 0.0))) / 100.0,
-            )
+            _next_state = np.asarray(obs_raw.get("state", []), dtype=np.float64).reshape(-1)
+            if _window["last_xy"] is not None and _next_state.size >= 2:
+                _next_xy = _next_state[:2]
+                _window["progress_meters"] += float(
+                    np.linalg.norm(_next_xy - _window["last_xy"])
+                )
+                _window["last_xy"] = _next_xy.copy()
+            # Match offline pretraining exactly: True iff the executed path over
+            # this BoN decision window travels strictly more than one meter.
+            _window["progress"] = float(_window["progress_meters"] > 1.0)
             _window["goal"] = max(
                 _window["goal"],
                 float(bool(done) and float(info.get("route_progress_pct", 0.0)) >= 99.5),
