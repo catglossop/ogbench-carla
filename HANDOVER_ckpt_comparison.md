@@ -1,9 +1,46 @@
 # Handover — SteerVLA checkpoint comparison on Bench2Drive (20-route subset)
 
-**Status:** paused, ~35% complete. Stopped on `bellman` 2026-08-24 18:0x because the box
-could no longer boot CARLA (see §7). Nothing is running there; no scheduled job will
-resume it. This doc is self-contained — everything needed to finish the job on a new
-machine is either inline or reachable from `gs://`.
+**Status:** steps 4000 / 6000 / 8000 / 10000 / 12000 are **COMPLETE** on `markov`
+(20/20 each, zero harness failures). Step **14000 is RUNNING** (13/20 as of 2026-08-25
+14:25 PT, ~2–3 h left). Results: `carla_results/checkpoint_comparison.md`.
+The earlier `bellman` stall was misdiagnosed — see §7, which has been corrected.
+
+| Checkpoint | GPU (train:render) | rpc / tm / display | tmux session | state |
+|---|---|---|---|---|
+| 4000  | 3:3 | 13000 / 19000 / :40 | —              | done 20/20 |
+| 6000  | 6:6 | 13100 / 19100 / :41 | —              | done 20/20 |
+| 8000  | 7:7 | 13200 / 19200 / :42 | —              | done 20/20 |
+| 10000 | 2:2 | 13300 / 19300 / :43 | —              | done 20/20 |
+| 12000 | 3:3 | 13400 / 19400 / :44 | —              | done 20/20 |
+| 14000 | 4:4 | 13500 / 19500 / :45 | `lb-ckpt14000` | running 13/20 |
+
+Records land in `leaderboard_runs/ckptcmp_step<STEP>/records/*.json`.
+
+**Finding so far — the gain plateaus at 10000 and no checkpoint beats base.** Over all
+20 routes: base 86.03 / SR 50% vs best checkpoint 10000 at 79.91 / SR 50%. 12000 falls
+back slightly (78.38), so training past 10000 buys nothing on this subset. Every
+checkpoint *does* improve on the 10 routes the base policy failed (base 72.07 → 76–78,
+SR 0% → 30–40%), but all of them regress on the 10 it passed (base 100.00 → 69–82). The
+loss is concentrated in **infraction penalty, not route completion** — 12000 posts the
+best RC of any checkpoint (97.11) while its IP stays at 0.802, i.e. these policies
+navigate fine and lose points to collisions/infractions.
+
+Verified render adapters on this box: **2, 3, 4, 6, 7 work; 0, 1 and 5 cannot render
+CARLA and must not be used** (§7). Re-sweep with `.run_carla/pf3.sh` on any new box.
+
+```bash
+.run_carla/ckpt_cmp_status.sh                    # progress of all six
+tmux attach -t lb-ckpt14000                      # live dashboard (detach: C-b d)
+.venv/bin/python .run_carla/gen_ckpt_report.py   # regenerate the report
+```
+
+Stop cleanly with a single `SIGINT` per orchestrator (§10.5) — never `SIGKILL`; one
+`SIGINT` parks in-flight routes as `pending` so `--resume` loses nothing.
+
+On-disk paths on `markov`: checkpoints at
+`/home/cglossop/steervla_pi_ckpts/pi05_cot_simplified_0823_154520/<STEP>` (steps 4000
+through 14000 downloaded; 12000 and 14000 verified param-tree-identical to 10000 by the
+§4 method), `CARLA_ROOT=/home/cglossop/carla`, repo at `/home/cglossop/ogbench-carla`.
 
 **Goal:** evaluate 4 training checkpoints (steps 4000 / 6000 / 8000 / 10000) of the
 SteerVLA CoT run on the same 20 Bench2Drive routes, and compare them against an already
@@ -30,6 +67,14 @@ These routes have real, valid records. `--resume` keeps them automatically. 12 o
 | 10000 | invading-turn-002 | 60.00 | 100.00 | 0.60 | Completed |
 | 10000 | parking-crossing-pedestrian-005 | 100.00 | 100.00 | 1.00 | Completed |
 | 10000 | vehicle-turning-route-pedestrian-005 | 100.00 | 100.00 | 1.00 | Completed |
+
+> **On `markov` the `ckptcmp_banked_records.tar.gz` archive was not present**, so none
+> of these 12 cells were restored and **all 20 routes are being re-run for every
+> checkpoint** (80 cells). The table above is therefore a *cross-check*, not an input.
+> First cross-check results: step 4000 / `parking-crossing-pedestrian-005` reproduced
+> **100.00** exactly; step 6000 on the same route scored **100.00** vs the banked
+> **50.00** — run-to-run variance from CARLA traffic, so expect the banked numbers to
+> agree only approximately.
 
 Remaining: **18** routes for step 4000, **18** for 6000, **16** for 8000, **16** for 10000.
 
@@ -198,11 +243,15 @@ for a full 16–18 route resume. All four run concurrently, so ~8–10 h total.
 
 ---
 
-## 7. Why this stalled — read before launching
+## 7. Why this stalled — CORRECTED 2026-08-24 on `markov`
 
-From ~11:45 on 2026-08-24, every route on `bellman` died the same way: CARLA's RPC port
-came up fine (~28 s), then `load_world` timed out 20 consecutive times and the simulator
-segfaulted with
+**The original diagnosis in this section was wrong.** It blamed machine-wide GPU
+contention from other users. The real cause is **per-GPU**: on a multi-GPU box, some
+GPUs simply cannot render CARLA at all, and the failure is identical regardless of how
+idle the machine is.
+
+The symptom is unchanged — CARLA's RPC port comes up in ~10 s, then `load_world` times
+out and the simulator dies with
 
 ```
 LowLevelFatalError [File:Unknown] [Line: 1214]
@@ -210,44 +259,57 @@ GameThread timed out waiting for RenderThread after 60.00 secs
 Signal 11 caught. → Segmentation fault (core dumped)
 ```
 
-This is **UE4's render thread being starved**, caused by machine-wide GPU contention from
-other users' jobs (all 8 GPUs holding 85–122 GB of resident CUDA contexts). Ruled out:
-it reproduced on a completely idle GPU with 77 GB free, and CPU (224 cores, load 34), RAM
-(1.7 TB free), disk (idle), `/dev/shm` (1%), and ECC/Xid were all clean. Other users'
-CARLA instances ran fine throughout — this is contention, not a broken install.
+### What actually distinguishes a good GPU from a bad one
 
-**Gate every launch on this preflight.** It boots a throwaway CARLA on the emptiest GPU
-and proves `load_world` works before you commit 8–10 GPU-hours. It cost a full day to
-learn this lesson; do not skip it.
+On `markov`, sweeping `load_world('Town12')` across every `-graphicsadapter` index:
+
+| adapter | result |
+|---|---|
+| 0 | FAIL (segfault) |
+| 1 | FAIL (segfault) — **while completely idle: 1 MiB used, 0% util** |
+| 2 | OK, 37 s |
+| 3 | OK, 35 s |
+| 5 | FAIL (segfault) — retested while idle, still failed |
+| 6 | OK, 35 s |
+| 7 | OK, 36 s |
+
+Three controls rule out every explanation this section previously offered:
+
+1. **Not contention.** GPU 1 failed with 80 GB free and 0% utilisation. GPU 5 failed
+   again later, idle. Meanwhile GPUs 3/6/7 worked *while* running our own jobs.
+2. **Not the CARLA install.** Another user's separate CARLA tree
+   (`/raid/users/surya/ogbench-carla/carla`) failed on GPU 1, and *our* tree succeeded
+   on GPU 6. The two `Content/` trees are byte-identical in size (27 G; Town12 259 M /
+   309 files, Town13 802 M / 339 files).
+3. **Not the map or the large-map assets.** The same binary loads Town12 in 35 s on a
+   good adapter.
+
+So: **the GPU set is the variable. Sweep it, do not assume.** Adapter indices are not
+stable across machines — verify per box.
+
+### The `-g.TimeoutForBlockOnRenderFence` flag does not work
+
+`ogbench/carla/carla_utils.py:663` already passes
+`-g.TimeoutForBlockOnRenderFence=300000`. **It has no effect** — UE4 still reports the
+default `60.00 secs` in the crash. Do not treat its presence as protection, and do not
+spend time tuning it.
+
+### Correct preflight: sweep all adapters
+
+The preflight previously in this section was **misleading**: it omitted the Xvfb display,
+the NVIDIA Vulkan ICD, and the rest of the environment that
+`carla_utils.py::_carla_subprocess_env` sets, so it did not reproduce the real launch
+path. Use `.run_carla/pf3.sh` instead (mirrors the real launcher exactly):
 
 ```bash
-#!/usr/bin/env bash
-set -u
-PORT=14600
-GPU=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits \
-      | sort -t, -k2 -n | head -1 | cut -d, -f1 | tr -d ' ')
-LOG=$(mktemp)
-cleanup() { pkill -u "$USER" -f "carla-rpc-port=${PORT}" 2>/dev/null; }
-trap cleanup EXIT
-VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json \
-  /path/to/carla/CarlaUE4.sh -RenderOffScreen -nosound \
-  -carla-rpc-port=$PORT -graphicsadapter="$GPU" -carla-streaming-port=$((PORT+1)) \
-  > "$LOG" 2>&1 &
-for _ in $(seq 1 12); do sleep 10; ss -ltn | grep -q ":${PORT} " && break; done
-ss -ltn | grep -q ":${PORT} " || { echo "PREFLIGHT FAIL: RPC never came up"; tail -4 "$LOG"; exit 1; }
-.venv/bin/python - "$PORT" <<'PY'
-import carla, sys, time
-c = carla.Client('localhost', int(sys.argv[1])); c.set_timeout(180.0)
-t = time.time()
-try:
-    c.load_world('Town12')
-    print("PREFLIGHT OK: load_world('Town12') in %.0fs" % (time.time() - t)); sys.exit(0)
-except Exception as e:
-    print("PREFLIGHT FAIL after %.0fs: %s" % (time.time() - t, e)); sys.exit(1)
-PY
+# ./pf3.sh CARLA_ROOT ADAPTER RPC_PORT DISPLAY_NUM [MAP]
+for g in 0 1 2 3 4 5 6 7; do
+  ./pf3.sh /home/cglossop/carla $g $((15000 + 10*g)) $((70 + g)) Town12 | grep RESULT
+done
 ```
 
----
+Keep every adapter that reports `rc=0`; assign one checkpoint per good adapter. Each
+sweep entry costs ~40 s on a good GPU and ~4 min on a bad one (it waits out the timeout).
 
 ## 8. Baseline for comparison
 

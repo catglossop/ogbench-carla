@@ -65,6 +65,11 @@ def get_config():
             # A window can be as small as one chunk or as large as a whole episode.
             query_every_n_episode_steps=150,
             query_on_episode_end=True,
+            # Run the VLM review in a background thread instead of blocking the rollout.
+            # The review is pure hindsight -- it reads a window already driven -- so nothing in
+            # the loop needs its result before the next window. Inline it cost ~30% of a
+            # 4000-step run waiting on Gemini. One worker, so windows stay ordered.
+            async_review=False,
             provider="gemini",
             gemini_model="gemini-3.5-flash",
             # Must match the rollout's action chunk length (config.action_horizon).
