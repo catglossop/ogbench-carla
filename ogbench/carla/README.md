@@ -116,6 +116,40 @@ There are a couple levers to pull to optimize the speed a bit:
 - `actions_per_cot`: int - how many actions to execute before getting new CoT (speed)
 
 
+## Which GPU can actually render? (`scripts/`)
+
+CARLA can fail on a *specific* GPU while every other card on the box is fine, and
+the symptom is misleading: the RPC port opens normally, then the Python client
+times out on `get_world()` because UE4 has already died with
+`VK_ERROR_DEVICE_LOST`. Two standalone tools diagnose this. Neither needs root
+or `vulkan-tools`.
+
+```bash
+# 1. Is the Vulkan stack healthy, and which physical card is -graphicsadapter=N?
+#    Enumerates devices in UE4's order and prints each one's PCI bus id (join it
+#    against nvidia-smi's Bus-Id column), then runs a real GPU submit per device.
+python3 scripts/vulkan_gpu_probe.py
+
+# 2. Does CARLA itself work there? Boots CARLA per adapter on its own port and
+#    X display, spawns a vehicle + RGB camera, and counts delivered frames.
+CARLA_ROOT=/path/to/carla python3 scripts/carla_gpu_sweep.py \
+  --adapters 0-7 --python .venv/bin/python
+
+# Repeat to separate a genuinely dead card from a flaky race:
+CARLA_ROOT=/path/to/carla python3 scripts/carla_gpu_sweep.py \
+  --adapters 0,5,6 --repeat 3 --python .venv/bin/python
+```
+
+The sweep prints a per-adapter USABLE/BROKEN table and keeps each UE4 log under
+`.run_carla/gpu_sweep/`. Note that a card can pass the Vulkan probe and still
+fail the CARLA sweep: the probe exercises allocation and queue submission, while
+UE4 drives the full graphics pipeline. **Trust the sweep for "can I run here?"**
+
+Results on `kalman` (2026-08-31, 8× H200, driver 570.124.06): adapters
+**1, 2, 3, 4, 7 usable**; **0, 5, 6 broken** (0/3 attempts each, while adapter 3
+passed 3/3). All 8 pass the raw Vulkan probe and report zero ECC errors and no
+row remapping, so the broken three are not defective silicon.
+
 ## Fail2Drive routes: 
 
 To add fail2drive routes, first pull down the f2d_content_pack.zip (see our slack channel)

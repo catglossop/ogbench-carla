@@ -47,7 +47,12 @@ checkpoint: ./simulation_results.json
 debug_checkpoint: ./live_results.txt
 # CARLA UE / rendering adapter index (leaderboard subprocess). JAX RL GPU is separate:
 # set ``training_gpu_rank`` in the agent config (e.g. steervla_dsrl_config.py).
-gpu_rank: 0 # Carla for some reason swaps the order of the GPUs, so we need to set the rank to 0 for GPU1 in nvtop and vice versa 
+# NOTE: measured on kalman (8x H200, driver 570.124.06), the adapter index is NOT
+# swapped -- CARLA's -graphicsadapter=N maps to nvidia-smi GPU N one-for-one.
+# Verify on any host with ``scripts/vulkan_gpu_probe.py``, which prints each
+# Vulkan index next to its PCI bus id, and confirm end-to-end with
+# ``scripts/carla_gpu_sweep.py``.  Do not assume the ordering; measure it.
+gpu_rank: 0
 repetitions: 1
 repetition_index: 0
 

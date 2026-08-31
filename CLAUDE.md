@@ -100,7 +100,7 @@ This is the part that is **not** discoverable by reading any single file. Trace 
 
 CARLA's UE4 renderer and JAX run on **different GPUs**, and the rank conventions are not the same:
 
-- `gpu_rank` in `impls/configs/carla_config.yaml` → passed as CARLA `-graphicsadapter`. CARLA's adapter ordering is **swapped** relative to `nvtop`/`nvidia-smi` — see the inline comment in `carla_config.yaml`.
+- `gpu_rank` in `impls/configs/carla_config.yaml` → passed as CARLA `-graphicsadapter`, which UE4 uses as an index into `vkEnumeratePhysicalDevices`. **Measure the mapping, don't assume it** — on `kalman` (8× H200, driver 570.124.06) it matches `nvidia-smi` one-for-one, contrary to the older "adapter ordering is swapped" note. Run `scripts/vulkan_gpu_probe.py` to print each Vulkan index beside its PCI bus id, and `scripts/carla_gpu_sweep.py` to confirm end-to-end.
 - `training_gpu_rank` in the agent config → pins JAX's default device via `jax.config.update("jax_default_device", devs[rank])`. Set to `-1` to leave alone.
 
 `run_carla.sh` exposes both as `--render-adapter` (alias `--sim-gpu`) and `--train-gpu`, generates a temp `carla_config.yaml` + temp agent config under `.run_carla/` for the run, and cleans them up on exit. When debugging multi-run setups, look at the printed `[run_carla.sh]` summary lines — they show every resolved port and GPU rank.
