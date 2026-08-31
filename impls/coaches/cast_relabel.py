@@ -1383,6 +1383,30 @@ def annotate_cast_relabel_frames(
 # ── Online session (wired into main_carla) ───────────────────────────────────────────
 
 
+def _pad_frames_to_common_shape(frames: list[np.ndarray]) -> list[np.ndarray]:
+    """Zero-pad ``frames`` (H, W, 3) to the max height/width across them, content top-left.
+
+    ``annotate_cast_relabel_frames`` sizes each frame's text column to the text it must fit, so one
+    window's composites can disagree in height/width and ``np.stack`` then raises. Returns the input
+    untouched when the frames already agree, so the common case costs one comparison and no copy.
+    """
+    shapes = {f.shape[:2] for f in frames}
+    if len(shapes) <= 1:
+        return frames
+    max_h = max(f.shape[0] for f in frames)
+    max_w = max(f.shape[1] for f in frames)
+    out: list[np.ndarray] = []
+    for f in frames:
+        h, w = f.shape[:2]
+        if (h, w) == (max_h, max_w):
+            out.append(f)
+            continue
+        buf = np.zeros((max_h, max_w, f.shape[2]), dtype=f.dtype)
+        buf[:h, :w] = f
+        out.append(buf)
+    return out
+
+
 def _as_config_dict(cfg: Any) -> dict[str, Any]:
     if cfg is None:
         return {}
@@ -1922,12 +1946,20 @@ class OnlineCastRelabelSession:
         n_hl = self._store_hl_samples(cast_json, metadata, traj_window, tag)
 
         if self.debug:
-            self._log_debug_video(
-                frames_window,
-                cast_json,
-                frame_chunk_indices=metadata.get("frame_chunk_indices") or [],
-                global_step=global_step,
-            )
+            # Guarded like the correction-memory update above: the debug video is an aid, and an
+            # exception here used to propagate out of _run_window and skip BOTH _log_scalars and
+            # the cursor advance below. With the cursors left un-advanced the next window re-reviews
+            # every frame from the start, so windows grow without bound and re-emit duplicate HL
+            # samples -- which silently inflates the pool and the sample-reuse telemetry.
+            try:
+                self._log_debug_video(
+                    frames_window,
+                    cast_json,
+                    frame_chunk_indices=metadata.get("frame_chunk_indices") or [],
+                    global_step=global_step,
+                )
+            except Exception as exc:  # noqa: BLE001 - the debug video is never a prerequisite.
+                print(f"[cast_relabel] debug video failed (non-fatal): {exc}", flush=True)
         self._log_scalars(events, cast_json, n_hl_samples=n_hl, global_step=global_step)
 
         # Advance cursors so the next window starts fresh.
@@ -2060,6 +2092,12 @@ class OnlineCastRelabelSession:
         # video exists. Camera frames therefore stay at the native 1024x512 and the composite is
         # ~2048px wide. Plain camera-only video (episode clips, local .mp4 dumps) still gets
         # downscaled in main_carla, where there is no text to lose.
+        # ``annotate_cast_relabel_frames`` sizes each frame's text column to the rationale it has
+        # to fit, so composites in one window can differ in height (and, for a wrapped subtask, in
+        # width). np.stack requires exact agreement, so pad each frame out to the window maximum
+        # with black rather than dropping the odd-sized ones -- content stays top-left aligned and
+        # every frame survives.
+        annotated = _pad_frames_to_common_shape(annotated)
         video = np.stack(annotated, axis=0)  # (T, H, W, 3)
         video = np.transpose(video, (0, 3, 1, 2))  # (T, C, H, W) for W&B
         wandb.log(

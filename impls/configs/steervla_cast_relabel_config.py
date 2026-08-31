@@ -206,8 +206,16 @@ def get_config():
             # ``load_trainable_params``) — in a rollout-only run the weights never change, so
             # there is nothing to checkpoint and main_carla says so at startup.
             #
-            # 0 disables. Empty dir -> ``<save_dir>/checkpoints`` (next to videos/ and trajectories/).
-            hl_checkpoint_every_steps=2000,
+            # **Opt-in: 0 (off) by default.** Each export is ~10 GB, so a run that does not
+            # actually need a redeployable policy should not silently leave tens of GB behind —
+            # two 8k-step runs cost 60 GB before anyone noticed. ``main_carla`` already treats a
+            # missing key as 0, so this just stops the base config from forcing it on.
+            # Enable per run with ``run_carla.sh --hl-ckpt-every N`` (plus ``--hl-ckpt-dir`` /
+            # ``--hl-ckpt-keep-last``), or use ``steervla_cast_relabel_train_config.py``, which
+            # turns it on deliberately.
+            #
+            # Empty dir -> ``<save_dir>/checkpoints`` (next to videos/ and trajectories/).
+            hl_checkpoint_every_steps=0,
             hl_checkpoint_dir="",
             # Each checkpoint is ~10 GB, so 2000-step spacing over a 20k-step run is ~100 GB.
             # Keep only the newest N step dirs (pruned after each successful write); 0 = keep all.

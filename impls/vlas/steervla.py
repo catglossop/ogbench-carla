@@ -1403,6 +1403,20 @@ class SteerVLAActor:
         self._hl_grpo_step = None
         self._hl_ref_params = None
         self._hl_update_calls = 0
+        # --- Policy-update / sample-reuse accounting (overfitting telemetry) -------------------
+        # ``_hl_update_calls`` above counts *attempts*, including the ones the ``hl_update_every``
+        # throttle drops, so it is not "how much did the policy actually move". These three are:
+        #   _hl_updates_applied -> update_hl bodies that reached the gradient loop.
+        #   _hl_grad_steps      -> cumulative optimizer steps applied to the backbone (the real
+        #                          "number of updates to the policy"; = sum of hl_update_num_steps).
+        #   _hl_sample_uses     -> per-sample-id count of gradient steps that consumed it. A batch
+        #                          row used by an ``ns``-step update counts ``ns`` times, and a row
+        #                          duplicated by ``_pad_hl_batch`` counts once per copy, because
+        #                          both really are extra gradient exposure for that sample.
+        self._hl_updates_applied = 0
+        self._hl_grad_steps = 0
+        self._hl_sample_uses: dict[str, int] = {}
+        self._hl_sample_uses_by_pool: dict[str, dict[str, int]] = {}
         # Diagnostics for :meth:`update_hl`, whose skip paths are otherwise silent (it returns
         # ``{}``), which makes an absent ``vla_hl/batch_text`` table impossible to explain.
         self._hl_pool_size = 0
@@ -2257,6 +2271,10 @@ class SteerVLAActor:
             # already have this -- but without propagating it here the dumped batch reports every
             # row as -1 ("unversioned"), which reads as if the sliding window were inert.
             "policy_version": int(e.get("policy_version", -1)),
+            # Stable on-disk identity of this sample. Used by :meth:`update_hl` to count how many
+            # gradient steps each distinct HL sample has been consumed by (the sample-reuse /
+            # overfitting telemetry logged under ``vla_hl/reuse_*``). Not consumed by the model.
+            "sample_id": str(npz_path),
         }
 
     def _load_hl_batch(self, batch_size: int):
@@ -2404,6 +2422,57 @@ class SteerVLAActor:
         if msg != getattr(self, "_last_hl_note", None):
             print(f"[steervla.update_hl] {msg}", flush=True)
             self._last_hl_note = msg
+
+    def _record_hl_sample_uses(self, records: list[dict[str, Any]], num_grad_steps: int) -> dict[str, float]:
+        """Book one HL update against the per-sample use counters and return reuse telemetry.
+
+        ``records`` is the batch about to be fed to ``num_grad_steps`` optimizer steps, so every row
+        is credited ``num_grad_steps`` uses (and a row that ``_pad_hl_batch`` duplicated is credited
+        once per copy — the duplicate really is extra gradient exposure for that sample).
+
+        Two different "average reuse" numbers are reported because they answer different questions
+        about overfitting:
+
+        * ``reuse_mean`` — uses per sample **that has ever been used**. This is the re-exposure
+          factor of the data the policy has actually seen.
+        * ``reuse_online_per_pool_sample`` — total online uses divided by the *current online pool
+          size*, i.e. counting never-drawn samples as zero. This is the one that tracks the small
+          cast_relabel pool being ground over and over as the run goes on.
+        """
+        ns = max(1, int(num_grad_steps))
+        for r in records:
+            sid = r.get("sample_id")
+            if not sid:
+                continue
+            pool = str(r.get("pool", "online"))
+            self._hl_sample_uses[sid] = self._hl_sample_uses.get(sid, 0) + ns
+            per_pool = self._hl_sample_uses_by_pool.setdefault(pool, {})
+            per_pool[sid] = per_pool.get(sid, 0) + ns
+
+        out: dict[str, float] = {}
+        uses = list(self._hl_sample_uses.values())
+        if uses:
+            total = float(sum(uses))
+            out["reuse_total_uses"] = total
+            out["reuse_distinct_samples"] = float(len(uses))
+            out["reuse_mean"] = total / len(uses)
+            out["reuse_max"] = float(max(uses))
+        online = self._hl_sample_uses_by_pool.get("online", {})
+        if online:
+            online_uses = list(online.values())
+            online_total = float(sum(online_uses))
+            out["reuse_online_total_uses"] = online_total
+            out["reuse_online_distinct_samples"] = float(len(online_uses))
+            out["reuse_online_mean"] = online_total / len(online_uses)
+            out["reuse_online_max"] = float(max(online_uses))
+            pool_size = int(self._hl_pool_size)
+            if pool_size > 0:
+                # Counts never-drawn pool samples as zero, so this only rises once the pool stops
+                # growing as fast as it is consumed.
+                out["reuse_online_per_pool_sample"] = online_total / float(pool_size)
+                out["reuse_online_pool_coverage"] = min(1.0, len(online_uses) / float(pool_size))
+        out["online_pool_size"] = float(self._hl_pool_size)
+        return out
 
     def _build_hl_observation_batch(self, records: list[dict[str, Any]]):
         """Build ``(Observation, actions)`` for :meth:`update_hl` from mixed HL records.
@@ -2648,6 +2717,31 @@ class SteerVLAActor:
         buf.seek(0)
         arr = plt.imread(buf)  # float32 RGBA in [0, 1]
         return (np.asarray(arr)[..., :3] * 255.0).astype(np.uint8)
+
+    def _log_hl_scalars_to_wandb(self, metrics: dict[str, float], *, global_step: int | None) -> None:
+        """Log :meth:`update_hl`'s scalar telemetry straight to wandb under ``vla_hl/``.
+
+        These scalars also travel back through ``DSRLAgent.update_with_vla`` into main_carla's
+        ``training/vla_hl/*``, but that path only reaches wandb on env steps that happen to be a
+        multiple of ``log_interval`` AND whose ``last_update_info`` still carries an HL block —
+        with ``hl_update_every`` throttling, most log intervals see a throttled (empty) info and
+        the series goes blank. The cumulative update count and the sample-reuse curves are the
+        point of this run, so log them here too, once per *applied* update, unconditionally.
+        """
+        try:
+            import wandb  # type: ignore
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+        try:
+            payload = {f"vla_hl/{k}": float(v) for k, v in metrics.items()}
+            # Same clamp as :meth:`_log_hl_batch_to_wandb`: the HL update runs after the env-step
+            # logging, and wandb silently drops a log whose step is behind the run's current step.
+            step = None if global_step is None else max(int(global_step), int(getattr(wandb.run, "step", 0) or 0))
+            wandb.log(payload, step=step)
+        except Exception as exc:  # noqa: BLE001 - telemetry must never break the update.
+            print(f"[steervla.update_hl] scalar wandb log failed (non-fatal): {exc}", flush=True)
 
     def _log_hl_batch_to_wandb(
         self,
@@ -3101,6 +3195,10 @@ class SteerVLAActor:
         # in the manifest-text logs above.
         self._dump_hl_batch_tokens(observation, actions, records, global_step=global_step)
 
+        # Book the batch against the per-sample use counters *before* the gradient loop, so the
+        # reuse numbers reported alongside this update describe the batch it actually trained on.
+        reuse_info = self._record_hl_sample_uses(records, ns)
+
         info: dict[str, Any] = {}
         for _ in range(max(1, ns)):
             if rng is None:
@@ -3108,6 +3206,8 @@ class SteerVLAActor:
             else:
                 step_rng = rng
             self._train_state, info = self._hl_train_step(step_rng, self._train_state, (observation, actions))
+            self._hl_grad_steps += 1
+        self._hl_updates_applied += 1
         self._weights_dirty = True
 
         out: dict[str, float] = {}
@@ -3117,6 +3217,13 @@ class SteerVLAActor:
             except Exception:
                 continue
         out["n_samples"] = float(len(records))
+        out["n_distinct_samples"] = float(len({r.get("sample_id") for r in records if r.get("sample_id")}))
+        # Cumulative policy movement: gradient steps actually applied to the backbone (NOT
+        # ``_hl_update_calls``, which counts attempts including throttled no-ops).
+        out["policy_updates"] = float(self._hl_grad_steps)
+        out["updates_applied"] = float(self._hl_updates_applied)
+        out["update_calls"] = float(self._hl_update_calls)
+        out.update(reuse_info)
 
         # True device memory around the HL gradient step. ``nvidia-smi`` only shows the
         # preallocated XLA pool (XLA_PYTHON_CLIENT_MEM_FRACTION), not live usage, so read it
@@ -3145,6 +3252,16 @@ class SteerVLAActor:
         except Exception as exc:  # noqa: BLE001 - memory telemetry must never break the update.
             print(f"[steervla.update_hl] memory_stats unavailable ({exc}).", flush=True)
 
+        self._log_hl_scalars_to_wandb(out, global_step=global_step)
+        print(
+            f"[steervla.update_hl] policy_updates={self._hl_grad_steps} "
+            f"(applied={self._hl_updates_applied}, calls={self._hl_update_calls}) "
+            f"reuse_mean={out.get('reuse_mean', float('nan')):.2f} "
+            f"online_reuse_mean={out.get('reuse_online_mean', float('nan')):.2f} "
+            f"online_uses_per_pool_sample={out.get('reuse_online_per_pool_sample', float('nan')):.2f} "
+            f"(online pool {int(self._hl_pool_size)})",
+            flush=True,
+        )
         return out
 
     def update_hl_grpo(
