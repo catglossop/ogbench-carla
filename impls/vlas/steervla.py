@@ -357,6 +357,9 @@ def _openpi_hl_train_step(
     rng: jax.Array,
     state: training_utils.TrainState,
     batch: tuple[_openpi_model.Observation, jnp.ndarray],
+    ref_params=None,
+    *,
+    log_kl: bool = False,
 ):
     """One OpenPI gradient step, jit-friendly (bind ``config`` via ``functools.partial``).
 
@@ -365,6 +368,13 @@ def _openpi_hl_train_step(
     high-level (VLM-backbone) update the batch is built with ``action_loss_mask`` all-``False`` so the
     action-flow loss is zero — the action-expert params receive no gradient and only the CoT/VLM
     backbone is updated, exactly like OpenPI's ``steervla_hl_datasets`` (``action_supervision=False``).
+
+    With ``log_kl`` and ``ref_params`` this also reports ``kl_to_ref`` — Schulman's k3 estimator of
+    ``KL(pi_theta || pi_ref)`` over the teacher-forced CoT tokens, the same quantity and estimator the
+    GRPO step penalizes, but here computed **purely as a metric**: it never enters the loss and no
+    gradient reaches the reference. It measures how far the HL update has drifted the CoT policy from
+    the checkpoint it started at. Cost is one extra forward pass per step (no backward, no activations
+    kept), so it roughly adds the forward share of the step -- gate it off if that matters.
     """
     model = nnx.merge(state.model_def, state.params)
     model.train()
@@ -377,6 +387,13 @@ def _openpi_hl_train_step(
             aux_metrics = {}
         loss = jnp.mean(chunked_loss)
         reduced_aux = {k: jnp.mean(v) for k, v in aux_metrics.items()}
+        if log_kl:
+            # Reuse this forward's chunked loss for the per-example CE; stop_gradient so the KL
+            # metric can never influence the update.
+            ce = jnp.asarray(chunked_loss)
+            reduced_aux["_ce_per_example"] = jax.lax.stop_gradient(
+                ce.reshape(ce.shape[0], -1).mean(axis=-1) if ce.ndim > 1 else ce
+            )
         return loss, reduced_aux
 
     train_rng = jax.random.fold_in(rng, state.step)
@@ -406,7 +423,19 @@ def _openpi_hl_train_step(
         )
 
     info = {"loss": loss, "grad_norm": optax.global_norm(grads)}
+    ce_theta = aux_metrics.pop("_ce_per_example", None)
     info.update(aux_metrics)
+
+    if log_kl and ref_params is not None and ce_theta is not None:
+        # Frozen reference forward, outside the grad path (params are the pre-update snapshot).
+        ref_model = nnx.merge(state.model_def, ref_params)
+        ref_model.eval()
+        ce_ref = jax.lax.stop_gradient(_cot_ce_per_example(ref_model, train_rng, observation, actions))
+        log_ratio = ce_ref - ce_theta  # log pi_theta - log pi_ref  (CE is the negative log-prob)
+        info["kl_to_ref"] = jnp.mean(jnp.exp(-log_ratio) + log_ratio - 1.0)  # k3, >= 0
+        info["ce_theta"] = jnp.mean(ce_theta)
+        info["ce_ref"] = jnp.mean(ce_ref)
+        info["log_ratio"] = jnp.mean(log_ratio)
     return new_state, info
 
 
@@ -1311,6 +1340,7 @@ class SteerVLAActor:
         hl_update_num_steps: int = 1,
         hl_lr: float | None = None,
         hl_freeze_regexes: list[str] | None = None,
+        hl_log_kl: bool = True,
         hl_replay_root: str | Path | None = None,
         hl_replay_pools: list[dict] | None = None,
         hl_online_weight: float = 1.0,
@@ -1358,6 +1388,7 @@ class SteerVLAActor:
         # Optional regexes of param paths to FREEZE in the trainable state (e.g. the SigLIP vision
         # tower and the tied token embedder), so their grad + Adam buffers are dropped and the HL
         # update fits. Applied in :meth:`setup` before the train state is built. None = full fine-tune.
+        self.hl_log_kl = bool(hl_log_kl)
         self.hl_freeze_regexes: list[str] | None = (
             [str(r) for r in hl_freeze_regexes if str(r).strip()] if hl_freeze_regexes else None
         )
@@ -1725,7 +1756,7 @@ class SteerVLAActor:
             # ``self._train_state`` to the output and never reuses the donated input. Only the state
             # is donated, not the batch — the batch is reused across ``hl_update_num_steps`` steps.
             self._hl_train_step = jax.jit(
-                functools.partial(_openpi_hl_train_step, self.train_cfg),
+                functools.partial(_openpi_hl_train_step, self.train_cfg, log_kl=self.hl_log_kl),
                 donate_argnums=(1,),
             )
             # GRPO (HL policy) step: same donate/static convention as above. Snapshot the loaded params
@@ -3205,7 +3236,12 @@ class SteerVLAActor:
                 self._train_rng, step_rng = jax.random.split(self._train_rng)
             else:
                 step_rng = rng
-            self._train_state, info = self._hl_train_step(step_rng, self._train_state, (observation, actions))
+            self._train_state, info = self._hl_train_step(
+                step_rng,
+                self._train_state,
+                (observation, actions),
+                self._hl_ref_params if self.hl_log_kl else None,
+            )
             self._hl_grad_steps += 1
         self._hl_updates_applied += 1
         self._weights_dirty = True
@@ -5525,6 +5561,7 @@ def create_steervla_pi0_cot_sample_fn(
         cot_overflow_max_resamples=int(steervla_cfg.get("cot_overflow_max_resamples", 2)),
         include_ego_history=bool(steervla_cfg.get("include_ego_history", False)),
         proprio_norm=bool(steervla_cfg.get("proprio_norm", True)),
+        hl_log_kl=bool(steervla_cfg.get("hl_log_kl", True)),
         output_action_format=steervla_cfg.get("output_action_format") or "DELTA_XY_T_DELTA_XY_SPACE",
         action_horizon=int(steervla_cfg.get("action_horizon", 10)),
         action_dim=int(steervla_cfg.get("action_dim", 4)),

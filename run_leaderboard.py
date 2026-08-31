@@ -356,11 +356,18 @@ def launch(slot: Slot, route: str, run_dir: Path, base_cfg: dict[str, Any],
     env["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(args.xla_mem_fraction)
     # Each route is its own process, so without a persistent cache every worker re-runs the
     # Pi0-CoT XLA compile from scratch -- measured at ~17 min on this box, which over 220
-    # routes is more wall-clock than the driving itself. The cache is keyed on the HLO, so
-    # it is shared safely across slots and across runs of the same checkpoint.
+    # routes is more wall-clock than the driving itself. The cache is keyed on the HLO, which
+    # does NOT capture device assignment -- so it is shared safely only among slots on the same
+    # train GPU (see the per-GPU scoping below), and across runs of the same checkpoint.
     if args.jax_cache_dir:
-        Path(args.jax_cache_dir).expanduser().mkdir(parents=True, exist_ok=True)
-        env["JAX_COMPILATION_CACHE_DIR"] = str(Path(args.jax_cache_dir).expanduser())
+        # Per-train-GPU subdirectory. A cached executable carries its device assignment, so a
+        # cache shared by slots on different train GPUs yields, at reuse time:
+        #   INVALID_ARGUMENT: Buffer ... is on device cuda:N, but replica is assigned to cuda:M
+        # Scoping by slot.train_gpu keeps the ~17 min Pi0-CoT compile amortised per GPU while
+        # letting one run span several train GPUs.
+        cache_dir = Path(args.jax_cache_dir).expanduser() / f"gpu{slot.train_gpu}"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        env["JAX_COMPILATION_CACHE_DIR"] = str(cache_dir)
         env["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] = "1.0"
         # Default (0) lets JAX pick a filesystem-dependent floor that can skip entries; -1
         # disables the size restriction so the big Pi0 modules are definitely cached.

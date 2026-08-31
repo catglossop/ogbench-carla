@@ -277,10 +277,10 @@ flags.DEFINE_bool(
 
 flags.DEFINE_bool(
     "bon_include_brake_candidate", False,
-    "When best-of-N is active (--bon_critic_ckpt or --bon_online_critic), append one "
+    "When best-of-N is active (including Qwen selection), append one "
     "extra synthetic all-zero (full-stop) action chunk to the N sampled candidates each "
-    "step, so the critic always has the option to brake regardless of what the pi0 base "
-    "policy actually sampled. Shown in candidate logging as '[synthetic] full brake'.",
+    "step, so the selector always has the option to brake regardless of what the pi0 base "
+    "policy actually sampled.",
 )
 
 flags.DEFINE_float(
@@ -1524,6 +1524,29 @@ def _annotate_waypoints_frame(frame: np.ndarray, action_flat, exec_cfg) -> np.nd
         return frame
 
 
+# Bottom text panel height, in text lines. This is FIXED rather than derived from the
+# per-frame line count: the number of lines varies frame to frame (optional HUD/expert rows,
+# and ``_wrap_overlay_lines`` wrapping longer reasoning into more rows), which changed the
+# output frame's height mid-video -- disorienting to watch, and some encoders/players cope
+# badly with a resolution that moves. Overflow is dropped with an ellipsis marker and short
+# frames are padded, so every frame of a rollout video is the same size.
+_VIDEO_PANEL_LINES = 14
+
+
+def _fit_panel_lines(lines, colors, max_lines: int = _VIDEO_PANEL_LINES):
+    """Clamp wrapped overlay lines to a fixed count so the panel height never changes."""
+    lines = list(lines)
+    colors = list(colors)
+    if len(colors) < len(lines):
+        colors += [(255, 255, 255)] * (len(lines) - len(colors))
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        colors = colors[:max_lines]
+        tail = lines[-1].rstrip()
+        lines[-1] = (tail[:-1] + "\u2026") if len(tail) > 1 else "\u2026"
+    return lines, colors[:len(lines)]
+
+
 def _annotate_text_panel(
     frame, raw, *, reward: float, critic_text: str = "", steervla_actor=None, hud: dict | None = None
 ) -> np.ndarray:
@@ -1614,7 +1637,8 @@ def _annotate_text_panel(
         lines, colors = _wrap_overlay_lines(
             lines, colors, frame_width=w, font_scale=font_scale, thickness=thickness
         )
-        panel_h = max(72, line_h * (len(lines) + 1))
+        lines, colors = _fit_panel_lines(lines, colors)
+        panel_h = line_h * (_VIDEO_PANEL_LINES + 1)
         annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
         annotated[:h, :, :] = annotated_top
         cv2.line(annotated, (0, h), (w - 1, h), (255, 255, 255), 1)
@@ -1833,6 +1857,12 @@ def run_online_carla(
 
     capacity = int(agent_config.get("buffer_capacity", 5_000))
     warmup = int(agent_config.get("warmup_steps", 1000))
+    # Episode-based warmup: hold updates until this many episodes have *completed*. Step-based
+    # ``warmup_steps`` can't express "one clean episode" because episode length varies with how
+    # the policy drives, so a step budget either cuts episode 1 short (contaminating the baseline
+    # measurement) or overshoots into episode 2. Both gates are ORed, so either alone works and
+    # setting both holds updates until the later of the two.
+    warmup_episodes = int(agent_config.get("warmup_episodes", 0))
     warmup_expo = int(agent_config.get("warmup_expo_steps", 0))
     updates_per_step = int(agent_config.get("updates_per_step", 1))
     update_interval = int(agent_config.get("update_interval", 1))
@@ -2666,7 +2696,8 @@ def run_online_carla(
                 font_scale=font_scale,
                 thickness=thickness,
             )
-            panel_h = max(72, line_h * (len(lines) + 1))
+            lines, _ = _fit_panel_lines(lines, [(255, 255, 255)] * len(lines))
+            panel_h = line_h * (_VIDEO_PANEL_LINES + 1)
             annotated = np.zeros((h + panel_h, w, 3), dtype=np.uint8)
             annotated[:h, :, :] = _annotate_reward_corner(base, reward_value)
             cv2.line(annotated, (0, h), (w - 1, h), (255, 255, 255), 1)
@@ -3008,7 +3039,9 @@ def run_online_carla(
         """
         brake_chunk = np.zeros((1,) + chunks_np.shape[1:], dtype=chunks_np.dtype)
         chunks_np = np.concatenate([chunks_np, brake_chunk], axis=0)
-        candidate_subtasks = candidate_subtasks + ["[synthetic] full brake"]
+        candidate_subtasks = candidate_subtasks + [
+            "The vehicle smoothly decelerates to a stop, normally following the route."
+        ]
         return chunks_np, candidate_subtasks
 
     def _sample_diverse_candidates(subkey, n: int) -> tuple[np.ndarray, list[str]]:
@@ -3196,6 +3229,10 @@ def run_online_carla(
     def _score_candidates_with_qwen(rng_key):
         """Sample each candidate exactly once and score it with the local Qwen service."""
         chunks_np, candidate_subtasks = _sample_diverse_candidates(rng_key, _bon_n)
+        if FLAGS.bon_include_brake_candidate:
+            chunks_np, candidate_subtasks = _append_brake_candidate(
+                chunks_np, candidate_subtasks
+            )
         base_frame = _as_video_frame(_viz_image_from_raw(obs_raw))
         routing_command = str(obs_raw.get("routing_command") or "follow the route")
         state_vec = np.asarray(obs_raw.get("state", []), dtype=np.float32).reshape(-1)
@@ -3235,6 +3272,10 @@ def run_online_carla(
                 "offroad": 0.0,
                 "traffic_violation": 0.0,
                 "progress": 0.0,
+                "progress_meters": 0.0,
+                "last_xy": state_vec[:2].astype(np.float64).copy()
+                if state_vec.size >= 2
+                else None,
             }
         print(
             f"[QWEN-BON] step={step} routing={routing_command!r} choice={best_idx} "
@@ -3517,7 +3558,11 @@ def run_online_carla(
         if FLAGS.expert_recover_debug and (episode_steps == _vla_steps_budget):
             env.reinit_expert()
         # master's off-by-one fix: `<` so exactly `warmup` steps are collected.
-        in_warmup = warmup > 0 and step < warmup
+        # ``episode_count`` increments on ``done``, so ``< warmup_episodes`` keeps updates off
+        # for exactly that many complete episodes and releases them at the episode boundary.
+        in_warmup = (warmup > 0 and step < warmup) or (
+            warmup_episodes > 0 and episode_count < warmup_episodes
+        )
         in_expo_warmup = (
             warmup_expo > 0
             and step <= warmup_expo
@@ -3887,10 +3932,16 @@ def run_online_carla(
             _window["traffic_violation"] = max(
                 _window["traffic_violation"], float(traffic_violation_delta > 0)
             )
-            _window["progress"] = min(
-                1.0,
-                _window["progress"] + max(0.0, float(info.get("route_progress_delta", 0.0))) / 100.0,
-            )
+            _next_state = np.asarray(obs_raw.get("state", []), dtype=np.float64).reshape(-1)
+            if _window["last_xy"] is not None and _next_state.size >= 2:
+                _next_xy = _next_state[:2]
+                _window["progress_meters"] += float(
+                    np.linalg.norm(_next_xy - _window["last_xy"])
+                )
+                _window["last_xy"] = _next_xy.copy()
+            # Match offline pretraining exactly: True iff the executed path over
+            # this BoN decision window travels strictly more than one meter.
+            _window["progress"] = float(_window["progress_meters"] > 1.0)
             _window["goal"] = max(
                 _window["goal"],
                 float(bool(done) and float(info.get("route_progress_pct", 0.0)) >= 99.5),
@@ -4061,7 +4112,12 @@ def run_online_carla(
             # the watchdogs/pseudo-sensors across the query so the route isn't stopped for
             # inactivity (same mechanism SteerVLA inference uses per step).
             if _cast_relabel.should_query(episode_steps):
-                _pause_offtick = hasattr(env, "pause_for_vla_inference")
+                # Pausing CARLA off-tick only matters when the review BLOCKS the rollout: it
+                # stops sim time advancing while the VLM thinks. With ``async_review`` the call
+                # returns as soon as the window is snapshotted, so pausing would just stall the
+                # sim for nothing -- the whole point is to keep driving through the review.
+                _async_review = bool(getattr(_cast_relabel, "async_review", False))
+                _pause_offtick = hasattr(env, "pause_for_vla_inference") and not _async_review
                 if _pause_offtick:
                     env.pause_for_vla_inference()
                 try:
@@ -4071,6 +4127,10 @@ def run_online_carla(
                 finally:
                     if _pause_offtick and hasattr(env, "resume_after_vla_inference"):
                         env.resume_after_vla_inference()
+            # Publish anything a background review finished since the last step. wandb is only
+            # ever touched from this thread; a worker parks its payload instead of logging.
+            if getattr(_cast_relabel, "async_review", False):
+                _cast_relabel.drain_wandb()
 
         # Pooled run: pick up a newly published policy version mid-episode (see CastPoolWatcher).
         if _cast_pool_watcher is not None and _cast_pool_watcher.maybe_reload(env, step):
@@ -4290,9 +4350,16 @@ def run_online_carla(
                 )
                 _vlm_coach.backfill_buffer(buffer)
             if _cast_relabel is not None:
+                # The end-of-episode window runs synchronously (``force=True``), so let any
+                # background review land first: windows must stay ordered, and the correction
+                # memory / HL sample dir are single-writer by design.
+                if getattr(_cast_relabel, "async_review", False):
+                    _cast_relabel.wait_for_reviews()
                 _cast_relabel.maybe_query(
                     episode_step=done_episode_steps, done_info=done_info, force=True, global_step=step
                 )
+                if getattr(_cast_relabel, "async_review", False):
+                    _cast_relabel.drain_wandb()
 
             # Flush any remaining trajectory capture for this episode.
             _traj_ep = getattr(steervla_actor, "_traj_capture", None) if steervla_actor else None

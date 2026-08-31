@@ -308,7 +308,12 @@ def build_coaching_prompt(
         Carefully watch the full video and identify moments where driving behavior was clearly
         good or clearly bad (lane keeping, speed, turns, collisions/near-misses,
         stopping, yielding, route progress, etc.). The collision log above shows ground-truth
-        sensor data — use it to anchor your feedback to the correct timestamps.
+        sensor data — use it to anchor your feedback to the correct timestamps. IMPORTANT: the 
+        subtask should always aline with the route command plan. For example, if the route command plan
+        if to turn left at the intersection, "turn right" would be a blatant violation of the route command plan.
+        If this is violated, make sure it is in the description of the event.
+        
+        Everything that is violated in the below steps should be in the description of the event.
         
         ** Step 1 **
         Determine the state of the vehicle and of the other agents (vehicles, pedestrians, cyclists, etc.) in the video. 
@@ -317,8 +322,8 @@ def build_coaching_prompt(
         - What other vehicles are there? What lanes are they in? 
         - Is there a leading vehicle? If so, how far ahead is it? Is it stopped or moving? 
         - Are there any pedestrians or cyclists in the video? If so, what are they doing? 
-        - Are there any stop signs or traffic lights in the video? What are their states?
-        - Is the vehicle stopped at a crosswalk or in the middle of the road?
+        - Are there any stop signs or traffic lights in the video? When are they red or green? Timing is important here.
+        - Where is the egovehicle in relation to other vehicles, pedestrians, lanes, crosswalks etc.?
         - According to the overall task (the ordered routing-command plan above) and the current
           routing command in the per-timestamp data, what maneuver should the vehicle be
           performing right now (following the road, turning left/right at the intersection,
@@ -326,7 +331,7 @@ def build_coaching_prompt(
 
         ** Step 2 **
         Analyze the vehicle's behavior in the video. For example, you can ask these questions to guide your analysis: 
-        - Does the vehicle's behavior conflict with the route command plan? (if yes, BAD; if no, GOOD)
+        - Does the vehicle's behavior conflict with the route command plan? (if yes, BAD; if no, GOOD). 
         - Is the vehicle maintaining a safe distance from the front car? (if yes, GOOD; if no, BAD)
         - Is the vehicle maintaining a safe speed? (if yes, GOOD; if no, BAD)
         - Does the vehicle crash with any other vehicles or structures? This is directly from the collision log above. (if yes, BAD; if no, GOOD)

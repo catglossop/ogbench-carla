@@ -82,6 +82,9 @@ def _shrink_frames_for_saving(frames, max_width: int = _SAVED_VIDEO_MAX_WIDTH):
         return [cv2.resize(_np.asarray(f), new_wh, interpolation=cv2.INTER_AREA) for f in frames]
     except Exception:  # noqa: BLE001 - never cost the video.
         return frames
+import concurrent.futures
+import threading
+
 from coaches.vlm_feedback import CoachEvent, create_coach
 
 # Default number of subtask suggestions produced per chunk that needs improvement.
@@ -1533,6 +1536,30 @@ class OnlineCastRelabelSession:
                     flush=True,
                 )
         self.window_count = 0
+        # ── Asynchronous window review ────────────────────────────────────────────────
+        # The VLM review is pure hindsight: it reads a window that has already been driven,
+        # so nothing in the rollout depends on its result before the next window. Running it
+        # inline therefore costs wall-clock for no correctness benefit (measured ~30% of a
+        # 4000-step run waiting on Gemini). With ``async_review`` the window is snapshotted and
+        # handed to a single background worker; the rollout continues immediately.
+        #
+        # ONE worker on purpose: windows stay strictly ordered, and ``_memory`` /
+        # ``_store_hl_samples`` / ``window_count`` are then only ever touched by one thread.
+        # Sample discovery is already safe against a racing reader -- ``_scan_pool`` keys off
+        # ``hl_samples.json``, which is written after every ``.npz``.
+        self.async_review = bool(self.cfg.get("async_review", False))
+        self._review_executor: concurrent.futures.ThreadPoolExecutor | None = (
+            concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="cast-review")
+            if self.async_review
+            else None
+        )
+        self._review_future: concurrent.futures.Future | None = None
+        # wandb is logged from the MAIN thread only. A worker finishing at wall-clock time T
+        # holds a ``global_step`` from when its window closed, which is now behind the run's
+        # current step; ``wandb.log(step=stale)`` is dropped. The worker parks its payload here
+        # and ``drain_wandb()`` (called from the env loop) logs it at the current step instead.
+        self._wandb_queue: list[dict[str, Any]] = []
+        self._wandb_lock = threading.Lock()
         self.hl_sample_count = 0
         self.reset_episode()
 
@@ -1695,6 +1722,85 @@ class OnlineCastRelabelSession:
             return False
         return episode_step != self._last_query_episode_step
 
+    def _run_window_async(self, snap, episode_step, done_info, global_step) -> None:
+        """Worker entry point: same review, on the snapshot, never fatal to the rollout."""
+        try:
+            self._run_window(
+                episode_step=episode_step,
+                done_info=done_info,
+                final=False,
+                global_step=global_step,
+                snapshot=snap,
+            )
+        except Exception as exc:  # noqa: BLE001 - a VLM failure must not kill the route
+            import traceback
+
+            print(f"[cast_relabel] async window query failed (non-fatal): {exc}", flush=True)
+            traceback.print_exc()
+
+    def _snapshot_window(self) -> dict[str, Any] | None:
+        """Slice the pending window and advance the cursors, on the MAIN thread.
+
+        Advancing here (not in the worker) is what makes the async path correct: the rollout
+        keeps appending to ``self.frames`` / ``self.trajectory_steps`` during the review, and
+        those rows belong to the *next* window.
+        """
+        frames_window = list(self.frames[self._frames_cursor:])
+        if not frames_window:
+            return None
+        snap = {
+            "frames": frames_window,
+            "subtasks": list(self.frame_subtasks[self._frames_cursor:]),
+            "frame_steps": list(self.frame_episode_steps[self._frames_cursor:]),
+            "traj": [dict(r) for r in self.trajectory_steps[self._traj_cursor:]],
+            "step_offset": self._traj_cursor,
+            "model_inputs": dict(self._model_inputs),
+        }
+        self.window_count += 1
+        snap["window_index"] = self.window_count
+        self._frames_cursor = len(self.frames)
+        self._traj_cursor = len(self.trajectory_steps)
+        self._model_inputs = {}
+        return snap
+
+    def _emit_wandb(self, payload: dict[str, Any], step: int | None) -> None:
+        """Log now (sync) or park for the main thread to log (async)."""
+        if not self.async_review:
+            import wandb
+
+            wandb.log(payload, step=step) if step is not None else wandb.log(payload)
+            return
+        with self._wandb_lock:
+            self._wandb_queue.append(payload)
+
+    def drain_wandb(self) -> int:
+        """Log anything a review worker parked. Call from the env loop (main thread)."""
+        if not self.async_review:
+            return 0
+        with self._wandb_lock:
+            pending, self._wandb_queue = self._wandb_queue, []
+        if not pending:
+            return 0
+        import wandb
+
+        if wandb.run is not None:
+            for payload in pending:
+                try:
+                    wandb.log(payload)  # no step= : attribute to completion time
+                except Exception as exc:  # noqa: BLE001 - logging must never kill a run
+                    print(f"[cast_relabel] wandb drain failed (non-fatal): {exc}", flush=True)
+        return len(pending)
+
+    def wait_for_reviews(self, timeout: float | None = None) -> None:
+        """Block until the in-flight review finishes (episode end / shutdown)."""
+        fut = self._review_future
+        if fut is not None and not fut.done():
+            try:
+                fut.result(timeout=timeout)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[cast_relabel] async review failed (non-fatal): {exc}", flush=True)
+        self.drain_wandb()
+
     def maybe_query(
         self,
         *,
@@ -1710,6 +1816,24 @@ class OnlineCastRelabelSession:
         # advance the cursors so the failed window is skipped rather than retried forever.
         # NOTE: only Exception is caught here; a watchdog timeout raises KeyboardInterrupt,
         # which is why main_carla pauses the leaderboard watchdogs around this call.
+        if self.async_review and self._review_executor is not None and not force:
+            # Keep at most one review in flight so windows stay ordered and the worker-owned
+            # state (_memory, window_count, HL sample dir) is never touched concurrently. A
+            # review normally finishes well inside one window, so this rarely blocks; when it
+            # does, the wait is still strictly less than running it inline.
+            if self._review_future is not None and not self._review_future.done():
+                try:
+                    self._review_future.result()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[cast_relabel] async review failed (non-fatal): {exc}", flush=True)
+            snap = self._snapshot_window()
+            self.drain_wandb()
+            if snap is not None:
+                self._review_future = self._review_executor.submit(
+                    self._run_window_async, snap, episode_step, done_info, global_step
+                )
+            self._last_query_episode_step = episode_step
+            return True
         try:
             self._run_window(
                 episode_step=episode_step, done_info=done_info, final=force, global_step=global_step
@@ -1869,13 +1993,25 @@ class OnlineCastRelabelSession:
         done_info: dict[str, Any] | None,
         final: bool,
         global_step: int | None,
+        snapshot: dict[str, Any] | None = None,
     ) -> None:
-        frames_window = self.frames[self._frames_cursor:]
-        subtasks_window = self.frame_subtasks[self._frames_cursor:]
-        frame_steps_window = self.frame_episode_steps[self._frames_cursor:]
-        traj_window = self.trajectory_steps[self._traj_cursor:]
-        step_offset = self._traj_cursor
-        self.window_count += 1
+        """Review one window. ``snapshot`` (async path) supplies the already-sliced window and
+        its ``window_index``; the cursors were advanced by ``_snapshot_window`` at submit time,
+        so re-deriving them here would swallow everything driven during the review."""
+        if snapshot is None:
+            frames_window = self.frames[self._frames_cursor:]
+            subtasks_window = self.frame_subtasks[self._frames_cursor:]
+            frame_steps_window = self.frame_episode_steps[self._frames_cursor:]
+            traj_window = self.trajectory_steps[self._traj_cursor:]
+            step_offset = self._traj_cursor
+            self.window_count += 1
+        else:
+            frames_window = snapshot["frames"]
+            subtasks_window = snapshot["subtasks"]
+            frame_steps_window = snapshot["frame_steps"]
+            traj_window = snapshot["traj"]
+            step_offset = snapshot["step_offset"]
+            self.window_count = snapshot["window_index"]
 
         tag = f"ep{self.episode_count:04d}_win{self.window_count:04d}{'_final' if final else ''}"
         work_dir = self.artifact_dir / tag
@@ -1962,10 +2098,13 @@ class OnlineCastRelabelSession:
                 print(f"[cast_relabel] debug video failed (non-fatal): {exc}", flush=True)
         self._log_scalars(events, cast_json, n_hl_samples=n_hl, global_step=global_step)
 
-        # Advance cursors so the next window starts fresh.
-        self._frames_cursor = len(self.frames)
-        self._traj_cursor = len(self.trajectory_steps)
-        self._model_inputs = {}
+        # Advance cursors so the next window starts fresh. On the async path this already
+        # happened at submit time -- redoing it here would discard every frame the rollout
+        # collected while this review was in flight.
+        if snapshot is None:
+            self._frames_cursor = len(self.frames)
+            self._traj_cursor = len(self.trajectory_steps)
+            self._model_inputs = {}
 
         if self.save_artifacts:
             print(f"[cast_relabel] saved artifacts under {work_dir}", flush=True)
@@ -2100,7 +2239,7 @@ class OnlineCastRelabelSession:
         annotated = _pad_frames_to_common_shape(annotated)
         video = np.stack(annotated, axis=0)  # (T, H, W, 3)
         video = np.transpose(video, (0, 3, 1, 2))  # (T, C, H, W) for W&B
-        wandb.log(
+        self._emit_wandb(
             {"cast_relabel/debug_video": wandb.Video(video, fps=int(self.video_fps), format="mp4")},
             step=global_step,
         )
@@ -2180,4 +2319,4 @@ class OnlineCastRelabelSession:
                     c.get("suggested_reasoning"),
                 )
             log["cast_relabel/chunks"] = tbl
-        wandb.log(log, step=global_step)
+        self._emit_wandb(log, global_step)
