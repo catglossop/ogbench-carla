@@ -14,9 +14,12 @@ Live status, refreshed every 60 s while the machine is up:
 
     carla_results/weak_routes_eval.md
 
-Queue file (routes not yet started) — **this is the resume point**:
+**RESUME POINT** — 94 routes still to run (90 never started + 4 killed mid-flight when the
+machine was handed over):
 
-    .run_carla/jobs/weak_queue.txt
+    .run_carla/jobs/weak_queue_RESUME.txt
+
+14 routes completed here, with videos, and are already excluded from that list.
 
 Per-route stdout: `.run_carla/jobs/weak_<route>.log`
 Runs + videos: `/raid/users/cglossop/carla_exps/OGBench-CARLA/weak_routes/<exp>/videos/epNNNN.mp4`
@@ -32,15 +35,14 @@ Runs + videos: `/raid/users/cglossop/carla_exps/OGBench-CARLA/weak_routes/<exp>/
    that box. **On this box 0/1/5 cannot render CARLA** — verify before assuming.
 4. Run it. It copies `weak_routes.txt` over the queue on start, so to resume only the remainder:
 
-       cp .run_carla/jobs/weak_queue.txt .run_carla/weak_routes.txt
+       cp .run_carla/jobs/weak_queue_RESUME.txt .run_carla/weak_routes.txt
        nohup .run_carla/weak_route_queue.sh > .run_carla/jobs/weak_queue_runner.log 2>&1 &
 
 ## Per-route command (what the queue runs)
 
-    CARLA_ROOT=/home/cglossop/carla \
-    CARLA_RPC_BASE=<20000+100*gpu> CARLA_TM_BASE=<26000+100*gpu> CARLA_DISPLAY_BASE=<110+gpu> \
-    XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    CARLA_ROOT=/home/cglossop/carla XLA_PYTHON_CLIENT_PREALLOCATE=false \
     bash run_carla.sh --route <ROUTE> --train-gpu <G> --render-adapter <G> \
+      --carla-port <P> --carla-streaming-port <P+1> --tm-port <T> --x-display-num <D> \
       --agent-config .run_carla/rollout_infer_apmq3_apc5.py \
       --steervla-checkpoint <CKPT> \
       --eval-only true --train-mode rl --critic-mode none \
@@ -52,6 +54,11 @@ update dispatch. `--max-episodes 1` is what stops a short episode being followed
 
 ## Gotchas carried over from this session
 
+- **Pass ports explicitly.** `run_carla.sh` does NOT read `CARLA_RPC_BASE` (that is
+  `carla_job.sh`'s variable). Left alone it defaults to `2000 + sim_gpu*20`, which collided with
+  another tenant here and killed 62 routes with `PermissionError` on `/tmp/carla_rpc2040.log`
+  before any of them started. The runner now passes `--carla-port/--tm-port/--x-display-num`
+  from a range whose `/tmp` logs are verified unowned.
 - **`enter-actor-flow-002` reproducibly crashes CARLA at tick ~1894** — seven times across three
   checkpoints and three seeds. It will hang a worker; the harness only recovers after the
   90-minute route timeout. `enter-actor-flow-001` is flaky at varying ticks.
