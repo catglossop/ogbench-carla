@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import urllib.error
 import urllib.request
 
 import numpy as np
@@ -23,6 +24,7 @@ class QwenActionSelector:
         routing_command: str,
         speed: float,
         route: str,
+        fallback_index: int | None = None,
     ) -> dict:
         buffer = io.BytesIO()
         Image.fromarray(np.asarray(frame, dtype=np.uint8)).save(buffer, format="JPEG", quality=92)
@@ -34,13 +36,20 @@ class QwenActionSelector:
                 "routing_command": routing_command,
                 "speed": float(speed),
                 "route": str(route),
+                "fallback_index": fallback_index,
             }
         ).encode()
         request = urllib.request.Request(
             f"{self.url}/score", payload, {"Content-Type": "application/json"}, method="POST"
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            result = json.loads(response.read())
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                result = json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Qwen scoring request failed with HTTP {exc.code}: {body}"
+            ) from exc
         if "error" in result:
             raise RuntimeError(result["error"])
         choice = int(result["choice"])

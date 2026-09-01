@@ -53,6 +53,7 @@ BON_CRITIC_CKPT=""
 BON_NUM_CANDIDATES="8"
 BON_ONLINE_CRITIC="false"
 BON_CANDIDATES_LOG_EVERY="20"
+BON_CANDIDATES_WANDB="false"
 BON_MAX_SAMPLE_ATTEMPTS="6"
 # 0.0 (the base config's default) makes subtask decoding greedy/deterministic, so every
 # candidate would decode to the identical subtask text and the diversity search in
@@ -211,9 +212,12 @@ Options:
                             on collected transitions. Warm-start with --pretrained-critic.
                             Requires --eval-only=false. Default: false.
   --bon-candidates-log-every N
-                            Log an overlay frame every N env steps showing every best-of-N
-                            candidate's subtask + Q value, selected one marked. 0 disables.
+                            Save a local overlay frame every N env steps showing every best-of-N
+                            candidate's subtask + score, selected one marked. 0 disables.
                             Default: 20.
+  --bon-candidates-wandb BOOL
+                            Also upload candidate panels to W&B. Default: false. Episode videos
+                            and scalar metrics are unaffected.
   --bon-max-sample-attempts N
                             Best-of-N diverse-subtask search: max resample attempts per
                             candidate slot (beyond the first). Each attempt is a full VLA
@@ -304,6 +308,7 @@ while [[ $# -gt 0 ]]; do
     --bon-num-candidates|--bon_num_candidates) BON_NUM_CANDIDATES="$2"; shift 2 ;;
     --bon-online-critic|--bon_online_critic) BON_ONLINE_CRITIC="$2"; shift 2 ;;
     --bon-candidates-log-every|--bon_candidates_log_every) BON_CANDIDATES_LOG_EVERY="$2"; shift 2 ;;
+    --bon-candidates-wandb|--bon_candidates_wandb) BON_CANDIDATES_WANDB="$2"; shift 2 ;;
     --bon-max-sample-attempts|--bon_max_sample_attempts) BON_MAX_SAMPLE_ATTEMPTS="$2"; shift 2 ;;
     --bon-cot-temperature|--bon_cot_temperature) BON_COT_TEMPERATURE="$2"; shift 2 ;;
     --bon-shadow-only|--bon_shadow_only) BON_SHADOW_ONLY="$2"; shift 2 ;;
@@ -599,6 +604,7 @@ while :; do
     --bon_num_candidates="${BON_NUM_CANDIDATES}" \
     --bon_online_critic="${BON_ONLINE_CRITIC}" \
     --bon_candidates_log_every="${BON_CANDIDATES_LOG_EVERY}" \
+    --bon_candidates_wandb="${BON_CANDIDATES_WANDB}" \
     --bon_max_sample_attempts="${BON_MAX_SAMPLE_ATTEMPTS}" \
     --bon_shadow_only="${BON_SHADOW_ONLY}" \
     --bon_critic_rollout_chunk="${BON_CRITIC_ROLLOUT_CHUNK}" \

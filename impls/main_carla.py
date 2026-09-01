@@ -255,9 +255,14 @@ flags.DEFINE_bool(
 )
 flags.DEFINE_integer(
     "bon_candidates_log_every", 20,
-    "When best-of-N is active (--bon_critic_ckpt or --bon_online_critic), log an "
-    "overlay frame every N env steps showing every candidate's subtask text and Q "
-    "value, with the selected candidate marked. 0 disables this.",
+    "When best-of-N is active, save a local overlay frame every N env steps showing "
+    "every candidate's subtask text and score, with the selected candidate marked. "
+    "0 disables candidate panels entirely.",
+)
+flags.DEFINE_bool(
+    "bon_candidates_wandb", False,
+    "Also upload candidate-panel images to W&B. Disabled by default because these "
+    "images are large; local panels are still saved when --save_video_local is true.",
 )
 flags.DEFINE_integer(
     "bon_max_sample_attempts", 6,
@@ -3039,9 +3044,9 @@ def run_online_carla(
         """
         brake_chunk = np.zeros((1,) + chunks_np.shape[1:], dtype=chunks_np.dtype)
         chunks_np = np.concatenate([chunks_np, brake_chunk], axis=0)
-        candidate_subtasks = candidate_subtasks + [
-            "The vehicle smoothly decelerates to a stop, normally following the route."
-        ]
+        # Keep this synthetic label in-distribution for the raw-commentary critic.
+        # This exact wording occurs frequently in the commentary training corpus.
+        candidate_subtasks = candidate_subtasks + ["Follow the route. Decelerate."]
         return chunks_np, candidate_subtasks
 
     def _sample_diverse_candidates(subkey, n: int) -> tuple[np.ndarray, list[str]]:
@@ -3244,6 +3249,9 @@ def run_online_carla(
             routing_command,
             speed,
             _qwen_route_id,
+            fallback_index=len(candidate_subtasks) - 1
+            if FLAGS.bon_include_brake_candidate
+            else None,
         )
         best_idx = int(result["choice"])
         utility = np.asarray(result["utility"], dtype=np.float32)
@@ -3277,9 +3285,24 @@ def run_online_carla(
                 if state_vec.size >= 2
                 else None,
             }
+        qwen_scores = result["scores"]
+        risk_max = [
+            round(
+                max(
+                    float(score["crash"]),
+                    float(score["offroad"]),
+                    float(score["traffic_violation"]),
+                ),
+                4,
+            )
+            for score in qwen_scores
+        ]
+        progress = [round(float(score["progress"]), 4) for score in qwen_scores]
+        goal = [round(float(score["goal"]), 4) for score in qwen_scores]
         print(
             f"[QWEN-BON] step={step} routing={routing_command!r} choice={best_idx} "
-            f"accepted={result['accepted']} utility={utility.round(4).tolist()}",
+            f"accepted={result['accepted']} utility={utility.round(4).tolist()} "
+            f"risk_max={risk_max} progress={progress} goal={goal}",
             flush=True,
         )
         return jax.numpy.asarray(chunks_np), utility, best_idx
@@ -4162,7 +4185,8 @@ def run_online_carla(
             _cand_frame = _as_video_frame(_viz_image_from_raw(obs_raw))
             _cand_tp = obs_raw.get("target_points") if isinstance(obs_raw, dict) else None
             _cand_frame = _annotate_candidates_panel(_cand_frame, _bon_last_candidates[0], target_points=_cand_tp)
-            wandb.log({"bon/candidates": wandb.Image(_cand_frame)}, step=step)
+            if FLAGS.bon_candidates_wandb:
+                wandb.log({"bon/candidates": wandb.Image(_cand_frame)}, step=step)
             if FLAGS.save_video_local:
                 import cv2  # type: ignore
 
