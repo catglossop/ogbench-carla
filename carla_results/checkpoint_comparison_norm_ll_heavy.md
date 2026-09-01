@@ -1,6 +1,6 @@
 # SteerVLA `norm_ll_heavy` checkpoint comparison — Bench2Drive 20-route subset
 
-_Generated 2026-08-30 09:50 local._
+_Generated 2026-09-01 06:59 local._
 
 Checkpoints under test — `ll_heavy_bs1152`, the first family trained with `skip_norm_stats=False` (predicts in quantile-normalized action space; OpenPI `Unnormalize` runs at inference, auto-detected from the checkpoint's `norm_stats.json`):
 

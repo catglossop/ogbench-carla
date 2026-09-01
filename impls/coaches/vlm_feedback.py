@@ -341,26 +341,42 @@ def build_coaching_prompt(
 
         ** Step 2 **
         Analyze the vehicle's behavior in the video. For example, you can ask these questions to guide your analysis: 
+
+        BEFORE answering ANY question below that mentions a red light, a green light, a stop
+        light or a signal: use the signal state you established in Step 1 FROM THE TRAFFIC FLOW.
+        Do not re-decide the light state by looking at the lamp again — you already determined
+        it, and the lamp is frequently only a few pixels across and washed out. Every judgement
+        below that depends on a signal MUST state, in its description, which flow evidence you
+        relied on (e.g. "cross-traffic was crossing, so our light was red"). If Step 1 concluded
+        the state was UNKNOWN, do not raise a GOOD/BAD event that depends on it at all — skip
+        that question rather than guessing.
+
         - Does the vehicle's behavior conflict with the route command plan? (if yes, BAD; if no, GOOD). 
         - Is the vehicle maintaining a safe distance from the front car? (if yes, GOOD; if no, BAD)
         - Is the vehicle maintaining a safe speed? (if yes, GOOD; if no, BAD)
         - Does the vehicle crash with any other vehicles or structures? This is directly from the collision log above. (if yes, BAD; if no, GOOD)
         - Did the vehicle get dangerously close to any other vehicles and/or collide with any other vehicles? (if yes, BAD; if no, GOOD)
-        - Does the vehicle leave unnecessary gaps between itself and the front car? For example, at a stop light, the car should move forward to be closer to the front car to not leave an unnecessary gap (if yes, BAD; if no, GOOD)
+        - Does the vehicle leave unnecessary gaps between itself and the front car? For example, at a
+          stop light (identified via the traffic flow in Step 1), the car should move forward to be
+          closer to the front car to not leave an unnecessary gap (if yes, BAD; if no, GOOD)
         - Does the vehicle properly wait for a gap in the traffic before changing lanes? (if yes, GOOD; if no, BAD)
         - Does the vehicle properly yield to other vehicles when necessary? (if yes, GOOD; if no, BAD)
-        - Does the vehicle properly stop at red lights and stop signs? (if yes, GOOD; if no, BAD)
+        - Does the vehicle properly stop at red lights and stop signs? Judge the light state from
+          the traffic flow you analysed in Step 1, not from the lamp. (if yes, GOOD; if no, BAD)
         - Does the vehicle properly follow the route and traffic laws? (if yes, GOOD; if no, BAD)
         - Does the vehicle yield to pedestrians and cyclists when necessary? (if yes, GOOD; if no, BAD)
         - Does the vehicle follow the rules of the road (turning from left or right most lane when making a turn, stopping at stop signs and red lights, etc.)? (if yes, GOOD; if no, BAD)
         - Is the vehicle making progress along the route toward completion? Completing the route
           is a primary objective (see the route-progress section above). If route progress is
           below 100% and the vehicle is stopped or crawling with a clear gap ahead and NO valid
-          reason to stop (no red light/stop sign, no close leading vehicle, no pedestrian/cyclist,
+          reason to stop (no red light/stop sign AS INFERRED FROM THE TRAFFIC FLOW in Step 1,
+          no close leading vehicle, no pedestrian/cyclist,
           no yield), that is BAD — it should accelerate and move forward. Conversely, resuming
           motion and advancing the route when the way is clear is GOOD. (Do NOT penalize stopping
           that is justified by a red light, stop sign, close leading vehicle, or a pedestrian/yield.)
-        - Is the vehicle an appropriate distance from the crosswalk at a red light? If not, it should move forward to be closer to the crosswalk to not leave an unnecessary gap.
+        - Is the vehicle an appropriate distance from the crosswalk at a red light (red as
+          established from the traffic flow in Step 1)? If not, it should move forward to be
+          closer to the crosswalk to not leave an unnecessary gap.
         - If the vehicle encounters an obstacle blocking the entire route, does it stop entirely before the obstruction? (if yes, GOOD; if no, BAD)
         - If the vehicle encounters an obstacle blocking part of the route (one lane), does it stop and wait for a gap to go around the obstruction? (if yes, GOOD; if no, BAD)
 
@@ -370,12 +386,12 @@ def build_coaching_prompt(
             {{
               "timestamp_sec": 12.5,
               "label": "GOOD",
-              "description": "Brief explanation of what went well."
+              "description": "Explanation of what went well. If this event depends on a traffic light or stop sign, it MUST name the traffic-flow evidence you used to establish that state. Example: 'Held position at the junction; cross-traffic was moving through it from t=10.0-14.0s, so our signal was red.'"
             }},
             {{
               "timestamp_sec": 18.0,
               "label": "BAD",
-              "description": "Brief explanation of what went wrong.",
+              "description": "Explanation of what went wrong, with the same traffic-flow evidence requirement. Example: 'Stayed stopped although the lead vehicle pulled away at t=16.5s and the queue ahead discharged, so our signal had turned green.'",
               "correction": "Concrete instruction for how to fix the behavior."
             }}
           ]
@@ -386,6 +402,13 @@ def build_coaching_prompt(
         - ``label`` must be exactly ``GOOD`` or ``BAD``.
         - Include ``correction`` only for ``BAD`` events (empty string otherwise).
         - Prefer 3–12 high-signal events rather than narrating every second.
+        - MANDATORY: any event whose description mentions a red/green light, a stop light, a
+          signal or a stop sign MUST also state the traffic-flow evidence that established that
+          state (cross-traffic moving, the queue discharging, the lead vehicle pulling away or
+          holding, pedestrians crossing). "The vehicle stopped at the red light" is NOT
+          acceptable on its own — the lamp is often a few washed-out pixels and cannot be read
+          reliably. If you could not establish the state from traffic flow, do not emit the
+          event at all.
         """
     ).strip()
 
