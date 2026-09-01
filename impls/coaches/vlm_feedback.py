@@ -298,7 +298,7 @@ def build_coaching_prompt(
 
     return textwrap.dedent(
         f"""
-        You are reviewing a driving rollout video for an autonomous vehicle policy.
+        You are reviewing a driving rollout video for an autonomous vehicle policy. You are seeing the view of the ego vehicle from the perspective of the ego vehicle's camera.
         {task_overview_block}
         Episode summary:
         ```json
@@ -322,7 +322,17 @@ def build_coaching_prompt(
         - What other vehicles are there? What lanes are they in? 
         - Is there a leading vehicle? If so, how far ahead is it? Is it stopped or moving? 
         - Are there any pedestrians or cyclists in the video? If so, what are they doing? 
-        - Are there any stop signs or traffic lights in the video? When are they red or green? Timing is important here.
+        - If you can see traffic lights or stop signs, where are they and what are their colors? Timing is important here.
+        - IMPORTANT: Always also infer the traffic light states from the traffic flow. Vision can be unreliable, so you must use the traffic flow to infer the traffic light states.
+          For example: 
+            * cross-traffic moving through the junction => our direction is almost certainly red
+            * the queue ahead of us discharging, or the lead vehicle pulling away => green
+            * the lead vehicle stopped at the line with no obstruction ahead of it => red
+            * pedestrians crossing our path => our direction is red
+          Traffic flow is observable from the same camera the car has, so an inference of this
+          kind is legitimate; a colour you cannot actually see is not. If neither the lamp nor
+          the traffic flow settles it, say the signal state is UNKNOWN and do not raise a
+          GOOD/BAD event that depends on it.
         - Where is the egovehicle in relation to other vehicles, pedestrians, lanes, crosswalks etc.?
         - According to the overall task (the ordered routing-command plan above) and the current
           routing command in the per-timestamp data, what maneuver should the vehicle be

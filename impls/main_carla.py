@@ -3994,6 +3994,14 @@ def run_online_carla(
             # master's, needed by _append_trajectory_step below.
             if step_in_video:
                 frame = _as_video_frame(_viz_image_from_raw(obs_raw))
+                # Keep the un-annotated camera frame for the CAST reviewer. Everything below
+                # composites overlays onto ``frame``: waypoint dots, the reward badge, and a
+                # fixed-height text panel that makes the image 1024x1292 -- of which only the
+                # top 513 rows are the scene. The VLM pays for those pixels out of the same
+                # budget as the road, and the panel's text (prompt / reasoning / subtask) is
+                # already supplied to it as structured data in the per-timestamp block, so the
+                # overlays cost resolution on small objects (traffic lights) and return nothing.
+                cast_raw_frame = frame
                 if not FLAGS.expert_debug:
                     _tp = obs_raw.get("target_points") if isinstance(obs_raw, dict) else None
                     if _bon_last_candidates[0] is not None:
@@ -4035,8 +4043,11 @@ def run_online_carla(
                 if _vlm_coach is not None:
                     _vlm_coach.record_frame(frame)
                 if _cast_relabel is not None:
+                    # Raw camera frame for the VLM to review; the overlaid copy rides along so
+                    # the W&B debug video keeps its waypoints / subtask / reward badge.
                     _cast_relabel.record_frame(
-                        frame,
+                        cast_raw_frame if getattr(_cast_relabel, "raw_video", True) else frame,
+                        annotated=frame,
                         subtask_text=(
                             _format_text_field(cot_obs_raw, "subtask_text")
                             or _format_text_field(cot_obs_raw, "subtask")

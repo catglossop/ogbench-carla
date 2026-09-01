@@ -69,6 +69,10 @@ def get_config():
             # The review is pure hindsight -- it reads a window already driven -- so nothing in
             # the loop needs its result before the next window. Inline it cost ~30% of a
             # 4000-step run waiting on Gemini. One worker, so windows stay ordered.
+            # Send the reviewer the raw 1024x512 camera frame instead of the annotated
+            # 1024x1292 composite (waypoints + reward badge + text panel). The overlays
+            # duplicate what the prompt already states and cost resolution on small objects.
+            raw_video=True,
             async_review=False,
             provider="gemini",
             gemini_model="gemini-3.5-flash",

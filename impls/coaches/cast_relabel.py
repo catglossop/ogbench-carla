@@ -1523,6 +1523,13 @@ class OnlineCastRelabelSession:
         # ``_store_hl_samples`` / ``window_count`` are then only ever touched by one thread.
         # Sample discovery is already safe against a racing reader -- ``_scan_pool`` keys off
         # ``hl_samples.json``, which is written after every ``.npz``.
+        # Feed the reviewer the un-annotated camera frame (1024x512) rather than the
+        # composited one (1024x1292: waypoints + reward badge + a fixed-height text panel,
+        # of which the bottom ~28% is blank). The overlays duplicate data the prompt already
+        # carries as structured text while consuming the VLM's fixed pixel budget -- measured
+        # on ep0002_win0023, the scene was only 40% of each frame, which puts a ~10x25 px
+        # traffic-light head at ~12 px after the model's downsample.
+        self.raw_video = bool(self.cfg.get("raw_video", True))
         self.async_review = bool(self.cfg.get("async_review", False))
         self._review_executor: concurrent.futures.ThreadPoolExecutor | None = (
             concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="cast-review")
@@ -1545,6 +1552,8 @@ class OnlineCastRelabelSession:
         self.route_name = "?"
         self.route_id = "?"
         self.frames: list[np.ndarray] = []
+        # Overlaid copies, same indices as ``frames``; used only for the W&B debug video.
+        self.frames_annotated: list[np.ndarray] = []
         self.frame_subtasks: list[str] = []
         self.frame_episode_steps: list[int] = []
         self.trajectory_steps: list[dict[str, Any]] = []
@@ -1578,10 +1587,27 @@ class OnlineCastRelabelSession:
         # the overall "task" context. May be empty if the route planner was unavailable.
         self.route_command_plan = list(route_command_plan) if route_command_plan else []
 
-    def record_frame(self, frame: np.ndarray | None, *, subtask_text: str = "", episode_step: int = 0) -> None:
+    def record_frame(
+        self,
+        frame: np.ndarray | None,
+        *,
+        subtask_text: str = "",
+        episode_step: int = 0,
+        annotated: np.ndarray | None = None,
+    ) -> None:
+        """Record one frame. ``frame`` is what the VLM reviews; ``annotated`` (optional) is the
+        overlaid copy kept only for the W&B debug video.
+
+        The two are separate on purpose: the reviewer should spend its fixed pixel budget on the
+        scene, while a human scrubbing the debug video wants the waypoints/subtask/reward burned
+        in. When ``annotated`` is omitted the same frame serves both.
+        """
         if frame is None:
             return
         self.frames.append(np.asarray(frame, dtype=np.uint8))
+        self.frames_annotated.append(
+            np.asarray(annotated if annotated is not None else frame, dtype=np.uint8)
+        )
         self.frame_subtasks.append(str(subtask_text or ""))
         self.frame_episode_steps.append(int(episode_step))
 
@@ -1726,6 +1752,7 @@ class OnlineCastRelabelSession:
             return None
         snap = {
             "frames": frames_window,
+            "frames_annotated": list(self.frames_annotated[self._frames_cursor:]),
             "subtasks": list(self.frame_subtasks[self._frames_cursor:]),
             "frame_steps": list(self.frame_episode_steps[self._frames_cursor:]),
             "traj": [dict(r) for r in self.trajectory_steps[self._traj_cursor:]],
@@ -1979,6 +2006,7 @@ class OnlineCastRelabelSession:
             subtasks_window = self.frame_subtasks[self._frames_cursor:]
             frame_steps_window = self.frame_episode_steps[self._frames_cursor:]
             traj_window = self.trajectory_steps[self._traj_cursor:]
+            annotated_window = self.frames_annotated[self._frames_cursor:]
             step_offset = self._traj_cursor
             self.window_count += 1
         else:
@@ -1986,6 +2014,7 @@ class OnlineCastRelabelSession:
             subtasks_window = snapshot["subtasks"]
             frame_steps_window = snapshot["frame_steps"]
             traj_window = snapshot["traj"]
+            annotated_window = snapshot.get("frames_annotated") or snapshot["frames"]
             step_offset = snapshot["step_offset"]
             self.window_count = snapshot["window_index"]
 
@@ -2059,7 +2088,7 @@ class OnlineCastRelabelSession:
 
         if self.debug:
             self._log_debug_video(
-                frames_window,
+                annotated_window,
                 cast_json,
                 frame_chunk_indices=metadata.get("frame_chunk_indices") or [],
                 global_step=global_step,
