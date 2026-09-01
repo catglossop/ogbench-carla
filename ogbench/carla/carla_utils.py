@@ -282,7 +282,7 @@ DEFAULT_TRAFFIC_VIOLATION_PENALTY = -20.0  # per new RunningStop or RunningRedLi
 # ("Reward settings") before changing, and re-check any critic checkpoint trained at another scale.
 DEFAULT_PROGRESS_REWARD_WEIGHT = 5.0
 DEFAULT_TERMINATE_ON_INFRACTION = False
-DEFAULT_MAX_EPISODE_STEPS = 250
+DEFAULT_MAX_EPISODE_STEPS = 4000
 # DEFAULT_CENTERING_REWARD_WEIGHT = 0.2
 # DEFAULT_HEADING_REWARD_WEIGHT = 0.2
 DEFAULT_STEER_PENALTY_WEIGHT = 0.0
@@ -745,6 +745,18 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
             except Exception as e:
                 print(f"load_world failed , attempts={attempts}", flush=True)
                 print(e, flush=True)
+                # A UE4 render-fence segfault ("GameThread timed out waiting for RenderThread")
+                # kills the server outright, and every remaining attempt then burns its full
+                # 300 s client timeout against a process that is gone -- up to ~100 minutes of
+                # silent stall before this loop gives up. The server is never relaunched from
+                # here (only run_carla.sh's outer retry does that), so once it is dead the only
+                # useful move is to fail fast and let that outer retry bring up a fresh one.
+                if self.server is not None and self.server.poll() is not None:
+                    raise RuntimeError(
+                        f"CARLA server (pid {self.server.pid}) exited with "
+                        f"{self.server.returncode} during world setup on rpc port {rpc_port}; "
+                        f"see the server log for the UE4 crash. Not retrying a dead server."
+                    ) from e
                 attempts += 1
                 time.sleep(5)
         else:
