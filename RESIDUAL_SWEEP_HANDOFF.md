@@ -6,11 +6,6 @@ on another machine. It deliberately excludes credentials and API keys.
 ## Current state
 
 - Working branch: `dev`.
-- Local handoff commit: `daac58a add resumable residual sweep runner`.
-- The commit was **not pushed** from the old host: `git push origin dev` failed
-  because that host did not have GitHub credentials. Push it from an authenticated
-  terminal, or transfer the commit/bundle directly.
-- The old hung sweep process group was terminated. Its completion state is intact.
 - The active sweep is `coarse_grid_v3`, defined in
   `impls/configs/residual_rl_sweeps.yaml` and executed by
   `run_residual_sweep.sh`.
@@ -151,23 +146,6 @@ an accidental discrepancy.
 Only the ordinary magnitude tether is in scope for the current sweep. Do not add
 other tether variants unless the experimental plan changes.
 
-### Existing residual findings
-
-A preliminary constrained-scale/magnitude-tether comparison was inconclusive:
-
-- Constraints gave some apparent improvement in success / driving score, but the
-  number of rollout points was sparse and noisy.
-- In the `0.5` scale comparison, the constrained run did not necessarily show an
-  action/residual EMA closer to zero. This is not a contradiction: the tether
-  acts on the sampled/training residual magnitude (and can change the policy /
-  critic/update distribution), whereas plotted rollout means are signed,
-  state-distribution dependent averages. Positive/negative cancellation and
-  changed visited states can conceal a magnitude reduction in a signed EMA.
-- Earlier charts showed high-scale variants with residual absolute means around
-  0.3 and low-scale variants around 0.06, confirming that the scale is active.
-
-The best next evidence is the controlled coarse grid below, not reward tuning.
-
 ## EXPO / best-of-N conclusions
 
 EXPO is currently out of scope for the sweep.
@@ -186,12 +164,6 @@ Observed failure mode:
 
 Gemini-backed EXPO selection was prototyped, including an uncertainty gate, but
 was removed because Gemini was called too frequently and was too expensive/slow.
-Do not re-enable it implicitly. If revisiting it, require an explicit budgeted
-setup with both:
-
-- an option to evaluate every decision; and
-- a conservative uncertain-only gate based on a well-defined critic uncertainty
-  measurement.
 
 The GRPO implementation is the useful reference for external/VLM decision
 plumbing. However, improving EXPO now should focus on a better critic (e.g., a
@@ -203,12 +175,6 @@ selection only in high-confidence/select instances, otherwise execute base.
 It is unrelated to the current no-EXPO residual sweep.
 
 ## Critic notes
-
-The residual critic has an ensemble/head array. The candidate values used by
-EXPO are derived from the critic head outputs; understand the exact aggregation
-(min/mean depending on the code path) before interpreting a single `q_*` chart.
-The key caveat is that EXPO's former selection sequence is not a full joint
-search over all `(base candidate, residual)` combinations.
 
 A possible future critic experiment is to apply a Monte-Carlo-return-trained
 state head on top of a SigLIP state encoder. This is conceptually modest wiring
