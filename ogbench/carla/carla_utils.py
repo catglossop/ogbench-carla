@@ -3456,13 +3456,30 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
     def close(self) -> None:
         try:
             if self._evaluator is not None:
-                try:
-                    self._stop_active_scenario()
-                finally:
+                # A UE4 crash leaves the CARLA Python client configured with the
+                # normal (very large) RPC timeout. Calling the usual scenario
+                # teardown in that state attempts to destroy each sensor over a
+                # dead connection and can block for hours (e.g. 7,200,000 ms).
+                # The evaluator owns the server subprocess, so its exit status is
+                # a cheap, local liveness check. When it is known dead, skip all
+                # CARLA RPC teardown and let _kill_carla_subprocesses() below reap
+                # the remaining local processes. This lets the outer launcher
+                # observe the crash and apply its normal retry/resume policy.
+                server = getattr(self._evaluator, "server", None)
+                server_dead = server is not None and server.poll() is not None
+                if server_dead:
+                    print(
+                        "[carla] UE4 already exited; skipping RPC teardown to avoid a long client timeout.",
+                        flush=True,
+                    )
+                else:
                     try:
-                        self._evaluator._reset_world_settings()
-                    except Exception:
-                        pass
+                        self._stop_active_scenario()
+                    finally:
+                        try:
+                            self._evaluator._reset_world_settings()
+                        except Exception:
+                            pass
         finally:
             self._kill_carla_subprocesses()
             self._evaluator = None

@@ -125,6 +125,9 @@ COT_TEMPERATURE=""
 # Crash supervisor: relaunch main_carla (resuming from checkpoint) after a CARLA native
 # crash (SIGSEGV/SIGABRT, exit code >=128). 0 disables the retry loop.
 MAX_RETRIES="${MAX_RETRIES:-50}"
+# Optional stable, human-readable run name. Used by sweep launchers so W&B
+# names identify the precise hyperparameter setting instead of only route/seed.
+EXP_NAME_OVERRIDE=""
 
 EXTRA_ARGS=()
 
@@ -182,6 +185,7 @@ Options:
   --state-encoder NAME      pi_prefix|pi_prefix_groups|siglip_pool|rl_token (residual stack).
   --rlt-checkpoint PATH     RLT autoencoder checkpoint (only for --state-encoder rl_token).
   --max-retries N           Auto-restart+resume after a CARLA crash. Default: 50 (0 disables)
+  --exp-name NAME           Fixed W&B/artifact run name. Default: route + seed + timestamp.
 
   --agent-config PATH       Base agent config. Default: impls/configs/pi0_residual_sac_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
@@ -292,6 +296,7 @@ while [[ $# -gt 0 ]]; do
     --state-encoder) STATE_ENCODER="$2"; shift 2 ;;
     --rlt-checkpoint) RLT_CHECKPOINT="$2"; shift 2 ;;
     --max-retries) MAX_RETRIES="$2"; shift 2 ;;
+    --exp-name|--exp_name) EXP_NAME_OVERRIDE="$2"; shift 2 ;;
     --agent-config) BASE_AGENT_CFG="$2"; shift 2 ;;
     --carla-config) BASE_CARLA_CFG="$2"; shift 2 ;;
     --steervla-checkpoint|--steervla_checkpoint) STEERVLA_CKPT="$2"; shift 2 ;;
@@ -575,7 +580,7 @@ echo "[run_carla.sh] hl_ckpt_dir=${HL_CKPT_DIR:-<config>} hl_ckpt_every=${HL_CKP
 # Stable run name so save_dir + the W&B run id survive restarts (the supervisor resumes,
 # it does not fork a new run).
 ROUTE_TAG="$(printf '%s' "$ROUTE" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')"
-EXP_NAME="${ROUTE_TAG}-sd$(printf '%03d' "$SEED")_$(date +%Y%m%d_%H%M%S)"
+EXP_NAME="${EXP_NAME_OVERRIDE:-${ROUTE_TAG}-sd$(printf '%03d' "$SEED")_$(date +%Y%m%d_%H%M%S)}"
 echo "[run_carla.sh] exp_name=${EXP_NAME}"
 
 # Supervisor loop (surya/rl-token): CARLA's leaderboard runs in-process and periodically

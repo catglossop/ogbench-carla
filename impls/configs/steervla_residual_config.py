@@ -56,7 +56,7 @@ def get_config():
     #                   learned compression to z_rl instead of mean-pool. Requires a
     #                   checkpoint (config.rl_token.checkpoint_path) and PyTorch.
     # All require local SteerVLA (remote HTTP mode does not expose Pi features).
-    config.state_encoder = "pi_prefix"
+    config.state_encoder = "siglip_pool"
 
     # Sanity check: feed the state encoders a black (zeroed) image while the base policy still sees the
     # real one, to verify the encoded state actually depends on the image. VLM encoders (pi_prefix /

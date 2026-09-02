@@ -1,0 +1,80 @@
+# Residual-RL hyperparameter sweep definitions.
+#
+# Select a profile with:
+#   SWEEP_PROFILE=coarse_grid_v2 ./run_residual_sweep.sh <physical-gpu>
+# The launcher accepts environment overrides (e.g. ACCEL_SCALES="0.4 0.7")
+# but the committed profiles below are the reproducible defaults.
+version: 1
+
+common:
+  online_steps: 20000
+  seeds: [0]
+  encoders: [siglip_pool]
+  fixed_agent_overrides:
+    expo: false
+    best_of_n: 1
+    otf_td_backup: false
+    residual_bc_normalize: false
+  steervla_overrides:
+    # Historical/default cadence: a fresh base-policy query and CoT each tick.
+    actions_per_model_query: 1
+    actions_per_cot: 1
+  launcher:
+    # Terminal per-run failures are recorded, then the sequential queue advances.
+    continue_on_failure: true
+    # A later rerun skips recorded failures unless explicitly requested.
+    retry_failed_on_resume: false
+
+profiles:
+  # Restarted cot-5 grid. Kept separate from the already-started cot-3 v2 run.
+  coarse_grid_v3:
+    label: coarse-grid-v3
+    run_group: ResidualRLHyperparameterSweep-coarse-grid-v3
+    routes:
+      - enter-actor-flow-004
+      - non-signalized-junction-right-turn-005
+      - pedestrian-crossing-004
+    accel_scales: [0.1, 0.4]
+    steer_scales: [0.1, 0.4]
+    betas: [0.0, 5.0]
+    steervla_overrides:
+      actions_per_model_query: 3
+      actions_per_cot: 5
+
+  # Started cot-3 grid, retained for W&B/artifact identity and reproducibility.
+  coarse_grid_v2:
+    label: coarse-grid-v2
+    run_group: ResidualRLHyperparameterSweep-coarse-grid-v2
+    routes:
+      - enter-actor-flow-004
+      - non-signalized-junction-right-turn-005
+      - pedestrian-crossing-004
+    accel_scales: [0.1, 0.4]
+    steer_scales: [0.1, 0.4]
+    betas: [0.0, 5.0]
+    steervla_overrides:
+      actions_per_model_query: 3
+      actions_per_cot: 3
+
+  coarse_grid_v1:
+    label: coarse-grid-v1
+    run_group: ResidualRLHyperparameterSweep-coarse-grid-v1
+    routes:
+      - enter-actor-flow-004
+      - non-signalized-junction-right-turn-005
+      - pedestrian-crossing-004
+    accel_scales: [0.1, 0.4, 0.7]
+    steer_scales: [-1]
+    betas: [0.0, 5.0]
+
+  initial_scale:
+    label: initial-scale-v1
+    run_group: ResidualRLHyperparameterSweep-initial-scale-v1
+    routes:
+      - enter-actor-flow-004
+      - signalized-junction-left-turn-001
+      - non-signalized-junction-right-turn-005
+      - pedestrian-crossing-004
+    accel_scales: [0.1, 0.3, 0.5, 0.7, 0.9]
+    steer_scales: [0.1]
+    betas: [0.0]

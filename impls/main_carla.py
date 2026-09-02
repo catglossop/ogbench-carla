@@ -1277,6 +1277,48 @@ def _accel_steer_stats_log(name: str, vec: np.ndarray) -> dict[str, float]:
     return out
 
 
+def _expo_critic_choice(
+    critic_heads: np.ndarray, n: int, *, conservative: bool
+) -> tuple[int, dict[str, float]]:
+    """Choose from EXPO's ``[base, edit]`` pool using critic lower bounds.
+
+    Conservative mode admits only edits that *every* critic head says improve their
+    own base, then compares the best such edit globally against the best unedited
+    base. This makes the edit gate invariant to Q scale: it uses paired signs rather
+    than an arbitrary threshold.
+    """
+    heads = np.asarray(critic_heads, dtype=np.float64)
+    if heads.ndim != 2 or heads.shape[1] != 2 * n:
+        raise ValueError(f"Expected critic heads (ensemble, {2 * n}), got {heads.shape}.")
+    q_lcb = heads.min(axis=0)
+    if not conservative:
+        winner = int(np.argmax(q_lcb))
+        return winner, {"expo/conservative_edit_accepted": float(winner >= n)}
+
+    base_idx = int(np.argmax(q_lcb[:n]))
+    paired_deltas = heads[:, n:] - heads[:, :n]  # (ensemble, N)
+    delta_min_all = paired_deltas.min(axis=0)
+    safe_edits = delta_min_all > 0.0
+    if np.any(safe_edits):
+        masked_edit_q = np.where(safe_edits, q_lcb[n:], -np.inf)
+        edit_idx = int(np.argmax(masked_edit_q))
+        accepted = bool(q_lcb[n + edit_idx] > q_lcb[base_idx])
+    else:
+        edit_idx = -1
+        accepted = False
+    winner = n + edit_idx if accepted else base_idx
+    selected_delta = paired_deltas[:, edit_idx] if edit_idx >= 0 else np.zeros(heads.shape[0])
+    return winner, {
+        "expo/conservative_edit_accepted": float(accepted),
+        "expo/conservative_delta_min": float(selected_delta.min()),
+        "expo/conservative_delta_mean": float(selected_delta.mean()),
+        "expo/conservative_delta_std": float(selected_delta.std()),
+        "expo/conservative_base_idx": float(base_idx),
+        "expo/conservative_edit_idx": float(edit_idx),
+        "expo/conservative_safe_edit_count": float(safe_edits.sum()),
+    }
+
+
 def _expo_candidate_log(base_cands: np.ndarray, q_all: np.ndarray, winner_idx: int, n: int) -> dict[str, float]:
     """EXPO diagnostics for one step's 2N pool: Q spread, base-vs-edit winner + margin, and
     base-action diversity as per-dim Gaussian entropy. q_all is (2N,) min-ensemble Q (first N
@@ -1572,33 +1614,18 @@ def _annotate_text_panel(
         line_h = max(22, int(round(26 * overlay_scale)))
         annotated_top = _draw_corner_badge(base, f"r={reward:+.3f}", corner="tl")
 
-        # ``openpi_prompt_text`` is already the full serialized model input
-        # ("Prompt: ...;State: ..."). Showing it under another "Prompt:"
-        # label created the confusing Prompt: Prompt:... line in videos.
-        prompt = ""
+        # This is a human-facing display line, not the serialized OpenPI input.  The raw
+        # routing command alone omits the speed, which made residual videos misleading.
+        state = np.asarray(raw.get("state", []), dtype=np.float32).reshape(-1) if isinstance(raw, dict) else np.zeros(0)
+        speed = float(state[_EGO_STATE_IDX_SPEED]) if state.size > _EGO_STATE_IDX_SPEED else 0.0
+        prompt_source = ""
         if isinstance(raw, dict):
-            prompt = str(raw.get("openpi_prompt_raw_text") or raw.get("routing_command") or "").strip()
-        if not prompt and isinstance(raw, dict):
-            from vlas.steervla import (
-                carla_state_vec_to_steervla_state,
-                format_steervla_cot_prompt,
-                routing_instruction_prompt,
-                steervla_prompt_state_dim,
-            )
-
-            state = np.asarray(raw.get("state", []), dtype=np.float32).reshape(-1)
-            speed = float(state[15]) if state.size > 15 else 0.0
-            routing = str(raw.get("routing_command", "") or "").strip() or "Follow the route."
-            include_hist = bool(getattr(steervla_actor, "include_ego_history", False))
-            proprio_norm = bool(getattr(steervla_actor, "proprio_norm", True)) if steervla_actor is not None else True
-            state_pad = carla_state_vec_to_steervla_state(
-                state, include_ego_history=include_hist, proprio_norm=proprio_norm
-            )
-            prompt = format_steervla_cot_prompt(
-                routing_instruction_prompt(routing_command=routing, current_speed_mps=speed),
-                state_pad,
-                state_dim=steervla_prompt_state_dim(include_ego_history=include_hist),
-            )
+            prompt_source = str(raw.get("openpi_prompt_raw_text") or raw.get("routing_command") or "").strip()
+        if prompt_source and "speed" in prompt_source.lower():
+            prompt = prompt_source
+        else:
+            routing = prompt_source or "Follow the route."
+            prompt = f"The current speed is {speed:.1f} m/s. {routing}"
         reasoning = _clean_overlay_text(
             _format_text_field(raw, "reasoning_text") or _format_text_field(raw, "reasoning")
         )
@@ -4581,16 +4608,28 @@ def run_online_residual(
     vla_action_dim = int(config["steervla"]["action_dim"])
     action_dim = int(config["steervla"]["action_horizon"]) * vla_action_dim
     warmup = int(config["residual_warmup_steps"])
-    # Warm-start ramp: residual authority (scale) is 0 through warmup, then linearly rises to
-    # ``residual_scale`` over ``residual_ramp_steps`` env steps, avoiding a magnitude jump at
+    # Warm-start ramp: residual authority is 0 through warmup, then linearly rises to the
+    # configured per-control scales over ``residual_ramp_steps`` env steps, avoiding a magnitude jump at
     # handover and keeping the critic in-distribution as the executed policy drifts off base.
     ramp_steps = max(0, int(config.get("residual_ramp_steps", 0)))
     _accel_steer_space = str(config.get("residual_action_space", "waypoint_chunk")).strip().lower() == "accel_steer"
-    _accel_scale = float(config["residual_scale"])
-    _steer_scale = float(config.get("residual_steer_scale", -1.0))
-    # Per-dim [accel, steer] authority in accel_steer mode (steer<0 -> reuse accel); scalar otherwise.
+    # ``residual_scale`` is retained solely for old launch commands. A negative
+    # accel scale means use it for both dimensions (legacy behavior). With an explicit
+    # accel scale, a negative steer scale means "tie steer to accel"; this makes
+    # ``residual_steer_scale=-1`` a useful coarse-grid setting rather than silently
+    # reverting steering to the old global default.
+    _legacy_scale = float(config.get("residual_scale", 0.1))
+    _configured_accel_scale = float(config.get("residual_accel_scale", -1.0))
+    _configured_steer_scale = float(config.get("residual_steer_scale", -1.0))
+    _accel_scale = _configured_accel_scale if _configured_accel_scale >= 0.0 else _legacy_scale
+    _steer_scale = (
+        _configured_steer_scale
+        if _configured_steer_scale >= 0.0
+        else _accel_scale
+    )
+    # Per-dim [accel, steer] authority in accel_steer mode; scalar otherwise.
     target_scale = (
-        np.array([_accel_scale, _steer_scale if _steer_scale >= 0.0 else _accel_scale], dtype=np.float32)
+        np.array([_accel_scale, _steer_scale], dtype=np.float32)
         if _accel_steer_space else np.float32(_accel_scale)
     )
 
@@ -4692,6 +4731,9 @@ def run_online_residual(
     use_otf = agent is not None and bool(config.get("expo", True))
     n_cand = max(1, int(config.get("best_of_n", 8))) if use_otf else 1
     cot_temp = float(config.get("vla_cot_temperature", 1.0))
+    expo_conservative = bool(config.get("expo_conservative", False))
+    if use_otf:
+        print(f"[expo] selector=critic conservative={expo_conservative}", flush=True)
     # Token encoders (pi_prefix / rl_token) fold the CoT into the state -> one state per candidate
     # (K=N). siglip_pool is image-only -> one shared state (K=1) broadcast across candidates.
     state_cot_dependent = bool(getattr(state_encoder, "cot_dependent", True)) if state_encoder is not None else False
@@ -4792,16 +4834,26 @@ def run_online_residual(
             residual_active = agent is not None and step > warmup
             q_all: Optional[np.ndarray] = None
             winner_idx = 0
+            expo_decision_log: dict[str, float] = {}
             if residual_active and use_otf:
                 rng, sample_key = jax.random.split(rng)
-                exe_b, wbase_b, wx_b, q_b, widx_b = agent.select_action_otf(
+                edited_b, q_heads_b = agent.score_action_otf(
                     jnp.asarray(x_cands), jnp.asarray(base_cands), scale_j, sample_key
                 )
-                final = np.asarray(jax.device_get(exe_b), dtype=np.float32).reshape(-1)
-                winner_base = np.asarray(jax.device_get(wbase_b), dtype=np.float32).reshape(-1)
-                winner_x = np.asarray(jax.device_get(wx_b), dtype=np.float32).reshape(-1)
-                q_all = np.asarray(jax.device_get(q_b), dtype=np.float32).reshape(-1)
-                winner_idx = int(jax.device_get(widx_b))
+                edited = np.asarray(jax.device_get(edited_b), dtype=np.float32)
+                q_heads = np.asarray(jax.device_get(q_heads_b), dtype=np.float32)
+                q_all = q_heads.min(axis=0)
+                pool_actions = np.concatenate([base_cands, edited], axis=0)
+                winner_idx, gate_log = _expo_critic_choice(
+                    q_heads, n_cand, conservative=expo_conservative
+                )
+                expo_decision_log.update(gate_log)
+                final = np.asarray(pool_actions[winner_idx], dtype=np.float32).reshape(-1)
+                base_idx = winner_idx % n_cand
+                winner_base = np.asarray(base_cands[base_idx], dtype=np.float32).reshape(-1)
+                winner_x = np.asarray(
+                    x_cands[base_idx if x_cands.shape[0] > 1 else 0], dtype=np.float32
+                ).reshape(-1)
                 last_residual = final - winner_base
             elif residual_active:
                 # Regular residual SAC: execute the single edit, no best-of-N selection.
@@ -4978,6 +5030,7 @@ def run_online_residual(
                 # EXPO 2N-pool diagnostics (only meaningful once OTF is active).
                 if residual_active and q_all is not None:
                     log.update(_expo_candidate_log(base_cands, q_all, winner_idx, n_cand))
+                    log.update(expo_decision_log)
                     if cands is not None:
                         subtasks = cands["subtask_texts"]
                         log["expo/n_unique_subtasks"] = float(len(set(subtasks)))
