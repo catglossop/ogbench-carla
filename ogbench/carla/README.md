@@ -42,6 +42,43 @@ WANDB_MODE=disabled .venv/bin/python impls/main_carla.py \
   --steervla_actor_config=pi05_steervla_inference
 ```
 
+### Frozen Qwen critic best-of-N
+
+`steervla_dsrl_config.py` defaults to the 14000-step commentary policy checkpoint on
+GCS. On machines with a RAID mirror, pass the local checkpoint explicitly when
+launching CARLA to avoid another large download. Start the critic from the
+`qwen-critic` repository on one GPU:
+
+```
+CUDA_VISIBLE_DEVICES=<qwen-gpu> \
+  .venv/bin/python scripts/serve_bon.py \
+  --adapter /raid/users/celine/qwen-critic/<run>/step-<best-step>/adapter \
+  --port 18784 --traffic-weight 0 --traffic-threshold 1.01
+```
+
+Then run CARLA on a separate GPU:
+
+```
+./run_carla.sh \
+  --agent-config impls/configs/steervla_dsrl_config.py \
+  --steervla-checkpoint /raid/users/celine/openpi/checkpoints/commentary-steervla-14000 \
+  --route generalization-wall-1097 \
+  --train-mode rl --eval-only false --enable-updates false \
+  --bon-online-critic false --bon-qwen-select true \
+  --qwen-bon-url http://127.0.0.1:18784 \
+  --bon-num-candidates 8 --bon-max-sample-attempts 1 \
+  --bon-qwen-cadence 5 --max-episodes 1 \
+  --bon-candidates-wandb false --save-video-local true \
+  --train-gpu <carla-gpu> --render-adapter <carla-gpu> -- \
+  --bon_include_brake_candidate=true
+```
+
+Each candidate is a complete 10-action chunk; `--bon-qwen-cadence` controls how much
+of the selected chunk is rolled out before resampling. Candidate images remain local
+when `--bon-candidates-wandb false`, while episode videos are still logged. Keep
+`--enable-updates false`, `--bon-online-critic false`, and omit `--online-train` from
+the Qwen server for frozen offline-critic evaluation.
+
 
 
 ## Configuring your env
@@ -362,7 +399,8 @@ uv pip install --python .venv-carla-0915/bin/python \
 Check:
 
 ```
-.venv-carla-0915/bin/python -c "import carla, srunner, fail2drive; print(carla.__version__)"
+.venv-carla-0915/bin/python -c \
+  "import carla, srunner, fail2drive; print(carla.__file__, fail2drive.__file__)"
 ```
 
 #### 2c. Run
@@ -383,6 +421,3 @@ CARLA_0915_ROOT=$HOME/f2d_carla ./carla_job.sh start --job 45 \
 
 The same variable works with `./run_carla.sh` directly. Unset it and the repo behaves  
 exactly as before, on 0.9.16.
-
-
-

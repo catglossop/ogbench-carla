@@ -3073,7 +3073,9 @@ def run_online_carla(
         chunks_np = np.concatenate([chunks_np, brake_chunk], axis=0)
         # Keep this synthetic label in-distribution for the raw-commentary critic.
         # This exact wording occurs frequently in the commentary training corpus.
-        candidate_subtasks = candidate_subtasks + ["Follow the route. Decelerate."]
+        candidate_subtasks = candidate_subtasks + [
+            "Follow the route. Remain stopped to stay behind the black car that is to the front."
+        ]
         return chunks_np, candidate_subtasks
 
     def _sample_diverse_candidates(subkey, n: int) -> tuple[np.ndarray, list[str]]:
@@ -3291,6 +3293,7 @@ def run_online_carla(
             "chunks": chunks_np,
             "qwen_scores": result["scores"],
             "accepted": result["accepted"],
+            "qwen_timings": result.get("timings", {}),
         }
         if FLAGS.qwen_online_train:
             _qwen_online_window[0] = {
@@ -3313,6 +3316,11 @@ def run_online_carla(
                 else None,
             }
         qwen_scores = result["scores"]
+        crash = [round(float(score["crash"]), 4) for score in qwen_scores]
+        offroad = [round(float(score["offroad"]), 4) for score in qwen_scores]
+        traffic = [
+            round(float(score["traffic_violation"]), 4) for score in qwen_scores
+        ]
         risk_max = [
             round(
                 max(
@@ -3329,7 +3337,9 @@ def run_online_carla(
         print(
             f"[QWEN-BON] step={step} routing={routing_command!r} choice={best_idx} "
             f"accepted={result['accepted']} utility={utility.round(4).tolist()} "
-            f"risk_max={risk_max} progress={progress} goal={goal}",
+            f"crash={crash} offroad={offroad} traffic={traffic} "
+            f"risk_max={risk_max} progress={progress} goal={goal} "
+            f"timings={result.get('timings', {})}",
             flush=True,
         )
         return jax.numpy.asarray(chunks_np), utility, best_idx
@@ -3669,7 +3679,8 @@ def run_online_carla(
                 _last_base_action_np = base_action_np
             print(
                 f"[ACTION_DEBUG] step={step} base={base_action_np.tolist() if base_action_np is not None else None} "
-                f"final={action.tolist()} speed={float(np.asarray(obs_raw.get('state', np.zeros(1))).reshape(-1)[0]) if isinstance(obs_raw, dict) else None}",
+                f"final={action.tolist()} "
+                f"speed={float(_ego_speed_mps_from_raw(obs_raw)) if isinstance(obs_raw, dict) else None}",
                 flush=True,
             )
 
