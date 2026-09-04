@@ -230,6 +230,10 @@ Options:
                             base config defaults to 0.0 (greedy -- every candidate would
                             decode to the same subtask), so this defaults to 1.0 here,
                             matching run_carla_teleop.sh's manual candidate picker.
+  --bon-qwen-cadence N      Environment ticks to replay the Qwen-selected action chunk before
+                            resampling. CARLA runs at 20 Hz and each policy action row is held
+                            for 5 ticks by default, so N=25 executes the first 5 rows of a
+                            10-row chunk; N=50 executes all 10 rows. Default: 5.
   --bon-critic-rollout-chunk BOOL
                             true|false. When --bon-critic-ckpt or --bon-online-critic is
                             active, execute the FULL selected action chunk (all

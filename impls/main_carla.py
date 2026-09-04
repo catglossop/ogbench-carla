@@ -222,7 +222,13 @@ flags.DEFINE_string(
 )
 flags.DEFINE_bool("bon_qwen_select", False, "Select candidates with a local Qwen service.")
 flags.DEFINE_string("qwen_bon_url", "http://127.0.0.1:18765", "Qwen BoN service URL.")
-flags.DEFINE_integer("bon_qwen_cadence", 5, "Environment steps per fixed candidate set.")
+flags.DEFINE_integer(
+    "bon_qwen_cadence",
+    5,
+    "Environment ticks per fixed candidate set. With the default 20 Hz environment and "
+    "4 Hz policy rows, 5 ticks replay one action row, 25 replay five rows, and 50 replay "
+    "the full ten-row chunk.",
+)
 flags.DEFINE_bool(
     "qwen_online_train", False,
     "After each Qwen selection window, submit the executed projected trajectory and causal "

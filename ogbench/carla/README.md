@@ -62,19 +62,22 @@ Then run CARLA on a separate GPU:
 ./run_carla.sh \
   --agent-config impls/configs/steervla_dsrl_config.py \
   --steervla-checkpoint /raid/users/celine/openpi/checkpoints/commentary-steervla-14000 \
+  --actor-config pi05_steervla_cot_simplified_reasoning_commentary \
   --route generalization-wall-1097 \
   --train-mode rl --eval-only false --enable-updates false \
   --bon-online-critic false --bon-qwen-select true \
   --qwen-bon-url http://127.0.0.1:18784 \
   --bon-num-candidates 8 --bon-max-sample-attempts 1 \
-  --bon-qwen-cadence 5 --max-episodes 1 \
+  --bon-qwen-cadence 25 --max-episodes 1 \
   --bon-candidates-wandb false --save-video-local true \
   --train-gpu <carla-gpu> --render-adapter <carla-gpu> -- \
   --bon_include_brake_candidate=true
 ```
 
-Each candidate is a complete 10-action chunk; `--bon-qwen-cadence` controls how much
-of the selected chunk is rolled out before resampling. Candidate images remain local
+Each candidate is sampled and scored as a complete 10-action chunk. The cadence is
+measured in 20 Hz environment ticks, while each 4 Hz policy action row is held for five
+ticks: cadence 25 rolls out the first five rows before resampling, and cadence 50 rolls
+out all ten. Candidate images remain local
 when `--bon-candidates-wandb false`, while episode videos are still logged. Keep
 `--enable-updates false`, `--bon-online-critic false`, and omit `--online-train` from
 the Qwen server for frozen offline-critic evaluation.
