@@ -926,16 +926,51 @@ def _decode_rgb_front_viz(sensor_dict: Dict[str, Any]) -> np.ndarray | None:
     return rgb
 
 
+# Framing crop applied before the squeeze to square, mirroring
+# ``openpi.training.steervla_rlds_dataset.SIMLINGO_FRAMING_CROP``. Keep the two in sync.
+#
+# Every SimLingo-derived training corpus reaches the model through this box: the
+# ``simlingo_dataset_*_img512_1116`` builds baked it in at dataset-creation time, and
+# ``simplified_reasoning_dataset`` -- which stored the full frame -- is re-cropped to it at decode
+# time by ``DATASET_IMAGE_CROPS``. The live CARLA camera renders the same 1024x512 view those
+# corpora were built from (see ``observation_only.py``: fov/x/z now match ``simlingo_obs.py``), so
+# without this crop the policy would see a wider FOV with the ego hood at the bottom -- the one
+# framing no longer present anywhere in training.
+#
+# Normalized so it lands correctly whatever the incoming resolution: on the native 1024x512 frame it
+# is the box (170, 0, 852, 359); on a stored 512x512 frame, (85, 0, 426, 359).
+SIMLINGO_FRAMING_CROP = (170 / 1024, 0.0, 852 / 1024, 359 / 512)
+
+
+def crop_to_simlingo_framing(rgb: np.ndarray) -> np.ndarray:
+    """Crop ``rgb`` to :data:`SIMLINGO_FRAMING_CROP`. Aspect is *not* preserved by the caller's resize."""
+    rgb = np.asarray(rgb, dtype=np.uint8)
+    h, w = rgb.shape[:2]
+    x0, y0, x1, y1 = SIMLINGO_FRAMING_CROP
+    left, top = int(round(x0 * w)), int(round(y0 * h))
+    right, bottom = int(round(x1 * w)), int(round(y1 * h))
+    cropped = rgb[top:bottom, left:right]
+    # A degenerate box (absurdly small input) would produce an empty array that cv2.resize rejects.
+    return cropped if cropped.size else rgb
+
+
 def downscale_rgb_for_policy(rgb_viz: np.ndarray) -> np.ndarray:
-    """Resize a viz-resolution RGB frame to policy/RL ``IMAGE_SHAPE_HWC``."""
+    """Crop to the SimLingo training framing, then squeeze to policy/RL ``IMAGE_SHAPE_HWC``.
+
+    The crop is what makes the live frame match what the SteerVLA checkpoint was trained on; the
+    resize is a plain distorting squeeze to square, matching the dataset preprocessing (a pad would
+    introduce black bars the backbone has never seen).
+    """
     rgb_viz = np.asarray(rgb_viz, dtype=np.uint8)
+    # Already at policy resolution => already processed (e.g. a replayed frame); cropping a second
+    # time would zoom in past the training framing.
     if rgb_viz.shape == IMAGE_SHAPE_HWC:
         return rgb_viz
     try:
         import cv2
 
         return cv2.resize(
-            rgb_viz,
+            crop_to_simlingo_framing(rgb_viz),
             (IMAGE_SHAPE_HWC[1], IMAGE_SHAPE_HWC[0]),
             interpolation=cv2.INTER_AREA,
         )
