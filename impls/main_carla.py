@@ -278,6 +278,13 @@ flags.DEFINE_integer(
     "2-3) to trade diversity guarantee for speed -- each draw is a full VLA forward pass.",
 )
 flags.DEFINE_bool(
+    "bon_batch_policy_candidates", False,
+    "When Qwen BoN is active and --bon_max_sample_attempts=1, sample all policy "
+    "candidates in one SteerVLA batch. Preserves the normal bounded full-model flow "
+    "noise and requires normalized chunks; malformed or overflowed batches fall back "
+    "to the checked sequential sampler. Disabled by default for controlled A/B testing.",
+)
+flags.DEFINE_bool(
     "bon_shadow_only", False,
     "When --bon_critic_ckpt is set, sample and Q-score N candidates every step (for the "
     "usual bon/q_best, bon/q_mean, and periodic candidates-panel logging) but do NOT use "
@@ -2118,11 +2125,19 @@ def run_online_carla(
         from qwen_bon_selector import QwenActionSelector
 
         _qwen_selector = QwenActionSelector(FLAGS.qwen_bon_url)
+        if FLAGS.bon_batch_policy_candidates and int(FLAGS.bon_max_sample_attempts) != 1:
+            raise ValueError(
+                "--bon_batch_policy_candidates requires --bon_max_sample_attempts=1; "
+                "adaptive per-slot diversity resampling remains sequential."
+            )
         print(
             f"[main_carla] Qwen rejection-sampling BoN enabled: url={FLAGS.qwen_bon_url} "
-            f"N={_bon_n} cadence={FLAGS.bon_qwen_cadence} online_critic={_bon_online}",
+            f"N={_bon_n} cadence={FLAGS.bon_qwen_cadence} online_critic={_bon_online} "
+            f"batched_policy_candidates={FLAGS.bon_batch_policy_candidates}",
             flush=True,
         )
+    elif FLAGS.bon_batch_policy_candidates:
+        raise ValueError("--bon_batch_policy_candidates is only supported with --bon_qwen_select=true.")
 
     _bon_last_q_best: list[float] = [0.0]
     _bon_last_q_mean: list[float] = [0.0]
@@ -3086,7 +3101,8 @@ def run_online_carla(
 
     def _sample_diverse_candidates(subkey, n: int) -> tuple[np.ndarray, list[str]]:
         """Sample ``n`` candidate action chunks from the frozen pi0 base policy for
-        best-of-N, one at a time (not batched), so each draw gets a fresh CoT.
+        best-of-N. The guarded Qwen/max-attempts=1 mode uses one actor batch;
+        otherwise draws are sequential so each attempt gets a fresh checked CoT.
 
         For each slot beyond the first, resamples up to
         ``subtask_diversity.MAX_SAMPLE_ATTEMPTS_PER_CANDIDATE`` times and keeps
@@ -3098,13 +3114,39 @@ def run_online_carla(
         this just falls back to the best of the attempted draws rather than
         forcing artificial diversity that isn't there.
 
-        Much slower than a single batched (N, ...) vla_sample_fn call (up to
+        The sequential path is much slower than a single batched candidate call (up to
         N * MAX_SAMPLE_ATTEMPTS_PER_CANDIDATE individual forward passes instead of
         one) -- the cost of actually getting distinct subtasks per candidate.
         """
         from subtask_diversity import DIVERSITY_JACCARD_THRESHOLD, diversity_score, subtask_categories
 
         max_attempts = max(1, int(FLAGS.bon_max_sample_attempts))
+        if FLAGS.bon_batch_policy_candidates and _qwen_selector is not None and max_attempts == 1:
+            from vlas.batched_candidates import (
+                BatchedCandidateValidationError,
+                sample_batched_policy_candidates,
+            )
+
+            try:
+                return sample_batched_policy_candidates(
+                    actor=steervla_actor,
+                    raw=obs_raw,
+                    rng=subkey,
+                    num_candidates=n,
+                    model_noise_dim=agent._flat_noise_dim(),
+                    env_action_dim=agent._flat_env_action_dim(),
+                    noise_scale=_vla_noise_scale,
+                )
+            except BatchedCandidateValidationError as exc:
+                # An overflowed/empty CoT or unit/shape mismatch is recoverable by
+                # drawing the candidates through the existing checked batch-1 path.
+                # Runtime/JAX failures intentionally propagate instead of masking an
+                # unhealthy backend and pretending the optimization was successful.
+                print(
+                    f"[best-of-N] batched policy candidates invalid ({exc}); "
+                    "falling back to sequential sampling for this decision.",
+                    flush=True,
+                )
         reset_cache = getattr(getattr(agent, "vla_sample_fn", None), "reset_action_cache", None)
         chunks: list[np.ndarray] = []
         subtasks: list[str] = []

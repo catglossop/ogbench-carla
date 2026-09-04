@@ -68,6 +68,7 @@ Then run CARLA on a separate GPU:
   --bon-online-critic false --bon-qwen-select true \
   --qwen-bon-url http://127.0.0.1:18784 \
   --bon-num-candidates 8 --bon-max-sample-attempts 1 \
+  --bon-batch-policy-candidates true \
   --bon-qwen-cadence 25 --max-episodes 1 \
   --bon-candidates-wandb false --save-video-local true \
   --train-gpu <carla-gpu> --render-adapter <carla-gpu> -- \
@@ -77,7 +78,10 @@ Then run CARLA on a separate GPU:
 Each candidate is sampled and scored as a complete 10-action chunk. The cadence is
 measured in 20 Hz environment ticks, while each 4 Hz policy action row is held for five
 ticks: cadence 25 rolls out the first five rows before resampling, and cadence 50 rolls
-out all ten. Candidate images remain local
+out all ten. With `--bon-max-sample-attempts 1`, enable
+`--bon-batch-policy-candidates true` to generate all eight policy chunks in one actor
+batch; the critic already scores the resulting nine candidates (including brake) in one
+Qwen batch. Candidate images remain local
 when `--bon-candidates-wandb false`, while episode videos are still logged. Keep
 `--enable-updates false`, `--bon-online-critic false`, and omit `--online-train` from
 the Qwen server for frozen offline-critic evaluation.

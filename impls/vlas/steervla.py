@@ -5430,7 +5430,9 @@ class SteerVLAActor:
 
         obs_full = _merge_cot_output_into_observation(obs_jax, cot_out)
 
-        # Build per-candidate noise in model space.
+        # Build per-candidate noise in model space. Explicit noise accepts the
+        # same MODEL and ENV layouts as _forward_pi0 so callers can preserve the
+        # ordinary rollout's full 10x32 flow latent when batching candidates.
         model_ah = int(self.model.action_horizon)
         model_ad = int(self.model.action_dim)
         cfg_ah = min(int(self.action_horizon), model_ah)
@@ -5442,15 +5444,37 @@ class SteerVLAActor:
             )
         else:
             noise_arr = jnp.asarray(noise, dtype=jnp.float32)
-            if noise_arr.ndim == 2:
-                noise_arr = noise_arr.reshape(
+            model_flat = model_ah * model_ad
+            env_flat = int(self.action_horizon) * int(self.action_dim)
+            if noise_arr.ndim == 3:
+                write_ah = min(int(noise_arr.shape[1]), model_ah)
+                write_ad = min(int(noise_arr.shape[2]), model_ad)
+                noise_chunk = noise_arr[:, :write_ah, :write_ad]
+            elif noise_arr.ndim == 2 and int(noise_arr.shape[-1]) == model_flat:
+                write_ah, write_ad = model_ah, model_ad
+                noise_chunk = noise_arr.reshape(noise_arr.shape[0], model_ah, model_ad)
+            elif noise_arr.ndim == 2 and int(noise_arr.shape[-1]) == env_flat:
+                write_ah, write_ad = cfg_ah, cfg_ad
+                noise_chunk = noise_arr.reshape(
                     noise_arr.shape[0], int(self.action_horizon), int(self.action_dim)
+                )[:, :write_ah, :write_ad]
+            else:
+                raise ValueError(
+                    f"SteerVLAActor.sample_candidates received noise of shape {tuple(noise_arr.shape)}. "
+                    f"Expected 3-D (batch, horizon, dim), model-flat width {model_flat}, or "
+                    f"env-flat width {env_flat}."
                 )
-            noise_chunk = noise_arr[:, :cfg_ah, :cfg_ad]
+            if noise_chunk.shape[0] not in (1, n):
+                raise ValueError(
+                    f"SteerVLAActor.sample_candidates received {noise_chunk.shape[0]} noise rows "
+                    f"for {n} candidates; expected 1 or {n}."
+                )
             if noise_chunk.shape[0] == 1 and n > 1:
-                noise_chunk = jnp.broadcast_to(noise_chunk, (n, cfg_ah, cfg_ad))
+                noise_chunk = jnp.broadcast_to(noise_chunk, (n, write_ah, write_ad))
         noise_full = jnp.zeros((n, model_ah, model_ad), dtype=jnp.float32)
-        noise_full = noise_full.at[:, :cfg_ah, :cfg_ad].set(
+        if noise is None:
+            write_ah, write_ad = cfg_ah, cfg_ad
+        noise_full = noise_full.at[:, :write_ah, :write_ad].set(
             jax.device_put(noise_chunk, self._jax_device)
         )
 
@@ -5520,6 +5544,7 @@ class SteerVLAActor:
             "actions_normalized": actions_norm,
             "subtask_texts": subtask_texts,
             "reasoning_texts": reasoning_texts,
+            "reasoning_overflowed": overflowed,
             "cot_out": cot_out,
             # (n,) context noise level per candidate, or None in the clean regime.
             "t_context": None if t_context is None else np.asarray(self._last_t_context, dtype=np.float32),

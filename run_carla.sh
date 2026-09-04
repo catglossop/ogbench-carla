@@ -55,6 +55,7 @@ BON_ONLINE_CRITIC="false"
 BON_CANDIDATES_LOG_EVERY="20"
 BON_CANDIDATES_WANDB="false"
 BON_MAX_SAMPLE_ATTEMPTS="6"
+BON_BATCH_POLICY_CANDIDATES="false"
 # 0.0 (the base config's default) makes subtask decoding greedy/deterministic, so every
 # candidate would decode to the identical subtask text and the diversity search in
 # _sample_diverse_candidates could never find a different one. run_carla_teleop.sh's
@@ -226,6 +227,9 @@ Options:
                             Best-of-N diverse-subtask search: max resample attempts per
                             candidate slot (beyond the first). Each attempt is a full VLA
                             forward pass; lower this to trade diversity for speed. Default: 6.
+  --bon-batch-policy-candidates BOOL
+                            Batch all policy candidates in one SteerVLA call when Qwen BoN
+                            and --bon-max-sample-attempts=1 are active. Default: false.
   --bon-cot-temperature F   CoT/subtask sampling temperature when best-of-N is active. The
                             base config defaults to 0.0 (greedy -- every candidate would
                             decode to the same subtask), so this defaults to 1.0 here,
@@ -319,6 +323,7 @@ while [[ $# -gt 0 ]]; do
     --bon-candidates-log-every|--bon_candidates_log_every) BON_CANDIDATES_LOG_EVERY="$2"; shift 2 ;;
     --bon-candidates-wandb|--bon_candidates_wandb) BON_CANDIDATES_WANDB="$2"; shift 2 ;;
     --bon-max-sample-attempts|--bon_max_sample_attempts) BON_MAX_SAMPLE_ATTEMPTS="$2"; shift 2 ;;
+    --bon-batch-policy-candidates|--bon_batch_policy_candidates) BON_BATCH_POLICY_CANDIDATES="$2"; shift 2 ;;
     --bon-cot-temperature|--bon_cot_temperature) BON_COT_TEMPERATURE="$2"; shift 2 ;;
     --bon-shadow-only|--bon_shadow_only) BON_SHADOW_ONLY="$2"; shift 2 ;;
     --bon-critic-rollout-chunk|--bon_critic_rollout_chunk) BON_CRITIC_ROLLOUT_CHUNK="$2"; shift 2 ;;
@@ -615,6 +620,7 @@ while :; do
     --bon_candidates_log_every="${BON_CANDIDATES_LOG_EVERY}" \
     --bon_candidates_wandb="${BON_CANDIDATES_WANDB}" \
     --bon_max_sample_attempts="${BON_MAX_SAMPLE_ATTEMPTS}" \
+    --bon_batch_policy_candidates="${BON_BATCH_POLICY_CANDIDATES}" \
     --bon_shadow_only="${BON_SHADOW_ONLY}" \
     --bon_critic_rollout_chunk="${BON_CRITIC_ROLLOUT_CHUNK}" \
     ${PID_BRAKE_SPEED:+--pid_brake_speed="${PID_BRAKE_SPEED}"} \
