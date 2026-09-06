@@ -289,6 +289,27 @@ class SACResidualAgent(flax.struct.PyTreeNode):
         return self._final_action(base_actions, residual, scale), residual
 
     @jax.jit
+    def score_action_otf(self, x_cands, base_cands, scale, seed):
+        """Sample one residual edit per base candidate and score the complete EXPO pool.
+
+        Returns ``(edited, critic_heads)`` where ``edited`` is ``(N, action_dim)`` and
+        ``critic_heads`` is ``(ensemble, 2N)`` in ``[base candidates, edited candidates]``
+        order. Keeping all heads lets the rollout loop make conservative paired decisions
+        or escalate uncertain choices to an external selector such as Gemini.
+        """
+        n, adim = base_cands.shape
+        edim = x_cands.shape[-1]
+        x_full = jnp.broadcast_to(x_cands, (n, edim))
+        z = self._enc(x_full)
+        dist = self.network.select("actor")(z, base_cands)
+        residual = dist.sample(seed=seed)
+        edited = self._final_action(base_cands, residual, scale)
+        pool_states = jnp.concatenate([z, z], axis=0)
+        pool_actions = jnp.concatenate([base_cands, edited], axis=0)
+        critic_heads = self.network.select("critic")(pool_states, None, actions=pool_actions)
+        return edited, critic_heads
+
+    @jax.jit
     def select_action_otf(self, x_cands, base_cands, scale, seed):
         """EXPO rollout: edit each of N base cands 1:1, execute the argmax-min-ensemble-Q of the
         2N base+edited pool.
@@ -385,7 +406,7 @@ class SACResidualAgent(flax.struct.PyTreeNode):
             use_state_head=bool(use_state_head),
             # O4 actor-side offline-RL tether (constraint ladder); all default off -> V0 behavior.
             residual_bc_beta=bc_beta,
-            residual_bc_normalize=bool(config.get("residual_bc_normalize", True)),
+            residual_bc_normalize=bool(config.get("residual_bc_normalize", False)),
             residual_kl_beta=kl_beta,
             residual_kl_sigma0=float(config.get("residual_kl_sigma0", 1.0)),
             residual_adv_gate=adv_gate,
@@ -412,8 +433,15 @@ def get_config():
             state_head_mlp=False,
             discount=0.99,
             tau=0.005,
+            # Deprecated shared authority. It remains a compatibility fallback for old
+            # ``--agent.residual_scale=...`` commands; new experiments should specify
+            # both per-control scales below.
             residual_scale=0.1,
-            # accel_steer only: steer-dim residual authority. <0 -> reuse residual_scale for both dims.
+            # accel_steer only: explicit per-control residual authority. A negative
+            # accel value falls back to the legacy shared ``residual_scale``; a negative
+            # steer value reuses the resolved accel authority. This preserves old commands
+            # while making throttle/brake and steering sweeps unambiguous.
+            residual_accel_scale=-1.0,
             residual_steer_scale=-1.0,
             # Consumed by main_carla.py (the SAC agent itself is space-agnostic):
             #   "accel_steer" (default) -> base chunk is PID-decoded to a 2-D [accel, steer] before residual is applied.
@@ -423,10 +451,11 @@ def get_config():
             target_entropy_multiplier=0.5,
             residual_warmup_steps=2000,
             residual_ramp_steps=3000,
-            # O4 actor-side tether ladder (default off = V0). V1 L2 penalty (beta, Q-normalized);
-            # V2 KL to N(0, sigma0^2 I); V3 gate relaxes V1/V2 where Q(base+res) > Q(base).
+            # O4 actor-side tether ladder (default off = V0). V1 L2 penalty with a
+            # fixed configured beta; V2 KL to N(0, sigma0^2 I); V3 gate relaxes V1/V2
+            # where Q(base+res) > Q(base). Q-normalization remains an explicit legacy option.
             residual_bc_beta=0.0,
-            residual_bc_normalize=True,
+            residual_bc_normalize=False,
             residual_kl_beta=0.0,
             residual_kl_sigma0=1.0,
             residual_adv_gate=False,
@@ -435,6 +464,9 @@ def get_config():
             best_of_n=8,
             vla_cot_temperature=1.0,
             otf_td_backup=False,
+            # EXPO uses the online critic only. Conservative mode admits an edited
+            # candidate only when both critic heads predict a paired improvement.
+            expo_conservative=False,
             updates_per_step=10,
             # Debug task: RL updates use reward = -ego_speed (m/s) instead of env reward,
             # so the policy should learn to brake to a stop.

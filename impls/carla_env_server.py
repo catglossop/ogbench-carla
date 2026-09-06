@@ -353,7 +353,21 @@ def main(_argv):
         elif msg.get("shutdown"):
             break
 
-    env.close()
+    # If UE4 has already crashed, the CARLA Python client retains its normal
+    # multi-hour RPC timeout. Calling env.close() would then block while trying
+    # to destroy sensors over the dead connection. The parent launcher owns
+    # process cleanup and retry; exit promptly so it can recover the run.
+    evaluator = getattr(env, "_evaluator", None)
+    server = getattr(evaluator, "server", None)
+    server_dead = server is not None and server.poll() is not None
+    if server_dead:
+        print(
+            "[env_server] UE4 already exited; skipping RPC teardown.",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        env.close()
 
 
 if __name__ == "__main__":

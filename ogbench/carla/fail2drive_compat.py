@@ -191,7 +191,7 @@ def _patch_scenario_discovery() -> Optional[str]:
         # Patch here rather than in apply(): discovery imports these modules under
         # their bare names, so this dict holds the class objects actually used to
         # build scenarios.
-        _patch_dynamic_object_crossing_walker(all_scenario_classes)
+        _patch_configured_walker_models(all_scenario_classes)
         return all_scenario_classes
 
     get_all_scenario_classes._fail2drive_patched = True  # type: ignore[attr-defined]
@@ -199,52 +199,172 @@ def _patch_scenario_discovery() -> Optional[str]:
     return None
 
 
-def _patch_dynamic_object_crossing_walker(scenario_classes: dict) -> None:
-    """Make ``DynamicObjectCrossing`` honor the route's ``<walker value=.../>``.
+def _patch_configured_walker_models(scenario_classes: dict) -> None:
+    """Make animal scenarios honor the route's ``<walker value=.../>``.
 
-    bench2drive's ``srunner/scenarios/object_crash_vehicle.py`` hardcodes
-    ``request_new_actor('walker.*', ...)`` for the adversary and never reads a
-    ``walker`` parameter, so ``CarlaDataProvider.create_blueprint`` picks a
-    *random* walker. On the Fail2Drive CARLA build that pool is 51 pedestrians
-    + 18 animals, so ``generalization-animals-*`` routes get a human ~74% of the
-    time even though the route XML asks for e.g. ``walker.animal.1006``.
+    ScenarioRunner's dynamic-crossing and turning-pedestrian classes hardcode
+    ``request_new_actor('walker.*', ...)`` and never read the route's ``walker``
+    parameter. On the Fail2Drive CARLA build that randomly selects from 51
+    pedestrians and 18 animals, so ``generalization-animals-*`` usually gets a
+    human even when the XML requests a concrete animal blueprint.
 
     Fail2Drive ships no ``object_crash_vehicle.py``, so the file overlay in
     :func:`_patch_scenario_discovery` doesn't cover this one. Patch the class
     object that discovery actually returned (imported under its bare module
     name, so it is *not* the same object as
     ``srunner.scenarios.object_crash_vehicle.DynamicObjectCrossing``) and
-    rewrite only the generic ``'walker.*'`` lookup. ``_replace_walker``
-    re-spawns by concrete ``type_id`` and passes through untouched.
+    rewrite only the generic ``'walker.*'`` lookup. For the turning scenario,
+    concrete animal actors also bypass its human-walker destroy/re-spawn
+    workaround so they can be restored visibly by the behavior tree.
     """
-    cls = scenario_classes.get('DynamicObjectCrossing')
-    if cls is None:
-        return
-    original = getattr(cls, '_initialize_actors', None)
-    if original is None or getattr(original, '_fail2drive_walker_patched', False):
-        return
+    for class_name in ('DynamicObjectCrossing', 'VehicleTurningRoutePedestrian'):
+        cls = scenario_classes.get(class_name)
+        if cls is None:
+            continue
 
-    def _initialize_actors(self, config):
-        try:
-            model = str(config.other_parameters['walker']['value'])
-        except (AttributeError, KeyError, TypeError):
-            return original(self, config)
+        # VehicleTurningRoutePedestrian's large-map workaround destroys the
+        # initially spawned walker and creates a replacement below the ego.
+        # It then moves that replacement another 50 m down. That keeps human
+        # walkers alive on large maps, but custom animal walkers can remain
+        # dormant/invisible when ActorTransformSetter later restores their
+        # scenario transform. Keep the original concrete animal actor instead;
+        # it was created at the correct sidewalk transform and only moved down
+        # temporarily by _initialize_actors.
+        replace_walker = getattr(cls, '_replace_walker', None)
+        if (
+            replace_walker is not None
+            and not getattr(replace_walker, '_fail2drive_animal_patched', False)
+        ):
+            def make_replace_walker(original_replace):
+                def _replace_walker(self, adversary):
+                    if str(adversary.type_id).startswith('walker.animal.'):
+                        adversary.set_simulate_physics(False)
+                        print(
+                            '[fail2drive animal] retaining original actor '
+                            f'id={adversary.id} type={adversary.type_id}',
+                            flush=True,
+                        )
+                        return adversary
+                    return original_replace(self, adversary)
 
-        from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
+                return _replace_walker
 
-        real = CarlaDataProvider.request_new_actor
+            patched_replace = make_replace_walker(replace_walker)
+            patched_replace._fail2drive_animal_patched = True  # type: ignore[attr-defined]
+            cls._replace_walker = patched_replace
 
-        def request_new_actor(model_arg, *args, **kwargs):
-            return real(model if model_arg == 'walker.*' else model_arg, *args, **kwargs)
+        original = getattr(cls, '_initialize_actors', None)
+        if original is None or getattr(original, '_fail2drive_walker_patched', False):
+            continue
 
-        CarlaDataProvider.request_new_actor = staticmethod(request_new_actor)
-        try:
-            return original(self, config)
-        finally:
-            CarlaDataProvider.request_new_actor = staticmethod(real)
+        def make_initialize_actors(original_initialize):
+            def _initialize_actors(self, config):
+                try:
+                    model = str(config.other_parameters['walker']['value'])
+                except (AttributeError, KeyError, TypeError):
+                    return original_initialize(self, config)
 
-    _initialize_actors._fail2drive_walker_patched = True  # type: ignore[attr-defined]
-    cls._initialize_actors = _initialize_actors
+                from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
+
+                real = CarlaDataProvider.request_new_actor
+
+                def request_new_actor(model_arg, *args, **kwargs):
+                    return real(model if model_arg == 'walker.*' else model_arg, *args, **kwargs)
+
+                CarlaDataProvider.request_new_actor = staticmethod(request_new_actor)
+                try:
+                    result = original_initialize(self, config)
+                    spawned = getattr(self, 'other_actors', ())
+                    # DynamicObjectCrossing appends ``[adversary, blocker]`` while
+                    # VehicleTurningRoutePedestrian appends ``[blocker, walker]``.
+                    # Report every actor instead of guessing from list position;
+                    # the old ``[-1]`` diagnostic falsely called the dynamic
+                    # crossing's vending-machine occluder the requested walker.
+                    actual = [actor.type_id for actor in spawned]
+                    matched = model in actual
+                    print(
+                        f'[fail2drive animal] requested={model} spawned={actual} matched={matched}',
+                        flush=True,
+                    )
+                    if not matched:
+                        raise RuntimeError(
+                            f'Fail2Drive requested animal {model!r}, but spawned actors were {actual!r}'
+                        )
+                    return result
+                finally:
+                    CarlaDataProvider.request_new_actor = staticmethod(real)
+
+            return _initialize_actors
+
+        initialize_actors = make_initialize_actors(original)
+        initialize_actors._fail2drive_walker_patched = True  # type: ignore[attr-defined]
+        cls._initialize_actors = initialize_actors
+
+        # Log the animal actor's canonical lifecycle without changing the
+        # scenario behavior.  A successful blueprint allocation by itself is
+        # not enough on large maps: the actor can remain dormant underground,
+        # or it can surface and finish its crossing while hidden by traffic.
+        # State-transition-only logging keeps normal runs quiet while making
+        # those cases distinguishable in the route log.
+        create_behavior = getattr(cls, '_create_behavior', None)
+        if (
+            create_behavior is not None
+            and not getattr(create_behavior, '_fail2drive_animal_monitored', False)
+        ):
+            def make_create_behavior(original_create):
+                def _create_behavior(self):
+                    behavior = original_create(self)
+                    actors = [
+                        actor for actor in getattr(self, 'other_actors', ())
+                        if str(getattr(actor, 'type_id', '')).startswith('walker.animal.')
+                    ]
+                    if not actors:
+                        return behavior
+
+                    import py_trees
+
+                    actor = actors[0]
+                    spawn_z = float(self._spawn_transform.location.z)
+
+                    class AnimalLifecycleMonitor(py_trees.behaviour.Behaviour):
+                        def __init__(monitor_self):
+                            super().__init__(name='Fail2DriveAnimalLifecycleMonitor')
+                            monitor_self._last_state = None
+
+                        def update(monitor_self):
+                            alive = bool(getattr(actor, 'is_alive', False))
+                            if alive:
+                                location = actor.get_location()
+                                state = 'surface' if location.z > spawn_z - 10.0 else 'deep'
+                                detail = (
+                                    f'location=({location.x:.2f},{location.y:.2f},{location.z:.2f}) '
+                                    f'spawn_z={spawn_z:.2f}'
+                                )
+                            else:
+                                state = 'destroyed'
+                                detail = ''
+                            if state != monitor_self._last_state:
+                                print(
+                                    f'[fail2drive animal lifecycle] id={actor.id} '
+                                    f'type={actor.type_id} state={state} {detail}'.rstrip(),
+                                    flush=True,
+                                )
+                                monitor_self._last_state = state
+                            return py_trees.common.Status.RUNNING
+
+                    root = py_trees.composites.Parallel(
+                        name='AnimalScenarioWithLifecycleMonitor',
+                        policy=py_trees.common.ParallelPolicy.SUCCESS_ON_ONE,
+                    )
+                    root.add_child(behavior)
+                    root.add_child(AnimalLifecycleMonitor())
+                    return root
+
+                return _create_behavior
+
+            monitored_create = make_create_behavior(create_behavior)
+            monitored_create._fail2drive_animal_monitored = True  # type: ignore[attr-defined]
+            cls._create_behavior = monitored_create
 
 
 def apply() -> None:

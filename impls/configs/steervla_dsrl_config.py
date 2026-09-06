@@ -59,8 +59,9 @@ def get_config():
     # standstill-diagnostic switch only -- it trains the policy to *minimise* speed. Left on by
     # aaa4c7a; off by default so real runs optimise the env reward. cast_relabel inherits this.
     config.debug_task = False
-    # Rollout-only: best-of-N random VLA noises minimizing first-step speed delta_xy.
-    config.debug_noise = True
+    # Keep the legacy short-horizon noise diagnostic disabled. Online BoN samples
+    # complete action chunks and executes the configured prefix of the selected chunk.
+    config.debug_noise = False
     config.debug_noise_samples = 8
     config.debug_noise_log_every_n_steps = 1
     # When debug_noise=True: if True, execute the slowest candidate; if False, log only and use actor noise.
@@ -149,8 +150,8 @@ def get_config():
             # checkpoint="gs://cat-logs/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning/pi05_steervla_cot_ki_simplified_reasoning_20260512_144250/50000",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention/pi05_steervla_cot_simplified_reasoning_no_attention_20260526_175924/4000",
             # checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_csp/pi05_steervla_cot_simplified_reasoning_csp/pi05_steervla_cot_simplified_reasoning_csp_20260713_095815/10000",
-            # Active checkpoint must match actor_config above (..._no_ego_history).
-            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_no_ego_history/pi05_steervla_simplified_reasoning_no_ego_history_v1/pi05_steervla_simplified_reasoning_no_ego_history_v1_20260718_201640/6000",
+            # Commentary policy checkpoint used for Qwen-critic BoN experiments.
+            checkpoint="gs://cat-logs/pi05_steervla_cot_simplified_reasoning_commentary/pi05_steervla_cot_simplfied_reasoning_commentary_0823/pi05_steervla_cot_simplfied_reasoning_commentary_0823_20260823_154520/14000",
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,
             include_ego_history=False,

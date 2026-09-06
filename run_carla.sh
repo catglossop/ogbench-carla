@@ -53,7 +53,9 @@ BON_CRITIC_CKPT=""
 BON_NUM_CANDIDATES="8"
 BON_ONLINE_CRITIC="false"
 BON_CANDIDATES_LOG_EVERY="20"
+BON_CANDIDATES_WANDB="false"
 BON_MAX_SAMPLE_ATTEMPTS="6"
+BON_BATCH_POLICY_CANDIDATES="false"
 # 0.0 (the base config's default) makes subtask decoding greedy/deterministic, so every
 # candidate would decode to the identical subtask text and the diversity search in
 # _sample_diverse_candidates could never find a different one. run_carla_teleop.sh's
@@ -124,6 +126,9 @@ COT_TEMPERATURE=""
 # Crash supervisor: relaunch main_carla (resuming from checkpoint) after a CARLA native
 # crash (SIGSEGV/SIGABRT, exit code >=128). 0 disables the retry loop.
 MAX_RETRIES="${MAX_RETRIES:-50}"
+# Optional stable, human-readable run name. Used by sweep launchers so W&B
+# names identify the precise hyperparameter setting instead of only route/seed.
+EXP_NAME_OVERRIDE=""
 
 EXTRA_ARGS=()
 
@@ -181,6 +186,7 @@ Options:
   --state-encoder NAME      pi_prefix|pi_prefix_groups|siglip_pool|rl_token (residual stack).
   --rlt-checkpoint PATH     RLT autoencoder checkpoint (only for --state-encoder rl_token).
   --max-retries N           Auto-restart+resume after a CARLA crash. Default: 50 (0 disables)
+  --exp-name NAME           Fixed W&B/artifact run name. Default: route + seed + timestamp.
 
   --agent-config PATH       Base agent config. Default: impls/configs/pi0_residual_sac_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
@@ -211,17 +217,27 @@ Options:
                             on collected transitions. Warm-start with --pretrained-critic.
                             Requires --eval-only=false. Default: false.
   --bon-candidates-log-every N
-                            Log an overlay frame every N env steps showing every best-of-N
-                            candidate's subtask + Q value, selected one marked. 0 disables.
+                            Save a local overlay frame every N env steps showing every best-of-N
+                            candidate's subtask + score, selected one marked. 0 disables.
                             Default: 20.
+  --bon-candidates-wandb BOOL
+                            Also upload candidate panels to W&B. Default: false. Episode videos
+                            and scalar metrics are unaffected.
   --bon-max-sample-attempts N
                             Best-of-N diverse-subtask search: max resample attempts per
                             candidate slot (beyond the first). Each attempt is a full VLA
                             forward pass; lower this to trade diversity for speed. Default: 6.
+  --bon-batch-policy-candidates BOOL
+                            Batch all policy candidates in one SteerVLA call when Qwen BoN
+                            and --bon-max-sample-attempts=1 are active. Default: false.
   --bon-cot-temperature F   CoT/subtask sampling temperature when best-of-N is active. The
                             base config defaults to 0.0 (greedy -- every candidate would
                             decode to the same subtask), so this defaults to 1.0 here,
                             matching run_carla_teleop.sh's manual candidate picker.
+  --bon-qwen-cadence N      Environment ticks to replay the Qwen-selected action chunk before
+                            resampling. CARLA runs at 20 Hz and each policy action row is held
+                            for 5 ticks by default, so N=25 executes the first 5 rows of a
+                            10-row chunk; N=50 executes all 10 rows. Default: 5.
   --bon-critic-rollout-chunk BOOL
                             true|false. When --bon-critic-ckpt or --bon-online-critic is
                             active, execute the FULL selected action chunk (all
@@ -288,6 +304,7 @@ while [[ $# -gt 0 ]]; do
     --state-encoder) STATE_ENCODER="$2"; shift 2 ;;
     --rlt-checkpoint) RLT_CHECKPOINT="$2"; shift 2 ;;
     --max-retries) MAX_RETRIES="$2"; shift 2 ;;
+    --exp-name|--exp_name) EXP_NAME_OVERRIDE="$2"; shift 2 ;;
     --agent-config) BASE_AGENT_CFG="$2"; shift 2 ;;
     --carla-config) BASE_CARLA_CFG="$2"; shift 2 ;;
     --steervla-checkpoint|--steervla_checkpoint) STEERVLA_CKPT="$2"; shift 2 ;;
@@ -304,7 +321,9 @@ while [[ $# -gt 0 ]]; do
     --bon-num-candidates|--bon_num_candidates) BON_NUM_CANDIDATES="$2"; shift 2 ;;
     --bon-online-critic|--bon_online_critic) BON_ONLINE_CRITIC="$2"; shift 2 ;;
     --bon-candidates-log-every|--bon_candidates_log_every) BON_CANDIDATES_LOG_EVERY="$2"; shift 2 ;;
+    --bon-candidates-wandb|--bon_candidates_wandb) BON_CANDIDATES_WANDB="$2"; shift 2 ;;
     --bon-max-sample-attempts|--bon_max_sample_attempts) BON_MAX_SAMPLE_ATTEMPTS="$2"; shift 2 ;;
+    --bon-batch-policy-candidates|--bon_batch_policy_candidates) BON_BATCH_POLICY_CANDIDATES="$2"; shift 2 ;;
     --bon-cot-temperature|--bon_cot_temperature) BON_COT_TEMPERATURE="$2"; shift 2 ;;
     --bon-shadow-only|--bon_shadow_only) BON_SHADOW_ONLY="$2"; shift 2 ;;
     --bon-critic-rollout-chunk|--bon_critic_rollout_chunk) BON_CRITIC_ROLLOUT_CHUNK="$2"; shift 2 ;;
@@ -570,7 +589,7 @@ echo "[run_carla.sh] hl_ckpt_dir=${HL_CKPT_DIR:-<config>} hl_ckpt_every=${HL_CKP
 # Stable run name so save_dir + the W&B run id survive restarts (the supervisor resumes,
 # it does not fork a new run).
 ROUTE_TAG="$(printf '%s' "$ROUTE" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')"
-EXP_NAME="${ROUTE_TAG}-sd$(printf '%03d' "$SEED")_$(date +%Y%m%d_%H%M%S)"
+EXP_NAME="${EXP_NAME_OVERRIDE:-${ROUTE_TAG}-sd$(printf '%03d' "$SEED")_$(date +%Y%m%d_%H%M%S)}"
 echo "[run_carla.sh] exp_name=${EXP_NAME}"
 
 # Supervisor loop (surya/rl-token): CARLA's leaderboard runs in-process and periodically
@@ -610,7 +629,9 @@ while :; do
     --bon_num_candidates="${BON_NUM_CANDIDATES}" \
     --bon_online_critic="${BON_ONLINE_CRITIC}" \
     --bon_candidates_log_every="${BON_CANDIDATES_LOG_EVERY}" \
+    --bon_candidates_wandb="${BON_CANDIDATES_WANDB}" \
     --bon_max_sample_attempts="${BON_MAX_SAMPLE_ATTEMPTS}" \
+    --bon_batch_policy_candidates="${BON_BATCH_POLICY_CANDIDATES}" \
     --bon_shadow_only="${BON_SHADOW_ONLY}" \
     --bon_critic_rollout_chunk="${BON_CRITIC_ROLLOUT_CHUNK}" \
     ${PID_BRAKE_SPEED:+--pid_brake_speed="${PID_BRAKE_SPEED}"} \
