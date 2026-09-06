@@ -954,28 +954,49 @@ def crop_to_simlingo_framing(rgb: np.ndarray) -> np.ndarray:
     return cropped if cropped.size else rgb
 
 
-def downscale_rgb_for_policy(rgb_viz: np.ndarray) -> np.ndarray:
+def downscale_rgb_for_policy(rgb_viz: np.ndarray, *, already_processed: bool = False) -> np.ndarray:
     """Crop to the SimLingo training framing, then squeeze to policy/RL ``IMAGE_SHAPE_HWC``.
 
-    The crop is what makes the live frame match what the SteerVLA checkpoint was trained on; the
-    resize is a plain distorting squeeze to square, matching the dataset preprocessing (a pad would
-    introduce black bars the backbone has never seen).
+    **Crop-then-resize is the only supported preprocessing for SteerVLA — there is no flag to
+    skip the crop.** It is what makes the live frame match what every SteerVLA checkpoint was
+    trained on; the resize is a plain distorting squeeze to square, matching the dataset
+    preprocessing (a pad would introduce black bars the backbone has never seen).
+
+    ``already_processed`` is the *only* way to get a frame through uncropped, and it exists
+    solely for frames that have already been through this function (a replayed or stored
+    frame), where cropping again would zoom in past the training framing. It is stated by the
+    caller rather than inferred from the shape: an uncropped frame that merely happens to be
+    ``IMAGE_SHAPE_HWC`` would otherwise skip the crop silently, which is exactly the bug this
+    signature prevents. No caller in this repo passes it -- ``_decode_rgb_front_viz``
+    normalises every live frame to ``VIZ_IMAGE_SHAPE_HWC`` first.
+
+    Raises rather than returning a black frame on failure: a silent ``_zeros_rgb_image()``
+    would put the policy on blank input and score as bad driving, indistinguishable from a
+    genuine failure.
     """
     rgb_viz = np.asarray(rgb_viz, dtype=np.uint8)
-    # Already at policy resolution => already processed (e.g. a replayed frame); cropping a second
-    # time would zoom in past the training framing.
-    if rgb_viz.shape == IMAGE_SHAPE_HWC:
+    if already_processed:
+        if rgb_viz.shape != IMAGE_SHAPE_HWC:
+            raise ValueError(
+                f"downscale_rgb_for_policy(already_processed=True) expects a frame already at "
+                f"{IMAGE_SHAPE_HWC}, got {rgb_viz.shape}."
+            )
         return rgb_viz
-    try:
-        import cv2
-
-        return cv2.resize(
-            crop_to_simlingo_framing(rgb_viz),
-            (IMAGE_SHAPE_HWC[1], IMAGE_SHAPE_HWC[0]),
-            interpolation=cv2.INTER_AREA,
+    if rgb_viz.shape == IMAGE_SHAPE_HWC:
+        raise ValueError(
+            f"downscale_rgb_for_policy got a frame already at policy resolution "
+            f"{IMAGE_SHAPE_HWC} without already_processed=True. Refusing to guess whether it "
+            f"has been cropped: passing it through would feed SteerVLA the uncropped framing "
+            f"no checkpoint was trained on. Live frames arrive at {VIZ_IMAGE_SHAPE_HWC}."
         )
-    except Exception:
-        return _zeros_rgb_image()
+
+    import cv2
+
+    return cv2.resize(
+        crop_to_simlingo_framing(rgb_viz),
+        (IMAGE_SHAPE_HWC[1], IMAGE_SHAPE_HWC[0]),
+        interpolation=cv2.INTER_AREA,
+    )
 
 
 def rgb_viz_from_leaderboard_dict(sensor_dict: Dict[str, Any]) -> np.ndarray:
