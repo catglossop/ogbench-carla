@@ -80,37 +80,85 @@ def load_metadata(metadata_path: str | Path) -> dict[str, Any]:
 
 
 def _build_task_overview_block(metadata: dict[str, Any]) -> str:
-    """Render the episode's full routing-command plan as an overall 'task' for the VLM.
+    """Render the episode's routing-command plan, and where the ego currently sits in it.
 
     ``metadata["route_command_plan"]`` is the ordered list of maneuvers the ego will be told
     to perform over the whole route (precomputed at episode start, e.g. ``follow the road``
-    → ``go right at the next intersection`` → ``follow the road``). Giving the VLM the whole
-    plan up front lets it judge whether the policy is progressing through the route correctly
-    rather than only reacting to the single command visible at each instant.
+    -> ``go right at the next intersection`` -> ``follow the road``), each keyed by the
+    cumulative ``start_distance_m`` at which it begins. Giving the VLM the whole plan up front
+    lets it judge whether the policy is progressing through the route correctly rather than
+    only reacting to the single command visible at each instant.
+
+    The plan is only half of it: without knowing how far along the route the ego actually is,
+    the plan cannot be aligned to what is on screen. So this block also states the ego's
+    position in METRES (the same unit the plan is keyed in), the routing command in force, and
+    every command change observed during the window. That is what makes a divergence legible --
+    "the command from 79 m was 'go left at the next intersection' and the ego went straight
+    through the junction at t=6.2s" -- rather than something the VLM has to infer.
     """
     plan = metadata.get("route_command_plan") or []
-    if not isinstance(plan, list) or not plan:
+    sections: list[str] = []
+
+    plan_lines: list[str] = []
+    if isinstance(plan, list):
+        for i, item in enumerate(plan):
+            if not isinstance(item, dict):
+                continue
+            command = str(item.get("command", "")).strip()
+            if not command:
+                continue
+            dist = item.get("start_distance_m")
+            if dist is not None:
+                plan_lines.append(f"  {i + 1}. {command} (from ~{float(dist):.0f} m along the route)")
+            else:
+                plan_lines.append(f"  {i + 1}. {command}")
+    if plan_lines:
+        sections.append(
+            "\nOverall task — the full sequence of routing commands the ego is given over this "
+            "route, in order (the video may cover only part of it):\n" + "\n".join(plan_lines)
+        )
+
+    # Where the ego actually is, in the plan's own units. Without this the plan above cannot be
+    # aligned against the video at all.
+    here = metadata.get("route_distance_end_m")
+    total = metadata.get("route_total_distance_m")
+    started = metadata.get("route_distance_start_m")
+    if here is not None:
+        pos = f"\nWhere the ego is now: ~{float(here):.0f} m along the route"
+        if total:
+            pos += f" (of ~{float(total):.0f} m total)"
+        if started is not None:
+            pos += f"; it entered this window at ~{float(started):.0f} m"
+        sections.append(pos + ".")
+
+    current = str(metadata.get("current_routing_command") or "").strip()
+    if current:
+        sections.append(f'\nThe routing command in force at the END of this window is: "{current}"')
+
+    changes = metadata.get("routing_commands_in_window") or []
+    if isinstance(changes, list) and len(changes) > 1:
+        change_lines = []
+        for c in changes:
+            if not isinstance(c, dict):
+                continue
+            cmd = str(c.get("command", "")).strip()
+            if not cmd:
+                continue
+            ts = c.get("video_timestamp_sec")
+            dist = c.get("route_distance_m")
+            when = f"t={float(ts):.2f}s" if ts is not None else "before the video starts"
+            where = f", ~{float(dist):.0f} m" if dist is not None else ""
+            change_lines.append(f"  - {when}{where}: {cmd}")
+        if change_lines:
+            sections.append(
+                "\nRouting commands issued during this window (the command changes as the ego "
+                "advances; judge each moment against the command in force AT that moment):\n"
+                + "\n".join(change_lines)
+            )
+
+    if not sections:
         return ""
-    lines: list[str] = []
-    for i, item in enumerate(plan):
-        if not isinstance(item, dict):
-            continue
-        command = str(item.get("command", "")).strip()
-        if not command:
-            continue
-        dist = item.get("start_distance_m")
-        if dist is not None:
-            lines.append(f"  {i + 1}. {command} (after ~{float(dist):.0f} m along the route)")
-        else:
-            lines.append(f"  {i + 1}. {command}")
-    if not lines:
-        return ""
-    body = "\n".join(lines)
-    return (
-        "\nOverall task — the full sequence of routing commands the ego is given over this "
-        "route, in order (the video may cover only part of it):\n"
-        f"{body}\n"
-    )
+    return "\n".join(sections) + "\n"
 
 
 def _build_route_progress_block(metadata: dict[str, Any]) -> str:
@@ -224,7 +272,15 @@ def _build_per_timestamp_block(metadata: dict[str, Any]) -> str:
         "braking; a sustained near-zero or negative stretch marks behavior the environment itself "
         "scores as bad. Use it as corroborating evidence, not as the verdict: it cannot see "
         "everything you can in the video, so flag behavior that looks wrong even where the reward "
-        "does not, and say so when the two disagree:\n"
+        "does not, and say so when the two disagree.\n\n"
+        "WARNING — ``subtask``, ``reasoning`` and ``prompt`` are the POLICY'S OWN output at that "
+        "moment, not ground truth. They are frequently WRONG, and correcting them is the entire "
+        "point of this review. In particular the policy routinely asserts a RED light when the "
+        "light is green. Treat anything it says about a traffic light, a stop sign, a hazard or a "
+        "leading vehicle as an unverified claim, NEVER as evidence, and never repeat it back as "
+        "your own finding. Establish the signal state yourself from traffic flow. Where the "
+        "policy's reasoning contradicts what the flow shows, the policy is wrong: say so "
+        "explicitly and raise a BAD event for it:\n"
         f"```json\n{json.dumps(per_timestamp, indent=2)}\n```\n"
     )
 
@@ -233,8 +289,24 @@ def build_coaching_prompt(
     metadata: dict[str, Any],
     *,
     include_plots: bool = False,
+    stage: str = "both",
+    scene_analysis: str = "",
 ) -> str:
-    """Prompt shared by Gemini and Perceptron coaches."""
+    """Prompt shared by Gemini and Perceptron coaches.
+
+    ``stage`` selects which of the two reasoning steps the returned prompt asks for:
+
+    * ``"both"`` (default) — Step 1 and Step 2 in one call, returning the events JSON. This is
+      the single-call behaviour the pipeline has always had; unchanged byte-for-byte.
+    * ``"scene"`` — header + Step 1 only, answered as prose. The scene/traffic-flow analysis on
+      its own, so it can be inspected and fed forward.
+    * ``"events"`` — header + Step 2 + the events schema, with ``scene_analysis`` (the Step-1
+      answer) injected as established context instead of being re-derived.
+
+    Splitting the two is what ``cast_relabel.two_stage_review`` runs: Step 1's answer becomes an
+    explicit, reviewable artifact rather than hidden intermediate reasoning, and Step 2 is then
+    bound to it. Both stages see the same video and the same header.
+    """
     # Summarise metadata compactly: top-level fields + collision events only.
     summary_keys = ("episode", "route", "episode_steps", "success",
                     "termination_reason", "route_progress_start_pct",
@@ -296,7 +368,7 @@ def build_coaching_prompt(
     # until something has actually been corrected.
     memory_block = str(metadata.get("correction_memory") or "")
 
-    return textwrap.dedent(
+    _header = textwrap.dedent(
         f"""
         You are reviewing a driving rollout video for an autonomous vehicle policy. You are seeing the view of the ego vehicle from the perspective of the ego vehicle's camera.
         {task_overview_block}
@@ -315,6 +387,11 @@ def build_coaching_prompt(
         
         Everything that is violated in the below steps should be in the description of the event.
         
+        """
+    )
+
+    _step1 = (
+        f"""\
         ** Step 1 **
         Determine the state of the vehicle and of the other agents (vehicles, pedestrians, cyclists, etc.) in the video. 
         Ask these questions to guide your analysis:
@@ -322,7 +399,7 @@ def build_coaching_prompt(
         - What other vehicles are there? What lanes are they in? 
         - Is there a leading vehicle? If so, how far ahead is it? Is it stopped or moving? 
         - Are there any pedestrians or cyclists in the video? If so, what are they doing? 
-        - If you can see traffic lights or stop signs, where are they and what are their colors? Timing is important here.
+        - What is the state of the traffic light in front of the vehicle? Is there a stop sign?
         - IMPORTANT: Always also infer the traffic light states from the traffic flow. Vision can be unreliable, so you must use the traffic flow to infer the traffic light states.
           For example: 
             * cross-traffic moving through the junction => our direction is almost certainly red
@@ -339,6 +416,11 @@ def build_coaching_prompt(
           performing right now (following the road, turning left/right at the intersection,
           changing lanes, etc.), and is it in the correct lane and position to do so?
 
+"""
+    )
+
+    _step2 = (
+        f"""\
         ** Step 2 **
         Analyze the vehicle's behavior in the video. For example, you can ask these questions to guide your analysis: 
 
@@ -350,6 +432,32 @@ def build_coaching_prompt(
         relied on (e.g. "cross-traffic was crossing, so our light was red"). If Step 1 concluded
         the state was UNKNOWN, do not raise a GOOD/BAD event that depends on it at all — skip
         that question rather than guessing.
+
+        PRIORITY — READ BEFORE USING THE CHECKLIST. **Completing the route is the primary
+        objective.** The rules below are CONSTRAINTS on how the vehicle makes progress, not goals
+        in their own right. A vehicle that breaks no rules but does not advance along the route has
+        FAILED, and must be judged as failing. When you are weighing an event, ask "did this
+        advance the route?" first, and "was it safe and legal?" second — both must hold, but a
+        stationary vehicle scores no points for safety.
+
+        Excessive caution is a REAL failure mode and you must flag it as BAD, just as you would a
+        collision. In particular, treat all of the following as BAD whenever there is no red
+        light (as established from traffic flow in Step 1), no stop sign, no close leading vehicle,
+        and no pedestrian/cyclist/yield obligation actually requiring it:
+          * stopping or crawling with a clear path ahead;
+          * waiting at a junction through a gap that was plainly large enough to take — an
+            unprotected left or right turn is meant to be COMPLETED, not waited out; if the
+            vehicle has been stopped for several seconds while cross-traffic has a usable gap,
+            that is BAD;
+          * abandoning a turn part-way, or stopping mid-junction, instead of clearing it;
+          * braking for an object that is not on the vehicle's path, or that it has already passed;
+          * creeping well below the speed limit on an open road.
+        Do NOT invent a hazard to justify a stop. If you cannot point to a specific, visible
+        reason the vehicle had to stop, then the stop was unjustified and the event is BAD.
+
+        Conversely, do not reward hesitancy: a "safe" event that consists of the vehicle sitting
+        still with the way clear is not GOOD. Only mark GOOD for stopping when you can name the
+        specific hazard or signal that required it.
 
         - Does the vehicle's behavior conflict with the route command plan? (if yes, BAD; if no, GOOD). 
         - Is the vehicle maintaining a safe distance from the front car? (if yes, GOOD; if no, BAD)
@@ -366,14 +474,20 @@ def build_coaching_prompt(
         - Does the vehicle properly follow the route and traffic laws? (if yes, GOOD; if no, BAD)
         - Does the vehicle yield to pedestrians and cyclists when necessary? (if yes, GOOD; if no, BAD)
         - Does the vehicle follow the rules of the road (turning from left or right most lane when making a turn, stopping at stop signs and red lights, etc.)? (if yes, GOOD; if no, BAD)
-        - Is the vehicle making progress along the route toward completion? Completing the route
-          is a primary objective (see the route-progress section above). If route progress is
-          below 100% and the vehicle is stopped or crawling with a clear gap ahead and NO valid
-          reason to stop (no red light/stop sign AS INFERRED FROM THE TRAFFIC FLOW in Step 1,
-          no close leading vehicle, no pedestrian/cyclist,
-          no yield), that is BAD — it should accelerate and move forward. Conversely, resuming
-          motion and advancing the route when the way is clear is GOOD. (Do NOT penalize stopping
-          that is justified by a red light, stop sign, close leading vehicle, or a pedestrian/yield.)
+        - Is the vehicle making progress along the route toward completion? THIS IS THE MOST
+          IMPORTANT QUESTION IN THIS LIST. If route progress is below 100% and the vehicle is
+          stopped or crawling with a clear gap ahead and NO valid reason to stop (no red light/stop
+          sign AS INFERRED FROM THE TRAFFIC FLOW in Step 1, no close leading vehicle, no
+          pedestrian/cyclist, no yield), that is BAD — it should accelerate and move forward.
+          Check the route-progress plot: any stretch where progress stops climbing while the
+          vehicle was free to move is a BAD event, and you should say what it should have done
+          instead (take the gap, complete the turn, resume speed). Conversely, resuming motion and
+          advancing the route when the way is clear is GOOD. (Do NOT penalize stopping that is
+          genuinely justified by a red light, stop sign, close leading vehicle, or a
+          pedestrian/yield — but require that justification to be visible, not assumed.)
+        - Is the vehicle completing the maneuver the routing command asks for? A turn that is
+          begun and then abandoned, or a junction the vehicle enters and then stalls in, is BAD:
+          the correction is to carry the turn through and clear the junction.
         - Is the vehicle an appropriate distance from the crosswalk at a red light (red as
           established from the traffic flow in Step 1)? If not, it should move forward to be
           closer to the crosswalk to not leave an unnecessary gap.
@@ -394,7 +508,12 @@ def build_coaching_prompt(
               "description": "Explanation of what went wrong, with the same traffic-flow evidence requirement. Example: 'Stayed stopped although the lead vehicle pulled away at t=16.5s and the queue ahead discharged, so our signal had turned green.'",
               "correction": "Concrete instruction for how to fix the behavior."
             }}
-          ]
+          ],
+          "route_divergence": {{
+            "diverged": false,
+            "timestamp_sec": null,
+            "reason": ""
+          }}
         }}
 
         Rules:
@@ -402,6 +521,10 @@ def build_coaching_prompt(
         - ``label`` must be exactly ``GOOD`` or ``BAD``.
         - Include ``correction`` only for ``BAD`` events (empty string otherwise).
         - Prefer 3–12 high-signal events rather than narrating every second.
+        - If route progress is below 100% and there is ANY stretch of the window where progress
+          stopped climbing, you MUST emit at least one event about it — BAD with a corrective
+          instruction if the vehicle was free to move, GOOD naming the specific hazard or signal
+          if the halt was genuinely required. Silence about a stall is not an option.
         - MANDATORY: any event whose description mentions a red/green light, a stop light, a
           signal or a stop sign MUST also state the traffic-flow evidence that established that
           state (cross-traffic moving, the queue discharging, the lead vehicle pulling away or
@@ -409,8 +532,83 @@ def build_coaching_prompt(
           acceptable on its own — the lamp is often a few washed-out pixels and cannot be read
           reliably. If you could not establish the state from traffic flow, do not emit the
           event at all.
+
+        ``route_divergence`` — did the ego LEAVE THE PLANNED ROUTE during this window?
+
+        Set ``diverged: true`` only when the ego committed to a maneuver that CONTRADICTS the
+        routing command in force at that moment — it is now driving somewhere the plan never
+        asked it to go. Concretely: the command was "go left at the next intersection" and the
+        ego went straight through or turned right; the command was to turn and the ego drove past
+        the junction entirely; the ego took a different branch, exit or side road than the one the
+        command named. Use the routing commands listed above (with the metre marks and the times
+        at which each took effect) to decide which command was in force — judge the maneuver
+        against the command active AT THAT MOMENT, not the one at the end of the window.
+
+        ``timestamp_sec`` is the moment the ego became committed to the wrong path — the point in
+        the video where the wrong branch was taken and recovery within the plan was no longer
+        happening (e.g. when it entered the wrong lane of the junction, or when its rear axle
+        cleared the junction on the wrong heading). Give the EARLIEST such moment, not when the
+        consequence became obvious.
+
+        This flag is destructive: everything from ``timestamp_sec`` onward is discarded and
+        never used to train the policy, because once the ego is off-route the situations it
+        encounters no longer relate to the task it was given. So be conservative and apply it
+        ONLY to a genuine wrong-branch maneuver:
+        - Being slow, hesitant, stopped, or failing to make progress is NOT divergence. It is
+          still on the planned route. Emit a BAD event for it instead.
+        - Lane drift, a wide turn, brief wander over a lane line, clipping a curb, or being
+          poorly positioned within the correct road is NOT divergence.
+        - A collision is NOT by itself divergence (it is handled separately). Only flag it if
+          the ego also ended up on a different road than the plan called for.
+        - If you are NOT confident the ego took a different path than the command asked for,
+          set ``diverged: false``. False is the safe answer; when in doubt, choose it.
+
+        When ``diverged`` is false, use ``timestamp_sec: null`` and ``reason: ""``. When it is
+        true, ``reason`` must name the command that was in force and the maneuver actually
+        performed — e.g. "command from 79 m was 'go left at the next intersection'; the ego drove
+        straight through the junction at t=6.2s and continued north on the through road."
         """
-    ).strip()
+    )
+
+    if stage == "scene":
+        return (
+            _header
+            + _step1
+            + textwrap.dedent(
+                """
+                Answer Step 1 now, and ONLY Step 1. Do not judge the driving, do not list
+                GOOD/BAD events, and do not return JSON — that is the next call's job.
+
+                Write prose under one heading per question above, in the order they are asked.
+                Be concrete and timestamped where a fact changes during the window (e.g. "0.0-4.5s
+                the lead vehicle is stopped ~8m ahead; from 4.5s it pulls away"). For the traffic
+                signal, state the conclusion as one of RED / GREEN / UNKNOWN and name the specific
+                flow evidence that established it; if the evidence does not settle it, say UNKNOWN
+                rather than guessing. This answer is carried verbatim into the next call and is the
+                only scene description it will have, so anything you omit here is lost.
+                """
+            )
+        ).strip()
+
+    if stage == "events":
+        scene_block = ""
+        if str(scene_analysis or "").strip():
+            scene_block = textwrap.dedent(
+                """
+                ** Step 1 (already completed) **
+                A previous call watched this same video and established the scene below. TREAT IT
+                AS GIVEN. Do not re-derive it, and in particular do not re-read the traffic light
+                from the lamp — the signal state below was settled from traffic flow and is the
+                one you must use. If it says UNKNOWN, do not raise any event that depends on the
+                signal.
+                ```
+                """
+            ) + str(scene_analysis).strip() + "\n```\n"
+        return (_header + scene_block + _step2).strip()
+
+    if stage != "both":
+        raise ValueError(f"stage must be 'both', 'scene' or 'events'; got {stage!r}")
+    return (_header + _step1 + _step2).strip()
 
 
 def _extract_json_payload(text: str) -> dict[str, Any]:
@@ -427,6 +625,47 @@ def _extract_json_payload(text: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Coach response must be a JSON object.")
     return payload
+
+
+def parse_route_divergence(text: str) -> dict[str, Any]:
+    """Extract the ``route_divergence`` verdict from a Step-2 response.
+
+    Returns ``{"diverged": bool, "timestamp_sec": float | None, "reason": str}``. Absent or
+    malformed input yields ``diverged=False``: this flag discards every high-level sample from
+    ``timestamp_sec`` onward, so anything short of an explicit, well-formed ``true`` must fail
+    closed to "no divergence" rather than silently throwing the window's training data away.
+
+    A ``diverged=true`` with no usable ``timestamp_sec`` is also downgraded to False — without a
+    moment there is nothing to cut at, and cutting the whole window on an unlocated claim would
+    be strictly worse than keeping it.
+    """
+    default: dict[str, Any] = {"diverged": False, "timestamp_sec": None, "reason": ""}
+    try:
+        payload = _extract_json_payload(text)
+    except Exception:  # noqa: BLE001 - the events parse reports its own failure; don't double-raise
+        return default
+    raw = payload.get("route_divergence")
+    if not isinstance(raw, dict):
+        return default
+    if raw.get("diverged") is not True:
+        return default
+    ts = raw.get("timestamp_sec")
+    try:
+        ts_f = float(ts)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        print(
+            "[vlm_feedback] route_divergence=true with no usable timestamp_sec "
+            f"({ts!r}); ignoring the divergence rather than cutting the whole window.",
+            flush=True,
+        )
+        return default
+    if ts_f < 0.0:
+        return default
+    return {
+        "diverged": True,
+        "timestamp_sec": ts_f,
+        "reason": str(raw.get("reason", "")).strip(),
+    }
 
 
 def parse_coach_response(text: str) -> list[CoachEvent]:
@@ -450,8 +689,29 @@ class VLMCOach(ABC):
         *,
         plot_paths: list[Path] | None = None,
         include_plots_in_prompt: bool = False,
+        out: dict[str, Any] | None = None,
     ) -> list[CoachEvent]:
         """Return timestamped GOOD/BAD events for a rollout video."""
+
+    def analyze_two_stage(
+        self,
+        video_path: str | Path,
+        metadata: dict[str, Any],
+        *,
+        plot_paths: list[Path] | None = None,
+        include_plots_in_prompt: bool = False,
+    ) -> dict[str, Any]:
+        """Run the review as two calls over the SAME video and return both transcripts.
+
+        Call 1 answers Step 1 only (scene + traffic-flow state) as prose. Call 2 is given that
+        answer as established context and does Step 2, returning the events JSON. Same video, same
+        header, both times.
+
+        Returns ``{"events", "scene_analysis", "stage1_prompt", "stage1_response",
+        "stage2_prompt", "stage2_response"}`` so the intermediate reasoning becomes a reviewable
+        artifact instead of being discarded inside a single call.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support two-stage analysis.")
 
     def complete_text(self, prompt: str) -> str:
         """Text-only completion (used for per-chunk feedback refinement)."""
@@ -590,7 +850,63 @@ class GeminiVLMCOach(VLMCOach):
         *,
         plot_paths: list[Path] | None = None,
         include_plots_in_prompt: bool = False,
+        out: dict[str, Any] | None = None,
     ) -> list[CoachEvent]:
+        parts = self._upload_media(video_path, plot_paths, include_plots_in_prompt)
+        prompt = build_coaching_prompt(
+            metadata, include_plots=bool(include_plots_in_prompt and plot_paths)
+        )
+        parts = parts + [{"text": prompt}]
+        text = _gemini_generate_content(self.model, [{"parts": parts}], self.api_key)
+        # ``analyze`` parses in place and returns only events, so the raw response would other-
+        # wise be unrecoverable -- and the route_divergence verdict rides in that same JSON.
+        # ``out`` is the single-call path's way to get at it without changing the return type.
+        if out is not None:
+            out["response"] = text
+            out["route_divergence"] = parse_route_divergence(text)
+        return parse_coach_response(text)
+
+    def analyze_two_stage(
+        self,
+        video_path: str | Path,
+        metadata: dict[str, Any],
+        *,
+        plot_paths: list[Path] | None = None,
+        include_plots_in_prompt: bool = False,
+    ) -> dict[str, Any]:
+        """Two calls, one upload. See :meth:`VLMCOach.analyze_two_stage`."""
+        # The video is uploaded ONCE and the resulting file_uri reused for both calls, so the
+        # split costs a second generate_content but not a second upload.
+        media = self._upload_media(video_path, plot_paths, include_plots_in_prompt)
+        with_plots = bool(include_plots_in_prompt and plot_paths)
+
+        p1 = build_coaching_prompt(metadata, include_plots=with_plots, stage="scene")
+        r1 = _gemini_generate_content(
+            self.model, [{"parts": media + [{"text": p1}]}], self.api_key
+        )
+        p2 = build_coaching_prompt(
+            metadata, include_plots=with_plots, stage="events", scene_analysis=r1
+        )
+        r2 = _gemini_generate_content(
+            self.model, [{"parts": media + [{"text": p2}]}], self.api_key
+        )
+        return {
+            "events": parse_coach_response(r2),
+            "route_divergence": parse_route_divergence(r2),
+            "scene_analysis": r1,
+            "stage1_prompt": p1,
+            "stage1_response": r1,
+            "stage2_prompt": p2,
+            "stage2_response": r2,
+        }
+
+    def _upload_media(
+        self,
+        video_path: str | Path,
+        plot_paths: list[Path] | None,
+        include_plots_in_prompt: bool,
+    ) -> list[Any]:
+        """Upload the window video (+ optional plots) and return the Gemini ``parts`` prefix."""
         path = Path(video_path)
         if not path.is_file():
             raise FileNotFoundError(f"Video not found: {path}")
@@ -638,13 +954,7 @@ class GeminiVLMCOach(VLMCOach):
                     }
                 )
 
-        prompt = build_coaching_prompt(
-            metadata, include_plots=bool(include_plots_in_prompt and plot_paths)
-        )
-        parts.append({"text": prompt})
-
-        text = _gemini_generate_content(self.model, [{"parts": parts}], self.api_key)
-        return parse_coach_response(text)
+        return parts
 
     def complete_text(self, prompt: str) -> str:
         """Text-only completion (used for per-chunk feedback refinement)."""
@@ -685,6 +995,7 @@ class PerceptronVLMCOach(VLMCOach):
         *,
         plot_paths: list[Path] | None = None,
         include_plots_in_prompt: bool = False,
+        out: dict[str, Any] | None = None,
     ) -> list[CoachEvent]:
         try:
             from perceptron import question, video

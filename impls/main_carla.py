@@ -3007,7 +3007,28 @@ def run_online_carla(
             "control_steer": float(drive["control_steer"]),
             "control_brake": float(drive["control_brake"]),
             "collision": bool(collision_occurred),
+            # Counted-infraction deltas, not mere sensor contact: >0 marks the step at which the
+            # leaderboard registered a NEW collision / outside-route event. cast_relabel uses these
+            # to cut high-level supervision for the remainder of an episode that has gone off the
+            # rails -- post-failure states are far out of distribution and teach nothing about
+            # strategy. ``termination_reason`` catches crash_stuck (collided, then never recovered).
+            "collision_delta": float(step_info.get("collision_delta", 0.0)),
+            "outside_route_delta": float(step_info.get("outside_route_delta", 0.0)),
+            "termination_reason": step_info.get("termination_reason"),
             "route_progress_pct": float(step_info.get("route_progress_pct", 0.0)),
+            # Progress in METRES along the plan, plus the route's total length. The routing-command
+            # plan keys each maneuver by ``start_distance_m``, so a percentage cannot be lined up
+            # against it; these two let the VLM review say which plan step the ego is actually on.
+            "route_distance_m": float(step_info.get("route_distance_m", 0.0)),
+            "route_total_distance_m": float(step_info.get("route_total_distance_m", 0.0)),
+            # The routing command in force at this step. Recorded per step so a divergence from the
+            # plan (going straight where the command says turn left) is attributable to a moment.
+            "routing_command_id": int(step_info.get("routing_command_id", 4)),
+            "routing_command": str(
+                step_info.get("routing_command_text")
+                or (state_raw.get("routing_command") if isinstance(state_raw, dict) else "")
+                or ""
+            ),
             # Env reward for this step (``_compute_reward_and_info``). Recorded so the VLM coaches
             # (window review + CAST credit assignment) can see the actual objective the RL side is
             # optimizing, instead of inferring it from speed / progress / collisions.
@@ -5222,6 +5243,7 @@ def _run_residual_entry(config):
         )
         if FLAGS.eval_only:
             _write_eval_summary(FLAGS.save_dir, route=str(FLAGS.route), seed=int(FLAGS.seed))
+        _mark_run_complete()
     finally:
         try:
             env.close()
@@ -5581,6 +5603,7 @@ def _run_grpo_entry(config):
             env, steervla_actor, vla_sample_fn, coach, config, obs,
             raw_holder=raw_holder, exec_cfg=exec_cfg,
         )
+        _mark_run_complete()
     finally:
         try:
             env.close()
@@ -5708,12 +5731,36 @@ def _run_dsrl_entry(config):
         )
         if FLAGS.eval_only:
             _write_eval_summary(FLAGS.save_dir, route=str(FLAGS.route), seed=int(FLAGS.seed))
+        _mark_run_complete()
     finally:
         try:
             env.close()
         except Exception:
             pass
         wandb.finish()
+
+
+def _mark_run_complete() -> None:
+    """Touch ``$OGBENCH_DONE_MARKER`` once an online run has finished its step budget.
+
+    CARLA routinely aborts during teardown -- ``std::runtime_error: set_actor_simulate_physics:
+    Actor could not be found in the registry`` -- which raises SIGABRT and so exits >= 128.
+    run_carla.sh cannot tell that apart from a genuine mid-run SIGSEGV, so it treats a run that
+    already reached ``online_steps`` as a crash and relaunches it from step 0. Observed twice on
+    2026-09-03/04, each time re-running a finished ~4h job (and with MAX_RETRIES=50 it was
+    prepared to do so another 49 times).
+
+    Written only on the success path, so its presence means "the loop finished"; its absence
+    leaves the existing retry behaviour intact for real crashes. Unset env var (any launcher
+    other than run_carla.sh) -> no-op.
+    """
+    path = os.environ.get("OGBENCH_DONE_MARKER")
+    if not path:
+        return
+    try:
+        Path(path).write_text("complete\n", encoding="utf-8")
+    except OSError as exc:  # never let bookkeeping take down a finished run
+        print(f"[main_carla] could not write done-marker {path}: {exc}", flush=True)
 
 
 def _resolve_carla_env_config(config) -> tuple[Optional[str], Optional[dict], Optional[dict]]:

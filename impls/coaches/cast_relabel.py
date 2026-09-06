@@ -85,7 +85,7 @@ def _shrink_frames_for_saving(frames, max_width: int = _SAVED_VIDEO_MAX_WIDTH):
 import concurrent.futures
 import threading
 
-from coaches.vlm_feedback import CoachEvent, create_coach
+from coaches.vlm_feedback import CoachEvent, build_coaching_prompt, create_coach
 
 # Default number of subtask suggestions produced per chunk that needs improvement.
 DEFAULT_NUM_SUBTASK_SUGGESTIONS = 3
@@ -143,6 +143,9 @@ SEED_SUBTASKS: tuple[str, ...] = (
     "The vehicle smoothly adjusts course to the right while cautiously maintaining speed behind the police car.",
     "The vehicle maintains a steady course, following the black car ahead at a normal pace.",
     "The vehicle remains stopped normally at the red traffic light.",
+    "The vehicle accelerates behind the black car at 8.8 meters, following it through the green traffic light.",
+    "The vehicle accelerated normally through the green traffic light.",
+    "The vehicle accelerates normally through the green traffic light in 4.8 meters.",
     "The vehicle smoothly decelerates to a stop, cautiously adjusting course to the left due to a pedestrian.",
     "The vehicle maintains a steady speed while following the route, staying behind the dark green SUV.",
     "The vehicle smoothly follows the route, cautiously reducing speed through the junction with steady lane keeping.",
@@ -163,9 +166,14 @@ SEED_SUBTASKS: tuple[str, ...] = (
     "The vehicle accelerates through a wide left turn, cautiously monitoring oncoming traffic.",
     "Cautiously adjusting course, the vehicle waits for a gap before changing lanes to the lane with oncoming traffic.",
     "The vehicle remains stopped behind the black car at 8.8 meters, obeying the red traffic light.",
+    "The vehicle proceeds through the junction normally due to a green traffic light.",
+    "The vehicle accelerates behind the maroon car, normally proceeding on the green traffic light.",
+    "The vehicle accelerates steadily as the queue ahead discharges through the green traffic light.",
     "The vehicle follows the route and maintains reduced speed with a steady course.",
     "The vehicle cautiously follows the route and remains stopped behind the black car to the front right.",
     "The vehicle remains stopped behind the front black car due to a red traffic light, normally maintaining its position.",
+    "The vehicle follows the front black car forward through the green traffic light, normally maintaining its position.",
+    "The vehicle accelerates normally at a green traffic light.",
     "The vehicle remained stopped, steadily maintaining its position behind the maroon SUV.",
     "The vehicle normally follows the route, accelerating and adjusting right.",
     "The vehicle cautiously waits for a gap in traffic before changing lanes.",
@@ -238,11 +246,16 @@ SEED_SUBTASKS: tuple[str, ...] = (
     "The vehicle maintains steady lane keeping, cautiously following the silver car ahead at 19.2 meters.",
     "The vehicle follows the route, accelerating normally to keep pace with the dark green SUV ahead.",
     "The vehicle remains stopped normally due to the red traffic light in 4.8 meters.",
+    "The vehicle accelerates normally at the green traffic light.",
+    "The vehicle moves off smoothly as the traffic light turns green, maintaining steady lane keeping.",
 )
 
 SEED_REASONING: tuple[str, ...] = (
     "Follow the route.",
     "Follow the route. Remain stopped to stay behind the maroon car that is to the front that is stopped because of a red traffic light.",
+    "Follow the route. Accelerate to stay behind the maroon car that is to the front that is pulling away because of a green traffic light.",
+    "Follow the route. Accelerate to stay behind the black car that is to the front at 8.0 meters that is moving off because of a green traffic light.",
+    "Follow the route. Maintain the speed to drive through the junction because the traffic light is green.",
     "Follow the route. Maintain the reduced speed to stay behind the black car that is to the front.",
     "Follow the route. Decelerate due to the stop sign in 1.0 meters.",
     "Follow the route. Decelerate to stay behind the black bicycle that is to the front.",
@@ -253,8 +266,12 @@ SEED_REASONING: tuple[str, ...] = (
     "Follow the route. Decelerate to stay behind the black car that is to the front.",
     "Follow the route. Decelerate to drive with the target speed.",
     "Follow the route. Remain stopped to stay behind the black car that is to the front that is stopped because of a red traffic light.",
+    "Follow the route. Accelerate to stay behind the black car that is to the front that is moving off because of a green traffic light.",
+    "Follow the route. Accelerate to stay behind the gray car that is to the front that is moving off because of a green traffic light.",
     "Follow the route. Remain stopped to stay behind the maroon car that is to the front in 4.7 meters.",
     "Turn right. Remain stopped due to the red traffic light in 1.5 meters.",
+    "Turn right. Accelerate due to the green traffic light in 1.5 meters.",
+    "Turn left. Accelerate because the traffic light is green and the oncoming vehicles are stopped.",
     "Follow the route. Accelerate because the traffic light is green but pay attention to the vehicle coming towards the junction.",
     "Follow the route. Accelerate to follow the black car that is to the front.",
     "Follow the route. Maintain your current speed.",
@@ -679,6 +696,18 @@ def build_credit_relabel_prompt(
         moments (below). Now assign that credit to the specific action chunks the policy
         executed, and for each chunk propose subtasks that would improve the behavior.
 
+        PRIORITY. **Completing the route is the primary objective.** Safety and traffic rules are
+        constraints on how the vehicle makes progress, not goals in their own right — a chunk in
+        which the vehicle sits still, having broken no rule but advanced the route not at all, is a
+        FAILING chunk, not a neutral one. Over-conservatism is as real a defect as recklessness and
+        must be labeled BAD with the same willingness: stopping or crawling with a clear path,
+        waiting out a gap that was plainly takeable, hesitating at or stalling inside a junction
+        instead of completing the turn, braking for something not on the vehicle's path, or
+        creeping far below the speed limit on an open road. Whenever you relabel such a chunk, the
+        corrected subtask must be one that MOVES the vehicle along the route (take the gap,
+        complete the turn, resume speed) — never a further-slowing subtask. Do not relabel a chunk
+        toward stopping unless you can name the specific visible hazard or signal that required it.
+
         Credit is CAUSAL, not just temporal. A bad driving outcome is usually already decided
         several chunks before it becomes visible: the vehicle carried too much speed into the
         approach, drifted toward the wrong lane, started braking too late, or committed to a gap
@@ -704,7 +733,13 @@ def build_credit_relabel_prompt(
 
         Action chunks in this window. ``original_subtask`` is the subtask the policy ACTUALLY
         executed over that chunk — it is what you are deciding whether to keep or replace, and the
-        sequence of them across chunks is what you are smoothing. ``reward_total_sum`` /
+        sequence of them across chunks is what you are smoothing. It is the policy's OWN output
+        and is frequently WRONG — most commonly it claims a red traffic light when the light was
+        green, or names a hazard that is not present. Never treat it as evidence about the scene:
+        the events and established scene above are what settle that. Where an ``original_subtask``
+        contradicts them, that chunk is BAD and its subtask MUST be replaced rather than kept, and
+        the replacement must describe what the scene actually showed (for a green light, a subtask
+        about proceeding or accelerating — not a stopped-at-red one). ``reward_total_sum`` /
         ``reward_total_mean`` /
         ``reward_total_min`` are the environment reward earned over each chunk's steps — the
         objective the policy is trained on. It rises with route progress and falls with collisions,
@@ -757,6 +792,10 @@ def build_credit_relabel_prompt(
           vehicle stopped or crawled prematurely while the route is unfinished and the way
           ahead is clear (no red light, stop sign, close leading vehicle, or pedestrian/yield),
           suggest a subtask that has it accelerate and make forward progress along the route.
+          The same applies to a chunk that waits out a usable gap at a junction, or that
+          hesitates or stalls part-way through a turn: the corrective subtask is to take the gap
+          and carry the turn through, NOT to keep waiting. Prefer the progress-making correction
+          whenever both a progress-making and a further-slowing subtask would be defensible.
           For GOOD or null chunks, keep the chunk's ``original_subtask`` verbatim.
           DO NOT USE "reverse" or "back up" or "backwards" OR ANYTHING LIKE THIS IN THE SUBTASK.
           This will not be understood by the model and will destroy the training signal.
@@ -807,6 +846,9 @@ def build_credit_relabel_prompt(
         - Never exceed {num_suggestions} suggested subtasks per chunk.
         - suggested_reasoning must be "" unless the chunk is BAD and you changed its subtask.
         - credit_source must be "" unless the chunk is BAD.
+        - A chunk over which route progress did not increase, while the vehicle was free to move,
+          is BAD (direct) — not null. Treat a flat stretch of route progress with no visible
+          hazard as an event in its own right, with a subtask that gets the vehicle moving again.
         - Only walk blame back as far as it is genuinely actionable: stop once the hazard was not
           yet observable from the vehicle's viewpoint, or the situation was still comfortably
           recoverable by the chunks that follow. Do not blanket every preceding chunk in the
@@ -912,11 +954,24 @@ def generate_cast_relabel(
     plot_paths: list[Path] | None = None,
     include_plots_in_prompt: bool = False,
     debug_task: bool = False,
+    two_stage: bool = False,
+    out_calls: dict[str, Any] | None = None,
 ) -> tuple[list[CoachEvent], dict[str, Any]]:
     """Full pipeline for one window: review -> credit assignment -> subtask suggestion.
 
     Returns ``(events, cast_relabel_json)``.
+
+    ``two_stage`` splits the review into two calls over the same video — Step 1 (scene +
+    traffic-flow state) answered as prose, then Step 2 (GOOD/BAD events) with that answer given
+    as established context. Costs one extra generate_content per window (the video is uploaded
+    once either way) and makes the scene reasoning an inspectable artifact rather than hidden
+    intermediate tokens.
+
+    ``out_calls``, when given, is filled in place with every prompt and raw response this window
+    produced (review + credit). Nothing else reads it; it exists so the caller can persist the
+    transcript for the review viewer.
     """
+    calls: dict[str, Any] = out_calls if out_calls is not None else {}
     chunk_specs = build_action_chunk_specs(
         metadata,
         steps_per_chunk=steps_per_chunk,
@@ -927,12 +982,77 @@ def generate_cast_relabel(
     # encoded, so the chunk time ranges are on the same clock as the events the VLM reads off it.
     chunk_specs = retime_chunk_specs(chunk_specs, metadata)
     # Step 2: VLM watches the window and flags what went well (GOOD) / poorly (BAD).
-    events = coach.analyze(
-        video_path,
-        metadata,
-        plot_paths=plot_paths,
-        include_plots_in_prompt=include_plots_in_prompt,
-    )
+    calls["two_stage"] = bool(two_stage)
+    if two_stage:
+        staged = coach.analyze_two_stage(
+            video_path,
+            metadata,
+            plot_paths=plot_paths,
+            include_plots_in_prompt=include_plots_in_prompt,
+        )
+        events = staged["events"]
+        calls["scene_analysis"] = staged.get("scene_analysis", "")
+        calls["review_stage1_prompt"] = staged.get("stage1_prompt", "")
+        calls["review_stage1_response"] = staged.get("stage1_response", "")
+        calls["review_stage2_prompt"] = staged.get("stage2_prompt", "")
+        calls["review_stage2_response"] = staged.get("stage2_response", "")
+        divergence = staged.get("route_divergence") or {"diverged": False}
+    else:
+        review_out: dict[str, Any] = {}
+        events = coach.analyze(
+            video_path,
+            metadata,
+            plot_paths=plot_paths,
+            include_plots_in_prompt=include_plots_in_prompt,
+            out=review_out,
+        )
+        # Single-call path: record the prompt that was sent. The raw response is not returned by
+        # ``analyze`` (it parses in place), so it is recovered through ``out=`` above -- which is
+        # also how the route_divergence verdict, which rides in that same JSON, gets here.
+        calls["review_prompt"] = build_coaching_prompt(
+            metadata, include_plots=bool(include_plots_in_prompt and plot_paths)
+        )
+        calls["review_response"] = review_out.get("response", "")
+        divergence = review_out.get("route_divergence") or {"diverged": False}
+
+    # Route divergence: the ego took a branch the routing command did not ask for, so from this
+    # moment on it is solving a task nobody set it. Everything after the divergence is cut BEFORE
+    # credit assignment runs -- relabeling off-route chunks would spend VLM calls inventing
+    # corrections for a situation the policy should never have been in, and would then train on
+    # them. The chunk that straddles the divergence goes too: it contains the wrong turn itself.
+    calls["route_divergence"] = divergence
+    divergence_ts = divergence.get("timestamp_sec") if divergence.get("diverged") else None
+    if divergence_ts is not None:
+        kept_specs = [c for c in chunk_specs if float(c.video_time_end_sec) <= float(divergence_ts)]
+        dropped = len(chunk_specs) - len(kept_specs)
+        # Events after the divergence describe off-route driving; leaving them in would let the
+        # credit pass attribute post-divergence blame onto the on-route chunks we are keeping.
+        kept_events = [e for e in events if float(e.timestamp_sec) <= float(divergence_ts)]
+        print(
+            f"[cast_relabel] route divergence at t={float(divergence_ts):.2f}s "
+            f"({divergence.get('reason', '')!r}): dropping {dropped} of {len(chunk_specs)} chunks "
+            f"and {len(events) - len(kept_events)} of {len(events)} events before credit "
+            f"assignment.",
+            flush=True,
+        )
+        calls["route_divergence_dropped_chunks"] = dropped
+        # Chunk index, NOT an episode step: ActionChunkSpec.episode_step_start is window-relative
+        # and 1-based (see retime_chunk_specs), while the session's HL cutoff is compared against
+        # absolute episode steps. Mixing the two would cut at the wrong place, so the caller
+        # derives its absolute cutoff from the divergence timestamp instead.
+        cut_chunks = [
+            int(c.chunk_index)
+            for c in chunk_specs
+            if float(c.video_time_end_sec) > float(divergence_ts)
+        ]
+        calls["route_divergence_first_dropped_chunk"] = min(cut_chunks) if cut_chunks else None
+        chunk_specs, events = kept_specs, kept_events
+
+    calls["events"] = [
+        {"timestamp_sec": e.timestamp_sec, "label": e.label,
+         "description": e.description, "correction": e.correction}
+        for e in events
+    ]
     # Steps 3 + 4: credit assignment onto chunks + suggested subtasks per chunk.
     if not hasattr(coach, "complete_text"):
         raise RuntimeError(f"Coach {type(coach).__name__} does not support text completion.")
@@ -953,7 +1073,9 @@ def generate_cast_relabel(
             seed_subtasks=seed_subtasks,
             num_suggestions=num_suggestions,
         )
+    calls["credit_prompt"] = prompt
     response_text = coach.complete_text(prompt)
+    calls["credit_response"] = response_text
     creds = parse_credit_relabel_response(
         response_text, num_chunks=len(chunk_specs), num_suggestions=num_suggestions
     )
@@ -1318,12 +1440,24 @@ def annotate_cast_relabel_frames(
     frames: list[np.ndarray],
     frame_chunk_indices: list[int],
     cast_json: dict[str, Any],
+    *,
+    dropped_chunk_indices: "set[int] | frozenset[int]" = frozenset(),
+    drop_reason: str = "",
 ) -> list[np.ndarray]:
     """Double each frame's width and draw the active chunk's GOOD/BAD label + subtasks.
 
     Input ``frames`` already carry the original subtask text panel and waypoint/action
     overlays (drawn upstream in ``main_carla``); this only adds the credit-assignment
     side panel so the debug video shows everything the user asked for.
+
+    The panel shows the chunk's ``original_subtask`` (what the policy actually said at that
+    moment) directly above the suggested replacements, so the correction is legible as a
+    before/after rather than as a list of suggestions with nothing to compare against.
+
+    ``dropped_chunk_indices`` are chunks whose data is NOT used as high-level training data --
+    either truncated out before credit assignment by a route divergence, or falling at/after the
+    episode's failure cutoff. Their frames get a red banner naming ``drop_reason``, so a stretch
+    of video that looks reviewed but is actually discarded cannot be mistaken for supervision.
     """
     import cv2  # type: ignore
 
@@ -1341,7 +1475,19 @@ def annotate_cast_relabel_frames(
         panel_x = w + 12
         wrap_width = max(24, w // 9)
         lines: list[tuple[str, tuple[int, int, int], int]] = []
-        if chunk is not None:
+        is_dropped = int(chunk_idx) in dropped_chunk_indices
+        if is_dropped:
+            # A dropped chunk is usually absent from ``action_chunks`` entirely (divergence
+            # truncates it before credit assignment), so there is no label or rationale to draw --
+            # the banner and the chunk id are the whole story for these frames.
+            lines.append((f"Chunk {int(chunk_idx)}", (255, 200, 80), 2))
+            lines.append(("NOT USED FOR TRAINING", (60, 60, 255), 2))
+            for part in _wrap(drop_reason or "dropped after the episode went off the rails",
+                              wrap_width):
+                lines.append((part, (170, 170, 255), 1))
+            if chunk is not None:
+                lines.append(("", (0, 0, 0), 1))
+        if chunk is not None and not is_dropped:
             label = chunk.get("label")
             t0 = float(chunk.get("video_time_start_sec", 0.0))
             t1 = float(chunk.get("video_time_end_sec", 0.0))
@@ -1363,15 +1509,37 @@ def annotate_cast_relabel_frames(
                 lines.append(("Why:", (255, 255, 255), 1))
                 for part in _wrap(rationale, wrap_width):
                     lines.append((part, (220, 220, 220), 1))
+            original = str(chunk.get("original_subtask") or "").strip()
+            if original:
+                lines.append(("Current subtask (what the policy said):", (255, 255, 255), 1))
+                for part in _wrap(original, wrap_width):
+                    lines.append((part, (170, 170, 170), 1))
             subtasks = chunk.get("suggested_subtasks") or []
             if subtasks:
-                lines.append(("Suggested subtasks:", (255, 255, 255), 1))
+                lines.append(
+                    ("Corrected to:" if original else "Suggested subtasks:", (255, 255, 255), 1)
+                )
                 for i, st in enumerate(subtasks):
                     for j, part in enumerate(_wrap(st, wrap_width)):
                         prefix = f"{i + 1}. " if j == 0 else "   "
                         lines.append((prefix + part, (120, 210, 255), 1))
 
         y = 24
+        if is_dropped:
+            # Full-width banner over the camera image too, not just the text column: at a glance,
+            # scrubbing the video should show exactly which stretch was thrown away.
+            cv2.rectangle(canvas, (0, 0), (w * 2, 30), (0, 0, 170), thickness=-1)
+            banner = "DROPPED - NOT USED FOR TRAINING"
+            if drop_reason:
+                # Fit the reason to the composite's real width rather than a fixed cut, which
+                # chopped it mid-word on the 2048px debug video. ~12px per char at scale 0.55.
+                room = max(20, ((w * 2 - 24) // 12) - len(banner) - 4)
+                shown = drop_reason if len(drop_reason) <= room else drop_reason[: room - 1] + "\u2026"
+                banner += f"  ({shown})"
+            cv2.putText(canvas, banner, (10, 21), font, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.rectangle(canvas, (0, 0), (w * 2 - 1, h - 1), (0, 0, 170), thickness=3)
+            y = 30 + 24
+
         line_h = 17
         for line, color, weight in lines:
             if y + line_h > h - 6:
@@ -1466,6 +1634,28 @@ class OnlineCastRelabelSession:
         # Also reinforce GOOD/unlabeled chunks by storing their original (uncorrected) subtask +
         # reasoning as HL samples. Set False to keep the dataset corrective (BAD chunks only).
         self.store_good_chunks = bool(self.cfg.get("store_good_chunks", True))
+        # Stop supervising the high-level policy for the REST of an episode once the run has
+        # seriously failed -- a counted collision, an outside-route event, or a crash_stuck
+        # termination. After such a failure the ego is somewhere the policy will never legitimately
+        # be (wedged against a wall, facing backwards, off the drivable surface), so those chunks
+        # are far out of distribution and carry no signal about strategy; relabeling them mostly
+        # teaches the CoT to narrate wreckage. Windows already stored before the cutoff are kept:
+        # the lead-up to the failure is exactly the part worth learning from.
+        # Split the window review into two VLM calls over the same video: Step 1 (scene +
+        # traffic-flow state) as prose, then Step 2 (GOOD/BAD events) with that answer supplied as
+        # established context. Costs one extra generate_content per window -- the video is uploaded
+        # once regardless -- and makes the scene reasoning an artifact you can actually read.
+        self.two_stage_review = bool(self.cfg.get("two_stage_review", False))
+        # Write every prompt + raw response per window to ``vlm_calls.json`` and refresh the live
+        # HTML review viewer. Independent of two_stage_review: useful on the single-call path too.
+        self.save_vlm_calls = bool(self.cfg.get("save_vlm_calls", True))
+        # One-shot guard so the viewer link is announced to W&B once, not once per window.
+        self._viewer_logged = False
+        self.review_viewer_path: Path | None = None
+        self.hl_stop_after_failure = bool(self.cfg.get("hl_stop_after_failure", True))
+        # Which failures trip the cutoff. Off by one -> that class no longer ends supervision.
+        self.hl_stop_on_collision = bool(self.cfg.get("hl_stop_on_collision", True))
+        self.hl_stop_on_off_route = bool(self.cfg.get("hl_stop_on_off_route", True))
         self.hl_action_dim = int(self.cfg.get("hl_action_dim", DEFAULT_HL_ACTION_DIM))
         # Per-step ego history stored with each HL sample (see DEFAULT_EGO_HISTORY_LEN).
         self.ego_history_len = max(1, int(self.cfg.get("ego_history_len", DEFAULT_EGO_HISTORY_LEN)))
@@ -1591,6 +1781,12 @@ class OnlineCastRelabelSession:
         # Rolling ``[speed, course]`` over the last ``ego_history_len`` env steps of THIS episode, so a
         # chunk-start sample can carry a real ego history rather than a tiled current pair.
         self._ego_hist: deque[tuple[float, float]] = deque(maxlen=self.ego_history_len)
+        # Episode step at which a serious failure first occurred; HL samples at or after it are
+        # dropped. ``None`` while the episode is still clean. See ``hl_stop_after_failure``.
+        self._hl_cutoff_step: int | None = None
+        # Why the cutoff fired ("collision" / "off_route" / "crash_stuck" / "route
+        # divergence ..."), purely so the debug video's banner can say which one it was.
+        self._hl_cutoff_reason: str = ""
 
     def begin_episode(
         self,
@@ -1637,6 +1833,95 @@ class OnlineCastRelabelSession:
 
     def record_trajectory_step(self, step_record: dict[str, Any]) -> None:
         self.trajectory_steps.append(dict(step_record))
+        self._maybe_trip_hl_cutoff(step_record)
+
+    def _maybe_trip_hl_cutoff(self, step_record: dict[str, Any]) -> None:
+        """Latch ``_hl_cutoff_step`` at the first serious failure of the episode.
+
+        Serious means the environment counted an infraction, not that a sensor grazed something:
+        ``collision_delta``/``outside_route_delta`` are per-step increments of the leaderboard's
+        own counters, so they fire once per event rather than for every tick of sustained contact.
+        ``crash_stuck`` is included because it means the ego collided and then never got moving
+        again -- the canonical "rest of the episode is garbage" case.
+
+        Latched, never cleared mid-episode: once the run is off the rails it does not come back,
+        and re-arming would let a brief recovery re-open supervision on a wrecked trajectory.
+        """
+        if not (self.hl_stop_after_failure and self.store_hl_dataset):
+            return
+        if self._hl_cutoff_step is not None:
+            return
+        reason = None
+        if self.hl_stop_on_collision and float(step_record.get("collision_delta", 0.0)) > 0.0:
+            reason = "collision"
+        elif self.hl_stop_on_off_route and float(step_record.get("outside_route_delta", 0.0)) > 0.0:
+            reason = "off_route"
+        elif step_record.get("termination_reason") == "crash_stuck":
+            reason = "crash_stuck"
+        if reason is None:
+            return
+        self._hl_cutoff_step = int(step_record.get("episode_step", 0))
+        self._hl_cutoff_reason = reason
+        print(
+            f"[cast_relabel] HL supervision cutoff at episode step {self._hl_cutoff_step} "
+            f"({reason}); the rest of this episode will be reviewed but not stored as "
+            f"high-level training data.",
+            flush=True,
+        )
+
+    def note_route_divergence(
+        self, divergence: dict[str, Any] | None, traj_window: list[dict[str, Any]]
+    ) -> None:
+        """Latch the HL cutoff at a VLM-reported route divergence.
+
+        ``divergence["timestamp_sec"]`` is a *video* time; ``_hl_cutoff_step`` is an *absolute*
+        episode step. ``traj_window`` carries both on every step it recorded, so the mapping is
+        read off the window rather than recomputed from the chunk table (whose episode steps are
+        window-relative and 1-based -- a mismatch there would silently cut in the wrong place).
+
+        The cutoff lands one step past the last frame shown strictly BEFORE the divergence, so the
+        moment of the wrong turn is itself excluded. Steps with no recorded frame carry no video
+        timestamp and cannot be placed on the video clock; erring one frame early is the safe
+        direction, since the cost is a few dropped good samples rather than trained-on garbage.
+
+        Same latching rule as ``_maybe_trip_hl_cutoff``: first cutoff of the episode wins, so a
+        later, looser verdict can never re-open supervision on an already-condemned trajectory.
+        """
+        if not (self.hl_stop_after_failure and self.store_hl_dataset):
+            return
+        if not divergence or not divergence.get("diverged"):
+            return
+        ts = divergence.get("timestamp_sec")
+        if ts is None:
+            return
+        last_before: int | None = None
+        for step in traj_window:
+            t = step.get("video_timestamp_sec")
+            if t is None:
+                continue
+            if float(t) < float(ts):
+                last_before = int(step.get("episode_step", 0))
+            else:
+                break
+        if last_before is not None:
+            cutoff = last_before + 1
+        elif traj_window:
+            # Diverged before the first recorded frame of this window: nothing here is usable.
+            cutoff = int(traj_window[0].get("episode_step", 0))
+        else:
+            return
+        if self._hl_cutoff_step is not None and self._hl_cutoff_step <= cutoff:
+            return
+        self._hl_cutoff_step = cutoff
+        self._hl_cutoff_reason = (
+            f"off route at t={float(ts):.1f}s: {divergence.get('reason', '')}".strip()
+        )
+        print(
+            f"[cast_relabel] HL supervision cutoff at episode step {cutoff} (route divergence at "
+            f"t={float(ts):.2f}s: {divergence.get('reason', '')}); the rest of this episode will "
+            f"be reviewed but not stored as high-level training data.",
+            flush=True,
+        )
 
     def record_model_input(
         self,
@@ -1789,6 +2074,41 @@ class OnlineCastRelabelSession:
         self._traj_cursor = len(self.trajectory_steps)
         self._model_inputs = {}
         return snap
+
+    def _refresh_review_viewer(self, cast_dir: Path) -> None:
+        """Rebuild the live HTML transcript viewer, and register its link with W&B once.
+
+        Called after every window. Cheap by construction: the page links videos by relative path
+        instead of embedding them (see coaches/cast_review_viewer.py), so cost is independent of
+        how many windows have accumulated.
+        """
+        try:
+            from coaches.cast_review_viewer import refresh as _refresh_viewer
+        except ImportError:
+            from impls.coaches.cast_review_viewer import refresh as _refresh_viewer
+
+        out = _refresh_viewer(cast_dir, title=f"{self.route_name} · {Path(self.save_dir).name}")
+        if self._viewer_logged:
+            return
+        self._viewer_logged = True
+        self.review_viewer_path = out
+        print(f"[cast_relabel] live review viewer -> {out}", flush=True)
+        try:
+            import wandb
+
+            if wandb.run is not None:
+                url = out.resolve().as_uri()
+                link = (
+                    f'<p style="font:14px system-ui">CAST relabel review transcripts '
+                    f'(regenerated after every window, auto-refreshing):<br>'
+                    f'<a href="{url}">{out}</a></p>'
+                )
+                self._emit_wandb({"cast_relabel/review_viewer": wandb.Html(link)}, None)
+                # Also as a plain summary field, which survives in the run overview and is easier
+                # to copy than a media panel.
+                wandb.run.summary["cast_relabel_review_viewer"] = str(out.resolve())
+        except Exception as exc:  # noqa: BLE001 - the link is a convenience, never fatal
+            print(f"[cast_relabel] could not register viewer link with wandb: {exc}", flush=True)
 
     def _emit_wandb(self, payload: dict[str, Any], step: int | None) -> None:
         """Log now (sync) or park for the main thread to log (async)."""
@@ -1964,6 +2284,45 @@ class OnlineCastRelabelSession:
             else None
         )
         route_completed = route_progress_end_pct is not None and route_progress_end_pct >= 99.5
+        # Absolute position along the plan, in metres. The routing-command plan keys each maneuver
+        # by ``start_distance_m``, so percentages alone cannot be aligned with it; giving the VLM
+        # "84 m of 210 m" lets it say which plan entry is in force and whether it was executed.
+        distances = [
+            float(s["route_distance_m"])
+            for s in traj_window
+            if s.get("route_distance_m") is not None
+        ]
+        route_distance_start_m = round(distances[0], 1) if distances else None
+        route_distance_end_m = round(distances[-1], 1) if distances else None
+        totals = [
+            float(s["route_total_distance_m"])
+            for s in traj_window
+            if s.get("route_total_distance_m")
+        ]
+        route_total_distance_m = round(totals[-1], 1) if totals else None
+        # The routing command in force over this window. ``current`` is the one active at the end
+        # of the window (what the ego is being asked to do now); the sequence records every change
+        # seen, with the video timestamp, so a divergence can be attributed to the exact command
+        # that was disobeyed rather than to the window as a whole.
+        commands_seen: list[dict[str, Any]] = []
+        for s in traj_window:
+            cmd = str(s.get("routing_command") or "").strip()
+            if not cmd:
+                continue
+            if not commands_seen or commands_seen[-1]["command"] != cmd:
+                commands_seen.append(
+                    {
+                        "command": cmd,
+                        "episode_step": s.get("episode_step"),
+                        "video_timestamp_sec": s.get("video_timestamp_sec"),
+                        "route_distance_m": (
+                            round(float(s["route_distance_m"]), 1)
+                            if s.get("route_distance_m") is not None
+                            else None
+                        ),
+                    }
+                )
+        current_routing_command = commands_seen[-1]["command"] if commands_seen else ""
         # Mean ego speed over the last few steps — a near-zero value with the route
         # unfinished is a strong hint the ego stopped prematurely.
         end_speeds = [
@@ -1997,6 +2356,11 @@ class OnlineCastRelabelSession:
             "route_progress_end_pct": route_progress_end_pct,
             "route_progress_delta_pct": route_progress_delta_pct,
             "route_completed": route_completed,
+            "route_distance_start_m": route_distance_start_m,
+            "route_distance_end_m": route_distance_end_m,
+            "route_total_distance_m": route_total_distance_m,
+            "current_routing_command": current_routing_command,
+            "routing_commands_in_window": commands_seen,
             "mean_end_speed_mps": mean_end_speed_mps,
             "window_reward_total": window_reward_total,
             "window_reward_mean": window_reward_mean,
@@ -2083,6 +2447,7 @@ class OnlineCastRelabelSession:
                 print(f"[cast_relabel] reward/progress plot failed (non-fatal): {exc}", flush=True)
                 plot_paths = None
 
+        vlm_calls: dict[str, Any] = {}
         events, cast_json = generate_cast_relabel(
             self._coach,
             video_path,
@@ -2094,8 +2459,25 @@ class OnlineCastRelabelSession:
             plot_paths=plot_paths,
             include_plots_in_prompt=self.include_plots_in_prompt,
             debug_task=self.debug_task,
+            two_stage=self.two_stage_review,
+            out_calls=vlm_calls,
         )
         (work_dir / "cast_relabel.json").write_text(json.dumps(cast_json, indent=2), encoding="utf-8")
+        if self.save_vlm_calls:
+            # The transcript is the point of the review viewer: prompts and raw responses are built
+            # on the fly and otherwise never touch disk. Non-fatal -- a failure here must not cost
+            # the window's HL samples.
+            try:
+                vlm_calls["route"] = self.route_name
+                vlm_calls["episode"] = self.episode_count
+                vlm_calls["window_index"] = self.window_count
+                vlm_calls["video"] = video_path.name if hasattr(video_path, "name") else str(video_path)
+                (work_dir / "vlm_calls.json").write_text(
+                    json.dumps(vlm_calls, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                self._refresh_review_viewer(work_dir.parent)
+            except Exception as exc:  # noqa: BLE001 - diagnostic artifact, never fatal
+                print(f"[cast_relabel] vlm_calls/viewer write failed (non-fatal): {exc}", flush=True)
 
         # Fold this window's corrections in *after* the prompts were built, so a window is never
         # shown its own outcome — only what came before it.
@@ -2107,6 +2489,22 @@ class OnlineCastRelabelSession:
             except Exception as exc:  # noqa: BLE001 - the memory is an aid, not a prerequisite
                 print(f"[cast_relabel] correction memory update failed (non-fatal): {exc}", flush=True)
 
+        # Route divergence latches the episode's HL cutoff. generate_cast_relabel has already
+        # kept the off-route chunks out of credit assignment; this additionally stops every LATER
+        # window of the same episode from contributing, since once the ego is off-route it stays
+        # off-route -- the same "never comes back" reasoning as the collision cutoff.
+        # NOTE: metadata["steps"], not traj_window. _build_metadata re-derives
+        # ``video_timestamp_sec`` onto COPIES of each step (window-relative, matching the video the
+        # VLM actually watched) and then rebinds only its own local name -- the caller's
+        # traj_window still carries main_carla's RUN-relative timestamps, which are never reset and
+        # so are all far larger than any window-relative divergence time. Passing that list made
+        # the lookup find no frame before the divergence, fall back to "cut at the window's first
+        # step", and silently discard the whole episode's supervision instead of just the
+        # post-divergence part. Observed live on 2026-09-03 (cutoff printed as step 1).
+        self.note_route_divergence(
+            vlm_calls.get("route_divergence"), metadata.get("steps") or traj_window
+        )
+
         # Persist BAD/relabeled chunks as high-level (VLM-backbone) SteerVLA samples.
         n_hl = self._store_hl_samples(cast_json, metadata, traj_window, tag)
 
@@ -2117,11 +2515,17 @@ class OnlineCastRelabelSession:
             # every frame from the start, so windows grow without bound and re-emit duplicate HL
             # samples -- which silently inflates the pool and the sample-reuse telemetry.
             try:
+                _frame_chunks = metadata.get("frame_chunk_indices") or []
+                _dropped, _drop_reason = self._debug_dropped_chunks(
+                    cast_json, traj_window, _frame_chunks, vlm_calls.get("route_divergence")
+                )
                 self._log_debug_video(
                     frames_window,
                     cast_json,
-                    frame_chunk_indices=metadata.get("frame_chunk_indices") or [],
+                    frame_chunk_indices=_frame_chunks,
                     global_step=global_step,
+                    dropped_chunk_indices=_dropped,
+                    drop_reason=_drop_reason,
                 )
             except Exception as exc:  # noqa: BLE001 - the debug video is never a prerequisite.
                 print(f"[cast_relabel] debug video failed (non-fatal): {exc}", flush=True)
@@ -2137,6 +2541,49 @@ class OnlineCastRelabelSession:
 
         if self.save_artifacts:
             print(f"[cast_relabel] saved artifacts under {work_dir}", flush=True)
+
+    def _debug_dropped_chunks(
+        self,
+        cast_json: dict[str, Any],
+        traj_window: list[dict[str, Any]],
+        frame_chunk_indices: list[int],
+        divergence: dict[str, Any] | None,
+    ) -> tuple[set[int], str]:
+        """Which chunk indices in this window contribute NO high-level training data, and why.
+
+        Two independent mechanisms put a chunk here, and the debug video should not care which:
+
+        * **Route divergence** truncated the chunk out before credit assignment, so it is absent
+          from ``cast_json["action_chunks"]`` entirely -- it shows up as a frame whose chunk index
+          has no entry.
+        * **The episode's failure cutoff** (collision / off-route / crash_stuck / divergence) sits
+          at an absolute episode step; a chunk starting at or after it is reviewed but never
+          stored. ``episode_step_start`` is window-relative and 1-based, so it is mapped through
+          ``traj_window`` rather than compared directly -- the same trap as ``note_route_divergence``.
+
+        Returns ``(indices, reason)``; an empty set when the window is entirely clean.
+        """
+        diverged = bool((divergence or {}).get("diverged"))
+        cutoff = self._hl_cutoff_step
+        if not diverged and cutoff is None:
+            return set(), ""
+
+        kept = {int(c.get("chunk_index", -1)) for c in cast_json.get("action_chunks", [])}
+        dropped: set[int] = set()
+        if diverged:
+            # Frames whose chunk was truncated away before credit assignment.
+            dropped |= {int(i) for i in frame_chunk_indices if int(i) not in kept}
+        if cutoff is not None:
+            for c in cast_json.get("action_chunks", []):
+                start = int(c.get("episode_step_start", 0)) - 1
+                if 0 <= start < len(traj_window):
+                    if int(traj_window[start].get("episode_step", 0)) >= cutoff:
+                        dropped.add(int(c.get("chunk_index", -1)))
+        reason = self._hl_cutoff_reason or (
+            f"off route at t={float((divergence or {}).get('timestamp_sec') or 0.0):.1f}s"
+            if diverged else ""
+        )
+        return dropped, reason
 
     def _store_hl_samples(
         self,
@@ -2168,6 +2615,17 @@ class OnlineCastRelabelSession:
                 route=self.route_id,
                 ego_history_len=self.ego_history_len,
             )
+            if self._hl_cutoff_step is not None:
+                cutoff = self._hl_cutoff_step
+                kept = [s for s in hl_samples if int(s.episode_step) < cutoff]
+                if len(kept) != len(hl_samples):
+                    print(
+                        f"[cast_relabel] dropped {len(hl_samples) - len(kept)} of "
+                        f"{len(hl_samples)} high-level samples at/after the failure cutoff "
+                        f"(episode step {cutoff}).",
+                        flush=True,
+                    )
+                hl_samples = kept
             if not hl_samples:
                 return 0
             hl_dir = self.hl_dataset_dir / tag
@@ -2237,6 +2695,8 @@ class OnlineCastRelabelSession:
         *,
         frame_chunk_indices: list[int],
         global_step: int | None,
+        dropped_chunk_indices: "set[int] | None" = None,
+        drop_reason: str = "",
     ) -> None:
         try:
             import wandb  # type: ignore
@@ -2251,7 +2711,13 @@ class OnlineCastRelabelSession:
                 (offset * self.video_frame_stride) // self.action_chunk_steps
                 for offset in range(len(frame_chunk_indices), len(frames_window))
             ]
-        annotated = annotate_cast_relabel_frames(frames_window, frame_chunk_indices, cast_json)
+        annotated = annotate_cast_relabel_frames(
+            frames_window,
+            frame_chunk_indices,
+            cast_json,
+            dropped_chunk_indices=frozenset(dropped_chunk_indices or ()),
+            drop_reason=drop_reason,
+        )
         if not annotated:
             return
         # NOT shrunk. ``annotate_cast_relabel_frames`` composites the camera frame beside an

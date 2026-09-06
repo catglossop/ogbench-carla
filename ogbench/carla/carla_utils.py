@@ -926,16 +926,51 @@ def _decode_rgb_front_viz(sensor_dict: Dict[str, Any]) -> np.ndarray | None:
     return rgb
 
 
+# Framing crop applied before the squeeze to square, mirroring
+# ``openpi.training.steervla_rlds_dataset.SIMLINGO_FRAMING_CROP``. Keep the two in sync.
+#
+# Every SimLingo-derived training corpus reaches the model through this box: the
+# ``simlingo_dataset_*_img512_1116`` builds baked it in at dataset-creation time, and
+# ``simplified_reasoning_dataset`` -- which stored the full frame -- is re-cropped to it at decode
+# time by ``DATASET_IMAGE_CROPS``. The live CARLA camera renders the same 1024x512 view those
+# corpora were built from (see ``observation_only.py``: fov/x/z now match ``simlingo_obs.py``), so
+# without this crop the policy would see a wider FOV with the ego hood at the bottom -- the one
+# framing no longer present anywhere in training.
+#
+# Normalized so it lands correctly whatever the incoming resolution: on the native 1024x512 frame it
+# is the box (170, 0, 852, 359); on a stored 512x512 frame, (85, 0, 426, 359).
+SIMLINGO_FRAMING_CROP = (170 / 1024, 0.0, 852 / 1024, 359 / 512)
+
+
+def crop_to_simlingo_framing(rgb: np.ndarray) -> np.ndarray:
+    """Crop ``rgb`` to :data:`SIMLINGO_FRAMING_CROP`. Aspect is *not* preserved by the caller's resize."""
+    rgb = np.asarray(rgb, dtype=np.uint8)
+    h, w = rgb.shape[:2]
+    x0, y0, x1, y1 = SIMLINGO_FRAMING_CROP
+    left, top = int(round(x0 * w)), int(round(y0 * h))
+    right, bottom = int(round(x1 * w)), int(round(y1 * h))
+    cropped = rgb[top:bottom, left:right]
+    # A degenerate box (absurdly small input) would produce an empty array that cv2.resize rejects.
+    return cropped if cropped.size else rgb
+
+
 def downscale_rgb_for_policy(rgb_viz: np.ndarray) -> np.ndarray:
-    """Resize a viz-resolution RGB frame to policy/RL ``IMAGE_SHAPE_HWC``."""
+    """Crop to the SimLingo training framing, then squeeze to policy/RL ``IMAGE_SHAPE_HWC``.
+
+    The crop is what makes the live frame match what the SteerVLA checkpoint was trained on; the
+    resize is a plain distorting squeeze to square, matching the dataset preprocessing (a pad would
+    introduce black bars the backbone has never seen).
+    """
     rgb_viz = np.asarray(rgb_viz, dtype=np.uint8)
+    # Already at policy resolution => already processed (e.g. a replayed frame); cropping a second
+    # time would zoom in past the training framing.
     if rgb_viz.shape == IMAGE_SHAPE_HWC:
         return rgb_viz
     try:
         import cv2
 
         return cv2.resize(
-            rgb_viz,
+            crop_to_simlingo_framing(rgb_viz),
             (IMAGE_SHAPE_HWC[1], IMAGE_SHAPE_HWC[0]),
             interpolation=cv2.INTER_AREA,
         )
@@ -2795,6 +2830,23 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         info["speed_limit_mps"] = speed_limit_mps
         info["route_progress_pct"] = float(route_progress_pct)
         info["route_progress_delta"] = float(route_progress_delta)
+        # Absolute route geometry, so consumers can express progress in METRES rather than only
+        # as a percentage. The routing-command plan (``_summarize_route_commands``) keys each
+        # maneuver by ``start_distance_m``, so a percentage alone cannot be lined up against the
+        # plan -- the VLM review needs "we are 84 m along a 210 m route, and the plan says the
+        # left turn starts at 78 m" to tell whether the commanded maneuver was actually executed.
+        info["route_total_distance_m"] = float(self._route_total_distance_m)
+        info["route_distance_m"] = float(
+            route_progress_pct / 100.0 * self._route_total_distance_m
+        )
+        # The routing command in force at this step, as the integer id and the human-readable
+        # text used everywhere else (ROUTING_COMMAND_TEXT). Recorded per step so a divergence
+        # from the plan -- going straight through a junction the plan says to turn left at --
+        # can be attributed to the exact moment it happened.
+        info["routing_command_id"] = int(self._current_routing_command)
+        info["routing_command_text"] = ROUTING_COMMAND_TEXT.get(
+            int(self._current_routing_command), "follow the road"
+        )
         info["speed_norm"] = speed_norm
         info["overspeed_frac"] = overspeed_frac
         info["centering_factor"] = centering_factor

@@ -580,7 +580,18 @@ echo "[run_carla.sh] exp_name=${EXP_NAME}"
 # e.g. a config bug) stops the loop.
 attempt=0
 RESUME_FLAG="false"
+# Completion marker. CARLA frequently aborts in teardown (std::runtime_error from
+# set_actor_simulate_physics), which is SIGABRT -> exit 134, indistinguishable here from a real
+# mid-run crash. Without this, a run that already finished its whole step budget gets relaunched
+# from step 0 -- observed twice on 2026-09-03/04, each costing ~4h of GPU, with 49 more retries
+# queued behind it. main_carla writes this file only after the online loop completes.
+DONE_MARKER="$(mktemp -u "${TMPDIR:-/tmp}/ogbench_done_XXXXXX")"
+export OGBENCH_DONE_MARKER="$DONE_MARKER"
+trap 'rm -f "$DONE_MARKER" 2>/dev/null || true' EXIT
 while :; do
+  # Clear per attempt: a marker left by an earlier attempt must never make a later crash look
+  # like a completed run.
+  rm -f "$DONE_MARKER" 2>/dev/null || true
   set +e
   WANDB_MODE="${WANDB_MODE}" uv run python impls/main_carla.py \
       --agent="${AGENT_CFG_TMP}" \
@@ -635,6 +646,10 @@ while :; do
   if [[ $CODE -lt 128 ]]; then
     echo "[run_carla.sh] exited with code ${CODE} (not a crash signal); not restarting."
     exit "$CODE"
+  fi
+  if [[ -f "$DONE_MARKER" ]]; then
+    echo "[run_carla.sh] run reached its step budget before crashing in teardown (exit ${CODE}); treating as complete, not restarting."
+    break
   fi
   attempt=$((attempt + 1))
   if [[ "$MAX_RETRIES" -le 0 || $attempt -gt "$MAX_RETRIES" ]]; then

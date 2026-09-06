@@ -1,0 +1,252 @@
+% Bench2Drive routes -- all 220, as a LaTeX longtable.
+% Generated 2026-09-01 15:43 by .run_carla/gen_routes_latex.py
+% Route names come from ogbench.carla.route_registry (bench2drive source), sorted alphabetically.
+% The 67 routes the prior-14k base policy scored DS 100 on in all three seeds are
+% pre-filled as No / "Base policy succeeds" (source: carla_results/prior14k_per_route.md).
+% All other rows are intentionally left blank to be filled in by hand.
+%
+% Requires: \usepackage{longtable}  \usepackage{booktabs}  \usepackage{array}
+
+\begingroup
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{0.34\linewidth}c>{\raggedright\arraybackslash}p{0.42\linewidth}@{}}
+\caption{Bench2Drive routes.}
+\label{tab:bench2drive-routes}\\
+\toprule
+\textbf{Route} & \textbf{In benchmark subset} & \textbf{Reason} \\
+\midrule
+\endfirsthead
+\multicolumn{3}{@{}l}{\footnotesize\itshape Table \thetable\ continued from previous page}\\
+\toprule
+\textbf{Route} & \textbf{In benchmark subset} & \textbf{Reason} \\
+\midrule
+\endhead
+\midrule
+\multicolumn{3}{r@{}}{\footnotesize\itshape continued on next page}\\
+\endfoot
+\bottomrule
+\endlastfoot
+\texttt{accident-001} & & \\
+\texttt{accident-002} & No & Base policy succeeds \\
+\texttt{accident-003} & & \\
+\texttt{accident-004} & & \\
+\texttt{accident-005} & & \\
+\texttt{accident-two-ways-001} & & \\
+\texttt{accident-two-ways-002} & & \\
+\texttt{accident-two-ways-003} & & \\
+\texttt{accident-two-ways-004} & & \\
+\texttt{accident-two-ways-005} & & \\
+\texttt{blocked-intersection-001} & & \\
+\texttt{blocked-intersection-002} & & \\
+\texttt{blocked-intersection-003} & No & Base policy succeeds \\
+\texttt{blocked-intersection-004} & & \\
+\texttt{blocked-intersection-005} & No & Base policy succeeds \\
+\texttt{construction-obstacle-001} & & \\
+\texttt{construction-obstacle-002} & & \\
+\texttt{construction-obstacle-003} & & \\
+\texttt{construction-obstacle-004} & & \\
+\texttt{construction-obstacle-005} & No & Base policy succeeds \\
+\texttt{construction-obstacle-two-ways-001} & & \\
+\texttt{construction-obstacle-two-ways-002} & & \\
+\texttt{construction-obstacle-two-ways-003} & & \\
+\texttt{construction-obstacle-two-ways-004} & & \\
+\texttt{construction-obstacle-two-ways-005} & & \\
+\texttt{control-loss-001} & No & Base policy succeeds \\
+\texttt{control-loss-002} & No & Base policy succeeds \\
+\texttt{control-loss-003} & & \\
+\texttt{control-loss-004} & No & Base policy succeeds \\
+\texttt{control-loss-005} & No & Base policy succeeds \\
+\texttt{crossing-bicycle-flow-001} & & \\
+\texttt{crossing-bicycle-flow-002} & & \\
+\texttt{crossing-bicycle-flow-003} & & \\
+\texttt{crossing-bicycle-flow-004} & & \\
+\texttt{crossing-bicycle-flow-005} & No & Base policy succeeds \\
+\texttt{dynamic-object-crossing-001} & No & Base policy succeeds \\
+\texttt{dynamic-object-crossing-002} & No & Base policy succeeds \\
+\texttt{dynamic-object-crossing-003} & No & Base policy succeeds \\
+\texttt{dynamic-object-crossing-004} & No & Base policy succeeds \\
+\texttt{dynamic-object-crossing-005} & & \\
+\texttt{enter-actor-flow-001} & & \\
+\texttt{enter-actor-flow-002} & & \\
+\texttt{enter-actor-flow-003} & & \\
+\texttt{enter-actor-flow-004} & & \\
+\texttt{enter-actor-flow-005} & & \\
+\texttt{hard-break-route-001} & & \\
+\texttt{hard-break-route-002} & & \\
+\texttt{hard-break-route-003} & & \\
+\texttt{hard-break-route-004} & No & Base policy succeeds \\
+\texttt{hard-break-route-005} & & \\
+\texttt{hazard-at-side-lane-001} & No & Base policy succeeds \\
+\texttt{hazard-at-side-lane-002} & & \\
+\texttt{hazard-at-side-lane-003} & & \\
+\texttt{hazard-at-side-lane-004} & & \\
+\texttt{hazard-at-side-lane-005} & & \\
+\texttt{hazard-at-side-lane-two-ways-001} & & \\
+\texttt{hazard-at-side-lane-two-ways-002} & & \\
+\texttt{hazard-at-side-lane-two-ways-003} & No & Base policy succeeds \\
+\texttt{hazard-at-side-lane-two-ways-004} & & \\
+\texttt{hazard-at-side-lane-two-ways-005} & No & Base policy succeeds \\
+\texttt{highway-cut-in-001} & & \\
+\texttt{highway-cut-in-002} & & \\
+\texttt{highway-cut-in-003} & No & Base policy succeeds \\
+\texttt{highway-cut-in-004} & & \\
+\texttt{highway-cut-in-005} & & \\
+\texttt{highway-exit-001} & & \\
+\texttt{highway-exit-002} & & \\
+\texttt{highway-exit-003} & & \\
+\texttt{highway-exit-004} & & \\
+\texttt{highway-exit-005} & No & Base policy succeeds \\
+\texttt{interurban-actor-flow-001} & No & Base policy succeeds \\
+\texttt{interurban-actor-flow-002} & & \\
+\texttt{interurban-actor-flow-003} & & \\
+\texttt{interurban-actor-flow-004} & & \\
+\texttt{interurban-actor-flow-005} & & \\
+\texttt{interurban-advanced-actor-flow-001} & No & Base policy succeeds \\
+\texttt{interurban-advanced-actor-flow-002} & No & Base policy succeeds \\
+\texttt{interurban-advanced-actor-flow-003} & No & Base policy succeeds \\
+\texttt{interurban-advanced-actor-flow-004} & No & Base policy succeeds \\
+\texttt{interurban-advanced-actor-flow-005} & No & Base policy succeeds \\
+\texttt{invading-turn-001} & & \\
+\texttt{invading-turn-002} & No & Base policy succeeds \\
+\texttt{invading-turn-003} & No & Base policy succeeds \\
+\texttt{invading-turn-004} & No & Base policy succeeds \\
+\texttt{invading-turn-005} & No & Base policy succeeds \\
+\texttt{merger-into-slow-traffic-001} & No & Base policy succeeds \\
+\texttt{merger-into-slow-traffic-002} & & \\
+\texttt{merger-into-slow-traffic-003} & No & Base policy succeeds \\
+\texttt{merger-into-slow-traffic-004} & & \\
+\texttt{merger-into-slow-traffic-005} & No & Base policy succeeds \\
+\texttt{merger-into-slow-traffic-v2-001} & No & Base policy succeeds \\
+\texttt{merger-into-slow-traffic-v2-002} & No & Base policy succeeds \\
+\texttt{merger-into-slow-traffic-v2-003} & & \\
+\texttt{merger-into-slow-traffic-v2-004} & & \\
+\texttt{merger-into-slow-traffic-v2-005} & No & Base policy succeeds \\
+\texttt{non-signalized-junction-left-turn-001} & & \\
+\texttt{non-signalized-junction-left-turn-002} & & \\
+\texttt{non-signalized-junction-left-turn-003} & & \\
+\texttt{non-signalized-junction-left-turn-004} & & \\
+\texttt{non-signalized-junction-left-turn-005} & & \\
+\texttt{non-signalized-junction-left-turn-enter-flow-001} & & \\
+\texttt{non-signalized-junction-left-turn-enter-flow-002} & & \\
+\texttt{non-signalized-junction-left-turn-enter-flow-003} & & \\
+\texttt{non-signalized-junction-left-turn-enter-flow-004} & & \\
+\texttt{non-signalized-junction-left-turn-enter-flow-005} & & \\
+\texttt{non-signalized-junction-right-turn-001} & & \\
+\texttt{non-signalized-junction-right-turn-002} & No & Base policy succeeds \\
+\texttt{non-signalized-junction-right-turn-003} & & \\
+\texttt{non-signalized-junction-right-turn-004} & & \\
+\texttt{non-signalized-junction-right-turn-005} & & \\
+\texttt{opposite-vehicle-running-red-light-001} & No & Base policy succeeds \\
+\texttt{opposite-vehicle-running-red-light-002} & & \\
+\texttt{opposite-vehicle-running-red-light-003} & & \\
+\texttt{opposite-vehicle-running-red-light-004} & & \\
+\texttt{opposite-vehicle-running-red-light-005} & No & Base policy succeeds \\
+\texttt{opposite-vehicle-taking-priority-001} & No & Base policy succeeds \\
+\texttt{opposite-vehicle-taking-priority-002} & & \\
+\texttt{opposite-vehicle-taking-priority-003} & & \\
+\texttt{opposite-vehicle-taking-priority-004} & & \\
+\texttt{opposite-vehicle-taking-priority-005} & & \\
+\texttt{parked-obstacle-001} & & \\
+\texttt{parked-obstacle-002} & & \\
+\texttt{parked-obstacle-003} & & \\
+\texttt{parked-obstacle-004} & & \\
+\texttt{parked-obstacle-005} & & \\
+\texttt{parked-obstacle-two-ways-001} & No & Base policy succeeds \\
+\texttt{parked-obstacle-two-ways-002} & & \\
+\texttt{parked-obstacle-two-ways-003} & & \\
+\texttt{parked-obstacle-two-ways-004} & & \\
+\texttt{parked-obstacle-two-ways-005} & & \\
+\texttt{parking-crossing-pedestrian-001} & No & Base policy succeeds \\
+\texttt{parking-crossing-pedestrian-002} & No & Base policy succeeds \\
+\texttt{parking-crossing-pedestrian-003} & & \\
+\texttt{parking-crossing-pedestrian-004} & & \\
+\texttt{parking-crossing-pedestrian-005} & No & Base policy succeeds \\
+\texttt{parking-cut-in-001} & No & Base policy succeeds \\
+\texttt{parking-cut-in-002} & No & Base policy succeeds \\
+\texttt{parking-cut-in-003} & No & Base policy succeeds \\
+\texttt{parking-cut-in-004} & No & Base policy succeeds \\
+\texttt{parking-cut-in-005} & No & Base policy succeeds \\
+\texttt{parking-exit-001} & & \\
+\texttt{parking-exit-002} & & \\
+\texttt{parking-exit-003} & & \\
+\texttt{parking-exit-004} & & \\
+\texttt{parking-exit-005} & & \\
+\texttt{pedestrian-crossing-001} & & \\
+\texttt{pedestrian-crossing-002} & & \\
+\texttt{pedestrian-crossing-003} & No & Base policy succeeds \\
+\texttt{pedestrian-crossing-004} & & \\
+\texttt{pedestrian-crossing-005} & & \\
+\texttt{sequential-lane-change-001} & No & Base policy succeeds \\
+\texttt{sequential-lane-change-002} & No & Base policy succeeds \\
+\texttt{sequential-lane-change-003} & No & Base policy succeeds \\
+\texttt{sequential-lane-change-004} & No & Base policy succeeds \\
+\texttt{sequential-lane-change-005} & No & Base policy succeeds \\
+\texttt{signalized-junction-left-turn-001} & & \\
+\texttt{signalized-junction-left-turn-002} & & \\
+\texttt{signalized-junction-left-turn-003} & & \\
+\texttt{signalized-junction-left-turn-004} & & \\
+\texttt{signalized-junction-left-turn-005} & & \\
+\texttt{signalized-junction-left-turn-enter-flow-001} & & \\
+\texttt{signalized-junction-left-turn-enter-flow-002} & & \\
+\texttt{signalized-junction-left-turn-enter-flow-003} & & \\
+\texttt{signalized-junction-left-turn-enter-flow-004} & & \\
+\texttt{signalized-junction-left-turn-enter-flow-005} & & \\
+\texttt{signalized-junction-right-turn-001} & & \\
+\texttt{signalized-junction-right-turn-002} & & \\
+\texttt{signalized-junction-right-turn-003} & & \\
+\texttt{signalized-junction-right-turn-004} & & \\
+\texttt{signalized-junction-right-turn-005} & & \\
+\texttt{static-cut-in-001} & & \\
+\texttt{static-cut-in-002} & & \\
+\texttt{static-cut-in-003} & No & Base policy succeeds \\
+\texttt{static-cut-in-004} & & \\
+\texttt{static-cut-in-005} & No & Base policy succeeds \\
+\texttt{t\_-junction-001} & No & Base policy succeeds \\
+\texttt{t\_-junction-002} & & \\
+\texttt{t\_-junction-003} & & \\
+\texttt{t\_-junction-004} & No & Base policy succeeds \\
+\texttt{t\_-junction-005} & & \\
+\texttt{vanilla-non-signalized-turn-001} & No & Base policy succeeds \\
+\texttt{vanilla-non-signalized-turn-002} & No & Base policy succeeds \\
+\texttt{vanilla-non-signalized-turn-003} & No & Base policy succeeds \\
+\texttt{vanilla-non-signalized-turn-004} & No & Base policy succeeds \\
+\texttt{vanilla-non-signalized-turn-005} & & \\
+\texttt{vanilla-non-signalized-turn-encounter-stopsign-001} & & \\
+\texttt{vanilla-non-signalized-turn-encounter-stopsign-002} & & \\
+\texttt{vanilla-non-signalized-turn-encounter-stopsign-003} & & \\
+\texttt{vanilla-non-signalized-turn-encounter-stopsign-004} & & \\
+\texttt{vanilla-non-signalized-turn-encounter-stopsign-005} & & \\
+\texttt{vanilla-signalized-turn-encounter-green-light-001} & & \\
+\texttt{vanilla-signalized-turn-encounter-green-light-002} & & \\
+\texttt{vanilla-signalized-turn-encounter-green-light-003} & & \\
+\texttt{vanilla-signalized-turn-encounter-green-light-004} & & \\
+\texttt{vanilla-signalized-turn-encounter-green-light-005} & No & Base policy succeeds \\
+\texttt{vanilla-signalized-turn-encounter-red-light-001} & & \\
+\texttt{vanilla-signalized-turn-encounter-red-light-002} & & \\
+\texttt{vanilla-signalized-turn-encounter-red-light-003} & & \\
+\texttt{vanilla-signalized-turn-encounter-red-light-004} & & \\
+\texttt{vanilla-signalized-turn-encounter-red-light-005} & & \\
+\texttt{vehicle-opens-door-two-ways-001} & No & Base policy succeeds \\
+\texttt{vehicle-opens-door-two-ways-002} & No & Base policy succeeds \\
+\texttt{vehicle-opens-door-two-ways-003} & No & Base policy succeeds \\
+\texttt{vehicle-opens-door-two-ways-004} & & \\
+\texttt{vehicle-opens-door-two-ways-005} & No & Base policy succeeds \\
+\texttt{vehicle-turning-route-001} & & \\
+\texttt{vehicle-turning-route-002} & & \\
+\texttt{vehicle-turning-route-003} & & \\
+\texttt{vehicle-turning-route-004} & & \\
+\texttt{vehicle-turning-route-005} & & \\
+\texttt{vehicle-turning-route-pedestrian-001} & & \\
+\texttt{vehicle-turning-route-pedestrian-002} & & \\
+\texttt{vehicle-turning-route-pedestrian-003} & & \\
+\texttt{vehicle-turning-route-pedestrian-004} & & \\
+\texttt{vehicle-turning-route-pedestrian-005} & & \\
+\texttt{yield-to-emergency-vehicle-001} & & \\
+\texttt{yield-to-emergency-vehicle-002} & & \\
+\texttt{yield-to-emergency-vehicle-003} & & \\
+\texttt{yield-to-emergency-vehicle-004} & & \\
+\texttt{yield-to-emergency-vehicle-005} & & \\
+\end{longtable}
+\endgroup

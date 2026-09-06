@@ -360,6 +360,7 @@ def _openpi_hl_train_step(
     ref_params=None,
     *,
     log_kl: bool = False,
+    kl_coef: float = 0.0,
 ):
     """One OpenPI gradient step, jit-friendly (bind ``config`` via ``functools.partial``).
 
@@ -375,9 +376,30 @@ def _openpi_hl_train_step(
     gradient reaches the reference. It measures how far the HL update has drifted the CoT policy from
     the checkpoint it started at. Cost is one extra forward pass per step (no backward, no activations
     kept), so it roughly adds the forward share of the step -- gate it off if that matters.
+
+    With ``kl_coef > 0`` and ``ref_params`` the same k3 KL becomes a **penalty in the loss**
+    (``loss = bc_loss + kl_coef * KL``), tethering the CoT policy to the checkpoint it started from
+    instead of merely measuring the drift. Identical estimator and reference to the GRPO step's
+    ``beta_kl`` term (see ``_openpi_hl_grpo_step``), so the two are directly comparable. The
+    reference CE is computed once outside the grad path, so the penalty adds no backward cost over
+    the ``log_kl`` metric and gradient flows only through ``ce_theta``. ``kl_coef=0.0`` (the default)
+    leaves the update bit-for-bit as it was before this term existed.
     """
     model = nnx.merge(state.model_def, state.params)
     model.train()
+
+    train_rng = jax.random.fold_in(rng, state.step)
+    observation, actions = batch
+
+    # Reference log-prob is a constant (frozen params, forward-only): computed outside the grad path
+    # so XLA keeps no backward activations for it and no gradient can reach the reference.
+    ce_ref_pen = None
+    if kl_coef > 0.0 and ref_params is not None:
+        _ref_model_pen = nnx.merge(state.model_def, ref_params)
+        _ref_model_pen.eval()
+        ce_ref_pen = jax.lax.stop_gradient(
+            _cot_ce_per_example(_ref_model_pen, train_rng, observation, actions)
+        )
 
     def loss_fn(model, rng, observation, actions):
         if hasattr(model, "compute_loss_with_aux"):
@@ -387,17 +409,25 @@ def _openpi_hl_train_step(
             aux_metrics = {}
         loss = jnp.mean(chunked_loss)
         reduced_aux = {k: jnp.mean(v) for k, v in aux_metrics.items()}
-        if log_kl:
-            # Reuse this forward's chunked loss for the per-example CE; stop_gradient so the KL
-            # metric can never influence the update.
+        if log_kl or ce_ref_pen is not None:
+            # Reuse this forward's chunked loss for the per-example CE (same quantity as
+            # _cot_ce_per_example: the action-flow loss is zero under an all-False action_loss_mask).
             ce = jnp.asarray(chunked_loss)
-            reduced_aux["_ce_per_example"] = jax.lax.stop_gradient(
-                ce.reshape(ce.shape[0], -1).mean(axis=-1) if ce.ndim > 1 else ce
-            )
+            ce_theta_pe = ce.reshape(ce.shape[0], -1).mean(axis=-1) if ce.ndim > 1 else ce
+        if ce_ref_pen is not None:
+            # k3 KL(pi_theta || pi_ref), differentiable through ce_theta only.
+            log_ratio_pen = ce_ref_pen - ce_theta_pe
+            kl_pen = jnp.mean(jnp.exp(-log_ratio_pen) + log_ratio_pen - 1.0)
+            loss = loss + kl_coef * kl_pen
+            reduced_aux["kl_to_ref"] = kl_pen
+            reduced_aux["kl_penalty"] = kl_coef * kl_pen
+            reduced_aux["ce_theta"] = jnp.mean(ce_theta_pe)
+            reduced_aux["ce_ref"] = jnp.mean(ce_ref_pen)
+            reduced_aux["log_ratio"] = jnp.mean(log_ratio_pen)
+        if log_kl:
+            # stop_gradient so the KL *metric* path can never influence the update.
+            reduced_aux["_ce_per_example"] = jax.lax.stop_gradient(ce_theta_pe)
         return loss, reduced_aux
-
-    train_rng = jax.random.fold_in(rng, state.step)
-    observation, actions = batch
 
     diff_state = nnx.DiffState(0, config.trainable_filter)
     (loss, aux_metrics), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
@@ -426,7 +456,7 @@ def _openpi_hl_train_step(
     ce_theta = aux_metrics.pop("_ce_per_example", None)
     info.update(aux_metrics)
 
-    if log_kl and ref_params is not None and ce_theta is not None:
+    if log_kl and ref_params is not None and ce_theta is not None and ce_ref_pen is None:
         # Frozen reference forward, outside the grad path (params are the pre-update snapshot).
         ref_model = nnx.merge(state.model_def, ref_params)
         ref_model.eval()
@@ -1341,6 +1371,7 @@ class SteerVLAActor:
         hl_lr: float | None = None,
         hl_freeze_regexes: list[str] | None = None,
         hl_log_kl: bool = True,
+        hl_kl_coef: float = 0.0,
         hl_replay_root: str | Path | None = None,
         hl_replay_pools: list[dict] | None = None,
         hl_online_weight: float = 1.0,
@@ -1389,6 +1420,9 @@ class SteerVLAActor:
         # tower and the tied token embedder), so their grad + Adam buffers are dropped and the HL
         # update fits. Applied in :meth:`setup` before the train state is built. None = full fine-tune.
         self.hl_log_kl = bool(hl_log_kl)
+        # >0 turns the k3 KL-to-reference from a metric into a loss term in the BC-HL step,
+        # tethering the CoT policy to the checkpoint it started from. 0.0 = metric only.
+        self.hl_kl_coef = float(hl_kl_coef)
         self.hl_freeze_regexes: list[str] | None = (
             [str(r) for r in hl_freeze_regexes if str(r).strip()] if hl_freeze_regexes else None
         )
@@ -1756,7 +1790,12 @@ class SteerVLAActor:
             # ``self._train_state`` to the output and never reuses the donated input. Only the state
             # is donated, not the batch — the batch is reused across ``hl_update_num_steps`` steps.
             self._hl_train_step = jax.jit(
-                functools.partial(_openpi_hl_train_step, self.train_cfg, log_kl=self.hl_log_kl),
+                functools.partial(
+                    _openpi_hl_train_step,
+                    self.train_cfg,
+                    log_kl=self.hl_log_kl,
+                    kl_coef=self.hl_kl_coef,
+                ),
                 donate_argnums=(1,),
             )
             # GRPO (HL policy) step: same donate/static convention as above. Snapshot the loaded params
@@ -3240,7 +3279,7 @@ class SteerVLAActor:
                 step_rng,
                 self._train_state,
                 (observation, actions),
-                self._hl_ref_params if self.hl_log_kl else None,
+                self._hl_ref_params if (self.hl_log_kl or self.hl_kl_coef > 0.0) else None,
             )
             self._hl_grad_steps += 1
         self._hl_updates_applied += 1
@@ -5562,6 +5601,7 @@ def create_steervla_pi0_cot_sample_fn(
         include_ego_history=bool(steervla_cfg.get("include_ego_history", False)),
         proprio_norm=bool(steervla_cfg.get("proprio_norm", True)),
         hl_log_kl=bool(steervla_cfg.get("hl_log_kl", True)),
+        hl_kl_coef=float(steervla_cfg.get("hl_kl_coef", 0.0)),
         output_action_format=steervla_cfg.get("output_action_format") or "DELTA_XY_T_DELTA_XY_SPACE",
         action_horizon=int(steervla_cfg.get("action_horizon", 10)),
         action_dim=int(steervla_cfg.get("action_dim", 4)),
