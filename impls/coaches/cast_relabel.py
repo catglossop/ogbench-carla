@@ -584,7 +584,7 @@ def build_debug_task_prompt(
     seed_subtasks: tuple[str, ...] = SEED_SUBTASKS,
     seed_reasonings: tuple[str, ...] = SEED_REASONING,
     num_suggestions: int = DEFAULT_NUM_SUBTASK_SUGGESTIONS,
-    max_seed_examples: int = 40,
+    max_seed_examples: int = 64,
 ) -> str:
     """Prompt that does credit assignment (step 3) + subtask suggestion (step 4)."""
     events_payload = [
@@ -631,6 +631,14 @@ def build_debug_task_prompt(
         the SAME concise style; describe what the vehicle should do, not meta commentary). For this debug task, the subtasks should be the ones that result in the vehicle remaining stopped or slowing down.:
         {seed_subtask_block}
 
+        REQUIRED REASONING FORMAT — "Follow the route. <ACTION> <because|to> <justification>."
+        Always begin with the literal prefix "Follow the route."; one imperative action clause;
+        then "because ..." / "to ..." naming the relevant scene object. Never first person
+        ("I", "my"), never explanation-first, one sentence after the prefix.
+
+        Example reasoning phrasings (reuse verbatim where one fits, otherwise obey the template):
+        {seed_reasoning_block}
+
         For EVERY chunk_index above, return:
         - label: "GOOD", "BAD", or null. Does not matter for this debug task.
         - rationale: one short sentence describing the slow down or stop behavior.
@@ -667,7 +675,7 @@ def build_credit_relabel_prompt(
     seed_subtasks: tuple[str, ...] = SEED_SUBTASKS,
     seed_reasonings: tuple[str, ...] = SEED_REASONING,
     num_suggestions: int = DEFAULT_NUM_SUBTASK_SUGGESTIONS,
-    max_seed_examples: int = 40,
+    max_seed_examples: int = 64,
 ) -> str:
     """Prompt that does credit assignment (step 3) + subtask suggestion (step 4)."""
     events_payload = [
@@ -761,9 +769,30 @@ def build_credit_relabel_prompt(
         the vehicle to prevent out of distribution objects from destroying the training signal.:
         {seed_subtask_block}
         
-        Example reasoning phrasings (open vocabulary — reuse verbatim OR write new phrases in
-        the SAME concise style; describe what the driver would think before arriving at the corrected subtask.
-        The new reasoning should CAN reference objects in the scene and the driving behavior of the vehicle.):
+        REQUIRED REASONING FORMAT. Each `suggested_reasoning` MUST follow the template below —
+        this is a hard constraint, not a stylistic preference. Reasonings that deviate are
+        discarded:
+
+          "Follow the route. <ACTION> <because|to> <justification referencing the scene>."
+
+        Rules:
+          1. Begin with the literal prefix "Follow the route." — always, with no preamble.
+          2. Follow it with ONE imperative action clause, in the same vocabulary as the
+             examples: Accelerate / Maintain the speed / Maintain speed / Decelerate /
+             Remain stopped / Slow down / Stop.
+          3. Then justify it with "because ..." or "to ...", naming the relevant object in the
+             scene (colour + type + position, e.g. "the red wooden fence on the left side",
+             "the maroon car that is to the front at 8.0 meters") when one is relevant.
+          4. NEVER write in the first person. No "I", "my", "I must", "I should". The reasoning
+             is a statement about what the vehicle does, not the driver's inner monologue.
+          5. NEVER lead with the explanation. Write
+             "Follow the route. Remain stopped to prevent collision with the red wooden fence on
+             the left side." — NOT "I must remain stopped to prevent colliding with the red
+             wooden fence." and NOT "The fence is blocking the path, so the vehicle stops."
+          6. One sentence after the prefix. No "Even though ...", no contrastive framing.
+
+        Example reasoning phrasings (reuse verbatim where one fits, otherwise write a new phrase
+        that obeys the template above):
         {seed_reasoning_block}
 
         For EVERY chunk_index above, return:
@@ -1181,6 +1210,50 @@ class HLSample:
         }
 
 
+# ── Reasoning format enforcement ──────────────────────────────────────────────────────
+# The VLM is given a hard template ("Follow the route. <ACTION> because/to <justification>.")
+# plus the SEED_REASONING exemplars, but compliance is never total: a 2026-09-06 audit of 113
+# relabeled reasonings found only 38% carried the "Follow the route." prefix (seeds: 78%) and
+# 20% were first person ("I must remain stopped ..."), which the seeds never are. Training the
+# backbone on those teaches a voice and shape the pretraining reasoning never had, so the
+# suggestion is normalised here and dropped if it cannot be made to fit.
+_REASON_PREFIX = "Follow the route."
+# Leading modal in the first person -> drop it and promote the verb to imperative. This is the
+# dominant deviation and is mechanically safe; anything subtler is discarded rather than guessed.
+_FIRST_PERSON_LEAD = re.compile(
+    r"^\s*I\s+(?:must|should|need\s+to|will|have\s+to|am\s+going\s+to|can|shall)\s+", re.I
+)
+_FIRST_PERSON_ANY = re.compile(r"\b(?:I|I'm|I've|my|me|myself)\b")
+
+
+def normalize_reasoning(text: Any) -> str:
+    """Coerce a VLM reasoning suggestion into the seed format, or return ``""`` to discard it.
+
+    ``"I must remain stopped to prevent colliding with the red wooden fence on the left side."``
+    -> ``"Follow the route. Remain stopped to prevent colliding with the red wooden fence on the
+    left side."``
+
+    Returns ``""`` when the text still reads in the first person after the leading modal is
+    stripped — a mid-sentence "I"/"my" cannot be rewritten without inventing meaning, and an
+    off-format target is worse than one fewer sample.
+    """
+    s = strip_cot_sentinels(text) if "strip_cot_sentinels" in globals() else str(text or "").strip()
+    s = re.sub(r"\s+", " ", str(s or "")).strip()
+    if not s:
+        return ""
+    # Already correct: leave untouched.
+    if s.startswith(_REASON_PREFIX):
+        body = s[len(_REASON_PREFIX):].strip()
+        return s if not _FIRST_PERSON_ANY.search(body) else ""
+    lead = _FIRST_PERSON_LEAD.match(s)
+    if lead:
+        s = s[lead.end():].strip()
+        s = s[:1].upper() + s[1:] if s else s
+    if _FIRST_PERSON_ANY.search(s):
+        return ""
+    return f"{_REASON_PREFIX} {s[:1].upper() + s[1:]}" if s else ""
+
+
 def _resolve_hl_targets(
     chunk: dict[str, Any],
     model_input: dict[str, Any],
@@ -1219,9 +1292,11 @@ def _resolve_hl_targets(
         suggested = chunk.get("suggested_subtasks") or []
         subtask_target = str(suggested[0]).strip() if suggested else ""
         if subtask_target:
-            reasoning_target = str(chunk.get("suggested_reasoning") or "").strip()
+            # Normalise to the seed template; the ``rationale`` fallback is free-form credit
+            # prose and almost never in format, so it is normalised too.
+            reasoning_target = normalize_reasoning(chunk.get("suggested_reasoning"))
             if not reasoning_target:
-                reasoning_target = str(chunk.get("rationale") or "").strip()
+                reasoning_target = normalize_reasoning(chunk.get("rationale"))
             # Corrected subtask: the executed action no longer matches it.
             return subtask_target, reasoning_target, False
         if label_str == "BAD" and not relabel_all:

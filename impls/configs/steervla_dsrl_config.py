@@ -155,7 +155,10 @@ def get_config():
             routing_command="Follow the route and stay in lane.",
             cot_temperature=0.0,
             include_ego_history=False,
-            proprio_norm=True,
+            # Raw m/s and degrees. Every ``pi05_steervla_cot_simplified_reasoning*``
+            # TrainConfig sets proprio_norm=False, so the old ``True`` (speed/20,
+            # course/180) fed the model a state layout it never trained on.
+            proprio_norm=False,
             # Replay buffer + CARLA ``step`` use OpenPI chunk layout (``action_horizon`` × ``action_dim``),
             # executed like ``simlingo/team_code/agent_steervla.py`` (cumsums + PID). Set
             # ``use_pi_action_chunk_for_env: false`` for legacy ``[accel, steer]`` controls only.

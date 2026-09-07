@@ -1351,7 +1351,7 @@ class SteerVLAActor:
         cot_resample_on_overflow: bool = True,
         cot_overflow_max_resamples: int = 2,
         include_ego_history: bool = False,
-        proprio_norm: bool = True,
+        proprio_norm: bool = False,
         output_action_format: Optional[str] = "DELTA_XY_T_DELTA_XY_SPACE",
         action_horizon: int = 10,
         action_dim: int = 4,
@@ -1829,9 +1829,9 @@ class SteerVLAActor:
         range and pins every state near -1. So there the checkpoint's value is *enforced*.
 
         Without norm stats the tokenized state is the only consumer and the legacy agent-config
-        value is left alone -- this only warns. (``config.steervla.proprio_norm=True`` disagrees
-        with every ``pi05_steervla_cot_simplified_reasoning*`` config, which is worth fixing, but
-        flipping it would change how the existing checkpoints drive and is a separate call.)
+        value is left alone -- this only warns. (The default was flipped to ``False`` on
+        2026-09-06 to agree with every ``pi05_steervla_cot_simplified_reasoning*`` config; runs
+        predating that were driven with the mismatched ``True``.)
         """
         dc = self._data_config
         if dc is None:

@@ -130,7 +130,7 @@ def get_config():
     # card. 16 lands near a 32 GiB peak, which leaves real headroom. Raise only with the
     # rematerialization line in the log as evidence -- the sibling cast_relabel config's
     # "start at 128" comment does not hold for this checkpoint.
-    config.steervla.hl_update_batch_size = 16
+    config.steervla.hl_update_batch_size = 64
     config.steervla.hl_update_every = 5
     config.steervla.hl_update_num_steps = 2
     config.steervla.hl_min_online_samples = 20

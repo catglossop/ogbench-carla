@@ -21,11 +21,11 @@ box: GPUs 0 and 6 are in nvidia-smi compute mode ``Prohibited``, so JAX enumerat
 ``CUDA_VISIBLE_DEVICES`` collapses the ambiguity — JAX and torch then both see exactly one
 device at index 0 — and also stops JAX from grabbing a ~0.5 GB stub on every other card.
 
-Because the HL train state (params + Adam mu/nu + backward activations) shares VRAM with
-the inference model, ``hl_update_batch_size`` is dropped from the base config's 64 (which
-assumes a dedicated card) to 16. To go back to a two-card split, drop the
-``CUDA_VISIBLE_DEVICES`` mask, set ``HL_GPU`` to a free JAX rank other than ``JOB_GPU``,
-and restore the batch to 64.
+The HL train state (params + Adam mu/nu + backward activations) shares VRAM with the
+inference model, so ``hl_update_batch_size`` is the knob to drop first if this OOMs; it is
+held at the base config's 64 (2026-09-06) and fits on the 143 GB H200s here. For a two-card
+split, drop the ``CUDA_VISIBLE_DEVICES`` mask and set ``HL_GPU`` to a free JAX rank other
+than ``JOB_GPU``.
 
 Launch on physical GPU 1 (ports/display come from ``carla_job.sh --job 1``)::
 
@@ -63,9 +63,9 @@ def get_config():
     # hl_device == infer_device, so split_hl is False and the whole train state stays on the
     # single job GPU.
     config.steervla.hl_training_gpu_rank = HL_GPU
-    # Reduced from the base config's 64: the HL forward+backward now shares VRAM with the
-    # inference model, so keep the batch modest to avoid OOM.
-    config.steervla.hl_update_batch_size = 16
+    # Held at the base config's 64. This shares VRAM with the inference model on one card, so
+    # watch for OOM on a smaller GPU; it fits on the 143 GB H200s here.
+    config.steervla.hl_update_batch_size = 64
 
     # Base config already has: enable_updates=True, enable_updates_rl=True,
     # enable_updates_bc_hl=True, cast_relabel.enabled=True, store_hl_dataset=True,

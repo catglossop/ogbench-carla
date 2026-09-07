@@ -342,6 +342,33 @@ flags.DEFINE_bool(
 )
 
 flags.DEFINE_integer("online_steps", 1000, "Number of online environment steps to run.")
+flags.DEFINE_float(
+    "stop_on_driving_score", -1.0,
+    "Once an episode finishes with driving score >= this, ARM a countdown of "
+    "--updates_after_driving_score further HL updates; training stops when that countdown is "
+    "spent (or at --max_hl_updates, whichever comes first), then runs "
+    "--post_stop_eval_episodes frozen evaluation episodes. <= 0 disables. The score is the "
+    "leaderboard's own score_composed for the episode, taken from info['driving_score'].",
+)
+flags.DEFINE_integer(
+    "max_hl_updates", 0,
+    "Stop TRAINING once this many HL (VLM-backbone) gradient updates have actually been APPLIED "
+    "-- SteerVLAActor._hl_updates_applied, not the throttled call count -- then run "
+    "--post_stop_eval_episodes frozen evaluation episodes and exit. <= 0 disables. Checked at "
+    "episode end, so the effective count can overshoot slightly within the final episode.",
+)
+flags.DEFINE_integer(
+    "updates_after_driving_score", 10,
+    "How many further HL gradient updates to APPLY after --stop_on_driving_score is first met. "
+    "Reaching the score does not stop training; it arms a countdown of this many more updates, so "
+    "the policy keeps learning from the episode that solved the route. --max_hl_updates still "
+    "applies as a hard cap, whichever comes first.",
+)
+flags.DEFINE_integer(
+    "post_stop_eval_episodes", 3,
+    "Frozen (no-update, no-CAST-review) episodes to run after either stop condition fires. Their "
+    "mean driving score is printed and logged as eval/mean_driving_score.",
+)
 flags.DEFINE_integer(
     "max_episodes", 0,
     "Stop after this many completed episodes (0 = unlimited, bounded only by "
@@ -3671,6 +3698,17 @@ def run_online_carla(
     # next-step backfills below from writing the new episode's data into it.
     _prev_transition_done = True
 
+    # Post-training evaluation phase (see --stop_on_driving_score / --max_hl_updates). Once a stop
+    # condition fires we do NOT exit immediately: updates and the CAST reviewer are switched off and
+    # the policy is rolled out frozen for --post_stop_eval_episodes episodes so the reported number
+    # is the performance of the weights that training actually produced.
+    eval_mode = False
+    eval_scores: list[float] = []
+    stop_reason = ""
+    # Set when --stop_on_driving_score is first met: the _hl_updates_applied count at which
+    # training should stop. None until the score is reached.
+    hl_target_after_score: int | None = None
+
     for step in tqdm.tqdm(range(1, FLAGS.online_steps + 1), smoothing=0.1, dynamic_ncols=True):
         t_sample_start = time.time()
         _bon_viz_img = None
@@ -4513,6 +4551,73 @@ def run_online_carla(
                     _pkl2.dump({"guidance_weight": _gw, "steps": _traj_ep}, _f2)
                 print(f"[traj-capture] episode end flush: {len(_traj_ep)} steps → {_ep_path}", flush=True)
                 steervla_actor._traj_capture = []
+
+            # ── stop conditions / frozen evaluation phase ────────────────────────────
+            _ep_ds = float(done_info.get("driving_score", 0.0) or 0.0)
+            _hl_applied = int(getattr(steervla_actor, "_hl_updates_applied", 0) or 0) if steervla_actor else 0
+            if eval_mode:
+                eval_scores.append(_ep_ds)
+                print(
+                    f"[main_carla] eval episode {len(eval_scores)}/{FLAGS.post_stop_eval_episodes}: "
+                    f"driving_score={_ep_ds:.2f}",
+                    flush=True,
+                )
+                if len(eval_scores) >= max(1, int(FLAGS.post_stop_eval_episodes)):
+                    _mean = sum(eval_scores) / len(eval_scores)
+                    print(
+                        f"[main_carla] EVAL DONE after {stop_reason}: "
+                        f"mean driving_score={_mean:.2f} over {len(eval_scores)} episodes "
+                        f"({', '.join(f'{v:.2f}' for v in eval_scores)}); stopping.",
+                        flush=True,
+                    )
+                    wandb.log(
+                        {
+                            "eval/mean_driving_score": _mean,
+                            "eval/episodes": float(len(eval_scores)),
+                            "eval/hl_updates_applied": float(_hl_applied),
+                        },
+                        step=step,
+                    )
+                    break
+            else:
+                # Reaching the score ARMS a countdown rather than stopping: the episode that
+                # solved the route is exactly the one worth learning from, so keep updating.
+                if (
+                    hl_target_after_score is None
+                    and FLAGS.stop_on_driving_score > 0
+                    and _ep_ds >= FLAGS.stop_on_driving_score
+                ):
+                    hl_target_after_score = _hl_applied + max(0, int(FLAGS.updates_after_driving_score))
+                    print(
+                        f"[main_carla] driving_score {_ep_ds:.2f} >= {FLAGS.stop_on_driving_score:g} "
+                        f"at {_hl_applied} HL updates; continuing for "
+                        f"{FLAGS.updates_after_driving_score} more (target {hl_target_after_score}).",
+                        flush=True,
+                    )
+                    wandb.log({"training/score_reached_at_hl_update": float(_hl_applied)}, step=step)
+                if hl_target_after_score is not None and _hl_applied >= hl_target_after_score:
+                    stop_reason = (
+                        f"{_hl_applied} HL updates applied >= {hl_target_after_score} "
+                        f"({FLAGS.updates_after_driving_score} past driving_score "
+                        f"{FLAGS.stop_on_driving_score:g})"
+                    )
+                elif FLAGS.max_hl_updates > 0 and _hl_applied >= FLAGS.max_hl_updates:
+                    stop_reason = f"{_hl_applied} HL updates applied >= cap {FLAGS.max_hl_updates}"
+                if stop_reason:
+                    eval_mode = True
+                    # Freeze everything: these gates are read live further down the loop.
+                    rl_updates_on = bc_updates_on = hl_updates_on = any_updates_on = False
+                    # Drop the CAST reviewer too -- every use of it is None-guarded. Otherwise the
+                    # eval episodes would keep paying for Gemini window reviews whose HL samples
+                    # nothing will ever train on.
+                    _cast_relabel = None
+                    print(
+                        f"[main_carla] STOP TRAINING ({stop_reason}); running "
+                        f"{FLAGS.post_stop_eval_episodes} frozen eval episodes.",
+                        flush=True,
+                    )
+                    wandb.log({"training/stopped_at_step": float(step),
+                               "training/hl_updates_at_stop": float(_hl_applied)}, step=step)
 
             if FLAGS.max_episodes > 0 and episode_count >= FLAGS.max_episodes:
                 print(f"[main_carla] Reached --max_episodes={FLAGS.max_episodes}; stopping.", flush=True)

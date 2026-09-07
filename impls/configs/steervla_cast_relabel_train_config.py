@@ -28,9 +28,11 @@ def get_config():
     # (1) Load SteerVLA as a trainable model (full train state), not inference-only.
     config.steervla.load_trainable_params = True
     # High-level (VLM-backbone) update cadence, run from DSRL ``update_with_vla``. Throttle so a
-    # full VLM forward/backward doesn't run on every DSRL update; keep the batch small for VRAM.
+    # full VLM forward/backward doesn't run on every DSRL update.
     config.steervla.hl_update_every = 8
-    config.steervla.hl_update_batch_size = 2
+    # Matches ``steervla_cast_relabel_config``'s 64. The former value of 2 made each HL step
+    # almost pure noise; 64 is the batch the base config was tuned around.
+    config.steervla.hl_update_batch_size = 64
     config.steervla.hl_update_num_steps = 1
 
     # Policy checkpoints for later inference. This is the config that actually *trains* the

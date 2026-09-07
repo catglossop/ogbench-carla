@@ -77,7 +77,7 @@ def get_config():
     config.steervla.hl_training_gpu_rank = HL_GPU
     # Dropped from the base config's 64: the HL forward+backward shares VRAM with the inference
     # model on a single card (same reasoning as steervla_cast_relabel_job1_slt001.py).
-    config.steervla.hl_update_batch_size = 16
+    config.steervla.hl_update_batch_size = 64
 
     # Base config already has enable_updates / enable_updates_bc_hl / cast_relabel.enabled /
     # store_hl_dataset / load_trainable_params on, and enable_updates_rl off. Left as-is: the
