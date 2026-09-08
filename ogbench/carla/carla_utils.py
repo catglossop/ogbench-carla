@@ -660,7 +660,16 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
             # Busy shared hosts can stall UE4's render thread for more than the
             # Linux default of 60 s during initial world/shader setup.  Let that
             # startup finish instead of crashing the simulator watchdog.
+            #
+            # Both spellings are needed. CARLA 0.9.16 accepts the `-g.<var>=<value>`
+            # form, but 0.9.15 (Fail2Drive's f2d_carla build) silently ignores it and
+            # keeps the 60 s default -- which shows up as
+            #     LowLevelFatalError: GameThread timed out waiting for RenderThread
+            #     after 60.00 secs  -> SIGSEGV
+            # while loading a heavy map like Town13. `-ExecCmds` works on both, so we
+            # pass it too; a console var set twice is harmless.
             "-g.TimeoutForBlockOnRenderFence=300000",
+            "-ExecCmds=g.TimeoutForBlockOnRenderFence 300000",
             f"-carla-rpc-port={rpc_port}",
             f"-graphicsadapter={sim_gpu_rank}",
         ]

@@ -286,6 +286,20 @@ done
 
 export CARLA_RPC_BASE="$RPC_BASE" CARLA_TM_BASE="$TM_BASE" CARLA_DISPLAY_BASE="$DISPLAY_BASE"
 
+# Make THIS checkout's ogbench/ win over the editable install's ogbench.pth, which always
+# points at the main working tree. Without it, a run launched from a git worktree silently
+# executes the main checkout's carla_utils.py. PYTHONPATH is searched before the .pth
+# site-packages entries, so this is enough.
+export PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+
+# W&B: runs must go to the school account (catherine_glossop), never the key in ~/.netrc.
+# Only matters when we are actually logging.
+if [[ "$WANDB_MODE" != "disabled" && -z "${WANDB_API_KEY:-}" && -r "${HOME}/.wandb_school_key" ]]; then
+  WANDB_API_KEY="$(tr -d '[:space:]' < "${HOME}/.wandb_school_key")"
+  export WANDB_API_KEY
+  say "using W&B school-account key from ~/.wandb_school_key"
+fi
+
 # ── Assemble the orchestrator command ─────────────────────────────────────────
 CMD=("$PYTHON" "${ROOT_DIR}/run_leaderboard.py"
      --slots "$SLOTS"
