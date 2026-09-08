@@ -324,7 +324,25 @@ def _patch_configured_walker_models(scenario_classes: dict) -> None:
                     import py_trees
 
                     actor = actors[0]
-                    spawn_z = float(self._spawn_transform.location.z)
+                    # ``_spawn_transform`` is set by Fail2Drive's
+                    # object_crash_intersection.py (VehicleTurningRoutePedestrian and
+                    # friends) but NOT by object_crash_vehicle.py's
+                    # DynamicObjectCrossing. This monitor is diagnostics only, so a
+                    # missing reference height must never take the scenario down with
+                    # it -- previously this raised
+                    #     'DynamicObjectCrossing' object has no attribute '_spawn_transform'
+                    # which the leaderboard swallowed as "Skipping scenario ... due to
+                    # setup error", silently running the route with no hazard at all.
+                    spawn_transform = getattr(self, '_spawn_transform', None)
+                    if spawn_transform is None:
+                        print(
+                            f'[fail2drive animal] {type(self).__name__} defines no '
+                            f'_spawn_transform; skipping lifecycle monitor for '
+                            f'{getattr(actor, "type_id", "?")} (scenario runs normally)',
+                            flush=True,
+                        )
+                        return behavior
+                    spawn_z = float(spawn_transform.location.z)
 
                     class AnimalLifecycleMonitor(py_trees.behaviour.Behaviour):
                         def __init__(monitor_self):
