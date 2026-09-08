@@ -78,6 +78,7 @@ ROUTE_TIMEOUT="7200"
 RETRIES="1"
 COT_TEMPERATURE="0.0"
 STALL_S="600"                   # watchdog: kill a worker silent this long w/ CARLA dead
+SETUP_TIMEOUT=""                # CARLA_SETUP_ATTEMPT_TIMEOUT; empty = carla_utils' 300 s
 DISPLAY_BASE="440"              # :440+k — well clear of the stale :30-:90 sockets on this box
 RPC_BASE="12000"
 TM_BASE="18000"
@@ -169,6 +170,7 @@ while [[ $# -gt 0 ]]; do
     --retries)                RETRIES="$2"; shift 2 ;;
     --cot-temperature)        COT_TEMPERATURE="$2"; shift 2 ;;
     --stall)                  STALL_S="$2"; shift 2 ;;
+    --setup-timeout)          SETUP_TIMEOUT="$2"; shift 2 ;;
     --display-base)           DISPLAY_BASE="$2"; shift 2 ;;
     --rpc-base)               RPC_BASE="$2"; shift 2 ;;
     --tm-base)                TM_BASE="$2"; shift 2 ;;
@@ -291,6 +293,13 @@ export CARLA_RPC_BASE="$RPC_BASE" CARLA_TM_BASE="$TM_BASE" CARLA_DISPLAY_BASE="$
 # executes the main checkout's carla_utils.py. PYTHONPATH is searched before the .pth
 # site-packages entries, so this is enough.
 export PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+
+# First boot of a CARLA build on a heavy map compiles shaders from cold, which can exceed
+# carla_utils' 300 s apply_settings window (seen on f2d_carla + Town13).
+if [[ -n "$SETUP_TIMEOUT" ]]; then
+  export CARLA_SETUP_ATTEMPT_TIMEOUT="$SETUP_TIMEOUT"
+  say "CARLA setup-attempt timeout = ${SETUP_TIMEOUT}s"
+fi
 
 # W&B: runs must go to the school account (catherine_glossop), never the key in ~/.netrc.
 # Only matters when we are actually logging.

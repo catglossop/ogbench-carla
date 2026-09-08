@@ -735,7 +735,12 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
         # World/shader setup can exceed a minute on a busy shared host. Match
         # the extended render-fence watchdog so we do not abandon the first
         # request and stack repeated setup RPCs while UE4 is still rendering.
-        _setup_attempt_timeout = 300.0
+        # Overridable: a cold shader cache (a CARLA build's first ever boot on a heavy map
+        # like Town13) can push the first apply_settings past 300 s, which shows up as
+        #   RuntimeError: time-out of 300000ms while waiting for the simulator
+        # against a server that is alive and still compiling. Raise it via
+        # CARLA_SETUP_ATTEMPT_TIMEOUT for those runs.
+        _setup_attempt_timeout = float(os.environ.get("CARLA_SETUP_ATTEMPT_TIMEOUT", "300"))
         while attempts < num_max_restarts:
             try:
                 client = carla.Client(args.host, rpc_port)
