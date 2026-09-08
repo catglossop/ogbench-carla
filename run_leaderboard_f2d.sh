@@ -271,8 +271,16 @@ for ((k = 0; k < N_SLOTS; k++)); do
       die "slot $k: port $p is already in use. Shift with --rpc-base / --tm-base."
     fi
   done
+  # A lock/socket on :N does NOT mean the display is in use -- a CARLA run that exited
+  # leaves both behind, and the next Xvfb on that display then dies with "server already
+  # running". Only a live Xvfb actually blocks us; anything else is debris we clear.
   if [[ -e "/tmp/.X${dpy}-lock" || -e "/tmp/.X11-unix/X${dpy}" ]]; then
-    die "slot $k: X display :$dpy already has a lock/socket. Shift with --display-base."
+    if pgrep -f "Xvfb :${dpy} " >/dev/null 2>&1; then
+      die "slot $k: an Xvfb is live on display :$dpy. Shift with --display-base."
+    fi
+    say "slot $k: clearing stale X debris for display :$dpy (no Xvfb running)"
+    rm -f "/tmp/.X${dpy}-lock" "/tmp/.X11-unix/X${dpy}" 2>/dev/null || \
+      die "slot $k: stale X debris on :$dpy is not removable (owned by another user?). Shift with --display-base."
   fi
 done
 
