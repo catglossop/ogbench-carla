@@ -125,6 +125,22 @@ if complete:
     w("Every route has landed, so **these numbers are final** for this checkpoint. The two jobs "
       "cover disjoint route sets with the same policy and identical scoring settings, which is "
       "what makes the combined row meaningful despite the different simulator builds.")
+    w("")
+    w("### Versus Bench2Drive, same checkpoint")
+    w("")
+    w("| benchmark | n | DS | RC | IP | success | km |")
+    w("|---|---:|---:|---:|---:|---:|---:|")
+    both_row = agg({**main_rows, **anim_rows})
+    w(f"| Fail2Drive | {both_row['n']} | {both_row['ds']:.2f} | {both_row['rc']:.2f} | "
+      f"{both_row['ip']:.3f} | {both_row['success']:.1f}% | {both_row['km']:.1f} |")
+    w("| Bench2Drive | 220 | 73.52 | 90.96 | 0.807 | 81.8% | 23.3 |")
+    w("")
+    w("Fail2Drive is markedly harder on **driving score** yet *higher* on **route completion** — "
+      "the policy usually reaches the end but accrues far more penalty on the way, which is the "
+      "shape you would expect from a benchmark built out of hazard scenarios. Both runs use the "
+      "same harness, the same greedy-CoT settings, and the same absent OpenPI norm stats "
+      "(`Normalize/Unnormalize disabled`), which is what makes them comparable; the Bench2Drive "
+      "figures come from `leaderboard_runs/llheavy_matchcrop_6k_b2d220`.")
 else:
     w("**The main job's numbers are partial and will move** until the remaining routes land.")
 w("")
@@ -187,21 +203,31 @@ w("")
 w("Two jobs, because they need different CARLA versions:")
 w("")
 w("```bash")
-w("# 1) the 187 non-animal routes, vanilla 0.9.16")
+w(f"# 1) the {len(main_rows)} non-animal routes, vanilla 0.9.16")
 w("./run_leaderboard_f2d.sh --slots 5:5,6:6 \\")
-w("  --routes @leaderboard_runs/f2d_routes_main.txt \\")
+w("  --routes @leaderboard_runs/f2d_routes_no_animals.txt \\")
 w("  --out-dir leaderboard_runs/f2d_llheavy_matchcrop_6k \\")
 w("  --resume --xla-mem-fraction 0.30 --stall 600 --route-timeout 2400")
 w("")
-w("# 2) the 7 runnable animal routes, Fail2Drive's own 0.9.15 build + matching client")
+w(f"# 2) the {len(anim_rows)} animal routes, Fail2Drive's own 0.9.15 build + matching client")
 w("./run_leaderboard_f2d.sh --slots 2:2 \\")
 w("  --routes @leaderboard_runs/f2d_routes_animals.txt \\")
 w("  --carla-root ~/f2d_carla \\")
 w("  --python /home/cglossop/ogbench-carla/.venv-f2d-eval/bin/python \\")
 w("  --out-dir leaderboard_runs/f2d_animals_eval \\")
-w("  --wandb-mode online --run-group f2d-animals-eval \\")
-w("  --rpc-base 13000 --tm-base 19000 --display-base 450 --setup-timeout 1200")
+w("  --resume --wandb-mode online --run-group f2d-animals-eval \\")
+w("  --rpc-base 13000 --tm-base 19000 --display-base 450 \\")
+w("  --xla-mem-fraction 0.30 --stall 1800 --route-timeout 3600 --setup-timeout 1200")
 w("```")
+w("")
+w("The two jobs need **different `--rpc-base` / `--tm-base` / `--display-base`** so their "
+  "CARLA servers and Xvfb displays cannot collide, and different `--out-dir`s so their "
+  "orchestrators do not race on `leaderboard_summary.json`.")
+w("")
+w("Historical note: the run was originally launched as 187 + 7 routes, with 6 excluded as "
+  "unrunnable. The deadlock fix made those 6 runnable and they were added afterwards, which "
+  "is why `f2d_routes_main.txt` still holds 187 — `f2d_routes_no_animals.txt` (190) is the "
+  "right list for a fresh sweep.")
 w("")
 w("Both use leaderboard-faithful settings (`crash_stuck_steps` disabled, `max_episode_steps=0`, "
   "`terminate_on_infraction=false`, greedy CoT, no gradient updates), identical to the "
@@ -239,9 +265,15 @@ w("| 3 | Animal lifecycle monitor read `self._spawn_transform` unconditionally; 
   "skip only the monitor |")
 w("| 4 | Worktree runs silently used the main checkout's `ogbench/` via `ogbench.pth` | patches "
   "had no effect | export `PYTHONPATH=$ROOT_DIR` |")
+w("| 5 | `build_scenarios` ran on the main thread while `runtime_init_mode` made "
+  "`BasicScenario.__init__` call `world.wait_for_tick()` | **deadlock**: any route with a "
+  "second `<scenario>` froze at 20 ticks and burned the full route timeout | clear the flag "
+  "around the wrapper's own `build_scenarios` (`ff7af76`) |")
 w("")
-w("Bug 3 is the one worth remembering: it produced *optimistic* scores rather than a visible "
-  "failure.")
+w("Two are worth remembering. **Bug 3** produced *optimistic* scores rather than a visible "
+  "failure — the hazard silently vanished from routes that still scored. **Bug 5** is "
+  "benchmark-agnostic: it applies to **Bench2Drive** wherever a route carries more than one "
+  "scenario, so sweeps predating `ff7af76` may have lost such routes to the timeout.")
 w("")
 w("## Caveat on this run's history")
 w("")
@@ -256,9 +288,10 @@ w("")
 w("```")
 w(f"{MAIN}/                 main run (records/, logs/, leaderboard_summary.json)")
 w(f"{ANIM}/                        animal run")
-w(f"{LB}/f2d_routes_main.txt                    187 non-animal routes")
-w(f"{LB}/f2d_routes_animals.txt                 7 runnable animal routes")
-w(f"{LB}/f2d_routes_hang_priorityatjunction.txt 6 blocked routes")
+w(f"{LB}/f2d_routes_no_animals.txt              190 non-animal routes (use this)")
+w(f"{LB}/f2d_routes_main.txt                    187 -- the original list, 6 routes short")
+w(f"{LB}/f2d_routes_animals.txt                 the animal routes needing f2d_carla")
+w(f"{LB}/f2d_routes_hang_priorityatjunction.txt the 6 formerly-deadlocked routes")
 w(f"{LB}/route_id_map.txt                       route name <-> id for all 420 routes")
 w("```")
 w("")
