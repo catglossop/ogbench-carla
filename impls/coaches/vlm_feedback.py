@@ -79,6 +79,85 @@ def load_metadata(metadata_path: str | Path) -> dict[str, Any]:
     return data
 
 
+# -- the episode's high-level objective ------------------------------------------------
+# What each Bench2Drive scenario family is actually ASKING the ego to accomplish. The routing
+# commands say which maneuvers to execute; they do not say why. "follow the road" -> "lane change
+# right" -> "follow the road" on ``highway-exit-002`` is the ego LEAVING THE HIGHWAY AT ITS EXIT,
+# and a reviewer that does not know that will happily mark a missed exit as fine because every
+# individual command looked obeyed. Stating the objective up front is what lets the review judge
+# whether the episode achieved anything, not merely whether it drove tidily.
+#
+# Keyed by scenario family (the route name with its trailing index stripped). Anything absent --
+# a new family, or the Fail2Drive ``base-*`` / ``generalization-*`` routes -- falls back to the
+# humanised family name, which is still enough to reason from together with the plan.
+ROUTE_GOAL_BY_FAMILY: dict[str, str] = {
+    "accident": "get past a crash blocking the lane, using the adjacent lane once it is clear",
+    "accident-two-ways": "get past a crash blocking the lane on a two-way road, briefly using the oncoming lane only when it is clear",
+    "blocked-intersection": "get through a junction that a stopped vehicle is obstructing",
+    "construction-obstacle": "get past a construction zone blocking the lane",
+    "construction-obstacle-two-ways": "get past a construction zone by briefly using the oncoming lane when it is clear",
+    "control-loss": "recover from a loss of vehicle control and stay on the route",
+    "crossing-bicycle-flow": "turn across a flow of cyclists without hitting one",
+    "dynamic-object-crossing": "avoid an object or pedestrian that suddenly crosses the ego's path",
+    "enter-actor-flow": "join a stream of moving traffic from a side road",
+    "hard-break-route": "keep a safe distance when the lead vehicle brakes hard",
+    "hazard-at-side-lane": "get past a hazard occupying part of the lane",
+    "hazard-at-side-lane-two-ways": "get past a hazard occupying part of the lane on a two-way road",
+    "highway-cut-in": "handle a vehicle cutting into the ego's lane on a highway",
+    "highway-exit": "LEAVE THE HIGHWAY at the correct exit -- change into the exit lane in time and take the ramp",
+    "interurban-actor-flow": "join or cross a flow of interurban traffic",
+    "interurban-advanced-actor-flow": "join or cross a fast flow of interurban traffic",
+    "invading-turn": "hold the lane when an oncoming vehicle cuts the corner into it",
+    "merger-into-slow-traffic": "merge into slower-moving traffic",
+    "merger-into-slow-traffic-v2": "merge into slower-moving traffic",
+    "non-signalized-junction-left-turn": "turn left at an unsignalised junction, yielding to cross traffic",
+    "non-signalized-junction-left-turn-enter-flow": "turn left at an unsignalised junction and merge into the traffic flow",
+    "non-signalized-junction-right-turn": "turn right at an unsignalised junction, yielding to cross traffic",
+    "opposite-vehicle-running-red-light": "avoid a vehicle running a red light through the junction",
+    "opposite-vehicle-taking-priority": "yield to an oncoming vehicle that takes priority, then continue",
+    "parked-obstacle": "get past a parked vehicle blocking the lane",
+    "parked-obstacle-two-ways": "get past a parked vehicle by briefly using the oncoming lane when it is clear",
+    "parking-crossing-pedestrian": "avoid a pedestrian emerging from between parked cars",
+    "parking-cut-in": "handle a vehicle pulling out of a parking space into the lane",
+    "parking-exit": "pull out of a parking space and join the road",
+    "pedestrian-crossing": "yield to pedestrians on a crossing, then continue",
+    "sequential-lane-change": "complete a sequence of lane changes",
+    "signalized-junction-left-turn": "turn left at a signalised junction",
+    "signalized-junction-left-turn-enter-flow": "turn left at a signalised junction and merge into the traffic flow",
+    "signalized-junction-right-turn": "turn right at a signalised junction",
+    "static-cut-in": "handle a stationary vehicle cutting into the lane",
+    "t_-junction": "negotiate a T-junction and take the commanded branch",
+    "vanilla-non-signalized-turn": "make the commanded turn at an unsignalised junction",
+    "vanilla-non-signalized-turn-encounter-stopsign": "stop at the stop sign, then make the commanded turn",
+    "vanilla-signalized-turn-encounter-green-light": "make the commanded turn on a green light without stopping unnecessarily",
+    "vanilla-signalized-turn-encounter-red-light": "stop for the red light, then make the commanded turn once it clears",
+    "vehicle-opens-door-two-ways": "avoid a car door opening into the lane",
+    "vehicle-turning-route": "handle a vehicle turning across the ego's path",
+    "vehicle-turning-route-pedestrian": "handle a vehicle turning across the ego's path while a pedestrian is present",
+    "yield-to-emergency-vehicle": "let an emergency vehicle past, then resume the route",
+}
+
+
+def route_family(route_name: str) -> str:
+    """Scenario family for a route name: ``highway-exit-002`` -> ``highway-exit``."""
+    return re.sub(r"[-_]?\d+$", "", str(route_name or "").strip()).strip("-_")
+
+
+def describe_route_goal(route_name: str) -> str:
+    """One-sentence statement of what this route is asking the ego to accomplish.
+
+    Falls back to the humanised family name when the family is not in the table, which still
+    gives the reviewer the scenario type to reason from alongside the routing-command plan.
+    """
+    fam = route_family(route_name)
+    if not fam:
+        return ""
+    goal = ROUTE_GOAL_BY_FAMILY.get(fam)
+    if goal:
+        return goal
+    return "complete the '" + fam.replace("-", " ").replace("_", " ").strip() + "' scenario"
+
+
 def _build_task_overview_block(metadata: dict[str, Any]) -> str:
     """Render the episode's routing-command plan, and where the ego currently sits in it.
 
@@ -98,6 +177,22 @@ def _build_task_overview_block(metadata: dict[str, Any]) -> str:
     """
     plan = metadata.get("route_command_plan") or []
     sections: list[str] = []
+
+    # The objective, before the maneuver list. The routing commands describe HOW to drive; this
+    # says WHAT the episode is for. Without it a reviewer grades obedience to each command in
+    # isolation and will pass an episode that obeyed every command and still failed the task --
+    # e.g. "follow the road" -> "lane change right" on a highway-exit route is the ego leaving
+    # the motorway, and never taking the ramp is a total failure however tidily it drove.
+    goal = describe_route_goal(str(metadata.get("route", "")))
+    if goal:
+        sections.append(
+            f"\nPRIMARY GOAL of this episode (route `{metadata.get('route', '')}`): {goal}.\n"
+            "This is what the ego is TRYING TO ACHIEVE. The routing commands below are the means "
+            "to it, not the end. Judge the episode first and foremost on whether it is making "
+            "real progress toward this goal; an episode that follows each command literally but "
+            "never accomplishes the goal has FAILED, and the failure to accomplish it is itself "
+            "the most important BAD event to report."
+        )
 
     plan_lines: list[str] = []
     if isinstance(plan, list):
@@ -485,6 +580,14 @@ def build_coaching_prompt(
           advancing the route when the way is clear is GOOD. (Do NOT penalize stopping that is
           genuinely justified by a red light, stop sign, close leading vehicle, or a
           pedestrian/yield — but require that justification to be visible, not assumed.)
+        - FIRST AND MOST IMPORTANT: is the vehicle actually accomplishing the PRIMARY GOAL
+          stated at the top of this prompt? That goal is inferred from the route's scenario type
+          and its routing-command plan together, and it is the point of the episode. If the ego
+          is drifting away from it — missing the exit it was supposed to take, failing to get
+          around the obstacle it was supposed to pass, never completing the merge — that is the
+          single most important BAD event in the window, and the correction must say what it
+          needed to do to achieve the goal. Obeying the individual routing commands while
+          failing the goal is NOT success.
         - Is the vehicle completing the maneuver the routing command asks for? A turn that is
           begun and then abandoned, or a junction the vehicle enters and then stalls in, is BAD:
           the correction is to carry the turn through and clear the junction.
