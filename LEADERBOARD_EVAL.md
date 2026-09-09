@@ -3,6 +3,17 @@
 Session handoff, 2026-08-20. Everything below is verified against the code unless marked
 otherwise. Read "Start here after the reboot" first if you just want to launch a run.
 
+> **Fail2Drive: see §10.** `run_leaderboard.py` scores both benchmarks, but Fail2Drive
+> needs two CARLA versions and two Python environments, so drive it through
+> `run_leaderboard_f2d.sh` rather than by hand. §10 covers the launcher, the split, and the
+> traps. A completed 200-route sweep and its numbers live in
+> `leaderboard_runs/F2D_LEADERBOARD_STATUS.md`; the portable version of §10 is
+> `HANDOFF_f2d_leaderboard.md`.
+>
+> **§7.6 applies to Bench2Drive too** — a deadlock that silently froze any route carrying
+> more than one `<scenario>`. It was fixed on 2026-09-08; runs made before that may have
+> lost such routes to the route timeout.
+
 ---
 
 ## 1. Why this script exists
@@ -50,25 +61,25 @@ not affect whether the *leaderboard scoring* is trustworthy.
 ## 2. Start here after the reboot
 
 ```bash
-cd /home/carla/ogbench-carla
+cd /home/cglossop/ogbench-carla
 
 # Sanity: no leftover CARLA, both GPUs near 0 MiB
 nvidia-smi --query-gpu=index,memory.used --format=csv
 
 # See the plan without launching anything
-CARLA_ROOT=/home/carla/carla-0-9-16 .venv/bin/python run_leaderboard.py \
+CARLA_ROOT=/home/cglossop/carla .venv/bin/python run_leaderboard.py \
   --slots 1:1 --routes bench2drive \
   --agent-config impls/configs/steervla_rollout_job2_eaf004_no_ego_history.py \
   --dry-run
 
 # Two routes first — confirms the stack works and warms the XLA cache
-CARLA_ROOT=/home/carla/carla-0-9-16 .venv/bin/python run_leaderboard.py \
+CARLA_ROOT=/home/cglossop/carla .venv/bin/python run_leaderboard.py \
   --slots 1:1 --routes accident-001,accident-002 \
   --agent-config impls/configs/steervla_rollout_job2_eaf004_no_ego_history.py \
   --xla-mem-fraction 0.60 --out-dir /tmp/lb_smoke
 
 # Then the full 220 (resumable; safe to Ctrl-C)
-CARLA_ROOT=/home/carla/carla-0-9-16 nohup .venv/bin/python run_leaderboard.py \
+CARLA_ROOT=/home/cglossop/carla nohup .venv/bin/python run_leaderboard.py \
   --slots 1:1 --routes bench2drive \
   --agent-config impls/configs/steervla_rollout_job2_eaf004_no_ego_history.py \
   --xla-mem-fraction 0.60 \
@@ -140,11 +151,13 @@ rpc     = 12000 + 100*k      streaming = rpc + 1
 tm      = 18000 + 100*k      display   = :30 + k
 ```
 
-**Confirmed empirically this session:** CARLA's `-graphicsadapter=1` renders on
-**physical GPU 0**, and `-graphicsadapter=0` on **physical GPU 1**. The adapter ordering is
-swapped relative to `nvidia-smi`, exactly as `carla_config.yaml` warns.
+**Corrected 2026-09-08: `-graphicsadapter=N` maps 1:1 to the `nvidia-smi` index.** The
+"swapped ordering" claim previously here (and in `carla_config.yaml`) is wrong on this box.
+Verified across the Fail2Drive sweep: `--slots 5:5,6:6` put the CARLA renderers on GPUs 5
+and 6, and `--slots 2:2` on GPU 2, each confirmed by per-GPU memory in `nvidia-smi`.
 
-So `--slots 1:1` = JAX/SigLIP on physical GPU 1, CARLA renderer on physical GPU 0.
+So `--slots 1:1` = JAX/SigLIP **and** the CARLA renderer both on physical GPU 1. Pair a
+train GPU with a different render adapter only if you actually want them split.
 
 ### Outputs
 
@@ -295,6 +308,61 @@ Each of these killed a real run during smoke-testing:
    killed immediately on SIGINT/SIGTERM.
 5. **Per-process XLA compile** — fixed with the persistent cache (§6.4).
 
+The next four were found while bringing Fail2Drive up (2026-09-08). Only 7.6 is
+benchmark-agnostic; the rest are in the Fail2Drive path.
+
+### 7.6 Deadlock building a route's second scenario — **affects Bench2Drive too**
+
+Any route carrying more than one `<scenario>` froze at exactly **20 ticks / 1.0 s game
+time**, with its CARLA server alive and nothing logged, burning the full `--route-timeout`
+(up to ~2 h at the leaderboard's 7200 s client timeout). Stack, from a `faulthandler`
+SIGUSR1 dump:
+
+```
+basic_scenario.py:67        world.wait_for_tick()
+green_traffic_light.py:40   PriorityAtJunction.__init__ -> super().__init__
+route_scenario.py:322       build_scenarios
+carla_utils.py:1182         _tick_scenario_locked
+```
+
+`RouteScenario.__init__` builds its first batch of scenarios and *then* sets
+`runtime_init_mode(True)`; with that on, `BasicScenario.__init__` calls
+`world.wait_for_tick()` instead of `world.tick()`. Upstream gets away with it because it
+builds scenarios on a **separate thread** (`ScenarioManager.build_scenarios_loop`) while the
+main thread ticks — but `CarlaBench2DriveWrapper` deliberately builds on the main thread to
+keep every CARLA RPC single-threaded, so it waits for a tick only its own blocked call stack
+could produce. Single-scenario routes never hit it: their only batch is built before the
+flag is set.
+
+Fixed by clearing `runtime_init_mode` around the wrapper's own `build_scenarios` call.
+The discriminator is **"route has a second scenario"**, not any particular scenario type, so
+**check whether earlier Bench2Drive sweeps lost routes to this.**
+
+### 7.7 Render-fence timeout ignored by CARLA 0.9.15
+
+`_setup_simulation` passed it only as `-g.TimeoutForBlockOnRenderFence=300000`, which 0.9.16
+honours and **0.9.15 silently ignores** — so Fail2Drive's 0.9.15 build kept the 60 s default
+and died loading Town13 with `GameThread timed out waiting for RenderThread`. Now the
+`-ExecCmds=g.TimeoutForBlockOnRenderFence 300000` form is passed as well; it works on both.
+Note this makes the 60 s render-fence SIGSEGV ambiguous: on a 0.9.15 server it may be the
+missing knob rather than co-tenant GPU starvation.
+
+### 7.8 Hardcoded 300 s setup timeout
+
+The client timeout around the first `get_world().apply_settings()` was pinned at 300 s. A
+CARLA build booting a heavy map (Town13) from a **cold shader cache** exceeds that while the
+server is alive and still compiling, surfacing as
+`RuntimeError: time-out of 300000ms while waiting for the simulator`. Now
+`CARLA_SETUP_ATTEMPT_TIMEOUT` (default unchanged), exposed as `--setup-timeout`.
+
+### 7.9 Animal lifecycle monitor dropped the scenario — silently optimistic scores
+
+`fail2drive_compat`'s diagnostic monitor read `self._spawn_transform`, which only
+Fail2Drive's `object_crash_intersection.py` defines — `DynamicObjectCrossing` does not. The
+leaderboard swallowed the AttributeError as *"Skipping scenario … due to setup error"*, so
+the animal spawned, **the scenario was dropped, and the route scored with no hazard at
+all**. Worth remembering as a class of bug: it inflated scores rather than failing visibly.
+
 ---
 
 ## 8. Manual cleanup crib sheet
@@ -333,3 +401,99 @@ pkill -9 -f "Xvfb :$((30 + k)) -screen"
   if anything ever resets mid-episode, every later route runs asynchronously and the
   results are silently garbage. Worth a defensive re-assert in
   `_load_route_and_begin_stepping`.
+
+---
+
+## 10. Fail2Drive routes
+
+Added 2026-09-08. Everything here is verified against a completed 200-route sweep.
+
+`run_leaderboard.py` scores Fail2Drive routes with the same harness and the same faithful
+overrides as Bench2Drive — but Fail2Drive needs **two CARLA versions and two Python
+environments**, so drive it through `run_leaderboard_f2d.sh`, which sets the environment,
+guards the version pairing, and refuses to start when they mismatch.
+
+### 10.1 The 190/10 split, and why
+
+- **190 routes** run on the vanilla **0.9.16** install (`$CARLA_ROOT`, `~/carla`).
+  `install_f2d_content.sh` already put all six Fail2Drive content packs there; every one of
+  the 42 `static.prop.*` ids the route XMLs reference resolves, and its `Content/` tree is a
+  strict superset of `~/f2d_carla`'s (40833 vs 40475 files).
+- **10 routes** (`generalization-animals-1075..1084`) reference `walker.animal.*`, which
+  **only `~/f2d_carla` registers**. Walker ids come from the *cooked*
+  `Content/Carla/Blueprints/Walkers/WalkerFactory.uasset`, so a loose-file content install
+  cannot add them.
+
+**Do not copy that WalkerFactory into the 0.9.16 tree.** Tested: 0.9.15-cooked blueprint
+bytecode is not loadable by a 0.9.16 engine and kills *every* server boot with
+`LowLevelFatalError: Unknown code token 30 … WalkerFactory_C:GenerateDefinitions` → SIGSEGV.
+Because that crash lands ~14 s into boot, a running orchestrator churns routes at ~3/min and
+burns their retry budgets — a 7-minute exposure destroyed 23 routes. A
+`WalkerFactory.{uasset,uexp}.stock-0.9.16.bak` sits beside the file; restore from it.
+
+### 10.2 Why a second environment
+
+`~/f2d_carla` is CARLA **0.9.15.2**. Pointing the repo's **0.9.16** client at it segfaults
+the worker (`rc=139`) shortly after the version-mismatch warning — so it needs a matching
+0.9.15 client, and carla 0.9.15 has **no cp311 wheel** (PyPI stops at cp310). Hence Python
+**3.10**, built by `build_f2d_eval_env.sh` into `.venv-f2d-eval`.
+
+openpi pins `requires-python = ">=3.11"`, but that is *nearly* conservative: the tree
+byte-compiles under 3.10 and every dependency allows 3.10. There is exactly **one** real
+3.11 API — a `datetime.UTC` in `openpi/shared/download.py`. The build script installs openpi
+from a staged copy with the pin relaxed and that line rewritten; the upstream clone is never
+touched. It also pins `torch==2.7.1` / `torchvision==0.22.1` (lerobot otherwise drags in
+torch 2.14+cu130, which reports `cuda_available=False` on a 570 driver and installs a
+CUDA-13 stack that shadows JAX's cu12 libs).
+
+### 10.3 Launching
+
+```bash
+# 190 routes, vanilla 0.9.16
+./run_leaderboard_f2d.sh --slots 5:5,6:6 \
+  --routes @leaderboard_runs/f2d_routes_no_animals.txt \
+  --out-dir leaderboard_runs/<tag> \
+  --resume --xla-mem-fraction 0.30 --stall 600 --route-timeout 2400
+
+# 10 animal routes, Fail2Drive's own build + the matching 0.9.15 client
+./run_leaderboard_f2d.sh --slots 2:2 \
+  --routes @leaderboard_runs/f2d_routes_animals.txt \
+  --carla-root ~/f2d_carla \
+  --python /home/cglossop/ogbench-carla/.venv-f2d-eval/bin/python \
+  --out-dir leaderboard_runs/<tag>_animals \
+  --resume --wandb-mode online --run-group <group> \
+  --rpc-base 13000 --tm-base 19000 --display-base 450 \
+  --xla-mem-fraction 0.30 --stall 1800 --route-timeout 3600 --setup-timeout 1200
+```
+
+The two jobs must use **different `--rpc-base` / `--tm-base` / `--display-base`** so their
+CARLA servers and Xvfb displays cannot collide, and different `--out-dir`s so their
+orchestrators do not race on `leaderboard_summary.json` (per-route records are safe either
+way). Beyond `--carla-root` / `--python`, flags carry the same meaning as §4.
+
+`report_f2d_status.py` regenerates `leaderboard_runs/F2D_LEADERBOARD_STATUS.md` — scored /
+remaining / blocked plus per-job and combined aggregates — straight from the records:
+
+```bash
+FAIL2DRIVE_ROUTES_DIR=~/fail2drive/fail2drive_split .venv/bin/python report_f2d_status.py
+```
+
+### 10.4 Route naming
+
+Fail2Drive route ids are **small integers that collide with Bench2Drive's file numbering**,
+so prefer the kebab name (`generalization-animals-1075`) or the `f2d:<id>` alias over a bare
+id. `leaderboard_runs/route_id_map.txt` maps all 420 routes across both benchmarks
+(name / id / alias / file / town / scenario type). Route discovery needs
+`FAIL2DRIVE_ROUTES_DIR`; scenario classes need `FAIL2DRIVE_SCENARIOS_DIR` — the launcher
+exports both and hard-errors if either is missing.
+
+### 10.5 Result of the first full sweep
+
+200/200 routes on `ll_heavy_unnormed_matchcrop/6000`, DS **60.89** / RC **95.68** / IP
+**0.620**, 93.5% success over 46.4 km. For contrast the Bench2Drive 220-route run on the
+same checkpoint scored DS 73.52 / RC 90.96 — Fail2Drive is harder on driving score while
+route completion is *higher*, i.e. the policy usually finishes but accrues more penalty.
+
+Norm stats are absent for this checkpoint in both sweeps (`Normalize/Unnormalize disabled`),
+which is what makes the two directly comparable — check that line in the worker log before
+comparing against any other run.
