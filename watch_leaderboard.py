@@ -127,11 +127,15 @@ def render(out_dir: Path, log: Path | None):
     _agent_cfg = summary.get("agent_config")
     head.add_row(f"[bold]{out_dir.name}[/]  {Path(_agent_cfg).name if _agent_cfg else '?'}",
                  f"routes [bold]{done}[/]/{total}   queued {orch.get('queued', '?')}")
-    # ETA from the mean wall-clock of completed routes; blank until one lands.
-    walls = [r.get("wall_s", 0.0) for r in routes if r.get("wall_s")]
+    # ETA from the *median* per-route wall time (robust to the one-off XLA compile on
+    # each slot's first route, which inflates the mean) divided by the number of
+    # concurrent slots. The old mean*remaining ignored concurrency and was dominated by
+    # the compile outlier, so it over-predicted by ~n_slots x (e.g. days vs hours).
+    walls = sorted(r.get("wall_s", 0.0) for r in routes if r.get("wall_s"))
     eta = ""
     if walls and total and done < total:
-        eta = f"   ETA {_hms(sum(walls) / len(walls) * (total - done))}"
+        n_slots = max(1, len(orch.get("slots") or []))
+        eta = f"   ETA {_hms(walls[len(walls) // 2] * (total - done) / n_slots)}"
     head.add_row(f"[dim]{ckpt}[/]", f"elapsed {orch.get('elapsed', '?')}{eta}")
 
     scores = Table.grid(expand=True, padding=(0, 2))

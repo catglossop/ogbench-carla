@@ -659,8 +659,15 @@ class Dashboard:
 
         elapsed = time.time() - self.started
         done = len(results)
-        rate = done / elapsed if elapsed > 0 and done else 0.0
-        eta = (self.total - done) / rate if rate > 0 else 0.0
+        remaining = self.total - done
+        # ETA from the *median* per-route wall time (robust to the one-off ~17 min XLA
+        # compile + checkpoint restore on each slot's first route) divided by the number
+        # of concurrent slots -- NOT the cumulative done/elapsed rate. That rate is
+        # dominated by startup while `done` is small, so it over-predicts by days early
+        # on and only converges near the end.
+        walls = sorted(r.wall_seconds for r in results if r.wall_seconds > 0)
+        have_eta = bool(walls and remaining > 0)
+        eta = (walls[len(walls) // 2] * remaining / max(1, len(slots))) if have_eta else 0.0
         agg = aggregate(results)
 
         head = Table.grid(expand=True, padding=(0, 2))
@@ -670,7 +677,7 @@ class Dashboard:
             f"[bold]{done}[/]/{self.total} routes",
             f"queued [bold]{queued}[/]",
             f"elapsed [bold]{_hms(elapsed)}[/]",
-            f"ETA [bold]{_hms(eta) if rate > 0 else '--'}[/]",
+            f"ETA [bold]{_hms(eta) if have_eta else '--'}[/]",
             f"[dim]{self.run_dir}[/]",
         )
         scores = Table.grid(expand=True, padding=(0, 2))
