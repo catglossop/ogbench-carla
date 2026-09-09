@@ -77,6 +77,7 @@ BON_QWEN_CADENCE="5"
 QWEN_ONLINE_TRAIN="false"
 QWEN_ONLINE_WARMUP_EPISODES="2"
 MAX_EPISODES=""
+MAX_EPISODE_STEPS=""
 TERMINATE_ON_COLLISION="false"
 EXPERT_CONTROLLER=""
 SAVE_VIDEO_LOCAL="true"
@@ -190,6 +191,7 @@ Options:
 
   --agent-config PATH       Base agent config. Default: impls/configs/pi0_residual_sac_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
+  --max-episode-steps N     Override CARLA's per-episode step cap (0 = no cap).
   --steervla-checkpoint PATH  Override config.steervla.checkpoint (deploy a relabelled ckpt).
   --actor-config NAME       Override config.steervla.actor_config (match the ckpt's model).
   --grpo-warmup N           GRPO only: drive the greedy base for N steps before scoring/updates.
@@ -340,6 +342,7 @@ while [[ $# -gt 0 ]]; do
     --qwen-online-train|--qwen_online_train) QWEN_ONLINE_TRAIN="$2"; shift 2 ;;
     --qwen-online-warmup-episodes|--qwen_online_warmup_episodes) QWEN_ONLINE_WARMUP_EPISODES="$2"; shift 2 ;;
     --max-episodes|--max_episodes) MAX_EPISODES="$2"; shift 2 ;;
+    --max-episode-steps|--max_episode_steps) MAX_EPISODE_STEPS="$2"; shift 2 ;;
     --terminate-on-collision|--terminate_on_collision) TERMINATE_ON_COLLISION="$2"; shift 2 ;;
     --expert-controller|--expert_controller) EXPERT_CONTROLLER="$2"; shift 2 ;;
     --save-video-local|--save_video_local) SAVE_VIDEO_LOCAL="$2"; shift 2 ;;
@@ -422,6 +425,10 @@ case "$BASE_ONLY" in
   ""|true|false) ;;
   *) echo "Invalid --base-only: $BASE_ONLY (expected true|false)" >&2; exit 2 ;;
 esac
+if [[ -n "$MAX_EPISODE_STEPS" ]] && ! [[ "$MAX_EPISODE_STEPS" =~ ^[0-9]+$ ]]; then
+  echo "Invalid --max-episode-steps: $MAX_EPISODE_STEPS (expected a non-negative integer)" >&2
+  exit 2
+fi
 
 TMP_ROOT="$ROOT_DIR/.run_carla"
 mkdir -p "$TMP_ROOT"
@@ -542,6 +549,8 @@ cfg["traffic_manager_port"] = int("${TM_PORT}")
 cfg["gpu_rank"] = int("${SIM_GPU_RANK}")
 cfg["x_display_num"] = int("${X_DISPLAY_NUM}")
 cfg["use_cuda_visible_devices"] = False
+if "${MAX_EPISODE_STEPS}" != "":
+    cfg["max_episode_steps"] = int("${MAX_EPISODE_STEPS}")
 if r"${EXPERT_CONTROLLER}":
     cfg["expert_controller"] = r"${EXPERT_CONTROLLER}"
 Path(r"${CARLA_CFG_TMP}").write_text(yaml.safe_dump(cfg, sort_keys=False))
@@ -569,7 +578,7 @@ echo "[run_carla.sh] train_mode=${TRAIN_MODE}"
 echo "[run_carla.sh] critic_mode=${CRITIC_FEEDBACK_MODE}"
 echo "[run_carla.sh] train_gpu_rank=${TRAIN_GPU_RANK} render_adapter=${SIM_GPU_RANK}"
 echo "[run_carla.sh] carla_host=${CARLA_HOST} carla_port=${CARLA_PORT} streaming_port=${CARLA_STREAMING_PORT} tm_port=${TM_PORT} x_display=:${X_DISPLAY_NUM}"
-echo "[run_carla.sh] expert_debug=${EXPERT_DEBUG} expert_recover_debug=${EXPERT_RECOVER_DEBUG} save_buffer=${SAVE_BUFFER} online_steps=${ONLINE_STEPS} include_proprio=${INCLUDE_PROPRIO}"
+echo "[run_carla.sh] expert_debug=${EXPERT_DEBUG} expert_recover_debug=${EXPERT_RECOVER_DEBUG} save_buffer=${SAVE_BUFFER} online_steps=${ONLINE_STEPS} max_episode_steps=${MAX_EPISODE_STEPS:-<config default>} include_proprio=${INCLUDE_PROPRIO}"
 echo "[run_carla.sh] temp agent config: ${AGENT_CFG_TMP}"
 echo "[run_carla.sh] temp carla config: ${CARLA_CFG_TMP}"
 if [[ -n "$BON_CRITIC_CKPT" ]]; then
