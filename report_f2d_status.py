@@ -15,9 +15,14 @@ MAIN, ANIM = LB / "f2d_llheavy_matchcrop_6k", LB / "f2d_animals_eval"
 OUT = LB / "F2D_LEADERBOARD_STATUS.md"
 CKPT = "/raid/users/cglossop/steervla_pi_ckpts/ll_heavy_unnormed_matchcrop/6000"
 
-BLOCKED = ["base-animals-0076", "base-animals-0079", "base-animals-0083",
-           "generalization-animals-1076", "generalization-animals-1079",
-           "generalization-animals-1083"]
+# Formerly blocked by the 20-tick build_scenarios deadlock (any route with a 2nd scenario).
+# Fixed in carla_utils.py (commit ff7af76), so nothing is blocked any more -- these are just
+# ordinary routes now. Kept as a named list because they are the ones to re-check first if
+# that deadlock ever regresses.
+WAS_BLOCKED = ["base-animals-0076", "base-animals-0079", "base-animals-0083",
+               "generalization-animals-1076", "generalization-animals-1079",
+               "generalization-animals-1083"]
+BLOCKED = []
 NEEDS_F2D = {f"generalization-animals-10{n}" for n in range(75, 85)}
 
 all_routes = [e.scenario_name for e in list_routes(source="fail2drive")]
@@ -88,8 +93,12 @@ w(f"| Blocked (cannot run) | **{len(BLOCKED)}** |")
 w("")
 w(f"`{len(scored)} scored + {len(remaining)} remaining + {len(BLOCKED)} blocked = {len(all_routes)}`")
 w("")
-w(f"Runnable universe is **{len(all_routes) - len(BLOCKED)} of {len(all_routes)}**; the other "
-  f"{len(BLOCKED)} hang deterministically (see *Blocked routes*).")
+if BLOCKED:
+    w(f"Runnable universe is **{len(all_routes) - len(BLOCKED)} of {len(all_routes)}**; the "
+      f"other {len(BLOCKED)} hang deterministically (see *Blocked routes*).")
+else:
+    w(f"**All {len(all_routes)} routes are runnable.** The 6 that used to hang at 20 ticks "
+      "were unblocked by the `build_scenarios` deadlock fix (commit `ff7af76`).")
 w("")
 
 w("## Scores so far")
@@ -127,18 +136,26 @@ w("## Route accounting")
 w("")
 w(f"### Blocked — not run, not queued ({len(BLOCKED)})")
 w("")
-w("Every route whose XML carries a second `<scenario type=\"PriorityAtJunction\">` hangs at "
-  "exactly **20 ticks / 1.0 s game time**. The worker sits in `futex_wait_queue` with its CARLA "
-  "server still alive, so nothing errors — it just burns the whole `--route-timeout`. "
-  "This is a pre-existing bug, **root cause not diagnosed**.")
-w("")
-w("| route | needs f2d_carla | blocker |")
-w("|---|---|---|")
-for r in BLOCKED:
-    w(f"| `{r}` | {'yes' if r in NEEDS_F2D else 'no'} | PriorityAtJunction hang |")
-w("")
-w("The three `base-animals-*` ones need nothing from f2d_carla and still hang on the plain "
-  "0.9.16 stack, so `PriorityAtJunction` — not the animal blueprints — is the binding constraint.")
+if BLOCKED:
+    w("| route | needs f2d_carla | blocker |")
+    w("|---|---|---|")
+    for r in BLOCKED:
+        w(f"| `{r}` | {'yes' if r in NEEDS_F2D else 'no'} | build_scenarios deadlock |")
+else:
+    w("**None.** Six routes previously hung at exactly 20 ticks / 1.0 s game time with their "
+      "CARLA server alive and nothing logged, burning the full `--route-timeout`. Cause: "
+      "`RouteScenario.__init__` sets `runtime_init_mode(True)` after building its first batch "
+      "of scenarios, which makes `BasicScenario.__init__` call `world.wait_for_tick()`. "
+      "Upstream builds scenarios on a separate thread while the main thread ticks; this "
+      "wrapper builds on the main thread, so it waited for a tick only its own blocked call "
+      "stack could produce. Fixed in `ff7af76` by clearing the flag around the wrapper's own "
+      "`build_scenarios` call.")
+    w("")
+    w("The discriminator was **\"route has a second scenario\"**, not the scenario type — so "
+      "this also affected 4 `Generalization_PedestrianCrowd` routes, and applies to "
+      "**Bench2Drive** wherever a route carries more than one scenario.")
+    w("")
+    w(f"Formerly blocked, now ordinary routes: {', '.join('`' + r + '`' for r in WAS_BLOCKED)}.")
 w("")
 
 w(f"### Remaining to run ({len(remaining)})")
