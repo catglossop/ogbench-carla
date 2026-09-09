@@ -110,6 +110,25 @@ def get_config():
             # moment it happens: nothing after it is worth imitating.
             hl_stop_after_failure=True,
             hl_stop_on_off_route=True,
+            # Leaving the planned ROUTE (as opposed to the lane) is detected programmatically by
+            # two independent signals, so it no longer depends on the VLM noticing it:
+            #   * the leaderboard's own InRouteTest counter (``route_deviation_delta``) --
+            #     authoritative, it is what scores the ``route_dev`` infraction, but late by
+            #     construction: MAX_ROUTE_PERCENTAGE=30 means 30% of the route length must
+            #     accumulate off-route before it fires;
+            #   * "driving but not progressing" -- ``route_distance_m`` comes from
+            #     RouteCompletionTest and only advances while the ego is ON the plan, so an ego
+            #     that is clearly moving while that number stalls has taken a wrong branch. This
+            #     catches the common wrong-turn case within seconds.
+            # The cut is backdated to where the run of motion began, not where the detector became
+            # confident, so the states after leaving the plan are all dropped.
+            hl_stop_on_route_divergence=True,
+            # Thresholds for the behavioural half: >2 m/s continuously for 60 ticks (3 s at 20 Hz,
+            # so >6 m driven) while gaining <2 m of route. A stopped or crawling ego never trips
+            # it -- waiting at a light or yielding is not divergence.
+            hl_divergence_speed_mps=2.0,
+            hl_divergence_ticks=60,
+            hl_divergence_progress_m=2.0,
             # A collision is NOT. Clipping a cone or brushing a barrier and driving on leaves the
             # rest of the episode perfectly good supervision, and cutting there threw it away for
             # nothing. Only a collision the ego gets STUCK in ends supervision: this many

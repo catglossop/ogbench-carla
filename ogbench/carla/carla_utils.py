@@ -1563,6 +1563,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._failure_bonus = float(self.carla_config.get("failure_bonus", FAILURE_BONUS))
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
+        self._prev_route_deviation_value = 0.0
         self._prev_route_progress_pct = 0.0
         self._max_episode_steps = int(
             self.carla_config.get("max_episode_steps", DEFAULT_MAX_EPISODE_STEPS)
@@ -1999,6 +2000,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._crash_stuck_ticks = 0
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
+        self._prev_route_deviation_value = 0.0
         self._prev_route_progress_pct = 0.0
         self._prev_traffic_violation_count = 0
         self._raw_collision_active = False
@@ -2809,9 +2811,12 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
 
         collision_delta = max(0, collision_count - self._prev_collision_count)
         outside_route_delta = max(0.0, outside_route_value - self._prev_outside_route_value)
+        route_deviation_value = self._route_deviation_value()
+        route_deviation_delta = max(0.0, route_deviation_value - self._prev_route_deviation_value)
         traffic_violation_delta = max(0, traffic_violation_count - self._prev_traffic_violation_count)
         self._prev_collision_count = collision_count
         self._prev_outside_route_value = outside_route_value
+        self._prev_route_deviation_value = route_deviation_value
         self._prev_traffic_violation_count = traffic_violation_count
 
         collision_contact_active = self._raw_collision_active
@@ -2843,6 +2848,10 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         info["outside_route_value"] = outside_route_value
         info["collision_delta"] = float(collision_delta)
         info["outside_route_delta"] = float(outside_route_delta)
+        # Distinct from outside_route_delta: that is OutsideRouteLanesTest (drove outside
+        # the lane markings); this is InRouteTest (left the planned route altogether).
+        info["route_deviation_value"] = float(route_deviation_value)
+        info["route_deviation_delta"] = float(route_deviation_delta)
         info["traffic_violation_count"] = traffic_violation_count
         info["traffic_violation_delta"] = float(traffic_violation_delta)
         info["lane_offset_m"] = lane_offset_m
@@ -3082,6 +3091,31 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 min_speed_val = max(min_speed_val, value)
 
         return outside_route_val, min_speed_val
+
+    def _route_deviation_value(self) -> float:
+        """Cumulative count from the leaderboard's ``InRouteTest`` criterion.
+
+        This is the criterion behind the ``route_dev`` infraction and the "Agent deviated from
+        the route" status: it increments ``actual_value`` every time the ego is judged to have
+        left the planned route. It is deliberately *slow* -- ``MAX_ROUTE_PERCENTAGE = 30`` means
+        it only fires once 30% of the route's total length has been accumulated off-route -- so
+        it is authoritative but very late. cast_relabel pairs it with a much earlier behavioural
+        check; see ``_maybe_trip_hl_cutoff``.
+        """
+        scenario = getattr(self.evaluator, "route_scenario", None)
+        if scenario is None:
+            return 0.0
+        for criterion in scenario.get_criteria():
+            name = str(getattr(criterion, "name", "")).lower()
+            # "inroute" is the class name (InRouteTest); the route+deviat pair is a fallback in
+            # case a fork renames it. Must NOT match OutsideRouteLanesTest -- that is a different
+            # failure (drove outside the lane markings), already carried by outside_route_delta.
+            if "inroute" in name or ("route" in name and "deviat" in name):
+                try:
+                    return float(getattr(criterion, "actual_value", 0.0))
+                except Exception:
+                    return 0.0
+        return 0.0
 
     def _criteria_snapshot(self) -> list[dict[str, Any]]:
         scenario = getattr(self.evaluator, "route_scenario", None)
