@@ -52,6 +52,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import faulthandler
+import itertools
 import json
 import os
 import random
@@ -2302,21 +2303,17 @@ def run_online_carla(
     _cast_relabel: OnlineCastRelabelSession | None = None
     cast_cfg = agent_config.get("cast_relabel")
     if cast_cfg is not None and bool(cast_cfg.get("enabled", False)):
-        # ``cast_relabel.prompt_version`` selects which copy of the labeling prompts to run.
-        # 1 (default) = coaches/cast_relabel.py + coaches/vlm_feedback.py -- the stable pair.
-        # 2           = coaches/cast_relabel_v2.py + coaches/vlm_feedback_v2.py -- the scratch pair
-        #               for prompt iteration. Nothing in v2 is imported unless this is set to 2, so
-        #               editing those files cannot perturb a run that did not opt in.
-        _cast_cls = OnlineCastRelabelSession
+        # ``cast_relabel.prompt_version`` used to select between coaches/cast_relabel.py and a
+        # scratch ``_v2`` copy of the labeling prompts. The v2 pair was deleted (2026-09-07), so 1
+        # is the only value left; it is still validated rather than ignored, because a stale config
+        # asking for 2 must fail loudly instead of silently running the v1 prompts.
         _prompt_version = int(cast_cfg.get("prompt_version", 1) or 1)
-        if _prompt_version == 2:
-            from coaches.cast_relabel_v2 import OnlineCastRelabelSession as _CastV2
-
-            _cast_cls = _CastV2
-            print("[cast_relabel] prompt_version=2 -> using cast_relabel_v2 + vlm_feedback_v2", flush=True)
-        elif _prompt_version != 1:
-            raise ValueError(f"cast_relabel.prompt_version must be 1 or 2, got {_prompt_version}")
-        _cast_relabel = _cast_cls(
+        if _prompt_version != 1:
+            raise ValueError(
+                f"cast_relabel.prompt_version must be 1 (the _v2 prompt copies were removed), "
+                f"got {_prompt_version}"
+            )
+        _cast_relabel = OnlineCastRelabelSession(
             cast_cfg,
             save_dir=FLAGS.save_dir,
             action_chunk_steps=int(agent_config.get("action_horizon", 10)),
@@ -3094,6 +3091,11 @@ def run_online_carla(
             # strategy. ``termination_reason`` catches crash_stuck (collided, then never recovered).
             "collision_delta": float(step_info.get("collision_delta", 0.0)),
             "outside_route_delta": float(step_info.get("outside_route_delta", 0.0)),
+            # Consecutive ticks the ego has been in contact AND below the crash-stuck speed
+            # threshold (``carla_utils._update_crash_stuck_state``; resets the moment it moves
+            # again). This is what separates "clipped a barrier and drove on" from "wedged into
+            # it" -- cast_relabel cuts HL supervision only on the latter.
+            "crash_stuck_ticks": int(step_info.get("crash_stuck_ticks", 0)),
             "termination_reason": step_info.get("termination_reason"),
             "route_progress_pct": float(step_info.get("route_progress_pct", 0.0)),
             # Progress in METRES along the plan, plus the route's total length. The routing-command
@@ -3708,8 +3710,29 @@ def run_online_carla(
     # Set when --stop_on_driving_score is first met: the _hl_updates_applied count at which
     # training should stop. None until the score is reached.
     hl_target_after_score: int | None = None
+    # Env step at which the eval phase began. The eval episodes are rolled out AFTER the
+    # ``--online_steps`` training budget is spent, not inside it: a run that stops late would
+    # otherwise hit the budget partway through eval and exit without ever logging
+    # ``eval/mean_driving_score`` -- which is the number the whole stop condition exists to
+    # produce. (Observed 2026-09-07: a run stopped at 120 HL updates, completed 2 of 3 eval
+    # episodes, then ran out at 8000/8000.) The extension is bounded so a route that never
+    # terminates cannot spin here forever.
+    eval_started_step: int | None = None
+    eval_step_budget = 2 * int(FLAGS.online_steps)
 
-    for step in tqdm.tqdm(range(1, FLAGS.online_steps + 1), smoothing=0.1, dynamic_ncols=True):
+    for step in tqdm.tqdm(itertools.count(1), total=FLAGS.online_steps, smoothing=0.1, dynamic_ncols=True):
+        if step > FLAGS.online_steps:
+            # Training budget spent. Identical to the old ``range(1, online_steps + 1)`` bound
+            # unless the eval phase is mid-flight, in which case it runs on to finish.
+            if eval_started_step is None:
+                break
+            if step - eval_started_step > eval_step_budget:
+                print(
+                    f"[main_carla] post-stop eval exceeded its {eval_step_budget}-step budget after "
+                    f"{len(eval_scores)}/{FLAGS.post_stop_eval_episodes} episodes; stopping.",
+                    flush=True,
+                )
+                break
         t_sample_start = time.time()
         _bon_viz_img = None
         if raw_obs_holder is not None:
@@ -4605,6 +4628,7 @@ def run_online_carla(
                     stop_reason = f"{_hl_applied} HL updates applied >= cap {FLAGS.max_hl_updates}"
                 if stop_reason:
                     eval_mode = True
+                    eval_started_step = step
                     # Freeze everything: these gates are read live further down the loop.
                     rl_updates_on = bc_updates_on = hl_updates_on = any_updates_on = False
                     # Drop the CAST reviewer too -- every use of it is None-guarded. Otherwise the
@@ -4758,6 +4782,26 @@ def run_online_carla(
             video_suffix="_incomplete",
         )
         wandb.log(_tail_rollout_log, step=step)
+
+    # A partial eval (budget exhausted, or --max_episodes hit mid-eval) still reports what it
+    # measured -- a two-episode mean is worth far more than no number at all, and the episode
+    # count is logged alongside it so it is never mistaken for a full one.
+    if eval_mode and eval_scores and len(eval_scores) < max(1, int(FLAGS.post_stop_eval_episodes)):
+        _mean = sum(eval_scores) / len(eval_scores)
+        print(
+            f"[main_carla] PARTIAL EVAL after {stop_reason}: mean driving_score={_mean:.2f} over "
+            f"{len(eval_scores)}/{FLAGS.post_stop_eval_episodes} episodes "
+            f"({', '.join(f'{v:.2f}' for v in eval_scores)}).",
+            flush=True,
+        )
+        wandb.log(
+            {
+                "eval/mean_driving_score": _mean,
+                "eval/episodes": float(len(eval_scores)),
+                "eval/partial": 1.0,
+            },
+            step=step,
+        )
 
     train_logger.close()
 

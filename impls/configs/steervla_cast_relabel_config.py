@@ -52,18 +52,16 @@ def get_config():
     config.cast_relabel = ml_collections.ConfigDict(
         dict(
             enabled=True,
-            # Which copy of the labeling prompts to run.
-            #   1 = coaches/cast_relabel.py + coaches/vlm_feedback.py      (stable)
-            #   2 = coaches/cast_relabel_v2.py + coaches/vlm_feedback_v2.py (scratch, for iterating
-            #       on the GOOD/BAD review + subtask prompts). v2 is not imported at all unless
-            #       this is 2, so editing it cannot perturb a run that did not opt in.
+            # Which copy of the labeling prompts to run. The scratch ``_v2`` copies were
+            # deleted (2026-09-07), so 1 -- coaches/cast_relabel.py + coaches/vlm_feedback.py --
+            # is the only accepted value; main_carla raises on anything else.
             prompt_version=1,
             # Log annotated debug videos (per-chunk GOOD/BAD + suggested subtasks) to wandb.
             debug=True,
             debug_task=False,
             # Review one window every N env steps (rounded down to whole action chunks).
             # A window can be as small as one chunk or as large as a whole episode.
-            query_every_n_episode_steps=150,
+            query_every_n_episode_steps=200,
             query_on_episode_end=True,
             # Run the VLM review in a background thread instead of blocking the rollout.
             # The review is pure hindsight -- it reads a window already driven -- so nothing in
@@ -107,6 +105,20 @@ def get_config():
             # reasoning as HL samples so good behavior is imitated. False -> corrective (BAD) only.
             store_good_chunks=True,
             hl_dataset_subdir="cast_relabel_hl_dataset",
+            # ── which failures stop storing HL samples for the rest of the episode ──────────
+            # Leaving the route (the ego stops following the routing command) is disqualifying the
+            # moment it happens: nothing after it is worth imitating.
+            hl_stop_after_failure=True,
+            hl_stop_on_off_route=True,
+            # A collision is NOT. Clipping a cone or brushing a barrier and driving on leaves the
+            # rest of the episode perfectly good supervision, and cutting there threw it away for
+            # nothing. Only a collision the ego gets STUCK in ends supervision: this many
+            # consecutive ticks in contact and below the crash-stuck speed threshold (20 ticks =
+            # 1.0 s at 20 Hz, matching the env's own crash_stuck_steps). The cut is backdated to
+            # the impact, not to the step the detector fired, so the wedged ticks are dropped too.
+            # Set 0 for the legacy "any counted collision cuts" behavior.
+            hl_stop_on_collision=True,
+            hl_collision_stuck_ticks=20,
             # Shape of the (unsupervised) stored action chunk; match config.steervla.action_dim.
             hl_action_dim=4,
             # Leave empty to use coaches.cast_relabel.SEED_SUBTASKS; set a list to override.
@@ -193,6 +205,28 @@ def get_config():
             # disable the sub-split (corrective slots drawn uniformly over BAD/precursor). Only takes
             # effect when hl_online_bad_fraction >= 0.
             hl_online_precursor_fraction=0.5,
+            # Draw the online pool by per-sample severity weight rather than uniformly within each
+            # bucket. The corrective/reinforce coverage quota above is UNCHANGED — this only decides
+            # *which* rows fill it. Ranking (see ADAPTIVE_SAMPLING_WEIGHTS in impls/vlas/steervla.py):
+            # a BAD(precursor) chunk that set up a catastrophic outcome (a counted collision, or the
+            # ego leaving the routing command's route) outranks an ordinary precursor, which outranks
+            # a directly-blamed BAD chunk; on the reinforce side a GOOD chunk from an episode that
+            # completed the route outranks an ordinary GOOD, which outranks an unlabeled chunk.
+            # Supersedes hl_online_precursor_fraction, which is ignored while this is True.
+            # Needs an online corpus collected after 2026-09-07 (earlier ones carry no `outcome`
+            # tag; update_hl warns once and falls back to precursor-over-direct weighting only).
+            # When the online pool cannot meet the hl_online_bad_fraction split -- e.g. 32 slots at
+            # 0.9 wants 29 corrective + 3 reinforce but only 5 corrective chunks exist yet -- take
+            # only what each bucket can supply at its target ratio and fill the remainder from the
+            # offline replay pools, rather than cross-filling from the other online bucket. The old
+            # cross-fill inverted the requested ratio exactly when the pool was thinnest (an early
+            # batch read 12 corrective / 18 reinforce under a 0.9 target); frozen pretraining data
+            # is the safer filler. Set False for the legacy always-fill-the-online-share behavior.
+            hl_online_backfill_from_replay=True,
+            use_adaptive_sampling=False,
+            # Optional per-category overrides, e.g. {"bad_direct": 0.25}. Unknown keys raise; the
+            # weights are normalized inside each bucket, so only ratios within a bucket matter.
+            adaptive_sampling_weights={},
             # How many online cast_relabel samples must exist before the first HL update fires. The
             # update never waits for the online pool to fill its full hl_online_weight share of
             # hl_update_batch_size: at/above this count it takes every online sample it has and fills

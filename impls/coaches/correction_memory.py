@@ -36,6 +36,15 @@ _LONGITUDINAL = ("stop", "decelerate", "maintain", "accelerate", "reverse")
 # Keep the transition table bounded no matter how long a run goes.
 _MAX_TRANSITIONS = 8
 _MAX_NOTES = 4
+# How many windows a crash keeps being mentioned before it is dropped even if the ego never
+# visibly recovers. Without a cap a single unrecovered crash would caption every remaining window
+# of the episode; with it, the note fades on its own.
+_MAX_CRASH_CARRY_WINDOWS = 4
+# What counts as "moving again" when deciding a crash is behind us: the ego must be above this
+# speed at the end of a window AND have made at least ``_RECOVERED_PROGRESS_PCT`` of route
+# progress during it. Speed alone is not enough -- spinning against a wall clears a speed gate.
+_RECOVERED_SPEED_MPS = 1.0
+_RECOVERED_PROGRESS_PCT = 0.5
 
 
 def _longitudinal_mode(text: str) -> str:
@@ -74,6 +83,13 @@ class CorrectionMemory:
         self.notes: list[str] = []
         self.summary: str = ""
         self.windows_seen: int = 0
+        # How the ego was doing at the end of the most recent window, and whether a crash from an
+        # EARLIER window is still hanging over it. The reviewer sees only the current window's
+        # video, so without this it re-reads a stopped car as a fresh decision to stop rather than
+        # as the aftermath of a collision two windows ago.
+        self.vehicle_state: str = ""
+        self.crash_note: str = ""
+        self.crash_age: int = 0
         self.load()
 
     # ── persistence ──────────────────────────────────────────────────────────────
@@ -89,6 +105,9 @@ class CorrectionMemory:
         self.notes = list(raw.get("notes") or [])
         self.summary = str(raw.get("summary") or "")
         self.windows_seen = int(raw.get("windows_seen") or 0)
+        self.vehicle_state = str(raw.get("vehicle_state") or "")
+        self.crash_note = str(raw.get("crash_note") or "")
+        self.crash_age = int(raw.get("crash_age") or 0)
 
     def save(self) -> None:
         if not self.path:
@@ -104,6 +123,9 @@ class CorrectionMemory:
                         "transitions": self.transitions,
                         "notes": self.notes,
                         "summary": self.summary,
+                        "vehicle_state": self.vehicle_state,
+                        "crash_note": self.crash_note,
+                        "crash_age": self.crash_age,
                         "rendered": self.render(),
                     },
                     indent=2,
@@ -120,8 +142,17 @@ class CorrectionMemory:
         *,
         window_index: int,
         route: str = "",
+        vehicle_state: dict[str, Any] | None = None,
     ) -> None:
-        """Fold one window's corrections into the memory, then re-fit it to the word budget."""
+        """Fold one window's corrections into the memory, then re-fit it to the word budget.
+
+        ``vehicle_state`` is the window's closing ego state (see :meth:`observe_vehicle_state`).
+        It is folded in unconditionally -- a window can end with the car wrecked and still contain
+        no corrections at all, and that is exactly the window whose aftermath the next one needs
+        to know about.
+        """
+        if vehicle_state is not None:
+            self.observe_vehicle_state(vehicle_state, window_index=window_index)
         chunks = cast_json.get("action_chunks") or []
         seen_this_window: dict[str, int] = {}
         for chunk in chunks:
@@ -138,6 +169,10 @@ class CorrectionMemory:
             seen_this_window[key] = seen_this_window.get(key, 0) + 1
 
         if not seen_this_window:
+            # No corrections, but the vehicle state may have changed; keep it on disk.
+            if vehicle_state is not None:
+                self._fit_budget()
+                self.save()
             return
         self.windows_seen += 1
         for key, n in seen_this_window.items():
@@ -157,9 +192,79 @@ class CorrectionMemory:
         self._fit_budget()
         self.save()
 
+    def observe_vehicle_state(self, state: dict[str, Any], *, window_index: int = 0) -> None:
+        """Record how the ego ended this window, and age any crash carried from an earlier one.
+
+        The crash note is what the user asked for: a collision in one window stays visible in the
+        next, and the next, until it stops being relevant. "Relevant" ends one of two ways --
+
+          * **Recovery.** The ego is moving again (``end_speed_mps`` over ``_RECOVERED_SPEED_MPS``)
+            AND made real route progress during the window. Both are required: a car spinning its
+            wheels against a barrier clears a speed test but is still stuck.
+          * **Age.** ``_MAX_CRASH_CARRY_WINDOWS`` windows pass regardless, so an ego that never
+            recovers does not caption the entire rest of the episode with the same sentence.
+
+        A fresh crash always resets the counter, so repeated collisions keep the note alive.
+        """
+        collided = bool(state.get("collided"))
+        stuck = bool(state.get("stuck"))
+        speed = float(state.get("end_speed_mps") or 0.0)
+        progress = float(state.get("route_progress_delta_pct") or 0.0)
+        recovered = speed >= _RECOVERED_SPEED_MPS and progress >= _RECOVERED_PROGRESS_PCT
+
+        if collided or stuck:
+            what = "collided and is stuck in it" if stuck else "collided"
+            self.crash_note = f"the ego {what} in window {int(window_index)}"
+            self.crash_age = 1
+        elif self.crash_age > 0:
+            if recovered or self.crash_age >= _MAX_CRASH_CARRY_WINDOWS:
+                self.crash_note = ""
+                self.crash_age = 0
+            else:
+                self.crash_age += 1
+
+        parts = [
+            f"ended at {speed:.1f} m/s",
+            (
+                f"route progress {float(state.get('route_progress_end_pct') or 0.0):.1f}%"
+                f" ({progress:+.1f} this window)"
+            ),
+        ]
+        if stuck:
+            parts.append("STUCK in a collision")
+        elif collided:
+            parts.append("collided")
+        self.vehicle_state = "; ".join(parts)
+
+    def render_vehicle_block(self) -> str:
+        """The carry-over paragraph, or ``""`` when there is nothing to carry."""
+        if not self.vehicle_state and not self.crash_note:
+            return ""
+        lines = []
+        if self.vehicle_state:
+            lines.append(f"- At the end of the PREVIOUS window: {self.vehicle_state}.")
+        if self.crash_note:
+            windows = "window" if self.crash_age == 1 else "windows"
+            lines.append(
+                f"- Still relevant: {self.crash_note} ({self.crash_age} {windows} ago). Read this "
+                "window as the aftermath — if the ego is stopped or crawling, that may be damage "
+                "or an obstruction rather than a fresh decision to stop, and the correction is "
+                "whatever gets it back onto the route."
+            )
+        return (
+            "\nVehicle state carried from the previous window (the video below starts mid-story, "
+            "so this is what happened just before it):\n" + "\n".join(lines) + "\n"
+        )
+
     # ── rendering + budget ───────────────────────────────────────────────────────
     def render(self) -> str:
-        """The block injected into both prompts. Empty until something has been corrected."""
+        """The block injected into both prompts.
+
+        Two independent halves: the vehicle-state carry-over (present as soon as ONE window has
+        been observed, corrections or not) and the correction log (present once something has
+        actually been corrected). Either can be empty.
+        """
+        vehicle_block = self.render_vehicle_block()
         if self.summary:
             body = self.summary
         elif self.transitions:
@@ -174,8 +279,8 @@ class CorrectionMemory:
                 lines.append("Recent: " + " ".join(self.notes[-_MAX_NOTES:]))
             body = "\n".join(lines)
         else:
-            return ""
-        return (
+            return vehicle_block
+        return vehicle_block + (
             "\nCorrection memory — longitudinal changes earlier windows of THIS run already made, "
             f"as `was -> corrected to` with how often ({self.windows_seen} windows so far). Stay "
             "consistent with it: do not reverse a correction that was already made in a comparable "

@@ -1200,6 +1200,50 @@ _HL_IMAGE_HW: tuple[int, int] = (224, 224)
 _HL_BATCH_FIG_MAX_SAMPLES: int = 6
 
 
+# ── Adaptive online sampling (``steervla.use_adaptive_sampling``) ─────────────────────
+# Per-sample draw weights for the ONLINE cast_relabel pool. Off by default; when
+# ``use_adaptive_sampling`` is set, the online pool's entries are drawn with probability
+# proportional to these instead of uniformly at random.
+#
+# Two things stay separate on purpose:
+#
+#   * **Coverage** between correcting bad behavior and reinforcing good behavior is still governed
+#     by ``hl_online_bad_fraction`` — the corrective/reinforce split is a *quota*, not something the
+#     weights are allowed to erode. Turning adaptive sampling on does not change how many corrective
+#     rows a batch gets, only *which* ones.
+#   * **Severity** within each of those two buckets is what these weights express.
+#
+# Because the draw is normalized inside each bucket, only ratios *within* a bucket are meaningful:
+# ``good_success`` does not compete with ``bad_precursor_catastrophic``; it competes with ``good``.
+#
+# The ordering encodes the intent: a chunk that causally set up a catastrophe (a collision, or the
+# ego abandoning the routing command) is the most informative correction available, an ordinary
+# precursor next, and the directly-blamed chunk least — by the time a chunk is directly overlapping
+# the failure the mistake is usually already unavoidable, so it teaches less than its lead-up does.
+# On the reinforce side, a chunk from an episode that actually completed the route is worth more
+# than a GOOD chunk from a mediocre one, and an unlabeled chunk carries no positive signal at all.
+ADAPTIVE_SAMPLING_WEIGHTS: dict[str, float] = {
+    # corrective bucket (label == "BAD")
+    "bad_precursor_catastrophic": 4.0,
+    "bad_precursor": 2.0,
+    "bad_direct_catastrophic": 1.0,
+    "bad_direct": 0.5,
+    # reinforce bucket (label GOOD or absent)
+    "good_success": 3.0,
+    "good": 1.0,
+    "unlabeled": 0.5,
+}
+
+# Outcome tags written per sample by ``coaches/cast_relabel.py::resolve_window_outcome``. Restated
+# here rather than imported: ``steervla.py`` is also imported by the inference server, which has no
+# reason to pull in the coach package. Kept in sync by the assertion in that module's docstring —
+# an unknown tag is treated as "unremarkable", never as an error, so an older corpus still trains.
+_ADAPTIVE_CATASTROPHIC_OUTCOMES = frozenset(
+    {"collision", "crash_stuck", "off_route", "route_divergence"}
+)
+_ADAPTIVE_SUCCESS_OUTCOMES = frozenset({"success", "route_completed"})
+
+
 def resize_stretch_np(image: Any, height: int, width: int) -> np.ndarray:
     """Plain distorting resize (stretch) to ``(height, width)`` — no aspect preservation, no pad.
 
@@ -1377,6 +1421,9 @@ class SteerVLAActor:
         hl_online_weight: float = 1.0,
         hl_online_bad_fraction: float = -1.0,
         hl_online_precursor_fraction: float = -1.0,
+        hl_online_backfill_from_replay: bool = True,
+        use_adaptive_sampling: bool = False,
+        adaptive_sampling_weights: dict | None = None,
         hl_min_online_samples: int = 1,
         hl_keep_last_rounds: int = 0,
         hl_log_batch_tokens: bool = True,
@@ -1447,6 +1494,45 @@ class SteerVLAActor:
         # sub-split (corrective slots drawn uniformly over BAD/precursor). Only meaningful when
         # ``hl_online_bad_fraction >= 0`` (the corrective bucket must exist to be sub-split).
         self.hl_online_precursor_fraction = float(hl_online_precursor_fraction)
+        # What to do when the online pool cannot meet the ``hl_online_bad_fraction`` split -- e.g.
+        # 32 slots at 0.9 wants 29 corrective + 3 reinforce, but only 5 corrective chunks exist yet.
+        #
+        #   True  (default): each online bucket contributes at most its own target. The online pool
+        #                    hands back FEWER than its weighted share and the shortfall is filled
+        #                    from the offline replay pools, so the corrective/reinforce ratio the
+        #                    config asked for is preserved instead of being silently inverted.
+        #   False (legacy):  the short bucket's slots are taken from the other online bucket, so the
+        #                    online share is always filled but at whatever ratio happens to be
+        #                    available.
+        #
+        # The legacy behavior is what made an early-run batch read 12 corrective / 18 reinforce
+        # under a 0.9 corrective target: with the corrective bucket nearly empty, cross-fill floods
+        # the batch with reinforce rows precisely when there is least to reinforce. Backfilling from
+        # replay instead trades those rows for frozen pretraining data, which is the safer filler.
+        self.hl_online_backfill_from_replay = bool(hl_online_backfill_from_replay)
+        # Draw the online pool by per-sample severity weight instead of uniformly. The
+        # corrective/reinforce coverage quota (``hl_online_bad_fraction``) is unchanged and still
+        # applies; only the choice of rows *within* each bucket becomes weighted. See
+        # ``ADAPTIVE_SAMPLING_WEIGHTS`` for the categories and the reasoning behind their order.
+        #
+        # This SUPERSEDES ``hl_online_precursor_fraction``: the precursor/direct balance is what the
+        # weights already express, and applying a hard sub-split on top of them would silently cap
+        # the very rows the weighting exists to promote. When both are set, the sub-split is ignored
+        # and :meth:`_load_hl_batch` says so once at the first update.
+        self.use_adaptive_sampling = bool(use_adaptive_sampling)
+        self.adaptive_sampling_weights = dict(ADAPTIVE_SAMPLING_WEIGHTS)
+        for key, value in (adaptive_sampling_weights or {}).items():
+            if key not in ADAPTIVE_SAMPLING_WEIGHTS:
+                raise ValueError(
+                    f"adaptive_sampling_weights: unknown category {key!r}; expected one of "
+                    f"{sorted(ADAPTIVE_SAMPLING_WEIGHTS)}"
+                )
+            if float(value) < 0.0:
+                raise ValueError(f"adaptive_sampling_weights[{key!r}] must be >= 0, got {value!r}")
+            self.adaptive_sampling_weights[key] = float(value)
+        # One-shot log flags so the mode announces itself once per run rather than per update.
+        self._adaptive_logged_once = False
+        self._adaptive_no_outcomes_warned = False
         # How many online cast_relabel samples must exist before the FIRST HL update runs. The batch
         # does NOT wait for the online pool to fill its whole weighted share: as soon as this many
         # online samples are on disk, the update takes whatever the online pool has and fills the rest
@@ -2165,6 +2251,11 @@ class SteerVLAActor:
                         # (the label split is only applied to the online pool).
                         "label": s.get("label"),
                         "credit_source": s.get("credit_source", ""),
+                        # How the episode this sample came from ended, written by
+                        # ``cast_relabel.resolve_window_outcome``. Only read when
+                        # ``use_adaptive_sampling`` is on; "" (the default, and what every replay
+                        # pool and every pre-2026-09-07 online corpus has) weights as unremarkable.
+                        "outcome": str(s.get("outcome") or ""),
                         "action_supervision": pool_action_sup,
                         "supervise_fast": pool_fast,
                         "state_format": state_format,
@@ -2223,6 +2314,83 @@ class SteerVLAActor:
         """True for a cast_relabel BAD(precursor) chunk (``credit_source == "precursor"``)."""
         return str(e.get("credit_source") or "").strip().lower() == "precursor"
 
+    @classmethod
+    def _adaptive_category(cls, e: dict[str, Any]) -> str:
+        """Which :data:`ADAPTIVE_SAMPLING_WEIGHTS` bucket one online entry falls in.
+
+        Resolution is total — every entry gets exactly one category — and unknown/absent outcome
+        tags fall back to the non-catastrophic, non-success variant, so a corpus written before
+        outcomes were recorded still draws (uniformly within its bucket, which is the old behavior).
+        """
+        outcome = str(e.get("outcome") or "").strip().lower()
+        if cls._is_bad_entry(e):
+            catastrophic = outcome in _ADAPTIVE_CATASTROPHIC_OUTCOMES
+            if cls._is_precursor_entry(e):
+                return "bad_precursor_catastrophic" if catastrophic else "bad_precursor"
+            return "bad_direct_catastrophic" if catastrophic else "bad_direct"
+        # Reinforce bucket. An unlabeled chunk is not evidence of good driving — the VLM simply had
+        # nothing to say about it — so it is categorised apart from a chunk actually marked GOOD,
+        # even when it comes from a successful episode.
+        if str(e.get("label") or "").strip().upper() != "GOOD":
+            return "unlabeled"
+        return "good_success" if outcome in _ADAPTIVE_SUCCESS_OUTCOMES else "good"
+
+    def _adaptive_weights_for(self, entries: list[dict[str, Any]]) -> np.ndarray:
+        """Per-entry draw weight, as a float array aligned with ``entries``."""
+        table = self.adaptive_sampling_weights
+        return np.array(
+            [float(table.get(self._adaptive_category(e), 0.0)) for e in entries], dtype=np.float64
+        )
+
+    @staticmethod
+    def _weighted_order(entries: list[dict[str, Any]], weights: np.ndarray) -> list[dict[str, Any]]:
+        """Random permutation of ``entries`` in which higher-weight entries tend to come first.
+
+        Efraimidis-Spirakis: draw ``key_i = -log(u_i) / w_i`` and sort ascending. Taking the first
+        k of that order is exactly weighted sampling *without replacement* with probabilities
+        proportional to ``w``, for every k at once — which is what the caller needs, since it wants
+        both a selection and a ranked list of leftovers to top up from.
+
+        Handles the degenerate cases the obvious ``np.random.choice(p=...)`` does not: a zero weight
+        sorts last instead of raising "fewer non-zero entries in p than size", and an all-zero
+        weight vector degrades to a plain shuffle rather than a division error.
+        """
+        n = len(entries)
+        if n == 0:
+            return []
+        w = np.asarray(weights, dtype=np.float64)
+        if w.shape != (n,) or not np.any(w > 0.0):
+            return [entries[int(j)] for j in np.random.permutation(n)]
+        with np.errstate(divide="ignore"):
+            # u in (0, 1] keeps -log(u) finite and >= 0; w == 0 -> key = inf -> sorted last.
+            keys = -np.log(1.0 - np.random.random(n)) / w
+        return [entries[int(j)] for j in np.argsort(keys, kind="stable")]
+
+    def _order_online_entries_adaptive(
+        self, entries: list[dict[str, Any]], cnt: int, bad_fraction: float
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Adaptive-sampling counterpart of :meth:`_order_online_entries`.
+
+        Same contract — ``(permutation, n_take)``, and the same corrective/reinforce coverage quota
+        from :meth:`_online_bucket_counts`. The only difference is that each bucket is ordered by
+        :meth:`_weighted_order` instead of shuffled uniformly, so severity decides *which* corrective
+        rows fill the corrective quota rather than chance.
+
+        ``hl_online_precursor_fraction`` is deliberately not applied here; see the constructor.
+        """
+        bad = [e for e in entries if self._is_bad_entry(e)]
+        good = [e for e in entries if not self._is_bad_entry(e)]
+        bad = self._weighted_order(bad, self._adaptive_weights_for(bad))
+        good = self._weighted_order(good, self._adaptive_weights_for(good))
+        # Identical quota arithmetic to the uniform path (including the backfill decision).
+        n_bad, n_good = self._online_bucket_counts(bad, good, cnt, bad_fraction)
+        selected = bad[:n_bad] + good[:n_good]
+        leftovers = bad[n_bad:] + good[n_good:]
+        # Shuffle only the selection's internal order (the batch is shuffled again downstream);
+        # leftovers keep their weighted ranking so a top-up still takes the most informative spares.
+        np.random.shuffle(selected)
+        return selected + leftovers, len(selected)
+
     @staticmethod
     def _balance_buckets(
         primary: list[dict[str, Any]],
@@ -2243,33 +2411,59 @@ class SteerVLAActor:
         leftovers = primary[n_primary:] + secondary[n_secondary:]
         return selected, leftovers
 
+    def _online_bucket_counts(
+        self,
+        bad: list[dict[str, Any]],
+        good: list[dict[str, Any]],
+        cnt: int,
+        bad_fraction: float,
+    ) -> tuple[int, int]:
+        """How many corrective / reinforce rows the online pool contributes to a ``cnt``-row share.
+
+        Targets are ``round(cnt * bad_fraction)`` corrective and the remainder reinforce. Whether a
+        bucket that cannot meet its target is topped up from the *other online bucket* or left short
+        (for the caller to backfill from the offline replay pools) is
+        ``hl_online_backfill_from_replay`` -- see the constructor.
+
+        Returns ``(n_bad, n_good)``, which sums to ``cnt`` only when both buckets can cover their
+        targets; under backfill it is deliberately allowed to sum to less.
+        """
+        n_bad_target = int(round(cnt * float(bad_fraction)))
+        n_good_target = cnt - n_bad_target
+        if self.hl_online_backfill_from_replay:
+            return min(len(bad), n_bad_target), min(len(good), n_good_target)
+        n_bad = min(len(bad), n_bad_target)
+        n_good = cnt - n_bad
+        if n_good > len(good):  # reinforce bucket short -> pull more corrective to reach cnt.
+            n_good = len(good)
+            n_bad = min(len(bad), cnt - n_good)
+        return n_bad, n_good
+
     def _order_online_entries(
         self,
         entries: list[dict[str, Any]],
         cnt: int,
         bad_fraction: float,
         precursor_fraction: float = -1.0,
-    ) -> list[dict[str, Any]]:
-        """Order online-pool entries so the first ``cnt`` are ~``bad_fraction`` BAD, the rest GOOD/null.
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Order online-pool entries so the leading rows are ~``bad_fraction`` BAD, the rest GOOD/null.
 
         BAD and BAD(precursor) chunks form the corrective bucket; GOOD and unlabeled/null chunks the
-        reinforce bucket. Selects ``round(cnt * bad_fraction)`` corrective + the remainder reinforce,
-        topping up from whichever bucket has spares when the other underfills so ``cnt`` is met when
-        possible. When ``precursor_fraction >= 0``, the corrective slots are themselves balanced
-        between BAD(precursor) and direct BAD chunks (``round(n_bad * precursor_fraction)`` precursor,
-        the rest direct), with the same underfill top-up. Remaining entries are appended (shuffled) as
-        leftover top-up candidates for the caller. The returned list is a full permutation of
-        ``entries``.
+        reinforce bucket; :meth:`_online_bucket_counts` sizes each. When ``precursor_fraction >= 0``,
+        the corrective slots are themselves balanced between BAD(precursor) and direct BAD chunks
+        (``round(n_bad * precursor_fraction)`` precursor, the rest direct), topping up from whichever
+        sub-bucket has spares -- that cross-fill is kept even under backfill, because it moves rows
+        *within* the corrective bucket and so cannot disturb the corrective/reinforce ratio.
+
+        Returns ``(permutation, n_take)``: a full permutation of ``entries`` whose first ``n_take``
+        rows are the selection, the rest ranked leftovers. ``n_take`` is ``cnt`` unless a bucket ran
+        short under ``hl_online_backfill_from_replay``.
         """
         bad = [e for e in entries if self._is_bad_entry(e)]
         good = [e for e in entries if not self._is_bad_entry(e)]
         np.random.shuffle(bad)
         np.random.shuffle(good)
-        n_bad = min(len(bad), int(round(cnt * float(bad_fraction))))
-        n_good = cnt - n_bad
-        if n_good > len(good):  # reinforce bucket short -> pull more corrective to reach cnt.
-            n_good = len(good)
-            n_bad = min(len(bad), cnt - n_good)
+        n_bad, n_good = self._online_bucket_counts(bad, good, cnt, bad_fraction)
         if precursor_fraction >= 0.0:
             # Sub-split the corrective bucket by BAD(precursor) vs direct BAD. ``bad`` is already
             # shuffled, so the comprehensions inherit that shuffle.
@@ -2282,7 +2476,7 @@ class SteerVLAActor:
         leftovers = bad_leftover + good[n_good:]
         np.random.shuffle(selected)
         np.random.shuffle(leftovers)
-        return selected + leftovers
+        return selected + leftovers, len(selected)
 
     def _read_hl_record(self, e: dict[str, Any]) -> dict[str, Any] | None:
         """Load one sample's arrays + resolve its per-sample supervision into a record dict."""
@@ -2394,29 +2588,48 @@ class SteerVLAActor:
         counts = self._largest_remainder(bs, [float(s["pool"]["weight"]) / wsum for s in active])
 
         records: list[dict[str, Any]] = []
+        # Spare candidates for topping the batch up when a pool underfills its share. Replay spares
+        # are kept apart from online ones and used FIRST: when the online pool comes up short it is
+        # because a bucket could not meet its target, so refilling from its own leftovers would put
+        # back exactly the rows the quota just excluded. Online spares remain as a last resort ahead
+        # of ``_pad_hl_batch``'s repeat-sampling, which is worse than any real row.
         leftovers: list[dict[str, Any]] = []
+        online_leftovers: list[dict[str, Any]] = []
+        online_short = 0
         for s, cnt in zip(active, counts):
-            # The online pool is bucketed 80/20 (BAD/precursor vs GOOD/null) when enabled; replay
-            # pools (and disabled split) draw uniformly at random.
-            if s["pool"].get("kind") == "online" and self.hl_online_bad_fraction >= 0.0:
-                ordered = self._order_online_entries(
-                    s["entries"], cnt, self.hl_online_bad_fraction, self.hl_online_precursor_fraction
-                )
+            # The online pool is bucketed (corrective vs reinforce) when enabled; replay pools (and
+            # a disabled split) draw uniformly at random.
+            is_online = s["pool"].get("kind") == "online"
+            if is_online and self.hl_online_bad_fraction >= 0.0:
+                if self.use_adaptive_sampling:
+                    self._log_adaptive_sampling_once(s["entries"])
+                    ordered, take = self._order_online_entries_adaptive(
+                        s["entries"], cnt, self.hl_online_bad_fraction
+                    )
+                else:
+                    ordered, take = self._order_online_entries(
+                        s["entries"], cnt, self.hl_online_bad_fraction, self.hl_online_precursor_fraction
+                    )
+                online_short = max(0, cnt - take)
             else:
                 ordered = [s["entries"][int(j)] for j in np.random.permutation(len(s["entries"]))]
+                take = cnt
+            spares = online_leftovers if is_online else leftovers
             taken = 0
             for e in ordered:
-                if taken >= cnt:
-                    leftovers.append(e)  # spare candidate for top-up if another pool underfills.
+                if taken >= take:
+                    spares.append(e)
                     continue
                 rec = self._read_hl_record(e)
                 if rec is None:
                     continue
                 records.append(rec)
                 taken += 1
-        if len(records) < bs and leftovers:
-            np.random.shuffle(leftovers)
-            for e in leftovers:
+        for spares in (leftovers, online_leftovers):
+            if len(records) >= bs or not spares:
+                continue
+            np.random.shuffle(spares)
+            for e in spares:
                 if len(records) >= bs:
                     break
                 rec = self._read_hl_record(e)
@@ -2441,11 +2654,26 @@ class SteerVLAActor:
             for r in records:
                 comp[r["pool"]] = comp.get(r["pool"], 0) + 1
             msg = f"[steervla.update_hl] HL batch mix (pool -> count): {comp}"
+            if online_short > 0:
+                msg += (
+                    f"; online pool {online_short} short of its share at "
+                    f"bad_fraction={self.hl_online_bad_fraction:g} -> backfilled from replay"
+                )
             if self.hl_online_bad_fraction >= 0.0:
                 n_bad = sum(1 for r in records if r.get("pool") == "online" and self._is_bad_entry(r))
                 n_online = sum(1 for r in records if r.get("pool") == "online")
                 msg += f"; online label split (BAD/precursor -> {n_bad}, GOOD/null -> {n_online - n_bad})"
-                if self.hl_online_precursor_fraction >= 0.0:
+                if self.use_adaptive_sampling:
+                    cats: dict[str, int] = {}
+                    for r in records:
+                        if r.get("pool") == "online":
+                            c = self._adaptive_category(r)
+                            cats[c] = cats.get(c, 0) + 1
+                    ordered_cats = {
+                        k: cats[k] for k in ADAPTIVE_SAMPLING_WEIGHTS if k in cats
+                    }
+                    msg += f"; adaptive online categories -> {ordered_cats}"
+                elif self.hl_online_precursor_fraction >= 0.0:
                     n_precursor = sum(
                         1
                         for r in records
@@ -2454,6 +2682,46 @@ class SteerVLAActor:
                     msg += f"; corrective split (precursor -> {n_precursor}, direct BAD -> {n_bad - n_precursor})"
             print(msg, flush=True)
         return records
+
+    def _log_adaptive_sampling_once(self, entries: list[dict[str, Any]]) -> None:
+        """Announce the adaptive-sampling mode, and warn if the corpus carries no outcome tags.
+
+        The warning matters: an online pool written before ``resolve_window_outcome`` existed has
+        every ``outcome`` empty, which collapses ``*_catastrophic`` and ``good_success`` to zero
+        occurrences. That still trains — it just silently degrades to weighting precursor over
+        direct BAD and GOOD over unlabeled — and the difference is invisible without saying so.
+        """
+        if not self._adaptive_logged_once:
+            self._adaptive_logged_once = True
+            weights = ", ".join(f"{k}={v:g}" for k, v in self.adaptive_sampling_weights.items())
+            print(
+                f"[steervla.update_hl] adaptive online sampling ON (weights: {weights}); "
+                f"corrective/reinforce coverage still fixed by hl_online_bad_fraction="
+                f"{self.hl_online_bad_fraction:g}",
+                flush=True,
+            )
+            if self.hl_online_precursor_fraction >= 0.0:
+                print(
+                    "[steervla.update_hl] NOTE: hl_online_precursor_fraction="
+                    f"{self.hl_online_precursor_fraction:g} is IGNORED under use_adaptive_sampling "
+                    "— the precursor/direct balance comes from the sample weights instead.",
+                    flush=True,
+                )
+        if self._adaptive_no_outcomes_warned:
+            return
+        if any(str(e.get("outcome") or "").strip() for e in entries):
+            # A tagged sample has appeared; stop checking.
+            self._adaptive_no_outcomes_warned = True
+            return
+        if len(entries) >= 32:  # enough of a sample to conclude the corpus really has no tags.
+            self._adaptive_no_outcomes_warned = True
+            print(
+                f"[steervla.update_hl] WARNING: use_adaptive_sampling is on but none of "
+                f"{len(entries)} online samples carry an 'outcome' tag — the catastrophic/success "
+                "categories will never fire. This is expected for a pool collected before "
+                "coaches/cast_relabel.py started writing outcomes; re-collect to use them.",
+                flush=True,
+            )
 
     def _hl_short_batch(self, got: int, bs: int):
         """Report a batch with nothing readable in it and skip the update."""
@@ -5651,6 +5919,15 @@ def create_steervla_pi0_cot_sample_fn(
         hl_online_weight=float(steervla_cfg.get("hl_online_weight", 1.0)),
         hl_online_bad_fraction=float(steervla_cfg.get("hl_online_bad_fraction", -1.0)),
         hl_online_precursor_fraction=float(steervla_cfg.get("hl_online_precursor_fraction", -1.0)),
+        hl_online_backfill_from_replay=bool(
+            steervla_cfg.get("hl_online_backfill_from_replay", True)
+        ),
+        use_adaptive_sampling=bool(steervla_cfg.get("use_adaptive_sampling", False)),
+        adaptive_sampling_weights=(
+            dict(steervla_cfg["adaptive_sampling_weights"])
+            if steervla_cfg.get("adaptive_sampling_weights")
+            else None
+        ),
         hl_min_online_samples=int(steervla_cfg.get("hl_min_online_samples", 1)),
         hl_keep_last_rounds=int(steervla_cfg.get("hl_keep_last_rounds", 0)),
         hl_log_batch_tokens=bool(steervla_cfg.get("hl_log_batch_tokens", True)),

@@ -310,6 +310,71 @@ SEED_REASONING: tuple[str, ...] = (
 
 
 
+# ── Window outcome tagging ────────────────────────────────────────────────────────────
+# Every stored HL sample carries a one-word summary of how the episode it came from turned out.
+# It is provenance only -- nothing in the coach reads it -- but ``SteerVLAActor`` uses it when
+# ``use_adaptive_sampling`` is on, to weight a lead-up-to-catastrophe correction above an ordinary
+# one and a route-completing GOOD chunk above an ordinary one. See ``ADAPTIVE_SAMPLING_WEIGHTS``
+# in ``impls/vlas/steervla.py``.
+
+# "Entirely wrong", not merely sub-optimal: the ego hit something, or left the route the routing
+# command asked for. These are the two failure kinds the user-facing knob names.
+CATASTROPHIC_OUTCOMES = ("collision", "crash_stuck", "off_route", "route_divergence")
+# Consecutive ticks of "in contact AND stopped" that make a collision disqualifying rather than
+# incidental. Matches ``carla_utils.DEFAULT_CRASH_STUCK_STEPS`` (20 ticks = 1.0 s at 20 Hz), which
+# is the threshold the env itself uses to declare ``termination_reason="crash_stuck"``.
+DEFAULT_HL_COLLISION_STUCK_TICKS = 20
+# Went especially right -- worth reinforcing harder than a GOOD chunk from a middling episode.
+SUCCESS_OUTCOMES = ("success", "route_completed")
+
+
+def resolve_window_outcome(
+    metadata: dict[str, Any],
+    cutoff_reason: str = "",
+    collision_stuck_ticks: int = DEFAULT_HL_COLLISION_STUCK_TICKS,
+) -> str:
+    """One tag for how the episode this window belongs to turned out; ``""`` when unremarkable.
+
+    Catastrophe beats success on purpose: a window that reached 100% route progress *and* wedged
+    itself into a barrier is not something to reinforce, so the collision tag wins. Note that a
+    *survivable* collision is no longer catastrophic at all -- ``collision_stuck_ticks`` is the
+    same threshold ``_maybe_trip_hl_cutoff`` uses, so a graze the ego drove away from neither ends
+    supervision nor 4x-upweights its lead-up.
+
+    ``cutoff_reason`` is ``OnlineCastRelabelSession._hl_cutoff_reason`` -- the latched reason for
+    the first serious failure of the episode. It is authoritative when set, because it names the
+    infraction the leaderboard actually counted rather than something inferred after the fact. It
+    is either a bare infraction name (``"collision"`` / ``"off_route"`` / ``"crash_stuck"``) or the
+    free text ``"off route at t=..s"`` that :meth:`note_route_divergence` writes for a
+    VLM-reported wrong turn -- i.e. the routing command was ignored, which is tagged distinctly as
+    ``"route_divergence"`` so the two "left the route" cases stay separable in analysis.
+
+    Note the interaction with ``hl_stop_after_failure``: samples at or after the cutoff are
+    dropped, so within a window tagged catastrophic every *surviving* sample is by construction
+    part of the lead-up. That is what makes "precursor of a catastrophe" a well-defined bucket.
+    """
+    reason = str(cutoff_reason or "").strip().lower()
+    if reason.startswith("off route"):  # free text from note_route_divergence
+        return "route_divergence"
+    if reason in CATASTROPHIC_OUTCOMES:
+        return reason
+    # No latched cutoff (or an unrecognised one) -> infer from the window summary. v2 has no
+    # cutoff machinery at all and always lands here.
+    if str(metadata.get("termination_reason") or "").strip().lower() == "crash_stuck":
+        return "crash_stuck"
+    # A counted collision is NOT automatically catastrophic: the ego clips a cone or brushes a
+    # barrier and drives on, route progress barely moves, and the window is still worth learning
+    # from. Only a collision it got STUCK in qualifies -- the same standard ``_maybe_trip_hl_cutoff``
+    # applies, so the outcome tag and the supervision cutoff can never disagree about what counts.
+    if int(metadata.get("max_crash_stuck_ticks", 0) or 0) >= max(1, int(collision_stuck_ticks)):
+        return "collision"
+    if metadata.get("success"):
+        return "success"
+    if metadata.get("route_completed"):
+        return "route_completed"
+    return ""
+
+
 # ── Structured per-chunk credit + subtask suggestions ────────────────────────────────
 
 
@@ -1179,6 +1244,11 @@ class HLSample:
     # Captured at chunk-start, not at window flush, because workers hot-reload mid-episode -- a
     # single window can straddle two versions. -1 outside a pooled run.
     policy_version: int = -1
+    # How the episode this sample came from turned out -- see :func:`resolve_window_outcome`.
+    # Window-level, so every sample from one window shares it. Consumed by ``use_adaptive_sampling``
+    # in ``SteerVLAActor``; ``""`` (the default) is read as "unremarkable" and weights normally, so
+    # a corpus written before this field existed still trains, just without severity weighting.
+    outcome: str = ""
 
     def manifest_entry(self, sample_file: str) -> dict[str, Any]:
         return {
@@ -1207,6 +1277,7 @@ class HLSample:
             "current_speed": float(self.current_speed),
             "ego_history_len": 0 if self.ego_hist is None else int(np.asarray(self.ego_hist).shape[0]),
             "policy_version": int(self.policy_version),
+            "outcome": self.outcome,
         }
 
 
@@ -1327,6 +1398,7 @@ def build_hl_samples_from_window(
     relabel_all: bool = False,
     route: str = "",
     ego_history_len: int = DEFAULT_EGO_HISTORY_LEN,
+    outcome: str = "",
 ) -> list[HLSample]:
     """Turn a window's chunks into ``steervla_hl_dataset_format`` samples.
 
@@ -1405,6 +1477,7 @@ def build_hl_samples_from_window(
                 route=str(route),
                 global_step=int(model_input.get("global_step", -1)),
                 policy_version=int(model_input.get("policy_version", -1)),
+                outcome=str(outcome or ""),
             )
         )
     return samples
@@ -1731,6 +1804,16 @@ class OnlineCastRelabelSession:
         # Which failures trip the cutoff. Off by one -> that class no longer ends supervision.
         self.hl_stop_on_collision = bool(self.cfg.get("hl_stop_on_collision", True))
         self.hl_stop_on_off_route = bool(self.cfg.get("hl_stop_on_off_route", True))
+        # How many consecutive stuck-in-contact ticks a collision must produce before it ends
+        # supervision. A counted collision alone is NOT enough: clipping a cone or grazing a wall
+        # and driving on leaves the trajectory perfectly usable, and cutting there threw away good
+        # samples for the rest of the episode. Only a collision the ego cannot get out of does
+        # that. ``DEFAULT_HL_COLLISION_STUCK_TICKS`` matches the env's own ``crash_stuck_steps``,
+        # so "stuck" means here exactly what it means to the leaderboard wrapper. Set 0 to restore
+        # the legacy behavior (any counted collision cuts).
+        self.hl_collision_stuck_ticks = max(
+            0, int(self.cfg.get("hl_collision_stuck_ticks", DEFAULT_HL_COLLISION_STUCK_TICKS))
+        )
         self.hl_action_dim = int(self.cfg.get("hl_action_dim", DEFAULT_HL_ACTION_DIM))
         # Per-step ego history stored with each HL sample (see DEFAULT_EGO_HISTORY_LEN).
         self.ego_history_len = max(1, int(self.cfg.get("ego_history_len", DEFAULT_EGO_HISTORY_LEN)))
@@ -1859,6 +1942,9 @@ class OnlineCastRelabelSession:
         # Episode step at which a serious failure first occurred; HL samples at or after it are
         # dropped. ``None`` while the episode is still clean. See ``hl_stop_after_failure``.
         self._hl_cutoff_step: int | None = None
+        # Episode step of the most recent COUNTED collision, used to backdate a stuck-collision
+        # cutoff to the impact rather than to the step the stuck detector finally tripped.
+        self._last_collision_step: int | None = None
         # Why the cutoff fired ("collision" / "off_route" / "crash_stuck" / "route
         # divergence ..."), purely so the debug video's banner can say which one it was.
         self._hl_cutoff_reason: str = ""
@@ -1881,6 +1967,13 @@ class OnlineCastRelabelSession:
         # Full ordered maneuver plan for the episode (constant), surfaced to the VLM coach as
         # the overall "task" context. May be empty if the route planner was unavailable.
         self.route_command_plan = list(route_command_plan) if route_command_plan else []
+        # Clear the failure cutoff. It is latched for the rest of the EPISODE, not the run: before
+        # this reset existed, one collision in episode 3 silently suppressed every sample past that
+        # episode step in episodes 4, 5, 6 ... for the remainder of the run, because the filter
+        # compares against ``episode_step`` and that counter restarts each episode.
+        self._hl_cutoff_step = None
+        self._hl_cutoff_reason = ""
+        self._last_collision_step = None
 
     def record_frame(
         self,
@@ -1913,29 +2006,58 @@ class OnlineCastRelabelSession:
     def _maybe_trip_hl_cutoff(self, step_record: dict[str, Any]) -> None:
         """Latch ``_hl_cutoff_step`` at the first serious failure of the episode.
 
-        Serious means the environment counted an infraction, not that a sensor grazed something:
-        ``collision_delta``/``outside_route_delta`` are per-step increments of the leaderboard's
-        own counters, so they fire once per event rather than for every tick of sustained contact.
-        ``crash_stuck`` is included because it means the ego collided and then never got moving
-        again -- the canonical "rest of the episode is garbage" case.
+        Two distinct failures end supervision, and they are judged differently.
+
+        **Leaving the route** is disqualifying the moment it happens: ``outside_route_delta`` is a
+        per-step increment of the leaderboard's own counter, so it fires once per counted event.
+        Once the ego stops following the routing command, nothing after it is worth imitating.
+
+        **Collisions** are not. A counted collision only means the sensor registered contact --
+        clipping a cone, brushing a barrier, a light tap while creeping in traffic. The ego usually
+        drives straight on, route progress is barely affected, and the rest of the episode is
+        perfectly good supervision; cutting there discarded it for nothing. What actually ruins a
+        trajectory is a collision the ego cannot get *out* of, so the trigger is
+        ``crash_stuck_ticks`` -- consecutive ticks in contact and below the crash-stuck speed
+        threshold, reset the moment the car moves again -- reaching
+        ``hl_collision_stuck_ticks``. ``termination_reason == "crash_stuck"`` is the same condition
+        as the env sees it, kept as a fallback for step records that predate the tick field.
+
+        The cutoff is **backdated** when a stuck collision trips it. The condition needs ~1 s of
+        evidence to become true, and those ticks are the ego already wedged -- exactly the states
+        worth dropping. So the cut lands at the collision that started it (or, failing that, at
+        the start of the stuck run), not at the step the detector finally fired.
 
         Latched, never cleared mid-episode: once the run is off the rails it does not come back,
         and re-arming would let a brief recovery re-open supervision on a wrecked trajectory.
         """
         if not (self.hl_stop_after_failure and self.store_hl_dataset):
             return
+        step = int(step_record.get("episode_step", 0))
+        # Remembered even when the cutoff has already fired -- costs nothing and keeps the field
+        # meaningful for anything else that reads it.
+        if float(step_record.get("collision_delta", 0.0)) > 0.0:
+            self._last_collision_step = step
         if self._hl_cutoff_step is not None:
             return
         reason = None
-        if self.hl_stop_on_collision and float(step_record.get("collision_delta", 0.0)) > 0.0:
-            reason = "collision"
-        elif self.hl_stop_on_off_route and float(step_record.get("outside_route_delta", 0.0)) > 0.0:
+        cutoff_step = step
+        stuck_ticks = int(step_record.get("crash_stuck_ticks", 0) or 0)
+        if self.hl_stop_on_off_route and float(step_record.get("outside_route_delta", 0.0)) > 0.0:
             reason = "off_route"
+        elif self.hl_stop_on_collision and self._is_stuck_collision(step_record, stuck_ticks):
+            reason = "collision"
+            # Start of the stuck run; prefer the collision that caused it when we saw one.
+            cutoff_step = max(0, step - stuck_ticks)
+            if self._last_collision_step is not None:
+                cutoff_step = min(cutoff_step, self._last_collision_step)
         elif step_record.get("termination_reason") == "crash_stuck":
             reason = "crash_stuck"
+            cutoff_step = max(0, step - stuck_ticks)
+            if self._last_collision_step is not None:
+                cutoff_step = min(cutoff_step, self._last_collision_step)
         if reason is None:
             return
-        self._hl_cutoff_step = int(step_record.get("episode_step", 0))
+        self._hl_cutoff_step = cutoff_step
         self._hl_cutoff_reason = reason
         print(
             f"[cast_relabel] HL supervision cutoff at episode step {self._hl_cutoff_step} "
@@ -1943,6 +2065,15 @@ class OnlineCastRelabelSession:
             f"high-level training data.",
             flush=True,
         )
+
+    def _is_stuck_collision(self, step_record: dict[str, Any], stuck_ticks: int) -> bool:
+        """Whether this step is a collision the ego is *stuck* in, not an incidental contact.
+
+        ``hl_collision_stuck_ticks == 0`` restores the legacy rule (any counted collision).
+        """
+        if self.hl_collision_stuck_ticks <= 0:
+            return float(step_record.get("collision_delta", 0.0)) > 0.0
+        return stuck_ticks >= self.hl_collision_stuck_ticks
 
     def note_route_divergence(
         self, divergence: dict[str, Any] | None, traj_window: list[dict[str, Any]]
@@ -2440,6 +2571,12 @@ class OnlineCastRelabelSession:
             "window_reward_total": window_reward_total,
             "window_reward_mean": window_reward_mean,
             "collision_events": collision_events,
+            # Longest run of "in contact AND stopped" ticks anywhere in this window. This, not the
+            # presence of a collision event, is what makes a collision disqualifying -- see
+            # :func:`resolve_window_outcome` and ``_maybe_trip_hl_cutoff``.
+            "max_crash_stuck_ticks": max(
+                (int(s.get("crash_stuck_ticks", 0) or 0) for s in traj_window), default=0
+            ),
             # Rendered cross-window correction memory, picked up by BOTH prompt builders straight
             # off the metadata (so no signature threading) and recorded in the window artifact, so
             # every window says exactly which memory was in play when it was reviewed.
@@ -2559,7 +2696,10 @@ class OnlineCastRelabelSession:
         if self._memory is not None:
             try:
                 self._memory.observe_window(
-                    cast_json, window_index=self.window_count, route=self.route_id
+                    cast_json,
+                    window_index=self.window_count,
+                    route=self.route_id,
+                    vehicle_state=self._window_vehicle_state(metadata),
                 )
             except Exception as exc:  # noqa: BLE001 - the memory is an aid, not a prerequisite
                 print(f"[cast_relabel] correction memory update failed (non-fatal): {exc}", flush=True)
@@ -2660,6 +2800,25 @@ class OnlineCastRelabelSession:
         )
         return dropped, reason
 
+    def _window_vehicle_state(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        """The window's closing ego state, for ``CorrectionMemory.observe_vehicle_state``.
+
+        ``collided`` counts only leaderboard-*counted* collisions (``new_event``), and ``stuck``
+        applies the same ``hl_collision_stuck_ticks`` standard as the supervision cutoff, so the
+        three places that ask "did this window go wrong" cannot disagree.
+        """
+        stuck_ticks = int(metadata.get("max_crash_stuck_ticks", 0) or 0)
+        return {
+            "collided": any(
+                bool(e.get("new_event")) for e in (metadata.get("collision_events") or [])
+            ),
+            "stuck": stuck_ticks >= max(1, int(self.hl_collision_stuck_ticks)),
+            "stuck_ticks": stuck_ticks,
+            "end_speed_mps": float(metadata.get("mean_end_speed_mps") or 0.0),
+            "route_progress_end_pct": float(metadata.get("route_progress_end_pct") or 0.0),
+            "route_progress_delta_pct": float(metadata.get("route_progress_delta_pct") or 0.0),
+        }
+
     def _store_hl_samples(
         self,
         cast_json: dict[str, Any],
@@ -2689,6 +2848,9 @@ class OnlineCastRelabelSession:
                 relabel_all=self.debug_task,
                 route=self.route_id,
                 ego_history_len=self.ego_history_len,
+                outcome=resolve_window_outcome(
+                    metadata, self._hl_cutoff_reason, self.hl_collision_stuck_ticks
+                ),
             )
             if self._hl_cutoff_step is not None:
                 cutoff = self._hl_cutoff_step
@@ -2756,6 +2918,7 @@ class OnlineCastRelabelSession:
                 "num_bad": int(n_bad),
                 "num_precursor": int(n_precursor),
                 "num_good_or_unlabeled": len(hl_samples) - int(n_bad),
+                "outcome": hl_samples[0].outcome if hl_samples else "",
             }
             with (self.hl_dataset_dir / "windows.jsonl").open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(line) + "\n")

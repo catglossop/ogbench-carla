@@ -62,9 +62,6 @@ def get_config():
     # for the whole hold, leaving the lateral loop open (see commit 69fd7c3). The actor already
     # defaults this to True, but a pooled run holds chunks on every one of its workers, so the
     # dependency is stated here instead of relying on that default.
-    # Use the v2 coaching prompts (coaches/cast_relabel_v2.py + coaches/vlm_feedback_v2.py).
-    config.cast_relabel.prompt_version = 2
-
     config.steervla.reanchor_cached_chunk = True
     # Chunk hold / CoT reuse. Decoupled deliberately: the chunk is re-queried every 3 env steps
     # while the CoT reasoning+subtask is reused for 5, so the policy re-plans its trajectory more
