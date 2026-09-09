@@ -122,7 +122,10 @@ def render(out_dir: Path, log: Path | None):
     head = Table.grid(expand=True, padding=(0, 2))
     head.add_column(ratio=1)
     head.add_column(justify="right")
-    head.add_row(f"[bold]{out_dir.name}[/]  {Path(summary.get('agent_config', '?')).name}",
+    # agent_config is legitimately null for a summary consolidated from an eval that did not
+    # record one (see consolidate_slurm_results.py); Path(None) would raise.
+    _agent_cfg = summary.get("agent_config")
+    head.add_row(f"[bold]{out_dir.name}[/]  {Path(_agent_cfg).name if _agent_cfg else '?'}",
                  f"routes [bold]{done}[/]/{total}   queued {orch.get('queued', '?')}")
     # ETA from the mean wall-clock of completed routes; blank until one lands.
     walls = [r.get("wall_s", 0.0) for r in routes if r.get("wall_s")]
