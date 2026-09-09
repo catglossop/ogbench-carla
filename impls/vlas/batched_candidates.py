@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import re
 from typing import Any
 
 import jax
@@ -14,6 +15,27 @@ class BatchedCandidateValidationError(RuntimeError):
     """The batched actor result is unsafe to use for environment execution."""
 
 
+def candidate_labels(texts: Any, count: int, source: str) -> list[str]:
+    """Select decoded actor text without rewriting its natural-language content."""
+    if source not in {"commentary", "subtask"}:
+        raise ValueError(f"Unknown candidate label source: {source}")
+    if not isinstance(texts, (list, tuple)) or len(texts) != count:
+        raise BatchedCandidateValidationError(
+            f"Expected {count} {source} labels from the actor."
+        )
+    labels = []
+    for text in texts:
+        if not isinstance(text, str):
+            raise BatchedCandidateValidationError(f"Invalid {source} label from the actor.")
+        # Both training label formats omit the actor's segment sentinels.
+        text = re.sub(r"<loc\d+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip().rstrip(" ;").strip()
+        if not text.strip():
+            raise BatchedCandidateValidationError(f"Empty {source} label from the actor.")
+        labels.append(text)
+    return labels
+
+
 def sample_batched_policy_candidates(
     *,
     actor: Any,
@@ -23,6 +45,9 @@ def sample_batched_policy_candidates(
     model_noise_dim: int,
     env_action_dim: int,
     noise_scale: float,
+    label_source: str = "subtask",
+    episode_index: int | None = None,
+    episode_step: int | None = None,
 ) -> tuple[np.ndarray, list[str]]:
     """Sample one normalized action-chunk batch while matching rollout noise.
 
@@ -45,6 +70,17 @@ def sample_batched_policy_candidates(
         jax.random.normal(rng_noise, (n, int(model_noise_dim)), dtype=jnp.float32)
     ) * jnp.asarray(noise_scale, dtype=jnp.float32)
 
+    # Keep token reuse separate from the actor's single-candidate action cache.
+    # Age is measured in executed environment steps, not candidate queries.
+    cache_key = (episode_index, n, label_source, raw.get("routing_command"))
+    cached = getattr(actor, "_bon_cot_cache", None)
+    reuse = (
+        episode_step is not None and episode_index is not None
+        and cached is not None and cached[0] == cache_key
+        and 0 < episode_step - cached[1] < int(getattr(actor, "actions_per_cot", 1))
+    )
+    cot_kwargs = {"cot_out": cached[2]} if reuse else {}
+    actor._bon_cot_cache = None  # Invalid results must never seed later reuse.
     reset_cache = getattr(actor, "reset_action_cache", None)
     if callable(reset_cache):
         reset_cache()
@@ -54,6 +90,7 @@ def sample_batched_policy_candidates(
         noise=noise,
         raw=raw,
         rng=rng_cot,
+        **cot_kwargs,
     )
     if not isinstance(result, Mapping):
         raise BatchedCandidateValidationError(
@@ -75,15 +112,10 @@ def sample_batched_policy_candidates(
     if not np.isfinite(actions).all():
         raise BatchedCandidateValidationError("normalized candidates contain NaN or infinity.")
 
-    subtasks_raw = result.get("subtask_texts")
-    if not isinstance(subtasks_raw, (list, tuple)) or len(subtasks_raw) != n:
-        count = len(subtasks_raw) if isinstance(subtasks_raw, (list, tuple)) else 0
-        raise BatchedCandidateValidationError(
-            f"sample_candidates() returned {count} subtasks, expected {n}."
-        )
-    subtasks = [str(text) for text in subtasks_raw]
-    if any(not text.strip() for text in subtasks):
-        raise BatchedCandidateValidationError("sample_candidates() returned an empty subtask.")
+    # The commentary actor emits raw commentary on its reasoning head; its
+    # subtask head emits the separate refined action summary.
+    text_key = "reasoning_texts" if label_source == "commentary" else "subtask_texts"
+    subtasks = candidate_labels(result.get(text_key), n, label_source)
 
     overflowed = result.get("reasoning_overflowed")
     if overflowed is None:
@@ -100,4 +132,6 @@ def sample_batched_policy_candidates(
         raise BatchedCandidateValidationError(
             f"reasoning overflowed for candidate rows {rows}; resample them via the checked path."
         )
+    if episode_step is not None and episode_index is not None and "cot_out" in result:
+        actor._bon_cot_cache = (cache_key, cached[1] if reuse else episode_step, result["cot_out"])
     return actions, subtasks
