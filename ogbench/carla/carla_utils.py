@@ -1178,11 +1178,41 @@ class SteppableScenarioManager(ScenarioManager):
             self._build_scenarios_tick += 1
             if self._build_scenarios_tick >= self._BUILD_SCENARIOS_INTERVAL:
                 self._build_scenarios_tick = 0
+                # DEADLOCK GUARD -- do not remove without reading this.
+                #
+                # RouteScenario.__init__ sets CarlaDataProvider.set_runtime_init_mode(True)
+                # right after building its first batch of scenarios. With that flag on,
+                # BasicScenario.__init__ (basic_scenario.py:67) waits for the world instead
+                # of ticking it:
+                #     if CarlaDataProvider.is_runtime_init_mode(): world.wait_for_tick()
+                #     elif CarlaDataProvider.is_sync_mode():       world.tick()
+                # Upstream can afford that because it builds scenarios on a *separate*
+                # thread (ScenarioManager.build_scenarios_loop) while the main thread ticks.
+                # We deliberately build on the main thread instead, to keep every CARLA RPC
+                # single-threaded -- so wait_for_tick() would block forever waiting for a
+                # tick that only this very call stack can produce. With the leaderboard's
+                # 7200 s client timeout that is a ~2 h hang, and it silently bit every route
+                # carrying a second scenario (the first batch is built before the flag is
+                # set, so single-scenario routes never hit it).
+                #
+                # Clearing the flag for the duration of our build makes BasicScenario take
+                # the sync-mode branch and tick the world itself, which is exactly what it
+                # does for the first batch during RouteScenario construction.
+                _prev_runtime_init = CarlaDataProvider.is_runtime_init_mode()
+                CarlaDataProvider.set_runtime_init_mode(False)
                 try:
                     self.scenario.build_scenarios(self.ego_vehicles[0], debug=self._debug_mode > 0)
                     self.scenario.spawn_parked_vehicles(self.ego_vehicles[0])
-                except Exception:
-                    pass
+                except Exception as exc:  # never let scenario spawning kill the route
+                    if not getattr(self, "_build_scenarios_warned", False):
+                        self._build_scenarios_warned = True
+                        print(
+                            f"[carla] build_scenarios raised {type(exc).__name__}: {exc} "
+                            f"(suppressed; further occurrences silent)",
+                            flush=True,
+                        )
+                finally:
+                    CarlaDataProvider.set_runtime_init_mode(_prev_runtime_init)
 
 
 def _default_config_path() -> Path:
