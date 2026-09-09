@@ -101,7 +101,8 @@ else:
       "were unblocked by the `build_scenarios` deadlock fix (commit `ff7af76`).")
 w("")
 
-w("## Scores so far")
+complete = len(scored) >= len(all_routes)
+w("## Final scores" if complete else "## Scores so far")
 w("")
 w("| Job | CARLA | env | n | DS | RC | IP | success | km |")
 w("|---|---|---|---:|---:|---:|---:|---:|---:|")
@@ -113,13 +114,23 @@ if anim_agg:
     w(f"| animals | 0.9.15 `~/f2d_carla` | `.venv-f2d-eval` (3.10) | {anim_agg['n']} | "
       f"{anim_agg['ds']:.2f} | {anim_agg['rc']:.2f} | {anim_agg['ip']:.3f} | "
       f"{anim_agg['success']:.1f}% | {anim_agg['km']:.2f} |")
+if complete and main_agg and anim_agg:
+    both = agg({**main_rows, **anim_rows})
+    w(f"| **all {both['n']} routes** | both | both | **{both['n']}** | **{both['ds']:.2f}** | "
+      f"**{both['rc']:.2f}** | **{both['ip']:.3f}** | **{both['success']:.1f}%** | "
+      f"**{both['km']:.1f}** |")
 w("")
 w("DS/RC/IP come straight from the leaderboard `StatisticsManager` records; nothing is recomputed.")
-w("**The main job's numbers are partial and will move** until the remaining routes land.")
+if complete:
+    w("Every route has landed, so **these numbers are final** for this checkpoint. The two jobs "
+      "cover disjoint route sets with the same policy and identical scoring settings, which is "
+      "what makes the combined row meaningful despite the different simulator builds.")
+else:
+    w("**The main job's numbers are partial and will move** until the remaining routes land.")
 w("")
 
 if anim_rows:
-    w("### Animal routes (all 7 runnable, complete)")
+    w(f"### Animal routes (all {len(anim_rows)}, on Fail2Drive's own simulator)")
     w("")
     w("| route | animal | DS | RC | IP | status |")
     w("|---|---|---:|---:|---:|---|")
