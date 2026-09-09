@@ -493,6 +493,17 @@ def build_coaching_prompt(
           closer to the crosswalk to not leave an unnecessary gap.
         - If the vehicle encounters an obstacle blocking the entire route, does it stop entirely before the obstruction? (if yes, GOOD; if no, BAD)
         - If the vehicle encounters an obstacle blocking part of the route (one lane), does it stop and wait for a gap to go around the obstruction? (if yes, GOOD; if no, BAD)
+        - When the vehicle is waiting to merge into or cross a flow of traffic, does it pull out
+          as soon as a gap opens? Other traffic in this simulator does NOT yield: no oncoming or
+          cross-traffic vehicle will slow down or stop to let our vehicle in, and no gap will be
+          created for it. The only safe gap is the one immediately behind a vehicle that has just
+          passed, so the correct behavior is to go the moment that vehicle clears — hesitating
+          there means the next vehicle arrives and the opportunity is gone, which is BAD and
+          eventually causes a collision when the vehicle finally commits too late. Waiting for a
+          driver to wave it through or expecting traffic to make room is never correct. Judge this
+          on the gap that was actually available: pulling out in front of a closing vehicle is
+          still BAD, but sitting still through a clear gap behind one that has just passed is BAD
+          as well, and the correction is to accelerate promptly as that vehicle clears.
 
         Return ONLY valid JSON with this schema (no markdown fences):
         {{

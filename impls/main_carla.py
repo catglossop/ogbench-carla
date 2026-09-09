@@ -3091,6 +3091,11 @@ def run_online_carla(
             # strategy. ``termination_reason`` catches crash_stuck (collided, then never recovered).
             "collision_delta": float(step_info.get("collision_delta", 0.0)),
             "outside_route_delta": float(step_info.get("outside_route_delta", 0.0)),
+            # InRouteTest, NOT OutsideRouteLanesTest: >0 marks the step at which the
+            # leaderboard decided the ego had left the planned route entirely. Authoritative
+            # but late -- it needs 30% of the route driven off-route -- so cast_relabel also
+            # runs an earlier behavioural check off route_distance_m / ego_speed_mps.
+            "route_deviation_delta": float(step_info.get("route_deviation_delta", 0.0)),
             # Consecutive ticks the ego has been in contact AND below the crash-stuck speed
             # threshold (``carla_utils._update_crash_stuck_state``; resets the moment it moves
             # again). This is what separates "clipped a barrier and drove on" from "wedged into

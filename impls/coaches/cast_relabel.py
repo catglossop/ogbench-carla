@@ -1804,6 +1804,28 @@ class OnlineCastRelabelSession:
         # Which failures trip the cutoff. Off by one -> that class no longer ends supervision.
         self.hl_stop_on_collision = bool(self.cfg.get("hl_stop_on_collision", True))
         self.hl_stop_on_off_route = bool(self.cfg.get("hl_stop_on_off_route", True))
+        # Leaving the planned ROUTE, as opposed to leaving the lane. Two independent detectors
+        # feed this, because neither alone is adequate:
+        #   * the leaderboard's own InRouteTest counter (``route_deviation_delta``) is
+        #     authoritative -- it is what scores the ``route_dev`` infraction -- but it only
+        #     fires after MAX_ROUTE_PERCENTAGE (30%) of the route length has accumulated
+        #     off-route, which on a 200 m route is 60 m of driving in the wrong place;
+        #   * a behavioural check that catches the common case far earlier: the ego is clearly
+        #     DRIVING but the route is not advancing, i.e. it took the wrong branch at a junction
+        #     and is now making good speed somewhere the plan never asked it to go.
+        # Before this existed the only route-divergence signal was the VLM's verdict, which is a
+        # judgement call on a video and cannot be relied on to fire every time.
+        self.hl_stop_on_route_divergence = bool(self.cfg.get("hl_stop_on_route_divergence", True))
+        # Behavioural detector thresholds. The ego must be moving faster than
+        # ``hl_divergence_speed_mps`` continuously for ``hl_divergence_ticks`` ticks while gaining
+        # less than ``hl_divergence_progress_m`` metres along the plan. Defaults: >2 m/s for 3 s
+        # (60 ticks at 20 Hz) is >6 m of driving; gaining under 2 m of route in that span means
+        # the ego is not on the plan. A stopped ego never triggers it -- waiting at a red light or
+        # yielding is not divergence -- and normal driving resets the run as soon as the progress
+        # threshold is cleared.
+        self.hl_divergence_speed_mps = float(self.cfg.get("hl_divergence_speed_mps", 2.0))
+        self.hl_divergence_ticks = int(self.cfg.get("hl_divergence_ticks", 60))
+        self.hl_divergence_progress_m = float(self.cfg.get("hl_divergence_progress_m", 2.0))
         # How many consecutive stuck-in-contact ticks a collision must produce before it ends
         # supervision. A counted collision alone is NOT enough: clipping a cone or grazing a wall
         # and driving on leaves the trajectory perfectly usable, and cutting there threw away good
@@ -1945,6 +1967,11 @@ class OnlineCastRelabelSession:
         # Episode step of the most recent COUNTED collision, used to backdate a stuck-collision
         # cutoff to the impact rather than to the step the stuck detector finally tripped.
         self._last_collision_step: int | None = None
+        # Start of the current continuous "ego is driving" run, and the route distance at that
+        # moment. The behavioural divergence detector measures route progress across this run.
+        # None whenever the ego is below the speed threshold (i.e. legitimately stopped).
+        self._moving_run_start_step: int | None = None
+        self._moving_run_start_route_m: float = 0.0
         # Why the cutoff fired ("collision" / "off_route" / "crash_stuck" / "route
         # divergence ..."), purely so the debug video's banner can say which one it was.
         self._hl_cutoff_reason: str = ""
@@ -1974,6 +2001,8 @@ class OnlineCastRelabelSession:
         self._hl_cutoff_step = None
         self._hl_cutoff_reason = ""
         self._last_collision_step = None
+        self._moving_run_start_step = None
+        self._moving_run_start_route_m = 0.0
 
     def record_frame(
         self,
@@ -2042,8 +2071,25 @@ class OnlineCastRelabelSession:
         reason = None
         cutoff_step = step
         stuck_ticks = int(step_record.get("crash_stuck_ticks", 0) or 0)
+        divergence_step = (
+            self._route_divergence_stall_step(step_record)
+            if self.hl_stop_on_route_divergence
+            else None
+        )
         if self.hl_stop_on_off_route and float(step_record.get("outside_route_delta", 0.0)) > 0.0:
             reason = "off_route"
+        elif self.hl_stop_on_route_divergence and float(
+            step_record.get("route_deviation_delta", 0.0)
+        ) > 0.0:
+            # The leaderboard's own InRouteTest fired. Authoritative, but late by construction.
+            reason = "route_deviation (leaderboard InRouteTest)"
+        elif divergence_step is not None:
+            reason = (
+                f"route_divergence (driving >{self.hl_divergence_speed_mps:g} m/s for "
+                f"{self.hl_divergence_ticks} ticks with <{self.hl_divergence_progress_m:g} m "
+                f"route progress)"
+            )
+            cutoff_step = divergence_step
         elif self.hl_stop_on_collision and self._is_stuck_collision(step_record, stuck_ticks):
             reason = "collision"
             # Start of the stuck run; prefer the collision that caused it when we saw one.
@@ -2065,6 +2111,45 @@ class OnlineCastRelabelSession:
             f"high-level training data.",
             flush=True,
         )
+
+    def _route_divergence_stall_step(self, step_record: dict[str, Any]) -> int | None:
+        """Step at which the ego started driving without following the plan, or ``None``.
+
+        The signal is "moving but not progressing along the route". ``route_distance_m`` is
+        derived from the leaderboard's ``RouteCompletionTest``, so it advances only while the ego
+        is actually on the planned route -- drive off it and the number simply stops climbing
+        while the odometer keeps turning. That divergence between speed and route progress is
+        what this measures, and it needs no map geometry of its own.
+
+        Returns the step the run of continuous motion BEGAN, not the step the detector became
+        confident, so the cutoff is backdated to where the ego actually left the plan -- the same
+        reasoning as the stuck-collision backdating.
+        """
+        speed = float(step_record.get("ego_speed_mps", 0.0) or 0.0)
+        route_m = float(step_record.get("route_distance_m", 0.0) or 0.0)
+        step = int(step_record.get("episode_step", 0))
+
+        if speed <= self.hl_divergence_speed_mps:
+            # Stopped or crawling: not divergence. A red light, a yield, or queued traffic all
+            # look like zero route progress and must never trip this.
+            self._moving_run_start_step = None
+            return None
+
+        if self._moving_run_start_step is None:
+            self._moving_run_start_step = step
+            self._moving_run_start_route_m = route_m
+            return None
+
+        gained = route_m - self._moving_run_start_route_m
+        if gained >= self.hl_divergence_progress_m:
+            # Progressing along the plan: restart the window from here.
+            self._moving_run_start_step = step
+            self._moving_run_start_route_m = route_m
+            return None
+
+        if (step - self._moving_run_start_step) >= self.hl_divergence_ticks:
+            return self._moving_run_start_step
+        return None
 
     def _is_stuck_collision(self, step_record: dict[str, Any], stuck_ticks: int) -> bool:
         """Whether this step is a collision the ego is *stuck* in, not an incidental contact.
