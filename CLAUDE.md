@@ -125,6 +125,26 @@ Outputs go to `cast_relabel.json` + annotated W&B debug videos, and — when `ca
 
 Configs: `steervla_cast_relabel_config.py` (observer only — writes artifacts, doesn't train) vs. `steervla_cast_relabel_train_config.py` (inherits it, then flips on `load_trainable_params` + `store_hl_dataset` + the `hl_update_*` cadence knobs).
 
+### YAY-Robot (`impls/coaches/yay_robot.py`)
+
+The **foresight** alternative to CAST relabel — not a layer on top of it. `main_carla` raises if both are enabled, because only one can own `steervla.hl_dataset_dir` and therefore the HL update.
+
+Where CAST asks "what should it have said?" after a window is already driven, YAY asks "what should it say *now*?" and then makes it say that. Every time the model is queried for a CoT, `SteerVLAActor._maybe_intervene_on_cot` decodes the freshly sampled subtask/reasoning and hands them, with the current camera frame, to `OnlineYayRobotSession.cot_intervention` (installed as `steervla_actor.cot_intervention_fn`). The VLM returns KEEP or CORRECT; a correction is re-tokenized by `SteerVLAActor._build_text_cot_out` and overwrites the `cot_out` **before** it reaches `_merge_cot_output_into_observation`, so the corrected language conditions the flow/action expert and every open-loop step that reuses that chain. It also lands in `raw["subtask_text"]` via `_stash_cot_in_raw`, so downstream trajectory records carry the corrected text automatically.
+
+Two call sites and they are not interchangeable: `cot_intervention` runs *inside the actor*, before the action exists; `set_step` / `record_model_input` / `finalize_episode` run in the rollout loop. A decision is therefore parked in `_pending` by the actor and flushed one env step later, when the executed action chunk exists.
+
+Stored samples (same `steervla_hl_dataset_format` schema, same `BAD`/`GOOD` + `direct`/`precursor` vocabulary as CAST, deliberately — that is what `update_hl`'s `hl_online_bad_fraction` / `hl_online_precursor_fraction` bucket on):
+
+- the intervention frame → `BAD`/`direct`, and uniquely `action_matches_subtask=True`, because the action really was produced under the corrected language;
+- the `pre_intervention_sec` (2 s = 40 env steps) *before* it → `BAD`/`precursor`, same corrected target. This is the point of foresight: it teaches the policy to reach the corrected subtask before the VLM has to ask;
+- KEPT frames (`store_kept_samples`, thinned by `kept_sample_stride`) → `GOOD`, the model's own CoT, the reinforce path.
+
+Samples are written the moment they are produced, so the `outcome` tag `use_adaptive_sampling` reads is backfilled by `finalize_episode` at episode end (JSON only, the `.npz` is untouched).
+
+Cost/latency gotcha: unlike CAST's window review this is a **blocking single-image call on the action path**. `yay_robot.request_timeout_sec` bounds it, because `vlm_feedback`'s Gemini client can otherwise spend >2 min in one call retrying 429s. A timed-out call is abandoned, not cancelled — the next few queries pass through uncorrected while it drains. The CARLA sim is already paused across `_sample_agent_action`, so this costs wall clock, not sim time.
+
+Configs: `steervla_yay_robot_config.py` (inherits the CAST config's whole stack, disables `cast_relabel`, adds the `yay_robot` block) vs. `steervla_yay_robot_train_config.py` (asserts the training invariants and sets `steervla.hl_checkpoint_every_steps = 2000` — the train-and-redeploy cadence). The post-stop eval episodes run with the hook **detached**: the deployable artifact is the backbone alone, with no VLM in the loop, and `yay_robot/intervention_rate` falling over a run is the signal that it is learning. Needs `GEMINI_API_KEY`; without it the session disables itself after `max_consecutive_failures` and the run degrades to a plain rollout.
+
 ### Update gating (why "nothing is training")
 
 `steervla_dsrl_config.py` has a master switch plus three per-kind switches, each ANDed with the master:

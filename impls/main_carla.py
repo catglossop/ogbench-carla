@@ -91,6 +91,7 @@ from coaches.critic_feedback import (
     critic_language_dim,
     resolve_critic_feedback_mode,
 )
+from coaches.yay_robot import OnlineYayRobotSession
 from impls.coaches.online_vlm_coach import OnlineVLMSession
 from impls.coaches.cast_relabel import OnlineCastRelabelSession
 
@@ -2508,6 +2509,55 @@ def run_online_carla(
             )
         capture_rollout_video = True
 
+    # YAY-Robot: foresight language correction. Unlike cast_relabel this is NOT an observer -- the
+    # VLM's correction conditions the flow expert on the step it fires (see
+    # ``SteerVLAActor.cot_intervention_fn``) and is stored, together with the ``pre_intervention_sec``
+    # of frames leading up to it, as HL supervision.
+    _yay_robot: OnlineYayRobotSession | None = None
+    yay_cfg = agent_config.get("yay_robot")
+    if yay_cfg is not None and bool(yay_cfg.get("enabled", False)):
+        if _cast_relabel is not None:
+            # Both write ``steervla_hl_dataset_format`` samples and both want to own
+            # ``steervla_actor.hl_dataset_dir``; whichever was wired second would silently take the
+            # HL update and the other's samples would never be trained on.
+            raise ValueError(
+                "cast_relabel and yay_robot are both enabled. They are alternative ways to produce "
+                "the high-level dataset (hindsight relabeling vs. foresight correction) and only "
+                "one can own the HL dataset dir -- disable one."
+            )
+        _yay_robot = OnlineYayRobotSession(
+            yay_cfg,
+            save_dir=FLAGS.save_dir,
+            action_chunk_steps=int(agent_config.get("action_horizon", 10)),
+            run_tag=exp_name,
+        )
+        print(
+            f"[main_carla] YAY-Robot enabled (provider={_yay_robot.provider}, "
+            f"correct every {_yay_robot.query_every_n_cot_queries} CoT query/queries, "
+            f"lead-up={_yay_robot.pre_intervention_sec}s = {_yay_robot.pre_intervention_steps} env "
+            f"steps, kept_samples={_yay_robot.store_kept_samples})",
+            flush=True,
+        )
+        if steervla_actor is not None:
+            # The intervention hook itself. This is what makes the method foresight rather than
+            # relabeling: it runs inside the actor's CoT query, before the action expert.
+            steervla_actor.cot_intervention_fn = _yay_robot.cot_intervention
+            if getattr(steervla_actor, "load_trainable_params", False):
+                steervla_actor.hl_dataset_dir = _yay_robot.hl_dataset_dir
+                print(
+                    f"[main_carla] SteerVLA high-level update wired to YAY-Robot HL dataset dir "
+                    f"{steervla_actor.hl_dataset_dir} (every {steervla_actor.hl_update_every} vla "
+                    f"updates, batch {steervla_actor.hl_update_batch_size}).",
+                    flush=True,
+                )
+        else:
+            print(
+                "[main_carla] WARNING: yay_robot.enabled=True but no SteerVLA actor was built, so "
+                "no CoT is ever queried and no correction can fire.",
+                flush=True,
+            )
+        capture_rollout_video = True
+
     # Pooled CAST run: this process is one of N rollout workers feeding a shared sample pool that a
     # separate trainer consumes (impls/train_hl_pooled.py). The worker takes no gradient steps -- it
     # only produces relabeled samples and hot-reloads whatever policy version the trainer publishes.
@@ -2722,6 +2772,12 @@ def run_online_carla(
             # ``route_name`` above is the current routing *command* (scene context for the VLM
             # prompt), not the scenario. The stored HL samples need the real route so a corpus
             # merged across routes can be split/weighted by it.
+            route_id=str(FLAGS.route or "?"),
+        )
+    if _yay_robot is not None:
+        _yay_robot.begin_episode(
+            episode_count=max(1, episode_count),
+            route_name=str(obs_raw.get("routing_command", "?") if isinstance(obs_raw, dict) else "?"),
             route_id=str(FLAGS.route or "?"),
         )
 
@@ -3939,6 +3995,12 @@ def run_online_carla(
         _bon_viz_img = None
         if raw_obs_holder is not None:
             raw_obs_holder["obs"] = obs_raw
+        if _yay_robot is not None:
+            # Stamp the step the actor is about to act on, so a correction decided inside the CoT
+            # query (which knows nothing about episode bookkeeping) is attributed to the right
+            # frame. ``episode_steps`` is only incremented after the env step, so the step being
+            # chosen here is the next one.
+            _yay_robot.set_step(episode_step=episode_steps + 1, global_step=step)
         _dump_obs_path = os.environ.get("DUMP_OBS_PATH")
         if _dump_obs_path and step == 1:
             import pickle as _pkl_dump
@@ -4536,6 +4598,36 @@ def run_online_carla(
             if getattr(_cast_relabel, "async_review", False):
                 _cast_relabel.drain_wandb()
 
+        if _yay_robot is not None:
+            # Same per-step model input cast_relabel records, and deliberately the same signature.
+            # Here it does double duty: it fills the rolling buffer the 2 s lead-up is drawn from,
+            # and it flushes any correction the actor parked for this step -- which is why it has
+            # to happen *after* the env step, when ``replay_action`` exists.
+            #
+            # ``subtask``/``reasoning`` come off ``cot_obs_raw``, which the VLA stashed AFTER the
+            # intervention, so on an intervention step these already hold the corrected language.
+            _yay_robot.record_model_input(
+                episode_step=episode_steps,
+                image=cot_obs_raw.get("image"),
+                state=cot_obs_raw.get("state"),
+                current_speed=float(_ego_speed_mps_from_raw(cot_obs_raw)),
+                prompt=(
+                    _format_text_field(cot_obs_raw, "openpi_prompt_raw_text")
+                    or _format_text_field(cot_obs_raw, "openpi_prompt_text")
+                ),
+                subtask=(
+                    _format_text_field(cot_obs_raw, "subtask_text")
+                    or _format_text_field(cot_obs_raw, "subtask")
+                ),
+                reasoning=(
+                    _format_text_field(cot_obs_raw, "reasoning_text")
+                    or _format_text_field(cot_obs_raw, "reasoning")
+                ),
+                action_chunk=replay_action,
+                routing_command=_format_text_field(cot_obs_raw, "routing_command"),
+                global_step=step,
+            )
+
         # Pooled run: pick up a newly published policy version mid-episode (see CastPoolWatcher).
         if _cast_pool_watcher is not None and _cast_pool_watcher.maybe_reload(env, step):
             wandb.log(
@@ -4667,6 +4759,8 @@ def run_online_carla(
         step_wb["training/rl_updates_on"] = float(rl_updates_on)
         step_wb["training/bc_updates_on"] = float(bc_updates_on)
         step_wb["training/hl_updates_on"] = float(hl_updates_on)
+        if _yay_robot is not None:
+            step_wb.update(_yay_robot.wandb_metrics())
         if "episode_step_count" in info:
             step_wb["rollout/episode_step"] = float(info["episode_step_count"])
 
@@ -4866,6 +4960,16 @@ def run_online_carla(
                     # eval episodes would keep paying for Gemini window reviews whose HL samples
                     # nothing will ever train on.
                     _cast_relabel = None
+                    # Detach the YAY-Robot correction hook as well, for a different reason: it is
+                    # not an observer, it drives. The deployable artifact is the fine-tuned
+                    # backbone WITHOUT a VLM in the loop -- the whole point is that it learns to
+                    # produce the corrected language itself -- so the frozen eval episodes must
+                    # run on the policy's own CoT.
+                    if _yay_robot is not None:
+                        if steervla_actor is not None:
+                            steervla_actor.cot_intervention_fn = None
+                        _yay_robot.close()
+                        _yay_robot = None
                     print(
                         f"[main_carla] STOP TRAINING ({stop_reason}); running "
                         f"{FLAGS.post_stop_eval_episodes} frozen eval episodes.",
@@ -4936,6 +5040,26 @@ def run_online_carla(
                     route_name=done_route,
                     # ``done_route`` is the env's own scenario name (info["route"]); fall back to
                     # the launched route if the leaderboard did not report one.
+                    route_id=str(done_route if done_route != "?" else (FLAGS.route or "?")),
+                )
+            if _yay_robot is not None:
+                # Backfill the episode's outcome tag onto the manifests written during it. YAY
+                # samples are written the moment the correction fires (the run trains on them the
+                # same episode), so the outcome ``use_adaptive_sampling`` reads is only knowable
+                # now. ``max_crash_stuck_ticks`` is not tracked out here -- a collision the ego
+                # never escaped still lands via ``termination_reason == "crash_stuck"``.
+                _yay_robot.finalize_episode(
+                    metadata={
+                        "termination_reason": done_info.get("termination_reason"),
+                        "success": done_info.get("success"),
+                        "route_completed": float(done_info.get("route_progress_pct", 0.0) or 0.0)
+                        >= 99.5,
+                    }
+                )
+                _yay_robot.reset_episode()
+                _yay_robot.begin_episode(
+                    episode_count=episode_count,
+                    route_name=done_route,
                     route_id=str(done_route if done_route != "?" else (FLAGS.route or "?")),
                 )
             _sync_steervla_debug_noise_context(done_route)
@@ -5051,6 +5175,10 @@ def run_online_carla(
         )
 
     train_logger.close()
+    if _yay_robot is not None:
+        # Release the corrector's worker thread. It is not a daemon, so an abandoned (timed-out)
+        # request would otherwise hold process exit open until its socket timeout expires.
+        _yay_robot.close()
 
     # Final export of the fine-tuned backbone at exit (in addition to the periodic saves above).
     _save_steervla_ckpt(FLAGS.online_steps, final=True)

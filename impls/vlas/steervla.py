@@ -1678,6 +1678,16 @@ class SteerVLAActor:
         # needed by the RLT state encoder to reproduce the prefix the policy acted on.
         self._last_cot_out: dict[str, Any] | None = None
 
+        # YAY-Robot foresight correction hook (``coaches.yay_robot.OnlineYayRobotSession``).
+        # ``main_carla`` assigns it after construction, the same way it assigns
+        # ``hl_dataset_dir``. Called by :meth:`_maybe_intervene_on_cot` on every fresh CoT sample:
+        # given the decoded subtask/reasoning + the raw obs, it returns a corrected
+        # ``(subtask, reasoning)`` pair to condition the action expert on instead, or ``None`` to
+        # keep the sampled chain. ``None`` here (the default) disables the whole path.
+        self.cot_intervention_fn: Optional[Callable[[dict[str, Any]], Optional[tuple[str, str]]]] = None
+        self._cot_interventions: int = 0
+        self._last_cot_intervention: dict[str, str] | None = None
+
         # Frozen prefix cached by _sample_actions_cached so pi_prefix / rl_token reuse it instead of
         # a second PaliGemma forward. out: f32[B, M, D], mask: bool[B, M] (B = N for EXPO else 1);
         # _prefix_cache_row picks the row, _last_prefix_n_fast = trailing FAST cols pi_prefix drops.
@@ -4327,6 +4337,9 @@ class SteerVLAActor:
     _EGO_STATE_IDX_X = 0
     _EGO_STATE_IDX_Y = 1
     _EGO_STATE_IDX_YAW_DEG = 5
+    # Forward speed in m/s -- the index the bare ``state_vec[15]`` reads elsewhere in this file
+    # and the one ``coaches.cast_relabel.EGO_STATE_IDX_SPEED`` mirrors. Keep the copies in sync.
+    _EGO_STATE_IDX_SPEED = 15
 
     # Output formats whose trailing two action columns are ego-frame xy route deltas, i.e. the
     # ones a rigid SE(2) transform is valid for. The ``*_delta_course_space`` formats store a
@@ -4553,11 +4566,36 @@ class SteerVLAActor:
         ref_array: jnp.ndarray,
     ) -> dict[str, Any]:
         """Teacher-forced CoT matching ``inspect_outputs.ipynb`` (no ``sample_cot``)."""
+        return self._build_text_cot_out(
+            subtask_text=self.fixed_subtask_text,
+            reasoning_text=self.fixed_reasoning_text or "Follow the route.",
+            batch_size=batch_size,
+            ref_array=ref_array,
+        )
+
+    def _build_text_cot_out(
+        self,
+        *,
+        subtask_text: str,
+        reasoning_text: str,
+        batch_size: int,
+        ref_array: jnp.ndarray,
+    ) -> dict[str, Any]:
+        """Tokenize a subtask/reasoning *string pair* into the ``cot_out`` dict ``sample_actions`` wants.
+
+        This is the inverse of decoding a sampled chain: it lets language that did not come out of
+        ``sample_cot`` -- a fixed teacher-forced CoT, or a YAY-Robot correction decided by a VLM at
+        query time (:meth:`_maybe_intervene_on_cot`) -- condition the action/flow expert exactly as
+        a sampled chain would. ``_merge_cot_output_into_observation`` does not care where the
+        tokens came from.
+
+        FAST token slots are zeroed: the corrected text has no FAST codes of its own, and the
+        sampled ones belonged to the chain that was just replaced.
+        """
         if self.tokenizer is None or self.model_cfg is None:
-            raise RuntimeError("Fixed CoT requires a loaded local SteerVLAActor tokenizer/model.")
-        reasoning_text = self.fixed_reasoning_text or "Follow the route."
+            raise RuntimeError("Text CoT requires a loaded local SteerVLAActor tokenizer/model.")
         rea_np, rea_mask_np = self.tokenizer.tokenize_reasoning(reasoning_text)
-        sub_np, sub_mask_np = self.tokenizer.tokenize_subtask(self.fixed_subtask_text)
+        sub_np, sub_mask_np = self.tokenizer.tokenize_subtask(subtask_text)
         device = self._jax_device if self._jax_device is not None else ref_array.devices().pop()
 
         def _tile(tok: np.ndarray, mask: np.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -4815,11 +4853,97 @@ class SteerVLAActor:
             self._last_cot_out = self._cached_cot
             return self._cached_cot
         cot_out = self._sample_cot_checked(rng, obs_jax)
+        # YAY-Robot: give the correction hook the freshly sampled chain BEFORE it is cached or
+        # handed to the action expert, so an intervention conditions the flow expert and every
+        # open-loop step that reuses this chain.
+        cot_out = self._maybe_intervene_on_cot(cot_out, obs_jax=obs_jax, batch_size=batch_size)
         if self._cot_cache_enabled(batch_size):
             self._cached_cot = dict(cot_out)
             self._cached_cot_actions_used = 0
         self._last_cot_out = cot_out
         return cot_out
+
+    def _maybe_intervene_on_cot(
+        self,
+        cot_out: dict[str, Any],
+        *,
+        obs_jax: _openpi_model.Observation,
+        batch_size: int,
+    ) -> dict[str, Any]:
+        """Let ``cot_intervention_fn`` replace a sampled CoT with corrected language.
+
+        This is the hook :class:`coaches.yay_robot.OnlineYayRobotSession` installs. It runs on
+        every *fresh* CoT sample (never on a cached reuse -- the chain has already been judged) and
+        only on the single-row rollout path: a batched forward is Best-of-N candidate generation,
+        where each row is a different candidate and there is no one CoT to correct.
+
+        The hook is handed the decoded subtask/reasoning plus the raw CARLA obs the chain was
+        sampled from, and returns either ``None`` (keep) or a ``(subtask, reasoning)`` pair, which
+        is re-tokenized here so the action expert is conditioned on the corrected language rather
+        than on what the model said.
+
+        Failures are swallowed: this sits on the driving path, and a coach that errors must leave
+        the policy running on its own CoT rather than stop the rollout.
+        """
+        hook = getattr(self, "cot_intervention_fn", None)
+        if hook is None or batch_size != 1 or self.tokenizer is None:
+            return cot_out
+        try:
+            subtask = decode_cot_token_ids(
+                self.tokenizer, cot_out["tokenized_subtask"], cot_out["tokenized_subtask_mask"]
+            )
+            reasoning = decode_cot_token_ids(
+                self.tokenizer, cot_out["tokenized_reasoning"], cot_out["tokenized_reasoning_mask"]
+            )
+            raw = self.raw_obs_holder.get("obs") if self.raw_obs_holder is not None else None
+            raw = raw if isinstance(raw, dict) else {}
+            state_vec = np.asarray(raw.get("state", []), dtype=np.float32).reshape(-1)
+            idx_speed = self._EGO_STATE_IDX_SPEED
+            speed = float(state_vec[idx_speed]) if state_vec.size > idx_speed else 0.0
+            corrected = hook(
+                {
+                    "subtask": subtask,
+                    "reasoning": reasoning,
+                    "image": raw.get("image"),
+                    "state": state_vec if state_vec.size else None,
+                    "current_speed": speed,
+                    # The bare routing instruction and the prompt built from it, matching what
+                    # ``coaches.cast_relabel`` stores for an HL sample.
+                    "routing_command": self.routing_command,
+                    "prompt": routing_instruction_prompt(
+                        routing_command=self.routing_command, current_speed_mps=speed
+                    ),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - never let a coach failure stop the car.
+            print(f"[DEBUG - steervla] cot_intervention_fn raised ({exc}); keeping sampled CoT.", flush=True)
+            return cot_out
+
+        if not corrected:
+            self._last_cot_intervention = None
+            return cot_out
+        new_subtask, new_reasoning = corrected
+        if not str(new_subtask).strip() or not str(new_reasoning).strip():
+            self._last_cot_intervention = None
+            return cot_out
+        try:
+            replaced = self._build_text_cot_out(
+                subtask_text=str(new_subtask),
+                reasoning_text=str(new_reasoning),
+                batch_size=batch_size,
+                ref_array=obs_jax.tokenized_prompt,
+            )
+        except Exception as exc:  # noqa: BLE001 - a tokenizer failure must not stop the car.
+            print(f"[DEBUG - steervla] could not tokenize corrected CoT ({exc}); keeping sampled CoT.", flush=True)
+            return cot_out
+        self._cot_interventions += 1
+        self._last_cot_intervention = {
+            "original_subtask": subtask,
+            "original_reasoning": reasoning,
+            "subtask": str(new_subtask),
+            "reasoning": str(new_reasoning),
+        }
+        return replaced
 
     def _grpo_scene_fields(self, raw: dict[str, Any]) -> tuple[np.ndarray, str, np.ndarray]:
         """Shared (state, prompt, image) for GRPO HL records built from a raw CARLA obs."""
@@ -4885,6 +5009,9 @@ class SteerVLAActor:
         self._cached_cot = None
         self._cached_cot_actions_used = 0
         self._last_cot_out = None
+        # The correction (if any) belonged to the chain just dropped; the cumulative
+        # ``_cot_interventions`` counter is run-scoped and deliberately survives.
+        self._last_cot_intervention = None
         self._last_prefix_out = None
         self._last_prefix_mask = None
         self._last_prefix_n_fast = 0
