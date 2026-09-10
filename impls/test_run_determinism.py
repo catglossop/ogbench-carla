@@ -69,6 +69,17 @@ check(
     "the weights training produced are exported at the stop",
     "_save_steervla_ckpt(int(step), final=True)" in src,
 )
+# --max_hl_updates must count GRADIENT STEPS, not update_hl calls. steervla keeps both and they
+# differ whenever hl_update_num_steps > 1: a burst config did 6 x 50 = 300 gradient steps while
+# _hl_updates_applied read 6, so a 150 cap never tripped and the run used its whole budget.
+check(
+    "the stop condition counts gradient steps",
+    '_hl_applied = int(getattr(steervla_actor, "_hl_grad_steps", 0) or 0)' in src,
+)
+check(
+    "it no longer reads the per-call counter",
+    'getattr(steervla_actor, "_hl_updates_applied"' not in src,
+)
 check(
     "periodic checkpointing stops once the eval phase begins",
     "        if not eval_phase:\n            if agent is not None and any_updates_on" in src
