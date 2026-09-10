@@ -10,6 +10,7 @@ import numpy as np
 
 from coaches.action_chunk_feedback import DEFAULT_ACTION_CHUNK_STEPS, DEFAULT_CHUNK_DURATION_SEC
 from coaches.online_vlm_coach import write_frames_to_mp4
+from coaches.gemini_models import DEFAULT_GEMINI_MODEL
 from coaches.static_coach import (
     DEFAULT_META_ACTIONS_FILE,
     MetaActionRecommendation,

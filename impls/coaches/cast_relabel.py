@@ -86,6 +86,7 @@ import concurrent.futures
 import threading
 
 from coaches.vlm_feedback import CoachEvent, build_coaching_prompt, create_coach
+from coaches.gemini_models import DEFAULT_GEMINI_MODEL
 
 # Default number of subtask suggestions produced per chunk that needs improvement.
 DEFAULT_NUM_SUBTASK_SUGGESTIONS = 3
