@@ -2033,6 +2033,7 @@ class OnlineCastRelabelSession:
         video_path: str | Path | None = None,
         episode_fps: float | None = None,
         route_goal: str = "",
+        global_step: int | None = None,
     ) -> str:
         """Summarise the finished episode into the memory bank, and return the sentence.
 
@@ -2068,12 +2069,54 @@ class OnlineCastRelabelSession:
         self._memory.add_strategy(
             sentence, episode=self.episode_count, driving_score=float(driving_score)
         )
+        self._log_strategy_to_wandb(global_step=global_step)
         print(
             f"[cast_relabel] episode {self.episode_count} strategy (score "
             f"{float(driving_score):.2f}, {len(corrections)} corrections reviewed): {sentence}",
             flush=True,
         )
         return sentence
+
+    def _log_strategy_to_wandb(self, *, global_step: int | None = None) -> None:
+        """Push the strategy bank to wandb: a growing table plus a couple of scalars.
+
+        The table is re-logged in full each episode rather than appended to, because wandb keeps
+        one value per (step, key) -- the same reason ``_log_hl_batch_to_wandb`` merges its rows.
+        Scalars are logged alongside it because a wandb Table renders only in the run's media
+        section and is easy to miss entirely in a workspace that hides it.
+        """
+        if self._memory is None:
+            return
+        try:
+            import wandb  # type: ignore
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+        try:
+            table = wandb.Table(columns=["episode", "driving_score", "strategy"])
+            for entry in self._memory.strategies:
+                table.add_data(
+                    int(entry.get("episode", 0)),
+                    float(entry.get("driving_score", 0.0)),
+                    str(entry.get("sentence", "")),
+                )
+            rendered = self._memory.render()
+            payload = {
+                "cast/strategy_memory": table,
+                "cast/strategy_episodes": float(len(self._memory.strategies)),
+                # Budget pressure: when this approaches correction_memory_words the pruner starts
+                # dropping notes and then older strategies, so a rising line explains a shrinking
+                # table without having to read the JSON.
+                "cast/memory_words": float(len(rendered.split())),
+                "cast/memory_word_budget": float(self._memory.max_words),
+            }
+            step = None if global_step is None else max(
+                int(global_step), int(getattr(wandb.run, "step", 0) or 0)
+            )
+            wandb.log(payload, step=step)
+        except Exception as exc:  # noqa: BLE001 - telemetry must never break a run
+            print(f"[cast_relabel] strategy wandb log failed (non-fatal): {exc}", flush=True)
 
     def record_frame(
         self,

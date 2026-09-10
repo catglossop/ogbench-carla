@@ -4809,6 +4809,7 @@ def run_online_carla(
                         route_completion=done_info.get("route_progress_pct"),
                         video_path=_ep_video if _ep_video.is_file() else None,
                         route_goal=describe_route_goal(str(FLAGS.route or "")),
+                        global_step=step,
                     )
                 except Exception as _exc:  # noqa: BLE001 - never break a scored episode
                     print(
