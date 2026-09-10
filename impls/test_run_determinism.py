@@ -93,6 +93,16 @@ check(
     "the final export happens before the gated periodic save in the same iteration",
     _stop_at < _periodic_at,
 )
+# ...and the exit-time export must not fire on top of it. It is tagged with --online_steps, a step
+# the run never reached when a stop condition fired, and lands AFTER the real export.
+check(
+    "the exit export is skipped when training already exported",
+    "if _final_ckpt_step is None:\n        _save_steervla_ckpt(FLAGS.online_steps, final=True)" in src,
+)
+check(
+    "and says so rather than failing silently",
+    "skipping exit checkpoint" in src,
+)
 
 # ── 2b. ... but only under --eval-mode ────────────────────────────────────────────────
 print("\n[2b] everything is gated behind --eval_mode")
