@@ -386,14 +386,17 @@ flags.DEFINE_float(
 )
 flags.DEFINE_integer(
     "max_hl_updates", 0,
-    "Stop TRAINING once this many HL (VLM-backbone) gradient updates have actually been APPLIED "
-    "-- SteerVLAActor._hl_updates_applied, not the throttled call count -- then run "
+    "Stop TRAINING once this many HL (VLM-backbone) GRADIENT STEPS have actually been applied "
+    "-- SteerVLAActor._hl_grad_steps, i.e. the sum of hl_update_num_steps over every update that "
+    "ran, NOT the number of update_hl calls -- then run "
     "--post_stop_eval_episodes frozen evaluation episodes and exit. <= 0 disables. Checked at "
     "episode end, so the effective count can overshoot slightly within the final episode.",
 )
 flags.DEFINE_integer(
     "updates_after_driving_score", 10,
-    "How many further HL gradient updates to APPLY after --stop_on_driving_score is first met. "
+    "How many further HL GRADIENT STEPS to apply after --stop_on_driving_score is first met. "
+    "Quantised to hl_update_num_steps, since the countdown is only checked between update_hl "
+    "calls and each call applies all of its steps. "
     "Reaching the score does not stop training; it arms a countdown of this many more updates, so "
     "the policy keeps learning from the episode that solved the route. --max_hl_updates still "
     "applies as a hard cap, whichever comes first.",
@@ -3909,7 +3912,7 @@ def run_online_carla(
     # of the final weights export. Both land in run_summary.json.
     final_train_driving_score = 0.0
     _final_ckpt_step: int | None = None
-    # Set when --stop_on_driving_score is first met: the _hl_updates_applied count at which
+    # Set when --stop_on_driving_score is first met: the _hl_grad_steps count at which
     # training should stop. None until the score is reached.
     hl_target_after_score: int | None = None
     # Env step at which the eval phase began. The eval episodes are rolled out AFTER the
@@ -4779,7 +4782,15 @@ def run_online_carla(
 
             # ── stop conditions / frozen evaluation phase ────────────────────────────
             _ep_ds = float(done_info.get("driving_score", 0.0) or 0.0)
-            _hl_applied = int(getattr(steervla_actor, "_hl_updates_applied", 0) or 0) if steervla_actor else 0
+            # GRADIENT steps, not update_hl bodies. steervla.py keeps both and they are not the
+            # same number: _hl_updates_applied counts one per update_hl call that reached the
+            # gradient loop, while _hl_grad_steps is the sum of hl_update_num_steps -- "the real
+            # number of updates to the policy", in that module's own words. With
+            # hl_update_num_steps=1 they coincide, which is why this went unnoticed; with the
+            # hl1500x50 recipe a run did 6 bursts x 50 = 300 gradient steps while this counter
+            # read 6, so --max_hl_updates=150 never tripped and the run silently used its whole
+            # step budget with no stop condition and no run_summary.json.
+            _hl_applied = int(getattr(steervla_actor, "_hl_grad_steps", 0) or 0) if steervla_actor else 0
             if eval_phase:
                 eval_scores.append(_ep_ds)
                 print(
