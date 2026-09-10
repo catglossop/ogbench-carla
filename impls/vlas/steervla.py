@@ -5683,6 +5683,7 @@ class SteerVLAActor:
         noise: jax.Array | None = None,
         raw: Optional[Dict[str, Any]] = None,
         rng: jax.Array | None = None,
+        cot_out: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Best-of-N support: sample ``n`` CoTs at ``temperature`` and decode each subtask.
 
@@ -5716,12 +5717,15 @@ class SteerVLAActor:
         )
 
         # n diverse CoTs in one batched call (temperature gives independent per-row samples).
-        cot_out = self._sample_cot(
-            rng_cot,
-            obs_jax,
-            temperature=float(temperature),
-            image_keys=CARLA_STEERVLA_IMAGE_KEYS,
-        )
+        # Optional candidate-wise token reuse; actions still use the current image
+        # and freshly supplied full-chunk noise on every query.
+        if cot_out is None:
+            cot_out = self._sample_cot(
+                rng_cot,
+                obs_jax,
+                temperature=float(temperature),
+                image_keys=CARLA_STEERVLA_IMAGE_KEYS,
+            )
 
         reason_tokens = np.asarray(jax.device_get(cot_out["tokenized_reasoning"]), dtype=np.int32)
         reason_mask = np.asarray(jax.device_get(cot_out["tokenized_reasoning_mask"]), dtype=bool)

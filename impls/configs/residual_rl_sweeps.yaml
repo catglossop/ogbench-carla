@@ -8,6 +8,9 @@ version: 1
 
 common:
   online_steps: 20000
+  # The normal CARLA config keeps its 4000-step default. Residual sweep runs
+  # intentionally cap individual episodes sooner for faster, comparable trials.
+  max_episode_steps: 2000
   seeds: [0]
   encoders: [siglip_pool]
   fixed_agent_overrides:
@@ -26,6 +29,20 @@ common:
     retry_failed_on_resume: false
 
 profiles:
+  coarse_grid_v4:
+    label: coarse-grid-v4
+    run_group: ResidualRLHyperparameterSweep-coarse-grid-v4
+    routes:
+      - enter-actor-flow-004
+      - non-signalized-junction-right-turn-005
+      - pedestrian-crossing-004
+    accel_scales: [0.1, 0.4]
+    steer_scales: [0.1, 0.4]
+    betas: [0.0, 1.0, 3.0]
+    steervla_overrides:
+      actions_per_model_query: 3
+      actions_per_cot: 5
+
   # Restarted cot-5 grid. Kept separate from the already-started cot-3 v2 run.
   coarse_grid_v3:
     label: coarse-grid-v3
