@@ -93,7 +93,17 @@ def get_config():
             # doesn't end up teaching both directions of the same decision. This is the whole
             # rendered block's word budget -- it is pruned oldest-note-first and, if still over,
             # summarized by the coach. Persisted to cast_relabel/correction_memory.json. 0 = off.
-            correction_memory_words=300,
+            #
+            # Raised 300 -> 900 when episode-level strategy summaries started sharing this budget
+            # (coaches/strategy_memory.py). At 300 the correction log alone filled it, so every
+            # strategy sentence immediately evicted the notes and the two halves competed instead
+            # of accumulating.
+            correction_memory_words=900,
+            # After each episode, one extra VLM call reviews the full rollout video plus every
+            # correction made during it, in the context of the driving score, and writes a
+            # one-sentence strategy summary into the same memory bank. Costs one call per EPISODE
+            # against one per window for the reviews. False disables it.
+            strategy_memory=True,
             save_artifacts=True,
             # Persist every BAD/relabeled chunk as a SteerVLA high-level (VLM-backbone) training
             # sample in the steervla_hl_dataset_format schema (image + ego state + prompt +

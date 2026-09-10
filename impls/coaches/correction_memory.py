@@ -25,9 +25,17 @@ from typing import Any
 
 from subtask_diversity import subtask_categories
 
-# Total word budget for the rendered block. Small on purpose: this is a consistency nudge, not a
+# Total word budget for the rendered block. Raised from 300 when episode-level strategy summaries
+# started sharing it (coaches/strategy_memory.py): the correction log alone fitted in 300, but with
+# a few strategy sentences the pruner was evicting the correction notes almost immediately, so the
+# two halves were competing rather than accumulating. Still bounded -- this is a nudge, not a
 # second source of instructions competing with the video.
-DEFAULT_MAX_WORDS = 300
+DEFAULT_MAX_WORDS = 900
+
+# How many episode strategy sentences to carry. The most recent ones matter most, but a couple of
+# older ones keep a trend visible ("scored 43, then 60, then 43 again") that a single sentence
+# cannot show.
+_MAX_STRATEGIES = 5
 
 # Transitions are tracked on the longitudinal axis (what the vehicle does about speed), which is
 # where the flip-flopping actually happens. Lateral tags are recorded in notes, not counted.
@@ -90,6 +98,10 @@ class CorrectionMemory:
         self.vehicle_state: str = ""
         self.crash_note: str = ""
         self.crash_age: int = 0
+        # Episode-level strategy summaries: [{"episode": int, "driving_score": float,
+        # "sentence": str}]. Written by strategy_memory after each episode ends; read by both
+        # prompt builders through render(). Distinct from ``notes``, which are within-episode.
+        self.strategies: list[dict[str, Any]] = []
         self.load()
 
     # ── persistence ──────────────────────────────────────────────────────────────
@@ -108,6 +120,7 @@ class CorrectionMemory:
         self.vehicle_state = str(raw.get("vehicle_state") or "")
         self.crash_note = str(raw.get("crash_note") or "")
         self.crash_age = int(raw.get("crash_age") or 0)
+        self.strategies = list(raw.get("strategies") or [])
 
     def save(self) -> None:
         if not self.path:
@@ -126,6 +139,7 @@ class CorrectionMemory:
                         "vehicle_state": self.vehicle_state,
                         "crash_note": self.crash_note,
                         "crash_age": self.crash_age,
+                        "strategies": self.strategies,
                         "rendered": self.render(),
                     },
                     indent=2,
@@ -236,6 +250,39 @@ class CorrectionMemory:
             parts.append("collided")
         self.vehicle_state = "; ".join(parts)
 
+    def add_strategy(self, sentence: str, *, episode: int, driving_score: float) -> None:
+        """Record an episode's strategy summary and its score.
+
+        Kept newest-last and capped at ``_MAX_STRATEGIES``. Scores are carried alongside the text
+        because the sentence is only actionable next to the number it produced -- "crept to every
+        junction" is a description; "crept to every junction and scored 27" is a lesson.
+        """
+        text = " ".join(str(sentence or "").split()).strip()
+        if not text:
+            return
+        self.strategies.append(
+            {"episode": int(episode), "driving_score": float(driving_score), "sentence": text}
+        )
+        del self.strategies[:-_MAX_STRATEGIES]
+        self._fit_budget()
+        self.save()
+
+    def render_strategy_block(self) -> str:
+        """Episode-level half of the memory block."""
+        if not self.strategies:
+            return ""
+        lines = [
+            f"- episode {e['episode']} (score {e['driving_score']:.1f}): {e['sentence']}"
+            for e in self.strategies
+        ]
+        return (
+            "\nStrategy memory — how PREVIOUS episodes of this run played out, and what they "
+            "scored. Use it to steer the high-level strategy of your labelling: if an approach "
+            "already scored badly, do not keep correcting toward it; if one scored well, keep "
+            "your corrections consistent with it. These are outcomes, not instructions about "
+            "this window — the video always wins.\n" + "\n".join(lines) + "\n"
+        )
+
     def render_vehicle_block(self) -> str:
         """The carry-over paragraph, or ``""`` when there is nothing to carry."""
         if not self.vehicle_state and not self.crash_note:
@@ -264,7 +311,7 @@ class CorrectionMemory:
         been observed, corrections or not) and the correction log (present once something has
         actually been corrected). Either can be empty.
         """
-        vehicle_block = self.render_vehicle_block()
+        vehicle_block = self.render_vehicle_block() + self.render_strategy_block()
         if self.summary:
             body = self.summary
         elif self.transitions:
@@ -294,6 +341,11 @@ class CorrectionMemory:
         """Prune, then summarize, until :meth:`render` fits in ``max_words``."""
         while _word_count(self.render()) > self.max_words and self.notes:
             self.notes.pop(0)  # oldest note first; the transition counts are the durable part
+        # Then the oldest strategy sentences. They are dropped AFTER the notes because an episode
+        # outcome outranks a single within-episode note, but before the transition table, which is
+        # the compact durable core. Always leaves the most recent one.
+        while _word_count(self.render()) > self.max_words and len(self.strategies) > 1:
+            self.strategies.pop(0)
         if _word_count(self.render()) <= self.max_words:
             return
         # Still over: the transition table itself is long. Ask the coach to compress it once and

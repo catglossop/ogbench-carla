@@ -857,6 +857,15 @@ class VLMCOach(ABC):
         """Single-image + text completion (used by the GRPO VLM critic to score candidates)."""
         raise NotImplementedError(f"{type(self).__name__} does not support image+text completion.")
 
+    def analyze_video_text(self, video_path: str | Path, prompt: str) -> str:
+        """Free-form question about a whole video, returning raw text.
+
+        Distinct from :meth:`analyze`, which imposes the CAST window prompt and parses the reply
+        into events. This one asks whatever it is given -- used by ``strategy_memory`` to review a
+        FULL episode rather than a window.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support video+text completion.")
+
 
 # ── Gemini REST API helpers (Python-3.8-compatible; no google-genai package needed) ──
 
@@ -1196,6 +1205,11 @@ class GeminiVLMCOach(VLMCOach):
             [{"parts": [{"text": prompt}]}],
             self.api_key,
         )
+
+    def analyze_video_text(self, video_path: str | Path, prompt: str) -> str:
+        """Ask ``prompt`` about a whole video. Goes through the same retrying upload as reviews."""
+        parts = self._upload_media(video_path, None, False) + [{"text": prompt}]
+        return _gemini_generate_content(self.model, [{"parts": parts}], self.api_key)
 
     def complete_image_text(self, image: Any, prompt: str) -> str:
         """Single-frame + text completion via an inline JPEG part."""
