@@ -923,6 +923,18 @@ def _gemini_upload_file(path: Path, api_key: str) -> dict[str, Any]:
     return body.get("file", body)
 
 
+def _gemini_delete_file_quiet(name: str | None, api_key: str) -> None:
+    """Best-effort delete of an uploaded File. Never raises -- it is cleanup, not the task."""
+    if not name:
+        return
+    try:
+        import requests
+
+        requests.delete(f"{_GEMINI_API_BASE}/{name}", params={"key": api_key}, timeout=15)
+    except Exception:  # noqa: BLE001 - a failed cleanup must not fail the upload
+        pass
+
+
 def _gemini_get_file(name: str, api_key: str) -> dict[str, Any]:
     """Fetch current metadata for a Gemini-uploaded file by its resource name."""
     import requests
@@ -940,6 +952,17 @@ def _gemini_get_file(name: str, api_key: str) -> dict[str, Any]:
 
 
 _GEMINI_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+# google.rpc.Code values that mean "the file was fine, the service faltered", so re-sending the
+# identical bytes has a real chance of working. Observed 2026-09-10: a ~70% window-drop rate whose
+# File resources all read {"code": 13, "message": "The file failed to be processed."} -- INTERNAL,
+# after the upload itself had succeeded (correct sizeBytes, sha256Hash present, mime video/mp4).
+#   13 INTERNAL, 14 UNAVAILABLE, 4 DEADLINE_EXCEEDED, 8 RESOURCE_EXHAUSTED
+# Deliberately NOT 3 INVALID_ARGUMENT or 9 FAILED_PRECONDITION: those mean the file itself is
+# unacceptable, and resending it just burns the retry budget and another upload.
+_GEMINI_RETRYABLE_FILE_ERROR_CODES = {4, 8, 13, 14}
+_GEMINI_UPLOAD_MAX_RETRIES = 4
+
 
 
 def _gemini_generate_content(model: str, contents: list[Any], api_key: str, max_retries: int = 5) -> str:
@@ -1061,38 +1084,77 @@ class GeminiVLMCOach(VLMCOach):
 
         mime_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
 
-        # Upload video and wait for it to become ACTIVE.
-        # The upload response may omit "state" when the file is already ready;
-        # in that case do a GET to get the authoritative status.
-        uploaded = _gemini_upload_file(path, self.api_key)
-        if uploaded.get("state") is None:
-            uploaded = _gemini_get_file(uploaded["name"], self.api_key)
-        _poll_start = time.time()
-        _polls = 0
-        while uploaded.get("state") == "PROCESSING":
-            time.sleep(1.0)
-            _polls += 1
-            uploaded = _gemini_get_file(uploaded["name"], self.api_key)
-        if uploaded.get("state") != "ACTIVE":
-            # Report the WHOLE File resource, not just the state. On FAILED the API populates an
-            # ``error`` (a google.rpc.Status with code/message) that says why -- and discarding it
-            # is why a 70% window-drop rate was diagnosable only as "state='FAILED'". The local
-            # file's size/mime are included because a truncated or mistyped encode is the other
-            # candidate, and the poll count separates "rejected immediately" from "processed for a
-            # while, then failed".
+        # Upload video and wait for it to become ACTIVE, retrying a service-side failure.
+        # The upload response may omit "state" when the file is already ready; in that case do a
+        # GET for the authoritative status.
+        #
+        # The retry exists because the failure we actually see is INTERNAL *after* a successful
+        # upload -- the bytes arrive intact and Gemini's own processing falls over. Without it a
+        # single such blip discards the whole window: no review, no HL samples, no debug video,
+        # and only a non-fatal log line to show for it.
+        uploaded = None
+        last_exc: Exception | None = None
+        for attempt in range(_GEMINI_UPLOAD_MAX_RETRIES + 1):
             try:
-                _detail = json.dumps(uploaded, indent=2, sort_keys=True)[:2000]
-            except Exception:  # noqa: BLE001 - diagnostics must not mask the original failure
-                _detail = repr(uploaded)[:2000]
-            _err = uploaded.get("error") or {}
-            raise RuntimeError(
-                f"Gemini file upload failed with state={uploaded.get('state')!r} "
-                f"after {_polls} poll(s) / {time.time() - _poll_start:.1f}s. "
-                f"error.code={_err.get('code')!r} error.status={_err.get('status')!r} "
-                f"error.message={_err.get('message')!r}. "
-                f"local_file={path.name} size={path.stat().st_size} bytes mime={mime_type!r}. "
-                f"full File resource:\n{_detail}"
+                uploaded = _gemini_upload_file(path, self.api_key)
+                if uploaded.get("state") is None:
+                    uploaded = _gemini_get_file(uploaded["name"], self.api_key)
+                _poll_start = time.time()
+                _polls = 0
+                while uploaded.get("state") == "PROCESSING":
+                    time.sleep(1.0)
+                    _polls += 1
+                    uploaded = _gemini_get_file(uploaded["name"], self.api_key)
+                if uploaded.get("state") == "ACTIVE":
+                    if attempt:
+                        print(
+                            f"[vlm_feedback] upload of {path.name} succeeded on attempt "
+                            f"{attempt + 1}/{_GEMINI_UPLOAD_MAX_RETRIES + 1}.",
+                            flush=True,
+                        )
+                    break
+
+                err = uploaded.get("error") or {}
+                code = err.get("code")
+                try:
+                    detail = json.dumps(uploaded, indent=2, sort_keys=True)[:2000]
+                except Exception:  # noqa: BLE001 - diagnostics must not mask the failure
+                    detail = repr(uploaded)[:2000]
+                last_exc = RuntimeError(
+                    f"Gemini file upload failed with state={uploaded.get('state')!r} "
+                    f"after {_polls} poll(s) / {time.time() - _poll_start:.1f}s. "
+                    f"error.code={code!r} error.status={err.get('status')!r} "
+                    f"error.message={err.get('message')!r}. "
+                    f"local_file={path.name} size={path.stat().st_size} bytes mime={mime_type!r}. "
+                    f"full File resource:\n{detail}"
+                )
+                # A failed File still occupies the account's quota until it expires; drop it
+                # rather than leaving one behind per attempt.
+                _gemini_delete_file_quiet(uploaded.get("name"), self.api_key)
+                if code not in _GEMINI_RETRYABLE_FILE_ERROR_CODES:
+                    raise last_exc
+            except RuntimeError as exc:
+                if exc is last_exc and (uploaded or {}).get("error", {}).get(
+                    "code"
+                ) not in _GEMINI_RETRYABLE_FILE_ERROR_CODES:
+                    raise
+                last_exc = exc
+            except Exception as exc:  # noqa: BLE001 - transport errors are retryable too
+                last_exc = exc
+
+            if attempt == _GEMINI_UPLOAD_MAX_RETRIES:
+                assert last_exc is not None
+                raise last_exc
+            delay = 2.0 * (2 ** attempt)
+            print(
+                f"[vlm_feedback] upload of {path.name} failed "
+                f"(attempt {attempt + 1}/{_GEMINI_UPLOAD_MAX_RETRIES + 1}); "
+                f"retrying in {delay:.0f}s -- {str(last_exc).splitlines()[0][:160]}",
+                flush=True,
             )
+            time.sleep(delay)
+
+        assert uploaded is not None and uploaded.get("state") == "ACTIVE"
 
         parts: list[Any] = [
             {
