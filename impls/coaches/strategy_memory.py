@@ -1,22 +1,24 @@
 """Episode-level strategy review: what the vehicle actually tried, and what it scored.
 
-``correction_memory`` remembers individual corrections *within* a run, as longitudinal mode
-transitions plus a few notes. That keeps consecutive windows from contradicting each other, but it
-is deliberately myopic: every entry is a local fix, and nothing ever asks whether the accumulated
-fixes added up to a route that scored well.
+After an episode ends this makes ONE extra VLM call over:
 
-This module closes that loop. After an episode ends it makes ONE extra VLM call over:
-
-  * the full-episode rollout video (not a 150-step window -- the whole route attempt), and
+  * the full-episode rollout video (not a 150-step window -- the whole route attempt),
   * every correction the CAST reviewer made during that episode, re-timed into the episode's
-    own clock so a correction can be pointed at in the video it belongs to, and
-  * the leaderboard driving score the episode actually earned.
+    own clock so a correction can be pointed at in the video it belongs to,
+  * the subtasks the policy actually executed, and the routing commands it was carrying out,
+  * and the leaderboard driving score the episode earned.
 
-The VLM answers in one or two sentences: what strategy the vehicle followed, which corrections
-mattered, and how that relates to the score. That sentence goes into the same
-:class:`CorrectionMemory` bank the window prompts already read, so the NEXT episode's labeling is
-written with "last time we kept braking early at junctions and scored 43" in view rather than
-starting from scratch.
+The VLM answers in one or two sentences: what strategy the vehicle followed, which behaviour cost
+or earned the most, and what to do differently. That sentence goes into :class:`StrategyMemory`,
+whose rendered block is injected into BOTH the window-review and the credit prompt, so the NEXT
+episode's labeling is written with "last time we crept to every junction and scored 27" in view
+rather than starting from scratch.
+
+This replaced ``coaches/correction_memory.py``, which remembered individual within-window
+corrections as longitudinal mode transitions plus notes, carried vehicle state and crash ageing
+across windows, and pruned and coach-summarised itself to fit a word budget. Five interacting
+mechanisms whose combined output was a table of ``stop -> accelerate: 7x`` -- an episode summary
+says the same thing causally, in one sentence, and can be read.
 
 Re-timing note. Window artifacts carry event timestamps in *window* seconds, but their action
 chunks carry BOTH ``episode_step_start/end`` and ``video_time_start/end_sec``. That pair defines a
@@ -37,6 +39,10 @@ from coaches.vlm_feedback import describe_route_goal
 # One or two sentences. This is a nudge that has to share a small word budget with the correction
 # log, not an essay.
 DEFAULT_MAX_SENTENCE_WORDS = 60
+
+# How many episode summaries to carry. The most recent matter most, but a few older ones
+# keep a trend visible ("scored 43, then 60, then 43 again") that one sentence cannot show.
+DEFAULT_MAX_ENTRIES = 8
 
 
 def _fps_from_chunks(chunks: list[dict[str, Any]]) -> float | None:
@@ -401,3 +407,74 @@ def summarize_episode_strategy(
         print(f"[strategy_memory] episode summary failed (non-fatal): {exc}", flush=True)
         return ""
     return _tidy_sentence(reply, max_words)
+
+
+class StrategyMemory:
+    """Bounded, persistent record of how previous episodes of this run played out.
+
+    Deliberately simple: a list of ``{episode, driving_score, sentence}``, newest last, capped by
+    count. It replaced ``CorrectionMemory``, which tracked longitudinal mode transitions, free-text
+    notes, vehicle-state carry-over and crash ageing, and then pruned and coach-summarised itself
+    to fit a word budget -- five interacting mechanisms whose combined output was a table of
+    ``stop -> accelerate: 7x``. An episode summary says the same thing causally and in one
+    sentence, so none of that machinery is needed to earn its keep.
+    """
+
+    def __init__(self, path: str | Path | None = None, *, max_entries: int = DEFAULT_MAX_ENTRIES) -> None:
+        self.path = Path(path) if path else None
+        self.max_entries = max(1, int(max_entries))
+        self.strategies: list[dict[str, Any]] = []
+        self.load()
+
+    def load(self) -> None:
+        if not self.path or not self.path.is_file():
+            return
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001 - a corrupt cache must not stop a run
+            print(f"[strategy_memory] could not read {self.path} ({exc}); starting empty.", flush=True)
+            return
+        self.strategies = list(raw.get("strategies") or [])
+
+    def save(self) -> None:
+        if not self.path:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(
+                json.dumps(
+                    {"version": 1, "max_entries": self.max_entries,
+                     "strategies": self.strategies, "rendered": self.render()},
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001 - best effort
+            print(f"[strategy_memory] could not write {self.path} ({exc}).", flush=True)
+
+    def add_strategy(self, sentence: str, *, episode: int, driving_score: float) -> None:
+        """Record an episode's summary and the score it produced."""
+        text = " ".join(str(sentence or "").split()).strip()
+        if not text:
+            return
+        self.strategies.append(
+            {"episode": int(episode), "driving_score": float(driving_score), "sentence": text}
+        )
+        del self.strategies[: -self.max_entries]
+        self.save()
+
+    def render(self) -> str:
+        """The block injected into both prompts. Empty until an episode has finished."""
+        if not self.strategies:
+            return ""
+        lines = [
+            f"- episode {e['episode']} (score {e['driving_score']:.1f}): {e['sentence']}"
+            for e in self.strategies
+        ]
+        return (
+            "\nStrategy memory — how PREVIOUS episodes of this run played out, and what they "
+            "scored. Use it to steer the high-level strategy of your labelling: if an approach "
+            "already scored badly, do not keep correcting toward it; if one scored well, keep "
+            "your corrections consistent with it. These are outcomes, not instructions about "
+            "this window — the video always wins.\n" + "\n".join(lines) + "\n"
+        )
