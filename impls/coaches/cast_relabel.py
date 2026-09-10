@@ -58,9 +58,9 @@ from coaches.action_chunk_feedback import (
     DEFAULT_CHUNK_DURATION_SEC,
     build_action_chunk_specs,
 )
-from coaches.correction_memory import DEFAULT_MAX_WORDS as DEFAULT_MEMORY_WORDS
-from coaches.correction_memory import CorrectionMemory
 from coaches.strategy_memory import (
+    DEFAULT_MAX_ENTRIES,
+    StrategyMemory,
     collect_episode_chunks,
     collect_episode_corrections,
     summarize_episode_strategy,
@@ -764,10 +764,10 @@ def build_credit_relabel_prompt(
     seed_subtask_block = "\n".join(f"- {s}" for s in seeds_subtasks)
     seeds_reasonings = list(seed_reasonings)[:max_seed_examples]
     seed_reasoning_block = "\n".join(f"- {s}" for s in seeds_reasonings)
-    # What earlier windows of this run already corrected (coaches.correction_memory). This call is
+    # How previous EPISODES of this run played out (coaches.strategy_memory). This call is
     # stateless, so without it every window re-decides the same trade-off from scratch and the HL
     # dataset can end up teaching both directions of one decision.
-    memory_block = str(metadata.get("correction_memory") or "")
+    memory_block = str(metadata.get("strategy_memory") or "")
 
     return textwrap.dedent(
         f"""
@@ -1899,22 +1899,15 @@ class OnlineCastRelabelSession:
         self.window_env_steps = n_chunks * self.action_chunk_steps
 
         self._coach = create_coach(self.provider, model=self.gemini_model)
-        # Bounded cross-window memory of corrections already made, injected into both prompts so
-        # later windows don't reverse earlier ones. ``correction_memory_words`` caps the whole
-        # rendered block; 0 disables the cache entirely.
-        memory_words = int(self.cfg.get("correction_memory_words", DEFAULT_MEMORY_WORDS))
-        # After each episode, summarise the whole attempt (full rollout video + every correction
-        # made during it + the driving score it earned) into one sentence, and put that in the same
-        # memory bank the window prompts read. Costs one extra VLM call per EPISODE, against one
-        # per window for the reviews themselves. See coaches/strategy_memory.py.
-        self.strategy_memory_enabled = bool(self.cfg.get("strategy_memory", True))
-        self._memory: CorrectionMemory | None = (
-            CorrectionMemory(
-                self.artifact_dir / "correction_memory.json",
-                max_words=memory_words,
-                coach=self._coach,
-            )
-            if memory_words > 0
+        # Bounded record of how previous EPISODES of this run played out (their strategy and the
+        # score it earned), injected into both prompts. Replaced the old correction memory, whose
+        # transition table / notes / vehicle-state carry-over / crash ageing / budget pruning were
+        # five interacting mechanisms to express what one episode summary says directly.
+        # ``strategy_memory_entries`` caps how many are carried; 0 disables the bank entirely.
+        memory_entries = int(self.cfg.get("strategy_memory_entries", DEFAULT_MAX_ENTRIES))
+        self._memory: StrategyMemory | None = (
+            StrategyMemory(self.artifact_dir / "strategy_memory.json", max_entries=memory_entries)
+            if memory_entries > 0
             else None
         )
         if self.provider == "gemini":
@@ -2041,7 +2034,8 @@ class OnlineCastRelabelSession:
         episode has already been driven and scored, so a failed summary costs a memory entry and
         nothing else. Returns ``""`` when disabled or unsuccessful.
         """
-        if self._memory is None or not self.strategy_memory_enabled:
+        # ``strategy_memory_entries: 0`` is the single off switch -- no separate boolean.
+        if self._memory is None:
             return ""
         try:
             corrections = collect_episode_corrections(self.artifact_dir, self.episode_count)
@@ -2105,11 +2099,9 @@ class OnlineCastRelabelSession:
             payload = {
                 "cast/strategy_memory": table,
                 "cast/strategy_episodes": float(len(self._memory.strategies)),
-                # Budget pressure: when this approaches correction_memory_words the pruner starts
-                # dropping notes and then older strategies, so a rising line explains a shrinking
-                # table without having to read the JSON.
+                # Rendered size of the block actually injected into the prompts.
                 "cast/memory_words": float(len(rendered.split())),
-                "cast/memory_word_budget": float(self._memory.max_words),
+                "cast/memory_entry_cap": float(self._memory.max_entries),
             }
             step = None if global_step is None else max(
                 int(global_step), int(getattr(wandb.run, "step", 0) or 0)
@@ -2844,7 +2836,7 @@ class OnlineCastRelabelSession:
             # Rendered cross-window correction memory, picked up by BOTH prompt builders straight
             # off the metadata (so no signature threading) and recorded in the window artifact, so
             # every window says exactly which memory was in play when it was reviewed.
-            "correction_memory": self._memory.render() if self._memory else "",
+            "strategy_memory": self._memory.render() if self._memory else "",
             "chunk_original_subtask": chunk_original_subtask,
             # Window-relative chunk index of each recorded frame, so the debug-video annotation
             # (and any offline viewer) can line frames up with chunks without re-deriving the
@@ -2955,19 +2947,6 @@ class OnlineCastRelabelSession:
             except Exception as exc:  # noqa: BLE001 - diagnostic artifact, never fatal
                 print(f"[cast_relabel] vlm_calls/viewer write failed (non-fatal): {exc}", flush=True)
 
-        # Fold this window's corrections in *after* the prompts were built, so a window is never
-        # shown its own outcome — only what came before it.
-        if self._memory is not None:
-            try:
-                self._memory.observe_window(
-                    cast_json,
-                    window_index=self.window_count,
-                    route=self.route_id,
-                    vehicle_state=self._window_vehicle_state(metadata),
-                )
-            except Exception as exc:  # noqa: BLE001 - the memory is an aid, not a prerequisite
-                print(f"[cast_relabel] correction memory update failed (non-fatal): {exc}", flush=True)
-
         # Route divergence latches the episode's HL cutoff. generate_cast_relabel has already
         # kept the off-route chunks out of credit assignment; this additionally stops every LATER
         # window of the same episode from contributing, since once the ego is off-route it stays
@@ -3063,25 +3042,6 @@ class OnlineCastRelabelSession:
             if diverged else ""
         )
         return dropped, reason
-
-    def _window_vehicle_state(self, metadata: dict[str, Any]) -> dict[str, Any]:
-        """The window's closing ego state, for ``CorrectionMemory.observe_vehicle_state``.
-
-        ``collided`` counts only leaderboard-*counted* collisions (``new_event``), and ``stuck``
-        applies the same ``hl_collision_stuck_ticks`` standard as the supervision cutoff, so the
-        three places that ask "did this window go wrong" cannot disagree.
-        """
-        stuck_ticks = int(metadata.get("max_crash_stuck_ticks", 0) or 0)
-        return {
-            "collided": any(
-                bool(e.get("new_event")) for e in (metadata.get("collision_events") or [])
-            ),
-            "stuck": stuck_ticks >= max(1, int(self.hl_collision_stuck_ticks)),
-            "stuck_ticks": stuck_ticks,
-            "end_speed_mps": float(metadata.get("mean_end_speed_mps") or 0.0),
-            "route_progress_end_pct": float(metadata.get("route_progress_end_pct") or 0.0),
-            "route_progress_delta_pct": float(metadata.get("route_progress_delta_pct") or 0.0),
-        }
 
     def _store_hl_samples(
         self,
@@ -3277,24 +3237,21 @@ class OnlineCastRelabelSession:
             "cast_relabel/n_hl_samples_window": int(n_hl_samples),
             "cast_relabel/hl_samples_total": int(self.hl_sample_count),
         }
-        # Cross-window correction memory (coaches/correction_memory.py). This block is injected into
-        # BOTH the window-review and credit prompts, so it silently steers every later window -- but
-        # until now it only existed in correction_memory.json on disk. Logged here as a Table (one
-        # row per window, so the whole history is scrubbable in the W&B UI) plus a word count for
-        # charting, since the block is pruned oldest-note-first once it exceeds
-        # ``correction_memory_words`` and it is useful to see when that pruning kicks in.
+        # The memory block injected into BOTH prompts, logged per window so its effect on any
+        # given review is scrubbable in the UI. The episode-level table lives under
+        # ``cast/strategy_memory`` (written once per episode by _log_strategy_to_wandb); this is
+        # the per-window view of the same text.
         if self._memory is not None:
             try:
                 block = self._memory.render() or ""
-                log["cast_relabel/correction_memory_words"] = len(block.split())
-                log["cast_relabel/correction_memory_chars"] = len(block)
+                log["cast_relabel/memory_words"] = len(block.split())
                 mem_tbl = wandb.Table(columns=["window_index", "episode", "n_words", "memory_block"])
                 mem_tbl.add_data(
                     int(self.window_count), int(self.episode_count), len(block.split()), block
                 )
-                log["cast_relabel/correction_memory"] = mem_tbl
+                log["cast_relabel/memory_block"] = mem_tbl
             except Exception as exc:  # noqa: BLE001 - logging must never break the run.
-                print(f"[cast_relabel] correction-memory logging failed (non-fatal): {exc}", flush=True)
+                print(f"[cast_relabel] memory logging failed (non-fatal): {exc}", flush=True)
         if self.debug and chunks:
             tbl = wandb.Table(
                 columns=[

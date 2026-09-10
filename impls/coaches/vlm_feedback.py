@@ -459,9 +459,9 @@ def build_coaching_prompt(
     )
 
     # Bounded record of what earlier windows of this run already corrected, so successive reviews
-    # don't flip the same behaviour back and forth. Written by coaches.correction_memory; absent
+    # don't flip the same behaviour back and forth. Written by coaches.strategy_memory; absent
     # until something has actually been corrected.
-    memory_block = str(metadata.get("correction_memory") or "")
+    memory_block = str(metadata.get("strategy_memory") or "")
 
     _header = textwrap.dedent(
         f"""

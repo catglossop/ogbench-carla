@@ -5,7 +5,7 @@
 
 Covers the 2026-09-10 feature: after each episode, one VLM call reviews the whole rollout plus
 every correction made during it, in the context of the driving score, and the resulting sentence
-goes into the CorrectionMemory bank the window prompts already read.
+goes into the StrategyMemory bank the window prompts read.
 """
 
 import json
@@ -24,8 +24,9 @@ def check(name, ok, detail=""):
         FAILURES.append(name)
 
 
-from coaches.correction_memory import DEFAULT_MAX_WORDS, CorrectionMemory
 from coaches.strategy_memory import (
+    DEFAULT_MAX_ENTRIES,
+    StrategyMemory,
     _tidy_sentence,
     collect_episode_chunks,
     collect_episode_corrections,
@@ -152,10 +153,10 @@ with tempfile.TemporaryDirectory() as td:
     )
     check("a VLM failure returns empty, never raises", quiet == "")
 
-print("\n[5] memory storage, rendering and pruning")
-check("the word budget was raised for this", DEFAULT_MAX_WORDS >= 900, str(DEFAULT_MAX_WORDS))
+print("\n[5] memory storage, rendering and capping")
 with tempfile.TemporaryDirectory() as td:
-    m = CorrectionMemory(Path(td) / "mem.json", max_words=DEFAULT_MAX_WORDS)
+    m = StrategyMemory(Path(td) / "mem.json")
+    check("empty until an episode finishes", m.render() == "")
     m.add_strategy("Crept to every junction.", episode=1, driving_score=27.5)
     m.add_strategy("Took gaps promptly.", episode=2, driving_score=71.0)
     r = m.render()
@@ -163,16 +164,19 @@ with tempfile.TemporaryDirectory() as td:
     check("each is paired with its score", "score 27.5" in r and "score 71.0" in r)
     check("the episode number is shown", "episode 2" in r)
     check("the block explains how to use it", "steer the high-level strategy" in r)
-    check("blank sentences are ignored", (m.add_strategy("   ", episode=3, driving_score=0.0), len(m.strategies))[1] == 2)
+    m.add_strategy("   ", episode=3, driving_score=0.0)
+    check("blank sentences are ignored", len(m.strategies) == 2)
 
-    for i in range(3, 12):
+    for i in range(3, 3 + DEFAULT_MAX_ENTRIES + 4):
         m.add_strategy(f"strategy number {i}.", episode=i, driving_score=float(i))
-    check("the list is capped", len(m.strategies) <= 5, f"n={len(m.strategies)}")
-    check("the newest survives", any("strategy number 11" in s["sentence"] for s in m.strategies))
-    check("the oldest was dropped", not any("Crept to every junction" in s["sentence"] for s in m.strategies))
+    check("the list is capped by count", len(m.strategies) == DEFAULT_MAX_ENTRIES, f"n={len(m.strategies)}")
+    check("the newest survives", m.strategies[-1]["episode"] == 3 + DEFAULT_MAX_ENTRIES + 3)
+    check("the oldest was dropped", not any("Crept to every junction" in x["sentence"] for x in m.strategies))
 
-    m2 = CorrectionMemory(Path(td) / "mem.json", max_words=DEFAULT_MAX_WORDS)
+    m2 = StrategyMemory(Path(td) / "mem.json")
     check("strategies persist across reload", len(m2.strategies) == len(m.strategies))
+    check("a corrupt file starts empty rather than raising",
+          (Path(td) / "bad.json").write_text("{ not json") or len(StrategyMemory(Path(td) / "bad.json").strategies) == 0)
 
 print("\n[6] the policy's OWN behaviour is included, not just the reviewer's commentary")
 with tempfile.TemporaryDirectory() as td:
@@ -221,7 +225,7 @@ check("a logger exists", "def _log_strategy_to_wandb" in src)
 check("it fires when a strategy is stored", "self._log_strategy_to_wandb(global_step=global_step)" in src)
 check("the table carries episode, score and sentence",
       'wandb.Table(columns=["episode", "driving_score", "strategy"])' in src)
-for key in ("cast/strategy_memory", "cast/strategy_episodes", "cast/memory_words", "cast/memory_word_budget"):
+for key in ("cast/strategy_memory", "cast/strategy_episodes", "cast/memory_words", "cast/memory_entry_cap"):
     check(f"logs {key}", f'"{key}"' in src)
 check("the table is rebuilt in full each time (wandb keeps one value per step/key)",
       "for entry in self._memory.strategies:" in src)
