@@ -1800,6 +1800,16 @@ class OnlineCastRelabelSession:
         self.save_vlm_calls = bool(self.cfg.get("save_vlm_calls", True))
         # One-shot guard so the viewer link is announced to W&B once, not once per window.
         self._viewer_logged = False
+        # Window-review accounting. A window whose VLM call fails is swallowed as non-fatal and
+        # simply produces no HL samples, no cast_relabel.json and no debug video -- so the run
+        # trains on less data with nothing in the metrics to say so. Observed 2026-09-10: 69-75%
+        # of windows lost to Gemini file-upload failures, i.e. the policy saw a quarter of its
+        # intended supervision while every chart looked normal. These are logged to wandb under
+        # ``cast/`` on every attempt so the loss is visible while a run is in flight.
+        self._windows_attempted = 0
+        self._windows_succeeded = 0
+        self._windows_dropped = 0
+        self._window_drop_reasons: dict[str, int] = {}
         self.review_viewer_path: Path | None = None
         self.hl_stop_after_failure = bool(self.cfg.get("hl_stop_after_failure", True))
         # Which failures trip the cutoff. Off by one -> that class no longer ends supervision.
@@ -2335,11 +2345,70 @@ class OnlineCastRelabelSession:
                 global_step=global_step,
                 snapshot=snap,
             )
+            self._record_window_outcome(ok=True, global_step=global_step)
         except Exception as exc:  # noqa: BLE001 - a VLM failure must not kill the route
             import traceback
 
-            print(f"[cast_relabel] async window query failed (non-fatal): {exc}", flush=True)
+            self._record_window_outcome(ok=False, exc=exc, global_step=global_step)
+            print(
+                f"[cast_relabel] async window query failed (non-fatal): {exc} "
+                f"[dropped {self._windows_dropped}/{self._windows_attempted} windows so far]",
+                flush=True,
+            )
             traceback.print_exc()
+
+    @staticmethod
+    def _drop_reason(exc: BaseException) -> str:
+        """Coarse bucket for a failed window, so the wandb series is readable.
+
+        The upload path is the one that actually fails in practice (a ~3 MB mp4 to the Gemini
+        Files API, no retry), and it is worth separating from a model/quota error because the
+        remedies differ.
+        """
+        text = f"{type(exc).__name__}: {exc}".lower()
+        if "upload failed" in text or "file upload" in text:
+            return "upload_failed"
+        if "429" in text or "quota" in text or "rate" in text:
+            return "rate_limited"
+        if "timeout" in text or "timed out" in text:
+            return "timeout"
+        if "404" in text or "not found" in text:
+            return "model_or_file_not_found"
+        return type(exc).__name__
+
+    def _record_window_outcome(self, *, ok: bool, exc: BaseException | None = None,
+                               global_step: int | None = None) -> None:
+        """Count a window attempt and push the drop stats to wandb."""
+        self._windows_attempted += 1
+        if ok:
+            self._windows_succeeded += 1
+        else:
+            self._windows_dropped += 1
+            reason = self._drop_reason(exc) if exc is not None else "unknown"
+            self._window_drop_reasons[reason] = self._window_drop_reasons.get(reason, 0) + 1
+        try:
+            import wandb  # type: ignore
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+        att = max(1, self._windows_attempted)
+        payload = {
+            "cast/windows_attempted": float(self._windows_attempted),
+            "cast/windows_succeeded": float(self._windows_succeeded),
+            "cast/windows_dropped": float(self._windows_dropped),
+            # The headline: fraction of reviews that produced no supervision at all.
+            "cast/window_drop_rate": float(self._windows_dropped) / float(att),
+        }
+        for k, v in self._window_drop_reasons.items():
+            payload[f"cast/window_drop_reason/{k}"] = float(v)
+        try:
+            step = None if global_step is None else max(
+                int(global_step), int(getattr(wandb.run, "step", 0) or 0)
+            )
+            wandb.log(payload, step=step)
+        except Exception:  # noqa: BLE001 - telemetry must never break a run
+            pass
 
     def _snapshot_window(self) -> dict[str, Any] | None:
         """Slice the pending window and advance the cursors, on the MAIN thread.
@@ -2477,10 +2546,16 @@ class OnlineCastRelabelSession:
             self._run_window(
                 episode_step=episode_step, done_info=done_info, final=force, global_step=global_step
             )
+            self._record_window_outcome(ok=True, global_step=global_step)
         except Exception as exc:  # noqa: BLE001 - deliberately non-fatal
             import traceback
 
-            print(f"[cast_relabel] window query failed (non-fatal): {exc}", flush=True)
+            self._record_window_outcome(ok=False, exc=exc, global_step=global_step)
+            print(
+                f"[cast_relabel] window query failed (non-fatal): {exc} "
+                f"[dropped {self._windows_dropped}/{self._windows_attempted} windows so far]",
+                flush=True,
+            )
             traceback.print_exc()
             self._frames_cursor = len(self.frames)
             self._traj_cursor = len(self.trajectory_steps)
