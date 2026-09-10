@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from coaches.gemini_models import DEFAULT_GEMINI_MODEL
+
 import json
 import tempfile
 from pathlib import Path
@@ -83,7 +85,7 @@ class OnlineVLMSession:
         self.query_every_n_episode_steps = int(self.cfg.get("query_every_n_episode_steps", 128))
         self.query_on_episode_end = bool(self.cfg.get("query_on_episode_end", True))
         self.provider = str(self.cfg.get("provider", "gemini"))
-        self.gemini_model = str(self.cfg.get("gemini_model", "gemini-3.5-flash"))
+        self.gemini_model = str(self.cfg.get("gemini_model", DEFAULT_GEMINI_MODEL))
         self.include_plots_in_prompt = bool(self.cfg.get("include_plots_in_prompt", False))
         self.action_chunk_steps = int(self.cfg.get("action_chunk_steps", action_chunk_steps))
         self.action_chunk_duration_sec = float(

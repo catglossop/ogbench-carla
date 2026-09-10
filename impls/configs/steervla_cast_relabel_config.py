@@ -73,7 +73,7 @@ def get_config():
             raw_video=True,
             async_review=False,
             provider="gemini",
-            gemini_model="gemini-3.5-flash",
+            gemini_model="gemini-3.7-flash",
             # Must match the rollout's action chunk length (config.action_horizon).
             action_chunk_steps=10,
             # How many subtasks to suggest per chunk that needs improvement.

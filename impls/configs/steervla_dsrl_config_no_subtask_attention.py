@@ -113,7 +113,7 @@ def get_config():
             query_every_n_episode_steps=128,
             query_on_episode_end=True,
             provider="gemini",
-            gemini_model="gemini-3.5-flash",
+            gemini_model="gemini-3.7-flash",
             include_plots_in_prompt=False,
             action_chunk_steps=10,
             action_chunk_duration_sec=0.5,

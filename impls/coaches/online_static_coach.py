@@ -53,7 +53,7 @@ class OnlineStaticCoachSession:
             self.cfg.get("meta_actions"),
             self.meta_actions_file,
         )
-        self.gemini_model = str(self.cfg.get("gemini_model", "gemini-3.5-flash"))
+        self.gemini_model = str(self.cfg.get("gemini_model", DEFAULT_GEMINI_MODEL))
         self.include_plots_in_prompt = bool(self.cfg.get("include_plots_in_prompt", True))
         self.action_chunk_steps = int(self.cfg.get("action_chunk_steps", action_chunk_steps))
         self.action_chunk_duration_sec = float(

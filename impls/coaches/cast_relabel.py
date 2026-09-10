@@ -1757,7 +1757,7 @@ class OnlineCastRelabelSession:
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
 
         self.provider = str(self.cfg.get("provider", "gemini"))
-        self.gemini_model = str(self.cfg.get("gemini_model", "gemini-3.5-flash"))
+        self.gemini_model = str(self.cfg.get("gemini_model", DEFAULT_GEMINI_MODEL))
         self.action_chunk_steps = int(self.cfg.get("action_chunk_steps", action_chunk_steps))
         self.video_fps = float(self.cfg.get("video_fps", 10.0))
         self.video_frame_stride = int(self.cfg.get("video_frame_stride", video_frame_stride))
