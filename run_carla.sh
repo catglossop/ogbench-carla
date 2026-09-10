@@ -49,6 +49,7 @@ PRETRAINED_CRITIC=""
 QGF_CRITIC_CKPT=""
 QGF_GUIDANCE_WEIGHT="0.0"
 EVAL_ONLY="false"
+EVAL_MODE="false"
 BON_CRITIC_CKPT=""
 BON_NUM_CANDIDATES="8"
 BON_ONLINE_CRITIC="false"
@@ -216,6 +217,16 @@ Options:
                             of a frozen --bon-critic-ckpt; keeps training via update_with_vla()
                             on collected transitions. Warm-start with --pretrained-critic.
                             Requires --eval-only=false. Default: false.
+  --eval-mode [true|false]  Treat this as a run whose numbers will be reported, and enforce
+                            what that needs: pin the simulator seed to --carla-seed, checkpoint
+                            the model every 2000 env steps (tightening --save_interval too),
+                            always export the weights training ended with, replay the training
+                            carla seed through the post-training eval while varying only the
+                            model seed, and write run_summary.json alongside the run.
+                            Bare --eval-mode means true. Default: false, so an exploratory run
+                            pays none of it.
+                            NOT --eval-only: that skips training entirely, whereas --eval-mode
+                            is for a run that DOES train and whose result must be reproducible.
   --bon-candidates-log-every N
                             Save a local overlay frame every N env steps showing every best-of-N
                             candidate's subtask + score, selected one marked. 0 disables.
@@ -344,6 +355,9 @@ while [[ $# -gt 0 ]]; do
     --expert-controller|--expert_controller) EXPERT_CONTROLLER="$2"; shift 2 ;;
     --save-video-local|--save_video_local) SAVE_VIDEO_LOCAL="$2"; shift 2 ;;
     --eval-only|--eval_only) EVAL_ONLY="$2"; shift 2 ;;
+    --eval-mode|--eval_mode)
+      if [[ "${2:-}" == "true" || "${2:-}" == "false" ]]; then EVAL_MODE="$2"; shift 2
+      else EVAL_MODE="true"; shift; fi ;;
     --fail2drive-carla-root) FAIL2DRIVE_CARLA_ROOT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; EXTRA_ARGS+=("$@"); break ;;
@@ -650,6 +664,7 @@ while :; do
     --terminate_on_collision="${TERMINATE_ON_COLLISION}" \
     --save_video_local="${SAVE_VIDEO_LOCAL}" \
     --eval_only="${EVAL_ONLY}" \
+    --eval_mode="${EVAL_MODE}" \
     "${EXTRA_ARGS[@]}" \
     --exp_name="${EXP_NAME}" \
     --resume="${RESUME_FLAG}"

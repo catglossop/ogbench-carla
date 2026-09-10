@@ -4,10 +4,11 @@ Run directly (no model, no CARLA, no VLM)::
 
     JAX_PLATFORMS=cpu PYTHONPATH=impls uv run python impls/test_run_determinism.py
 
-Covers the 2026-09-09 change: --carla_seed and --train_seed are separate, the post-training eval
-replays the training carla seed with a different MODEL seed per episode, the model's sampling is
-actually a function of that seed (it used to be a function of the call counter alone), and every
-run writes run_summary.json.
+Covers the 2026-09-09 change: --carla_seed and --train_seed are separate, the model's sampling is
+actually a function of the train seed (it used to be a function of the call counter alone), and
+--eval-mode turns on everything a reportable run needs -- pinned simulator seed, 2000-step
+checkpoints, a final weights export, eval episodes that replay the training carla seed while
+varying only the model seed, and run_summary.json. None of that is enforced without the flag.
 """
 
 import json
@@ -65,9 +66,38 @@ check(
     "_hl_ckpt_every = DEFAULT_ONLINE_CKPT_EVERY_STEPS" in src,
 )
 check(
-    "the weights training produced are always exported",
+    "the weights training produced are exported at the stop",
     "_save_steervla_ckpt(int(step), final=True)" in src,
 )
+
+# ── 2b. ... but only under --eval-mode ────────────────────────────────────────────────
+print("\n[2b] everything is gated behind --eval_mode")
+check("the flag exists and defaults off", FLAGS.eval_mode is False)
+check(
+    "checkpoint-interval correction is gated",
+    "if FLAGS.eval_mode and _hl_updating and _hl_ckpt_every <= 0:" in src,
+)
+check("--save_interval tightening is gated", "        FLAGS.eval_mode\n        and any_updates_on" in src)
+_final_export = src[src.index("final_train_driving_score = _ep_ds"):]
+check("final weights export is gated",
+      _final_export.index("if FLAGS.eval_mode:") < _final_export.index("_save_steervla_ckpt(int(step), final=True)"))
+check("eval reseeding is gated", "if eval_phase and FLAGS.eval_mode:" in src)
+check("run_summary.json is gated", "                    if FLAGS.eval_mode:\n                        write_run_summary(" in src)
+check("simulator-seed pin is gated", "if FLAGS.eval_mode or FLAGS.eval_only:" in src)
+check(
+    "the frozen-eval local was renamed so it cannot be confused with the flag",
+    "eval_phase = False" in src and "    eval_mode = False" not in src,
+)
+
+# ── 2c. run_carla.sh exposes it ───────────────────────────────────────────────────────
+print("\n[2c] run_carla.sh --eval-mode")
+sh = Path("run_carla.sh").read_text()
+check("default is off", 'EVAL_MODE="false"' in sh)
+check("flag is parsed (both spellings)", "--eval-mode|--eval_mode)" in sh)
+check("bare --eval-mode means true", 'else EVAL_MODE="true"; shift; fi ;;' in sh)
+check("explicit true/false is honoured", 'if [[ "${2:-}" == "true" || "${2:-}" == "false" ]]' in sh)
+check("forwarded to main_carla", '--eval_mode="${EVAL_MODE}"' in sh)
+check("documented in --help", "--eval-mode [true|false]" in sh)
 
 # ── 3. eval replays the training carla seed, varying only the model ───────────────────
 print("\n[3] eval reseeding")
@@ -77,7 +107,7 @@ check(
     "each eval episode sets a different model sampling seed",
     "steervla_actor.sampling_seed = int(_eval_seeds[_eval_idx])" in src,
 )
-check("the simulator seed is pinned for every run, not just --eval_only",
+check("the simulator seed is pinned under --eval-mode (or --eval_only)",
       'extra_carla["traffic_manager_seed"] = int(_carla_seed_rc)' in src)
 
 # ── 4. model sampling is a function of the seed, not the call counter ─────────────────
