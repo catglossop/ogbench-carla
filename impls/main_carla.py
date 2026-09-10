@@ -250,6 +250,11 @@ flags.DEFINE_string(
     "Gemini model used for --bon_gemini_select.",
 )
 flags.DEFINE_bool("bon_qwen_select", False, "Select candidates with a local Qwen service.")
+flags.DEFINE_enum(
+    "bon_qwen_label_source", "commentary", ["commentary", "subtask"],
+    "Actor text sent to Qwen: raw commentary from the reasoning head (default), "
+    "or the refined subtask for critics trained on action summaries. Does not change action sampling.",
+)
 flags.DEFINE_string("qwen_bon_url", "http://127.0.0.1:18765", "Qwen BoN service URL.")
 flags.DEFINE_integer(
     "bon_qwen_cadence",
@@ -3313,9 +3318,10 @@ def run_online_carla(
         chunks_np = np.concatenate([chunks_np, brake_chunk], axis=0)
         # Keep this synthetic label in-distribution for the raw-commentary critic.
         # This exact wording occurs frequently in the commentary training corpus.
-        candidate_subtasks = candidate_subtasks + [
-            "Follow the route. Remain stopped to stay behind the black car that is to the front."
-        ]
+        brake_label = "Follow the route. Remain stopped to stay behind the black car that is to the front."
+        if _qwen_selector is not None and FLAGS.bon_qwen_label_source == "subtask":
+            brake_label = "The vehicle smoothly decelerates to a stop, normally following the route."
+        candidate_subtasks = candidate_subtasks + [brake_label]
         return chunks_np, candidate_subtasks
 
     def _sample_diverse_candidates(subkey, n: int) -> tuple[np.ndarray, list[str]]:
@@ -3340,6 +3346,7 @@ def run_online_carla(
         from subtask_diversity import DIVERSITY_JACCARD_THRESHOLD, diversity_score, subtask_categories
 
         max_attempts = max(1, int(FLAGS.bon_max_sample_attempts))
+        label_source = FLAGS.bon_qwen_label_source if _qwen_selector is not None else "subtask"
         if FLAGS.bon_batch_policy_candidates and _qwen_selector is not None and max_attempts == 1:
             from vlas.batched_candidates import (
                 BatchedCandidateValidationError,
@@ -3355,6 +3362,9 @@ def run_online_carla(
                     model_noise_dim=agent._flat_noise_dim(),
                     env_action_dim=agent._flat_env_action_dim(),
                     noise_scale=_vla_noise_scale,
+                    label_source=label_source,
+                    episode_index=episode_count,
+                    episode_step=episode_steps,
                 )
             except BatchedCandidateValidationError as exc:
                 # An overflowed/empty CoT or unit/shape mismatch is recoverable by
@@ -3388,8 +3398,21 @@ def run_online_carla(
                     jax.numpy.asarray(agent.vla_sample_fn(obs[None], noise))
                 )
                 chunk_np = np.asarray(jax.device_get(chunk_jax[0]), dtype=np.float32)
-                _decoded = steervla_actor.decode_last_batch_subtasks() if steervla_actor is not None else []
-                subtask = _decoded[0] if _decoded else ""
+                if label_source == "commentary":
+                    from vlas.batched_candidates import candidate_labels
+
+                    # Match the batched path; never silently substitute the
+                    # refined action summary when raw commentary is missing.
+                    _decoded = steervla_actor.decode_last_batch_reasoning() if steervla_actor is not None else []
+                    subtask = candidate_labels(_decoded, 1, "commentary")[0]
+                else:
+                    _decoded = steervla_actor.decode_last_batch_subtasks() if steervla_actor is not None else []
+                    if _qwen_selector is not None:
+                        from vlas.batched_candidates import candidate_labels
+
+                        subtask = candidate_labels(_decoded, 1, "subtask")[0]
+                    else:
+                        subtask = _decoded[0] if _decoded else ""
                 cats = subtask_categories(subtask)
                 score = diversity_score(cats, accepted_cats)
                 if score > best_score:
@@ -3551,6 +3574,12 @@ def run_online_carla(
         )
         best_idx = int(result["choice"])
         utility = np.asarray(result["utility"], dtype=np.float32)
+        if step == 1:
+            print(
+                f"[QWEN-BON-LABELS] source={FLAGS.bon_qwen_label_source} "
+                f"labels={candidate_subtasks!r}",
+                flush=True,
+            )
         _bon_last_q_best[0] = float(utility[best_idx])
         _bon_last_q_mean[0] = float(utility.mean())
         _bon_last_candidates[0] = {
