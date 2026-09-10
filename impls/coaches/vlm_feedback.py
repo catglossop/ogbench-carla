@@ -639,6 +639,28 @@ def build_coaching_prompt(
           stopped climbing, you MUST emit at least one event about it — BAD with a corrective
           instruction if the vehicle was free to move, GOOD naming the specific hazard or signal
           if the halt was genuinely required. Silence about a stall is not an option.
+        - MANDATORY: check the executed SUBTASK against the vehicle's own REASONING and against
+          the ROUTING COMMAND in force at that moment, and report any disagreement between the
+          three. All three are in the per-timestamp trajectory data (``subtask``, ``reasoning``,
+          and ``prompt``, which carries the routing command) and in the routing-command plan at
+          the top. They are supposed to describe the SAME intent; when they do not, the policy is
+          about to act on a subtask that contradicts what it reasoned or what the route asked, and
+          that is a defect to report even if the vehicle happened to drive acceptably.
+          The authority order is: ROUTING COMMAND first (it is the route's instruction and is
+          never wrong), then REASONING, then SUBTASK. So:
+            * subtask disagrees with reasoning AND routing command -> the SUBTASK is wrong. Emit a
+              BAD event whose correction is the subtask that matches them. Example: the subtask
+              says "turn right", the reasoning says "turn left" and the routing command says
+              "turn left" -> the subtask must be corrected to turning left.
+            * subtask and reasoning agree with each other but disagree with the routing command ->
+              BOTH are wrong; the correction is the subtask that follows the routing command.
+            * subtask matches the routing command but the reasoning contradicts it -> report it as
+              BAD naming the inconsistent reasoning; the correction keeps the routing command's
+              maneuver.
+          Judge against the command in force AT THAT TIMESTAMP, not the one at the end of the
+          window. Ignore pure wording differences -- "go left at the next intersection" and "turn
+          left at the junction" are the same intent; only a genuine conflict of maneuver,
+          direction, or target counts.
         - MANDATORY: any event whose description mentions a red/green light, a stop light, a
           signal or a stop sign MUST also state the traffic-flow evidence that established that
           state (cross-traffic moving, the queue discharging, the lead vehicle pulling away or
