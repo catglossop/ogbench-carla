@@ -98,6 +98,15 @@ check("bare --eval-mode means true", 'else EVAL_MODE="true"; shift; fi ;;' in sh
 check("explicit true/false is honoured", 'if [[ "${2:-}" == "true" || "${2:-}" == "false" ]]' in sh)
 check("forwarded to main_carla", '--eval_mode="${EVAL_MODE}"' in sh)
 check("documented in --help", "--eval-mode [true|false]" in sh)
+check("--carla-seed exposed", "--carla-seed|--carla_seed)" in sh)
+check("--train-seed exposed", "--train-seed|--train_seed)" in sh)
+check("--eval-seeds exposed", "--eval-seeds|--eval_seeds)" in sh)
+check(
+    "seeds forwarded only when set, so the --seed fallback still applies",
+    '${CARLA_SEED:+--carla_seed="${CARLA_SEED}"}' in sh
+    and '${TRAIN_SEED:+--train_seed="${TRAIN_SEED}"}' in sh
+    and '${EVAL_SEEDS:+--eval_seeds="${EVAL_SEEDS}"}' in sh,
+)
 
 # ── 3. eval replays the training carla seed, varying only the model ───────────────────
 print("\n[3] eval reseeding")
