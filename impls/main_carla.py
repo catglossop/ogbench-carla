@@ -5009,10 +5009,17 @@ def run_online_carla(
             wandb.log(metrics, step=step)
             train_logger.log(metrics, step=step)
 
-        if agent is not None and any_updates_on and step % FLAGS.save_interval == 0:
-            save_agent(agent, FLAGS.save_dir, step)
-
-        _save_steervla_ckpt(step)
+        # Checkpoint only while TRAINING. Once the stop condition fires, eval_phase freezes the
+        # weights, so every further periodic save is a byte-identical ~10 GB copy of the final
+        # export -- and with hl_checkpoint_keep_last those copies ROTATE THE FINAL EXPORT OUT.
+        # Observed 2026-09-09: generalization-wall-1095 exported its trained policy at step 5961,
+        # then wrote 6000/8000/10000 during eval and evicted 5961, leaving run_summary.json
+        # pointing at a checkpoint that no longer existed. Stopping here makes the end-of-training
+        # export the last checkpoint written, which is what it should always have been.
+        if not eval_phase:
+            if agent is not None and any_updates_on and step % FLAGS.save_interval == 0:
+                save_agent(agent, FLAGS.save_dir, step)
+            _save_steervla_ckpt(step)
 
     # online_steps was exhausted without the current episode ever hitting `done`
     # (no collision/success/off-route termination) -- the video/frame logging
