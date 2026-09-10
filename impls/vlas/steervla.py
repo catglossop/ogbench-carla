@@ -3133,11 +3133,19 @@ class SteerVLAActor:
             subtasks = [str(r.get("subtask", "")) for r in records]
             reasonings = [str(r.get("reasoning", "")) for r in records]
             pools = [str(r.get("pool", "online")) for r in records]
+            # Which ADAPTIVE_SAMPLING_WEIGHTS bucket each sample was drawn from -- BAD(precursor),
+            # BAD(direct), GOOD, unlabeled, and their catastrophic/success variants. ``pool`` above
+            # is a different axis entirely (which replay pool the sample came from: online, or a
+            # named offline one), so a batch that looks balanced by pool can still be dominated by
+            # one severity bucket. Resolved with the same classifier the sampler itself uses, so
+            # the table cannot disagree with the draw weights.
+            source_pools = [str(self._adaptive_category(r)) for r in records]
             rows = [
                 [
                     int(self._hl_update_calls),
                     i,
                     pools[i],
+                    source_pools[i],
                     prompts[i],
                     subtasks[i],
                     reasonings[i],
@@ -3150,7 +3158,12 @@ class SteerVLAActor:
                 self._hl_table_step = global_step
                 self._hl_table_rows = rows
 
-            table = wandb.Table(columns=["hl_update_call", "sample", "pool", "prompt", "subtask", "reasoning"])
+            table = wandb.Table(
+                columns=[
+                    "hl_update_call", "sample", "pool", "source_pool",
+                    "prompt", "subtask", "reasoning",
+                ]
+            )
             for row in self._hl_table_rows:
                 table.add_data(*row)
             payload: dict[str, Any] = {
@@ -3160,6 +3173,10 @@ class SteerVLAActor:
             }
             for p in set(pools):
                 payload[f"vla_hl/pool/{p}"] = float(pools.count(p))
+            # Same treatment for the severity buckets, so the corrective/reinforce mix of each
+            # batch is visible in Charts rather than only by reading the table.
+            for sp in set(source_pools):
+                payload[f"vla_hl/source_pool/{sp}"] = float(source_pools.count(sp))
             if figure is not None:
                 payload["vla_hl/batch_images"] = wandb.Image(
                     figure,
@@ -3309,6 +3326,9 @@ class SteerVLAActor:
             row: dict[str, Any] = {
                 "sample": i,
                 "pool": str(rec.get("pool", "online")),
+                # The ADAPTIVE_SAMPLING_WEIGHTS bucket this sample was drawn from; see
+                # _log_hl_batch_to_wandb for why it is a different axis from ``pool``.
+                "source_pool": str(self._adaptive_category(rec)),
                 "label": rec.get("label"),
                 "credit_source": rec.get("credit_source"),
                 "supervise_fast": bool(rec.get("supervise_fast", False)),
@@ -3430,6 +3450,7 @@ class SteerVLAActor:
                 "hl_update_call",
                 "sample",
                 "pool",
+                "source_pool",
                 "decoded_prompt",
                 "decoded_reasoning",
                 "decoded_subtask",
