@@ -890,7 +890,11 @@ def _gemini_upload_file(path: Path, api_key: str) -> dict[str, Any]:
         json={"file": {"display_name": path.name}},
         timeout=30,
     )
-    start_resp.raise_for_status()
+    if not start_resp.ok:
+        raise RuntimeError(
+            f"Gemini upload: session start failed HTTP {start_resp.status_code} "
+            f"for {path.name} ({file_size} bytes, {mime_type}): {start_resp.text[:1000]}"
+        )
     upload_url = start_resp.headers.get("X-Goog-Upload-URL")
     if not upload_url:
         raise RuntimeError("Gemini upload: missing X-Goog-Upload-URL in response headers.")
@@ -909,7 +913,11 @@ def _gemini_upload_file(path: Path, api_key: str) -> dict[str, Any]:
         data=data,
         timeout=120,
     )
-    upload_resp.raise_for_status()
+    if not upload_resp.ok:
+        raise RuntimeError(
+            f"Gemini upload: content POST failed HTTP {upload_resp.status_code} "
+            f"for {path.name} ({file_size} bytes, {mime_type}): {upload_resp.text[:1000]}"
+        )
     body = upload_resp.json()
     # The Files API wraps the metadata under a "file" key on upload.
     return body.get("file", body)
@@ -924,7 +932,10 @@ def _gemini_get_file(name: str, api_key: str) -> dict[str, Any]:
         params={"key": api_key},
         timeout=15,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        raise RuntimeError(
+            f"Gemini get-file failed HTTP {resp.status_code} for {name}: {resp.text[:1000]}"
+        )
     return resp.json()
 
 
@@ -1046,6 +1057,9 @@ class GeminiVLMCOach(VLMCOach):
         path = Path(video_path)
         if not path.is_file():
             raise FileNotFoundError(f"Video not found: {path}")
+        import mimetypes
+
+        mime_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
 
         # Upload video and wait for it to become ACTIVE.
         # The upload response may omit "state" when the file is already ready;
@@ -1053,11 +1067,32 @@ class GeminiVLMCOach(VLMCOach):
         uploaded = _gemini_upload_file(path, self.api_key)
         if uploaded.get("state") is None:
             uploaded = _gemini_get_file(uploaded["name"], self.api_key)
+        _poll_start = time.time()
+        _polls = 0
         while uploaded.get("state") == "PROCESSING":
             time.sleep(1.0)
+            _polls += 1
             uploaded = _gemini_get_file(uploaded["name"], self.api_key)
         if uploaded.get("state") != "ACTIVE":
-            raise RuntimeError(f"Gemini file upload failed with state={uploaded.get('state')!r}.")
+            # Report the WHOLE File resource, not just the state. On FAILED the API populates an
+            # ``error`` (a google.rpc.Status with code/message) that says why -- and discarding it
+            # is why a 70% window-drop rate was diagnosable only as "state='FAILED'". The local
+            # file's size/mime are included because a truncated or mistyped encode is the other
+            # candidate, and the poll count separates "rejected immediately" from "processed for a
+            # while, then failed".
+            try:
+                _detail = json.dumps(uploaded, indent=2, sort_keys=True)[:2000]
+            except Exception:  # noqa: BLE001 - diagnostics must not mask the original failure
+                _detail = repr(uploaded)[:2000]
+            _err = uploaded.get("error") or {}
+            raise RuntimeError(
+                f"Gemini file upload failed with state={uploaded.get('state')!r} "
+                f"after {_polls} poll(s) / {time.time() - _poll_start:.1f}s. "
+                f"error.code={_err.get('code')!r} error.status={_err.get('status')!r} "
+                f"error.message={_err.get('message')!r}. "
+                f"local_file={path.name} size={path.stat().st_size} bytes mime={mime_type!r}. "
+                f"full File resource:\n{_detail}"
+            )
 
         parts: list[Any] = [
             {
