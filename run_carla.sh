@@ -50,6 +50,9 @@ QGF_CRITIC_CKPT=""
 QGF_GUIDANCE_WEIGHT="0.0"
 EVAL_ONLY="false"
 EVAL_MODE="false"
+CARLA_SEED=""
+TRAIN_SEED=""
+EVAL_SEEDS=""
 BON_CRITIC_CKPT=""
 BON_NUM_CANDIDATES="8"
 BON_ONLINE_CRITIC="false"
@@ -142,6 +145,15 @@ Options:
   --route NAME              Bench2Drive route name/id. Default: parking-cut-in-001
   --online-steps N          Number of env steps. Default: 5000
   --seed N                  Random seed. Default: 0
+  --carla-seed N            Simulator-side seed: traffic manager, scenario actors,
+                            env.reset(). Held fixed through the --eval-mode eval
+                            episodes. Default: --seed.
+  --train-seed N            Model-side seed: JAX PRNG, numpy/random, agent construction,
+                            and the actor's CoT / action / noise sampling. Default: --seed.
+  --eval-seeds A,B,C        Comma-separated MODEL seeds for the --eval-mode eval episodes
+                            (no spaces). Each replays the same --carla-seed, so their
+                            spread measures the policy, not the scenario.
+                            Default: train-seed+1001, +1002, ... one per eval episode.
   --run-group NAME          W&B / experiment group. Default: Debug
   --save-buffer BOOL        true|false. Default: true
   --expert-debug BOOL       true|false. Default: false
@@ -289,6 +301,9 @@ while [[ $# -gt 0 ]]; do
     --route) ROUTE="$2"; shift 2 ;;
     --online-steps) ONLINE_STEPS="$2"; shift 2 ;;
     --seed) SEED="$2"; shift 2 ;;
+    --carla-seed|--carla_seed) CARLA_SEED="$2"; shift 2 ;;
+    --train-seed|--train_seed) TRAIN_SEED="$2"; shift 2 ;;
+    --eval-seeds|--eval_seeds) EVAL_SEEDS="$2"; shift 2 ;;
     --run-group) RUN_GROUP="$2"; shift 2 ;;
     --save-buffer) SAVE_BUFFER="$2"; shift 2 ;;
     --expert-debug) EXPERT_DEBUG="$2"; shift 2 ;;
@@ -633,6 +648,9 @@ while :; do
     --online_steps="${ONLINE_STEPS}" \
     --save_buffer="${SAVE_BUFFER}" \
     --seed="${SEED}" \
+    ${CARLA_SEED:+--carla_seed="${CARLA_SEED}"} \
+    ${TRAIN_SEED:+--train_seed="${TRAIN_SEED}"} \
+    ${EVAL_SEEDS:+--eval_seeds="${EVAL_SEEDS}"} \
     --run_group="${RUN_GROUP}" \
     --expert_debug="${EXPERT_DEBUG}" \
     --expert_recover_debug="${EXPERT_RECOVER_DEBUG}" \
