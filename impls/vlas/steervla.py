@@ -1650,6 +1650,14 @@ class SteerVLAActor:
         self._last_t_context: np.ndarray | None = None
         self.prompt_state_dim = steervla_prompt_state_dim(include_ego_history=include_ego_history)
         self._call_counter = 0
+        # Model-side sampling seed. Every sampling key is fold_in(PRNGKey(sampling_seed), call),
+        # so CoT / action / noise draws are a function of (seed, call index) rather than the call
+        # index ALONE -- which is what they used to be. That old behaviour made the actor's
+        # randomness independent of --seed entirely: two runs with different seeds sampled
+        # identically, and the post-training eval episodes were identical rollouts whenever the
+        # trajectory was, because the same counter sequence reproduced the same draws. Set this to
+        # vary sampling between a training run and each of its eval seeds.
+        self.sampling_seed = 0
         self._cached_action_chunk: np.ndarray | None = None
         self._cached_action_step = 0
         # Ego pose (world x, y, yaw_rad) the cached chunk was sampled from, and the diagnostics
@@ -3913,6 +3921,16 @@ class SteerVLAActor:
         out = jnp.asarray(first_step, dtype=jnp.float32)
         return out
 
+    def _next_sampling_rng(self):
+        """PRNG key for the next sampling call, derived from (sampling_seed, call index).
+
+        Folding the counter into a seeded key keeps successive calls decorrelated while making the
+        whole sequence a function of ``sampling_seed`` -- so a run is reproducible from its seed,
+        and a different seed genuinely resamples.
+        """
+        self._call_counter += 1
+        return jax.random.fold_in(jax.random.PRNGKey(int(self.sampling_seed)), self._call_counter)
+
     def sample_candidates(
         self,
         n: int,
@@ -3932,8 +3950,7 @@ class SteerVLAActor:
         ), "sample_candidates requires a local SteerVLAActor (checkpoint loaded)."
         n = max(1, int(n))
         if rng is None:
-            self._call_counter += 1
-            rng = jax.random.PRNGKey(self._call_counter)
+            rng = self._next_sampling_rng()
         else:
             rng = jax.random.fold_in(jnp.asarray(rng), self._call_counter)
         rng_cot, rng_act, rng_noise = jax.random.split(rng, 3)
@@ -4208,8 +4225,7 @@ class SteerVLAActor:
         ):
             return self._cached_policy_embed
 
-        self._call_counter += 1
-        rng = jax.random.PRNGKey(self._call_counter)
+        rng = self._next_sampling_rng()
         obs_np_struct = self.build_observation_batch_numpy(batch_size, raw=raw)
         obs_jax = jax.tree.map(
             lambda x: jax.device_put(jnp.asarray(x), self._jax_device),
@@ -5039,8 +5055,7 @@ class SteerVLAActor:
         assert self.model is not None and self._jax_device is not None
         self._refresh_inference_weights()
         if rng is None:
-            self._call_counter += 1
-            rng = jax.random.PRNGKey(self._call_counter)
+            rng = self._next_sampling_rng()
 
         # Build the observation from the batch
         obs_np_struct = self.build_observation_batch_numpy(batch_size, raw=raw)
@@ -5280,8 +5295,7 @@ class SteerVLAActor:
         import matplotlib.pyplot as plt
 
         n = int(self.debug_noise_samples)
-        self._call_counter += 1
-        rng = jax.random.PRNGKey(self._call_counter)
+        rng = self._next_sampling_rng()
         rng, samp_rng = jax.random.split(rng)
 
         ref_noise = np.asarray(jax.device_get(noise_jax), dtype=np.float32)
@@ -5599,8 +5613,7 @@ class SteerVLAActor:
             return np.asarray(out, dtype=np.float32)
 
         assert self.model is not None and self._jax_device is not None
-        self._call_counter += 1
-        rng = jax.random.PRNGKey(self._call_counter)
+        rng = self._next_sampling_rng()
         rng_noise, rng_act = jax.random.split(rng)
         # Full model-layout noise, matching Pi0CoT._denoise's own default
         # ``normal(rng, (batch, action_horizon, action_dim))``.
@@ -5621,8 +5634,7 @@ class SteerVLAActor:
 
         assert self.model is not None and self.tokenizer is not None and self._jax_device is not None
         self._refresh_inference_weights()
-        self._call_counter += 1
-        rng = jax.random.PRNGKey(self._call_counter)
+        rng = self._next_sampling_rng()
 
         obs_np_struct = self.build_observation_batch_numpy(1, raw=state)
         obs_jax = jax.tree.map(
@@ -5692,8 +5704,7 @@ class SteerVLAActor:
         self._refresh_inference_weights()
         n = max(1, int(n))
         if rng is None:
-            self._call_counter += 1
-            rng = jax.random.PRNGKey(self._call_counter)
+            rng = self._next_sampling_rng()
         else:
             rng = jax.random.fold_in(jnp.asarray(rng), self._call_counter)
         rng_cot, rng_act, rng_noise = jax.random.split(rng, 3)
