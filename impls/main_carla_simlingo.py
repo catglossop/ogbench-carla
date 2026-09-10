@@ -272,7 +272,7 @@ flags.DEFINE_bool("use_gemini_coach", False,
                   "backfilled into the replay buffer to condition the critic.")
 flags.DEFINE_string("gemini_api_key", "",
                     "Gemini API key. Falls back to GEMINI_API_KEY env var.")
-flags.DEFINE_string("gemini_model", "gemini-2.0-flash",
+flags.DEFINE_string("gemini_model", "gemini-3.7-flash",
                     "Gemini model name for VLM coaching.")
 flags.DEFINE_integer("coach_action_chunk_steps", 10,
                      "Number of SAC global_steps per coach action chunk. "

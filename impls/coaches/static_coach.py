@@ -1,6 +1,6 @@
 """Static meta-action coach: review the previous action chunk and pick a corrective meta-action.
 
-Uses Google Gemini (``gemini-3.5-flash`` by default) with rollout video and trajectory plots
+Uses Google Gemini (see ``coaches.gemini_models.DEFAULT_GEMINI_MODEL``) with rollout video and trajectory plots
 **up to the current env step**. The coach summarizes behavior during the just-finished action
 chunk and selects one meta-action from a text file (one subtask description per line).
 
@@ -45,7 +45,7 @@ from coaches.trajectory_plots import (
 from coaches.vlm_feedback import _extract_json_payload
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
-DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+from coaches.gemini_models import DEFAULT_GEMINI_MODEL  # noqa: F401  (re-exported)
 DEFAULT_META_ACTIONS_FILE = Path(__file__).resolve().parent / "metadata" / "example_subtasks.txt"
 
 

@@ -111,6 +111,7 @@ from utils.live_policy_viewer import LivePolicyViewer
 from utils.datasets import ReplayBuffer
 from utils.flax_utils import save_agent
 
+from coaches.gemini_models import DEFAULT_GEMINI_MODEL, EVAL_MODE_GEMINI_MODEL
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
 
 FLAGS = flags.FLAGS
@@ -246,7 +247,7 @@ flags.DEFINE_bool(
     "--bon_online_critic.",
 )
 flags.DEFINE_string(
-    "gemini_model", "gemini-3.6-flash",
+    "gemini_model", DEFAULT_GEMINI_MODEL,
     "Gemini model used for --bon_gemini_select.",
 )
 flags.DEFINE_bool("bon_qwen_select", False, "Select candidates with a local Qwen service.")
@@ -2485,6 +2486,18 @@ def run_online_carla(
                 f"cast_relabel.prompt_version must be 1 (the _v2 prompt copies were removed), "
                 f"got {_prompt_version}"
             )
+        # A run whose numbers get reported must not silently inherit an older reviewer from a
+        # stale config: the model that wrote the corrections is part of the result. Forced here,
+        # immediately before the session is built, so it applies whatever the config said.
+        if FLAGS.eval_mode:
+            _cfg_model = str(cast_cfg.get("gemini_model", "") or "")
+            if _cfg_model != EVAL_MODE_GEMINI_MODEL:
+                print(
+                    f"[main_carla] --eval-mode: forcing cast_relabel.gemini_model "
+                    f"{_cfg_model or '<unset>'} -> {EVAL_MODE_GEMINI_MODEL}",
+                    flush=True,
+                )
+                cast_cfg["gemini_model"] = EVAL_MODE_GEMINI_MODEL
         _cast_relabel = OnlineCastRelabelSession(
             cast_cfg,
             save_dir=FLAGS.save_dir,
@@ -6152,7 +6165,7 @@ def _run_grpo_entry(config):
         vlm_cfg = config.get("vlm_coach") or {}
         coach = create_coach(
             str(vlm_cfg.get("provider", "gemini")),
-            model=str(vlm_cfg.get("gemini_model", "gemini-2.0-flash")),
+            model=str(vlm_cfg.get("gemini_model", DEFAULT_GEMINI_MODEL)),
         )
 
         run_online_grpo(

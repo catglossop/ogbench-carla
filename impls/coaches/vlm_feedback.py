@@ -1,7 +1,7 @@
 """VLM coaches that review driving rollout videos and annotate good/bad moments.
 
 Supports:
-  - Google Gemini (``gemini-2.0-flash`` by default)
+  - Google Gemini (see ``coaches.gemini_models.DEFAULT_GEMINI_MODEL``)
   - Perceptron video QA API
 
 Run from ``impls/``::
@@ -33,7 +33,7 @@ ProviderName = Literal["gemini", "perceptron"]
 # Placeholders — override via environment variables in real runs.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
 PERCEPTRON_API_KEY = os.environ.get("PERCEPTRON_API_KEY", "YOUR_PERCEPTRON_API_KEY_HERE")
-DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
+from coaches.gemini_models import DEFAULT_GEMINI_MODEL  # noqa: F401  (re-exported)
 
 DEFAULT_ACTION_CHUNK_STEPS = 10
 DEFAULT_CHUNK_DURATION_SEC = 0.5

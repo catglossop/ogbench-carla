@@ -108,7 +108,7 @@ DEBUG_OBS_HIST="false"
 DEBUG_OBS_HIST_STEPS="2000"
 USE_GEMINI_COACH="false"
 CRITIC_MODE="none"
-GEMINI_MODEL="gemini-3.5-flash"
+GEMINI_MODEL="gemini-3.7-flash"
 GEMINI_API_KEY=""
 COACH_ACTION_CHUNK_STEPS="10"
 TRAIN_GPU=""          # empty = preserve inherited CUDA_VISIBLE_DEVICES
@@ -233,7 +233,7 @@ Critic mode (expert feedback as critic input):
 
 Gemini VLM coach:
   --use-gemini-coach        Enable Gemini VLM coach (retroactive critic label backfill)
-  --gemini-model MODEL      Gemini model to use. Default: gemini-2.0-flash
+  --gemini-model MODEL      Gemini model to use. Default: gemini-3.7-flash
   --gemini-api-key KEY      Gemini API key (or set GEMINI_API_KEY env var)
   --coach-action-chunk-steps N
                             SAC global-steps per coach action chunk. Default: 10
