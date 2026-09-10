@@ -5103,8 +5103,20 @@ def run_online_carla(
 
     train_logger.close()
 
-    # Final export of the fine-tuned backbone at exit (in addition to the periodic saves above).
-    _save_steervla_ckpt(FLAGS.online_steps, final=True)
+    # Final export of the fine-tuned backbone at exit -- but ONLY if a stop condition did not
+    # already export it. When --eval-mode stops training at, say, step 3884, the weights are
+    # frozen from then on, so this would write a byte-identical copy tagged with --online_steps
+    # (10000): a step number the run never trained to, landing AFTER the real export and, under
+    # hl_checkpoint_keep_last, able to rotate it off disk. Observed on generalization-wall-1095,
+    # which stopped at 5030 env steps and still produced a "10000" checkpoint.
+    if _final_ckpt_step is None:
+        _save_steervla_ckpt(FLAGS.online_steps, final=True)
+    else:
+        print(
+            f"[main_carla] skipping exit checkpoint: training already exported its final weights "
+            f"at step {_final_ckpt_step}; nothing has changed since.",
+            flush=True,
+        )
 
     if FLAGS.save_buffer:
         buffer_path = FLAGS.buffer_path or os.path.join(FLAGS.save_dir, "buffer.npz")
