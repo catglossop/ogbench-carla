@@ -27,8 +27,11 @@ def check(name, ok, detail=""):
 from coaches.correction_memory import DEFAULT_MAX_WORDS, CorrectionMemory
 from coaches.strategy_memory import (
     _tidy_sentence,
+    collect_episode_chunks,
     collect_episode_corrections,
     format_corrections_block,
+    format_executed_block,
+    format_route_plan_block,
     summarize_episode_strategy,
 )
 
@@ -46,6 +49,10 @@ def write_window(root: Path, ep: int, win: int, *, step0: int, events: list[dict
             "episode_step_end": step0 + i * 10 + 9,
             "video_time_start_sec": i * 1.0,
             "video_time_end_sec": i * 1.0 + 0.9,
+            "label": "GOOD" if i < 2 else "BAD",
+            "credit_source": "" if i < 2 else "precursor",
+            "original_subtask": "hold lane and follow traffic" if i < 2 else "come to a stop",
+            "suggested_subtasks": [] if i < 2 else ["take the gap and complete the turn"],
         }
         for i in range(3)
     ]
@@ -130,7 +137,7 @@ with tempfile.TemporaryDirectory() as td:
     check("route completion is in the prompt", "88.0%" in prompt)
     check("the route goal is in the prompt", "LEAVE THE HIGHWAY" in prompt)
     check("the corrections are in the prompt", "take the gap" in prompt)
-    check("it asks for a strategy, not an event list", "not a list of" in prompt)
+    check("it asks for a strategy, not an event list", "as a pattern rather than a list" in prompt)
 
     c2 = FakeCoach()
     summarize_episode_strategy(c2, video_path=None, corrections=got, route="r", driving_score=1.0)
@@ -166,6 +173,47 @@ with tempfile.TemporaryDirectory() as td:
 
     m2 = CorrectionMemory(Path(td) / "mem.json", max_words=DEFAULT_MAX_WORDS)
     check("strategies persist across reload", len(m2.strategies) == len(m.strategies))
+
+print("\n[6] the policy's OWN behaviour is included, not just the reviewer's commentary")
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    write_window(root, 1, 0, step0=1, events=[
+        {"timestamp_sec": 0.0, "label": "GOOD", "description": "ok", "correction": ""},
+    ])
+    ch = collect_episode_chunks(root, 1)
+    check("chunks are collected", len(ch) == 3, f"n={len(ch)}")
+    check("the EXECUTED subtask is captured", ch[0]["executed_subtask"] == "hold lane and follow traffic", ch[0]["executed_subtask"])
+    check("the relabelled subtask is captured", ch[2]["corrected_subtask"] == "take the gap and complete the turn")
+    check("the verdict and credit source come too", (ch[2]["label"], ch[2]["credit_source"]) == ("BAD", "precursor"))
+    check("chunks are ordered along the episode", [c["episode_step_start"] for c in ch] == [1, 11, 21])
+
+    blk = format_executed_block(ch, episode_fps=10.0)
+    check("identical consecutive subtasks collapse", "(2 consecutive chunks)" in blk, blk.splitlines()[0])
+    check("the collapsed run spans both chunks", "0.1-  2.0s" in blk or "0.1-2.0s" in blk.replace(" ", ""))
+    check("a relabel is shown", "relabelled to:" in blk)
+    check("an empty list is stated", "no executed subtasks" in format_executed_block([]))
+
+print("\n[7] routing commands and the scenario goal")
+plan = [{"command": "follow the road", "start_distance_m": 0},
+        {"command": "go left at the next intersection", "start_distance_m": 78}]
+rb = format_route_plan_block(plan)
+check("commands render in order with distances", "1. follow the road" in rb and "~78 m" in rb)
+check("an absent plan renders nothing", format_route_plan_block(None) == "")
+
+from coaches.strategy_memory import build_strategy_prompt
+
+prompt = build_strategy_prompt(
+    route="signalized-junction-left-turn-001", route_goal="", driving_score=43.5,
+    route_completion=88.0, corrections_block="<C>",
+    executed_block=format_executed_block(ch, episode_fps=10.0),
+    route_plan_block=rb,
+)
+check("the goal is DERIVED from the scenario name", "turn left at a signalised junction" in prompt)
+check("it is framed as the PRIMARY GOAL, as in the review prompt", "PRIMARY GOAL of this episode" in prompt)
+check("obeying commands but failing the goal is called out", "never accomplished the" in prompt)
+check("routing commands are in the prompt", "go left at the next intersection" in prompt)
+check("executed subtasks are in the prompt", "hold lane and follow traffic" in prompt)
+check("it asks the summary to read strategy off the executed subtasks", "read it off the executed subtasks" in prompt)
 
 print()
 if FAILURES:

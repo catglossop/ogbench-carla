@@ -31,6 +31,9 @@ import re
 from pathlib import Path
 from typing import Any
 
+# Same derivation the window review uses, so both judge the episode against one objective.
+from coaches.vlm_feedback import describe_route_goal
+
 # One or two sentences. This is a nudge that has to share a small word budget with the correction
 # log, not an essay.
 DEFAULT_MAX_SENTENCE_WORDS = 60
@@ -142,6 +145,121 @@ def collect_episode_corrections(artifact_dir: str | Path, episode: int) -> list[
     return out
 
 
+def collect_episode_chunks(artifact_dir: str | Path, episode: int) -> list[dict[str, Any]]:
+    """Every action chunk of ``episode``: the subtask the policy EXECUTED and its verdict.
+
+    The events collected above are the reviewer's commentary. These are the policy's own
+    decisions -- ``original_subtask`` is what it actually chose to do over those steps, and
+    ``suggested_subtasks`` is what the reviewer relabelled it to. Summarising "strategy" without
+    them describes the critic rather than the driver.
+    """
+    root = Path(artifact_dir)
+    if not root.is_dir():
+        return []
+    out: list[dict[str, Any]] = []
+    for win_dir in sorted(root.glob(f"ep{int(episode):04d}_win*")):
+        path = win_dir / "cast_relabel.json"
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        for c in data.get("action_chunks") or []:
+            suggested = c.get("suggested_subtasks") or []
+            if isinstance(suggested, str):
+                suggested = [suggested]
+            out.append(
+                {
+                    "episode_step_start": c.get("episode_step_start"),
+                    "episode_step_end": c.get("episode_step_end"),
+                    "label": str(c.get("label", "")),
+                    "credit_source": str(c.get("credit_source", "")),
+                    "executed_subtask": strip_cot(str(c.get("original_subtask", ""))),
+                    "corrected_subtask": strip_cot(str(suggested[0])) if suggested else "",
+                }
+            )
+    out.sort(key=lambda c: (c["episode_step_start"] is None, c["episode_step_start"] or 0))
+    return out
+
+
+def strip_cot(text: str) -> str:
+    """Drop CoT sentinels and collapse whitespace, so the table reads as plain subtasks."""
+    t = re.sub(r"<[^>]{0,40}>", " ", str(text or ""))
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def format_executed_block(
+    chunks: list[dict[str, Any]], *, episode_fps: float | None = None, max_runs: int = 25
+) -> str:
+    """What the policy executed, with consecutive identical subtasks collapsed into runs.
+
+    Collapsing matters: a 400-step episode is ~40 chunks and the same subtask usually persists
+    across many of them, so an uncollapsed list reads as noise and buries the handful of places
+    the behaviour actually changed -- which is exactly what a strategy summary needs to see.
+    """
+    if not chunks:
+        return "(no executed subtasks were recorded for this episode)"
+    runs: list[dict[str, Any]] = []
+    for c in chunks:
+        key = (c["executed_subtask"], c["label"], c["corrected_subtask"])
+        if runs and runs[-1]["key"] == key:
+            runs[-1]["end"] = c["episode_step_end"]
+            runs[-1]["n"] += 1
+            continue
+        runs.append(
+            {
+                "key": key,
+                "start": c["episode_step_start"],
+                "end": c["episode_step_end"],
+                "n": 1,
+                **c,
+            }
+        )
+    lines = []
+    for r in runs[:max_runs]:
+        start, end = r["start"], r["end"]
+        if episode_fps and start is not None and end is not None:
+            when = f"t={start / episode_fps:5.1f}-{end / episode_fps:5.1f}s"
+        else:
+            when = f"steps {start}-{end}"
+        label = r["label"] or "?"
+        if r["credit_source"]:
+            label += f"/{r['credit_source']}"
+        line = f"- {when} [{label}] executed: \"{r['executed_subtask'] or '(none)'}\""
+        if r["corrected_subtask"] and r["corrected_subtask"] != r["executed_subtask"]:
+            line += f"  ->  relabelled to: \"{r['corrected_subtask']}\""
+        if r["n"] > 1:
+            line += f"  ({r['n']} consecutive chunks)"
+        lines.append(line)
+    if len(runs) > max_runs:
+        lines.append(f"- (+{len(runs) - max_runs} further runs omitted)")
+    return "\n".join(lines)
+
+
+def format_route_plan_block(route_command_plan: list[dict[str, Any]] | None) -> str:
+    """The routing commands the episode was given, in order."""
+    if not route_command_plan:
+        return ""
+    lines = []
+    for i, item in enumerate(route_command_plan):
+        if not isinstance(item, dict):
+            continue
+        cmd = str(item.get("command", "")).strip()
+        if not cmd:
+            continue
+        dist = item.get("start_distance_m")
+        lines.append(
+            f"  {i + 1}. {cmd}" + (f" (from ~{float(dist):.0f} m along the route)" if dist is not None else "")
+        )
+    if not lines:
+        return ""
+    return (
+        "\nRouting commands this episode was given, in order — the task the vehicle was actually "
+        "asked to carry out:\n" + "\n".join(lines) + "\n"
+    )
+
+
 def format_corrections_block(
     corrections: list[dict[str, Any]], *, episode_fps: float | None = None, max_events: int = 40
 ) -> str:
@@ -173,27 +291,51 @@ def build_strategy_prompt(
     driving_score: float,
     route_completion: float | None,
     corrections_block: str,
+    executed_block: str = "",
+    route_plan_block: str = "",
     max_words: int = DEFAULT_MAX_SENTENCE_WORDS,
 ) -> str:
-    """Prompt for the episode-level strategy summary."""
+    """Prompt for the episode-level strategy summary.
+
+    Mirrors the review prompt's framing deliberately: the episode is judged against the same
+    PRIMARY GOAL, derived the same way (scenario family + the routing-command plan). A strategy
+    summary written against a different notion of the objective than the one the window reviews
+    used would push the labelling in a direction the reviews never intended.
+    """
+    if not route_goal:
+        route_goal = describe_route_goal(route)
     score_line = f"Driving score for this episode: {driving_score:.2f} / 100."
     if route_completion is not None:
         score_line += f" Route completion: {route_completion:.1f}%."
-    goal_line = f"The route's objective was: {route_goal}." if route_goal else ""
+    goal_block = (
+        f"PRIMARY GOAL of this episode (route `{route}`): {route_goal}.\n"
+        "This is what the vehicle was TRYING TO ACHIEVE. The routing commands below are the means "
+        "to it, not the end — an episode that obeyed every command but never accomplished the "
+        "goal has FAILED, whatever else it did well.\n"
+        if route_goal
+        else f"Route: `{route}`.\n"
+    )
     return (
         "You are reviewing a COMPLETE driving episode, not a short window. The attached video is "
         "the whole route attempt.\n\n"
-        f"Route: `{route}`. {goal_line}\n"
+        f"{goal_block}"
+        f"{route_plan_block}\n"
         f"{score_line}\n\n"
-        "During the episode a reviewer flagged the following moments and, where the behavior was "
-        "bad, wrote a correction. Timestamps are in the attached video's own clock:\n\n"
+        "What the policy ACTUALLY DID — the subtask it chose over each stretch, the reviewer's "
+        "verdict on it, and where the reviewer relabelled it. Consecutive identical subtasks are "
+        "collapsed into one line:\n\n"
+        f"{executed_block}\n\n"
+        "Moments the reviewer flagged, with the correction where the behaviour was bad. "
+        "Timestamps are in the attached video's own clock:\n\n"
         f"{corrections_block}\n\n"
         "Summarise, in AT MOST "
         f"{max_words} words and as one or two plain sentences:\n"
-        "  1. the strategy the vehicle actually followed over this episode (not a list of "
-        "events -- the pattern, e.g. 'crept to every junction and waited for a full gap');\n"
-        "  2. whether that strategy is what produced the score above, naming the ONE behavior "
-        "that cost the most (or, on a high score, the one that earned it);\n"
+        "  1. the strategy the vehicle actually followed over this episode — read it off the "
+        "executed subtasks above, as a pattern rather than a list (e.g. 'crept to every junction "
+        "and waited for a full gap');\n"
+        "  2. whether that strategy achieved the PRIMARY GOAL and produced the score above, "
+        "naming the ONE behaviour that cost the most (or, on a high score, the one that earned "
+        "it);\n"
         "  3. what the next episode should do differently, stated as a strategy rather than a "
         "single fix.\n\n"
         "Be concrete and causal. Do not restate the score. Do not hedge. Return ONLY the "
@@ -222,6 +364,8 @@ def summarize_episode_strategy(
     driving_score: float = 0.0,
     route_completion: float | None = None,
     episode_fps: float | None = None,
+    chunks: list[dict[str, Any]] | None = None,
+    route_command_plan: list[dict[str, Any]] | None = None,
     max_words: int = DEFAULT_MAX_SENTENCE_WORDS,
 ) -> str:
     """One sentence describing the episode's strategy in the context of its score.
@@ -239,6 +383,8 @@ def summarize_episode_strategy(
         driving_score=driving_score,
         route_completion=route_completion,
         corrections_block=format_corrections_block(corrections, episode_fps=episode_fps),
+        executed_block=format_executed_block(chunks or [], episode_fps=episode_fps),
+        route_plan_block=format_route_plan_block(route_command_plan),
         max_words=max_words,
     )
     try:

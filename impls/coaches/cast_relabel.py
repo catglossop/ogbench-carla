@@ -60,7 +60,11 @@ from coaches.action_chunk_feedback import (
 )
 from coaches.correction_memory import DEFAULT_MAX_WORDS as DEFAULT_MEMORY_WORDS
 from coaches.correction_memory import CorrectionMemory
-from coaches.strategy_memory import collect_episode_corrections, summarize_episode_strategy
+from coaches.strategy_memory import (
+    collect_episode_chunks,
+    collect_episode_corrections,
+    summarize_episode_strategy,
+)
 from coaches.online_vlm_coach import write_frames_to_mp4
 
 # Saved/logged video only -- never the frames a model consumes. See main_carla for the rationale.
@@ -2040,10 +2044,16 @@ class OnlineCastRelabelSession:
             return ""
         try:
             corrections = collect_episode_corrections(self.artifact_dir, self.episode_count)
+            # The chunks are what the POLICY did (its executed subtasks and how they were
+            # relabelled); the corrections are what the REVIEWER said about it. The summary needs
+            # both, plus the routing-command plan, to judge strategy against the actual task.
+            chunks = collect_episode_chunks(self.artifact_dir, self.episode_count)
             sentence = summarize_episode_strategy(
                 self._coach,
                 video_path=video_path,
                 corrections=corrections,
+                chunks=chunks,
+                route_command_plan=self.route_command_plan,
                 route=self.route_id,
                 route_goal=route_goal,
                 driving_score=float(driving_score),
