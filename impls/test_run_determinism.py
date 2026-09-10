@@ -69,6 +69,19 @@ check(
     "the weights training produced are exported at the stop",
     "_save_steervla_ckpt(int(step), final=True)" in src,
 )
+check(
+    "periodic checkpointing stops once the eval phase begins",
+    "        if not eval_phase:\n            if agent is not None and any_updates_on" in src
+    and "            _save_steervla_ckpt(step)" in src,
+)
+# The end-of-training export must be the LAST checkpoint written: eval-phase saves are
+# byte-identical copies and, under hl_checkpoint_keep_last, rotate the real one off disk.
+_stop_at = src.index("final_train_driving_score = _ep_ds")
+_periodic_at = src.index("        if not eval_phase:\n            if agent is not None")
+check(
+    "the final export happens before the gated periodic save in the same iteration",
+    _stop_at < _periodic_at,
+)
 
 # ── 2b. ... but only under --eval-mode ────────────────────────────────────────────────
 print("\n[2b] everything is gated behind --eval_mode")
