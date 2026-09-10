@@ -128,6 +128,16 @@ flags.DEFINE_integer(
     "Seed for everything MODEL-side: JAX PRNG, numpy/random, and SteerVLAActor.sampling_seed "
     "(CoT sampling, action sampling, flow noise). <0 falls back to --seed.",
 )
+flags.DEFINE_bool(
+    "eval_mode", False,
+    "Treat this as a run whose numbers will be reported, and enforce what that needs: pin the "
+    "simulator seed to --carla_seed, checkpoint the model every "
+    "2000 env steps (tightening --save_interval too), always export the weights training ended "
+    "with, replay the training --carla_seed through the post-training eval while varying only "
+    "the model seed, and write run_summary.json. Off by default -- an exploratory run pays none "
+    "of it. NOT the same as --eval_only, which skips training altogether; --eval_mode is about a "
+    "run that DOES train and whose result must be reproducible.",
+)
 flags.DEFINE_string(
     "eval_seeds", "",
     "Comma-separated MODEL seeds for the post-training eval episodes, e.g. '1,2,3'. Each eval "
@@ -2122,7 +2132,7 @@ def run_online_carla(
         and steervla_actor is not None
         and bool(getattr(steervla_actor, "load_trainable_params", False))
     )
-    if _hl_updating and _hl_ckpt_every <= 0:
+    if FLAGS.eval_mode and _hl_updating and _hl_ckpt_every <= 0:
         _hl_ckpt_every = DEFAULT_ONLINE_CKPT_EVERY_STEPS
         print(
             f"[main_carla] online model updates are ON with no checkpoint interval set; "
@@ -2132,7 +2142,12 @@ def run_online_carla(
     # Same rule for the DSRL / residual agent, which checkpoints on --save_interval. Its default
     # is 100_000 env steps -- coarser than most runs are long, so a run that trained for 10k steps
     # saved the agent exactly never. Tighten it (never loosen a deliberately finer setting).
-    if any_updates_on and agent is not None and FLAGS.save_interval > DEFAULT_ONLINE_CKPT_EVERY_STEPS:
+    if (
+        FLAGS.eval_mode
+        and any_updates_on
+        and agent is not None
+        and FLAGS.save_interval > DEFAULT_ONLINE_CKPT_EVERY_STEPS
+    ):
         print(
             f"[main_carla] --save_interval={FLAGS.save_interval} is coarser than the "
             f"{DEFAULT_ONLINE_CKPT_EVERY_STEPS}-step online checkpoint cadence; tightening it.",
@@ -3858,7 +3873,7 @@ def run_online_carla(
     # condition fires we do NOT exit immediately: updates and the CAST reviewer are switched off and
     # the policy is rolled out frozen for --post_stop_eval_episodes episodes so the reported number
     # is the performance of the weights that training actually produced.
-    eval_mode = False
+    eval_phase = False
     eval_scores: list[float] = []
     stop_reason = ""
     # Driving score of the last TRAINING episode (the one that tripped the stop), and the env step
@@ -4736,7 +4751,7 @@ def run_online_carla(
             # ── stop conditions / frozen evaluation phase ────────────────────────────
             _ep_ds = float(done_info.get("driving_score", 0.0) or 0.0)
             _hl_applied = int(getattr(steervla_actor, "_hl_updates_applied", 0) or 0) if steervla_actor else 0
-            if eval_mode:
+            if eval_phase:
                 eval_scores.append(_ep_ds)
                 print(
                     f"[main_carla] eval episode {len(eval_scores)}/{FLAGS.post_stop_eval_episodes}: "
@@ -4760,23 +4775,24 @@ def run_online_carla(
                         step=step,
                     )
                     _ckpt_root = _hl_ckpt_dir or os.path.join(FLAGS.save_dir, "checkpoints")
-                    write_run_summary(
-                        FLAGS.save_dir,
-                        route=str(FLAGS.route or ""),
-                        carla_seed=_carla_seed,
-                        train_seed=_train_seed,
-                        eval_seeds=list(_eval_seeds[: len(eval_scores)]),
-                        eval_scores=list(eval_scores),
-                        final_train_driving_score=final_train_driving_score,
-                        stop_reason=stop_reason,
-                        hl_updates_applied=_hl_applied,
-                        env_steps=int(step),
-                        final_checkpoint=(
-                            os.path.join(_ckpt_root, str(_final_ckpt_step))
-                            if _final_ckpt_step is not None
-                            else None
-                        ),
-                    )
+                    if FLAGS.eval_mode:
+                        write_run_summary(
+                            FLAGS.save_dir,
+                            route=str(FLAGS.route or ""),
+                            carla_seed=_carla_seed,
+                            train_seed=_train_seed,
+                            eval_seeds=list(_eval_seeds[: len(eval_scores)]),
+                            eval_scores=list(eval_scores),
+                            final_train_driving_score=final_train_driving_score,
+                            stop_reason=stop_reason,
+                            hl_updates_applied=_hl_applied,
+                            env_steps=int(step),
+                            final_checkpoint=(
+                                os.path.join(_ckpt_root, str(_final_ckpt_step))
+                                if _final_ckpt_step is not None
+                                else None
+                            ),
+                        )
                     break
             else:
                 # Reaching the score ARMS a countdown rather than stopping: the episode that
@@ -4803,17 +4819,18 @@ def run_online_carla(
                 elif FLAGS.max_hl_updates > 0 and _hl_applied >= FLAGS.max_hl_updates:
                     stop_reason = f"{_hl_applied} HL updates applied >= cap {FLAGS.max_hl_updates}"
                 if stop_reason:
-                    eval_mode = True
+                    eval_phase = True
                     eval_started_step = step
                     # The score of the episode that ended training -- reported in run_summary.json
                     # as the training result, distinct from the frozen eval mean below.
                     final_train_driving_score = _ep_ds
-                    # Always export the weights training actually produced, whatever the env-step
-                    # count happens to be. Without this a run that stopped at, say, 3100 steps
-                    # would leave only the 2000-step checkpoint on disk and the trained policy
-                    # would be unrecoverable.
-                    _save_steervla_ckpt(int(step), final=True)
-                    _final_ckpt_step = int(step)
+                    if FLAGS.eval_mode:
+                        # Export the weights training actually produced, whatever the env-step
+                        # count happens to be. Without this a run that stopped at, say, 3100 steps
+                        # would leave only the 2000-step checkpoint on disk and the trained policy
+                        # would be unrecoverable.
+                        _save_steervla_ckpt(int(step), final=True)
+                        _final_ckpt_step = int(step)
                     # Freeze everything: these gates are read live further down the loop.
                     rl_updates_on = bc_updates_on = hl_updates_on = any_updates_on = False
                     # Drop the CAST reviewer too -- every use of it is None-guarded. Otherwise the
@@ -4836,7 +4853,7 @@ def run_online_carla(
             # deterministically (carla_seed + index) so the run still reproduces. Eval episodes
             # REPLAY the training carla_seed and change only the model's sampling seed, which is
             # what makes their spread a measure of the policy rather than of the scenario.
-            if eval_mode:
+            if eval_phase and FLAGS.eval_mode:
                 _eval_idx = len(eval_scores)
                 if steervla_actor is not None and _eval_idx < len(_eval_seeds):
                     steervla_actor.sampling_seed = int(_eval_seeds[_eval_idx])
@@ -4987,7 +5004,7 @@ def run_online_carla(
     # A partial eval (budget exhausted, or --max_episodes hit mid-eval) still reports what it
     # measured -- a two-episode mean is worth far more than no number at all, and the episode
     # count is logged alongside it so it is never mistaken for a full one.
-    if eval_mode and eval_scores and len(eval_scores) < max(1, int(FLAGS.post_stop_eval_episodes)):
+    if eval_phase and eval_scores and len(eval_scores) < max(1, int(FLAGS.post_stop_eval_episodes)):
         _mean = sum(eval_scores) / len(eval_scores)
         print(
             f"[main_carla] PARTIAL EVAL after {stop_reason}: mean driving_score={_mean:.2f} over "
@@ -5627,8 +5644,9 @@ def _run_residual_entry(config):
     # Leaving it to carla_config.yaml (a fixed 0) meant the traffic manager was seeded
     # independently of the run, so two runs with different --seed still drew the same traffic and
     # a run could not be reproduced from its recorded seed alone.
-    _carla_seed_rc, _, _ = resolve_run_seeds()
-    extra_carla["traffic_manager_seed"] = int(_carla_seed_rc)
+    if FLAGS.eval_mode or FLAGS.eval_only:
+        _carla_seed_rc, _, _ = resolve_run_seeds()
+        extra_carla["traffic_manager_seed"] = int(_carla_seed_rc)
     if FLAGS.eval_only:
         # Deterministic eval: greedy CoT on top of the pinned traffic seed.
         steervla_cfg["cot_temperature"] = 0.0
