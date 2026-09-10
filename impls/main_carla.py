@@ -116,7 +116,25 @@ from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("run_group", "Debug", "Run group.")
-flags.DEFINE_integer("seed", 0, "Random seed.")
+flags.DEFINE_integer("seed", 0, "Random seed. Base for --carla_seed / --train_seed when those are unset.")
+flags.DEFINE_integer(
+    "carla_seed", -1,
+    "Seed for everything SIMULATOR-side: traffic manager, scenario actors, env.reset(). Held "
+    "FIXED across the post-training eval episodes so those episodes differ only in the model's "
+    "own sampling. <0 falls back to --seed.",
+)
+flags.DEFINE_integer(
+    "train_seed", -1,
+    "Seed for everything MODEL-side: JAX PRNG, numpy/random, and SteerVLAActor.sampling_seed "
+    "(CoT sampling, action sampling, flow noise). <0 falls back to --seed.",
+)
+flags.DEFINE_string(
+    "eval_seeds", "",
+    "Comma-separated MODEL seeds for the post-training eval episodes, e.g. '1,2,3'. Each eval "
+    "episode replays the same --carla_seed with a different model seed, so the spread measures "
+    "the policy's own stochasticity rather than scenario variation. Empty -> "
+    "train_seed+1001, +1002, ... one per --post_stop_eval_episodes.",
+)
 flags.DEFINE_string(
     "env_name",
     "carla-bench2drive",
@@ -1868,6 +1886,98 @@ _EVAL_COLS = {
 }
 
 
+# Checkpoint cadence for any run whose model is updated online (CAST/HL or residual RL).
+# Enforced rather than merely defaulted: see the _hl_ckpt_every correction in run_online_carla.
+DEFAULT_ONLINE_CKPT_EVERY_STEPS = 2000
+
+
+def run_carla_seed() -> int:
+    """Simulator-side seed for this run (see resolve_run_seeds)."""
+    return resolve_run_seeds()[0]
+
+
+def run_train_seed() -> int:
+    """Model-side seed for this run (see resolve_run_seeds)."""
+    return resolve_run_seeds()[1]
+
+
+
+def resolve_run_seeds() -> tuple[int, int, list[int]]:
+    """(carla_seed, train_seed, eval_seeds) for this run.
+
+    Split deliberately. A single --seed cannot express "same scenario, different policy draws",
+    which is exactly what a post-training eval needs: hold the simulator fixed so the three
+    episodes are the same traffic and the same scenario, and vary only the model's sampling. With
+    one seed the eval episodes differ in both at once and the spread means nothing.
+
+    Both default to --seed, so existing invocations are unchanged.
+    """
+    carla_seed = int(FLAGS.carla_seed) if int(FLAGS.carla_seed) >= 0 else int(FLAGS.seed)
+    train_seed = int(FLAGS.train_seed) if int(FLAGS.train_seed) >= 0 else int(FLAGS.seed)
+    raw = str(FLAGS.eval_seeds or "").strip()
+    if raw:
+        eval_seeds = [int(x) for x in raw.replace(",", " ").split() if x.strip()]
+    else:
+        n = max(1, int(FLAGS.post_stop_eval_episodes))
+        eval_seeds = [train_seed + 1001 + i for i in range(n)]
+    return carla_seed, train_seed, eval_seeds
+
+
+def write_run_summary(
+    save_dir: str,
+    *,
+    route: str,
+    carla_seed: int,
+    train_seed: int,
+    eval_seeds: list[int],
+    eval_scores: list[float],
+    final_train_driving_score: float,
+    stop_reason: str,
+    hl_updates_applied: int,
+    env_steps: int,
+    final_checkpoint: str | None,
+) -> dict:
+    """Write ``run_summary.json``: what the run achieved and exactly how to reproduce it.
+
+    Deliberately separate from ``eval_summary.json``, which aggregates per-episode rollout stats
+    out of train.csv. This one is the reproducibility record -- the seeds, the score training
+    ended at, and each eval seed paired with the score it produced.
+    """
+    summary = {
+        "route": route,
+        "seeds": {"carla_seed": int(carla_seed), "train_seed": int(train_seed)},
+        "training": {
+            "final_driving_score": float(final_train_driving_score),
+            "stop_reason": stop_reason,
+            "hl_updates_applied": int(hl_updates_applied),
+            "env_steps": int(env_steps),
+            "final_checkpoint": final_checkpoint,
+        },
+        # Same carla_seed as training; only the model seed differs between these.
+        "eval": [
+            {"eval_seed": int(sd), "driving_score": float(sc)}
+            for sd, sc in zip(eval_seeds, eval_scores)
+        ],
+        "eval_mean_driving_score": (
+            float(sum(eval_scores) / len(eval_scores)) if eval_scores else None
+        ),
+    }
+    path = os.path.join(save_dir, "run_summary.json")
+    try:
+        with open(path, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"[main_carla] wrote run summary -> {path}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - a summary write must never kill a finished run.
+        print(f"[main_carla] run_summary.json write failed (non-fatal): {exc}", flush=True)
+    if wandb.run is not None:
+        wandb.summary.update({
+            "run/carla_seed": int(carla_seed),
+            "run/train_seed": int(train_seed),
+            "run/final_train_driving_score": float(final_train_driving_score),
+        })
+    return summary
+
+
 def _write_eval_summary(save_dir: str, *, route: str, seed: int) -> Optional[dict]:
     """Aggregate per-episode rollout rows in train.csv -> eval_summary.json + wandb.summary."""
     import csv as _csv
@@ -1986,10 +2096,49 @@ def run_online_carla(
             flush=True,
         )
 
+    # ── run seeds ────────────────────────────────────────────────────────────────
+    # Resolved once and used for every reset and every sampling draw below, so the run is
+    # reproducible from (carla_seed, train_seed) alone and the eval episodes vary only the model.
+    _carla_seed, _train_seed, _eval_seeds = resolve_run_seeds()
+    if steervla_actor is not None:
+        steervla_actor.sampling_seed = int(_train_seed)
+    print(
+        f"[main_carla] seeds: carla={_carla_seed} train={_train_seed} "
+        f"eval={_eval_seeds} (eval replays carla={_carla_seed} with each model seed)",
+        flush=True,
+    )
+    if wandb.run is not None:
+        wandb.summary.update({"run/carla_seed": int(_carla_seed), "run/train_seed": int(_train_seed)})
+
     # Export the HL-fine-tuned SteerVLA backbone as a redeployable params-only checkpoint every
     # ``hl_checkpoint_every_steps`` env steps and at exit. Only when the HL update is actually running.
     _steervla_cfg = agent_config.get("steervla", None)
     _hl_ckpt_every = int(_steervla_cfg.get("hl_checkpoint_every_steps", 0)) if _steervla_cfg is not None else 0
+    # Any run whose model is being updated online checkpoints on a fixed 2000-env-step cadence.
+    # A run that trains and saves nothing cannot be evaluated or resumed afterwards, so an
+    # unset/zero interval is corrected rather than honoured.
+    _hl_updating = (
+        hl_updates_on
+        and steervla_actor is not None
+        and bool(getattr(steervla_actor, "load_trainable_params", False))
+    )
+    if _hl_updating and _hl_ckpt_every <= 0:
+        _hl_ckpt_every = DEFAULT_ONLINE_CKPT_EVERY_STEPS
+        print(
+            f"[main_carla] online model updates are ON with no checkpoint interval set; "
+            f"forcing every {_hl_ckpt_every} env steps.",
+            flush=True,
+        )
+    # Same rule for the DSRL / residual agent, which checkpoints on --save_interval. Its default
+    # is 100_000 env steps -- coarser than most runs are long, so a run that trained for 10k steps
+    # saved the agent exactly never. Tighten it (never loosen a deliberately finer setting).
+    if any_updates_on and agent is not None and FLAGS.save_interval > DEFAULT_ONLINE_CKPT_EVERY_STEPS:
+        print(
+            f"[main_carla] --save_interval={FLAGS.save_interval} is coarser than the "
+            f"{DEFAULT_ONLINE_CKPT_EVERY_STEPS}-step online checkpoint cadence; tightening it.",
+            flush=True,
+        )
+        FLAGS.save_interval = DEFAULT_ONLINE_CKPT_EVERY_STEPS
     _hl_ckpt_dir = str(_steervla_cfg.get("hl_checkpoint_dir", "") or "") if _steervla_cfg is not None else ""
     # Retain only the newest N step dirs (0 = keep every one). Each is ~10 GB.
     _hl_ckpt_keep = int(_steervla_cfg.get("hl_checkpoint_keep_last", 0)) if _steervla_cfg is not None else 0
@@ -2253,7 +2402,7 @@ def run_online_carla(
     if raw_obs_holder is not None and raw_obs_holder.get("obs") is not None:
         obs_raw = raw_obs_holder["obs"]
     else:
-        obs_raw, _info = env.reset(seed=FLAGS.seed)
+        obs_raw, _info = env.reset(seed=run_carla_seed())
     if raw_obs_holder is not None:
         raw_obs_holder["obs"] = obs_raw
         raw_obs_holder["next_obs"] = obs_raw
@@ -2483,7 +2632,7 @@ def run_online_carla(
             raise KeyError(f"Transition missing replay buffer keys: {sorted(missing)}")
         return transition
     
-    rng = jax.random.PRNGKey(FLAGS.seed + 1)
+    rng = jax.random.PRNGKey(run_train_seed() + 1)
     # Index of the transition added last step, so the next step can backfill its
     # next-state CoT fields (master 63e19f7). Reset to None on episode boundaries.
     _last_buf_idx: int | None = None
@@ -3712,6 +3861,10 @@ def run_online_carla(
     eval_mode = False
     eval_scores: list[float] = []
     stop_reason = ""
+    # Driving score of the last TRAINING episode (the one that tripped the stop), and the env step
+    # of the final weights export. Both land in run_summary.json.
+    final_train_driving_score = 0.0
+    _final_ckpt_step: int | None = None
     # Set when --stop_on_driving_score is first met: the _hl_updates_applied count at which
     # training should stop. None until the score is reached.
     hl_target_after_score: int | None = None
@@ -4606,6 +4759,24 @@ def run_online_carla(
                         },
                         step=step,
                     )
+                    _ckpt_root = _hl_ckpt_dir or os.path.join(FLAGS.save_dir, "checkpoints")
+                    write_run_summary(
+                        FLAGS.save_dir,
+                        route=str(FLAGS.route or ""),
+                        carla_seed=_carla_seed,
+                        train_seed=_train_seed,
+                        eval_seeds=list(_eval_seeds[: len(eval_scores)]),
+                        eval_scores=list(eval_scores),
+                        final_train_driving_score=final_train_driving_score,
+                        stop_reason=stop_reason,
+                        hl_updates_applied=_hl_applied,
+                        env_steps=int(step),
+                        final_checkpoint=(
+                            os.path.join(_ckpt_root, str(_final_ckpt_step))
+                            if _final_ckpt_step is not None
+                            else None
+                        ),
+                    )
                     break
             else:
                 # Reaching the score ARMS a countdown rather than stopping: the episode that
@@ -4634,6 +4805,15 @@ def run_online_carla(
                 if stop_reason:
                     eval_mode = True
                     eval_started_step = step
+                    # The score of the episode that ended training -- reported in run_summary.json
+                    # as the training result, distinct from the frozen eval mean below.
+                    final_train_driving_score = _ep_ds
+                    # Always export the weights training actually produced, whatever the env-step
+                    # count happens to be. Without this a run that stopped at, say, 3100 steps
+                    # would leave only the 2000-step checkpoint on disk and the trained policy
+                    # would be unrecoverable.
+                    _save_steervla_ckpt(int(step), final=True)
+                    _final_ckpt_step = int(step)
                     # Freeze everything: these gates are read live further down the loop.
                     rl_updates_on = bc_updates_on = hl_updates_on = any_updates_on = False
                     # Drop the CAST reviewer too -- every use of it is None-guarded. Otherwise the
@@ -4652,7 +4832,23 @@ def run_online_carla(
                 print(f"[main_carla] Reached --max_episodes={FLAGS.max_episodes}; stopping.", flush=True)
                 break
 
-            obs_raw, _info = env.reset(seed=FLAGS.seed + episode_count)
+            # Training episodes walk the simulator seed so the policy sees varied traffic, but
+            # deterministically (carla_seed + index) so the run still reproduces. Eval episodes
+            # REPLAY the training carla_seed and change only the model's sampling seed, which is
+            # what makes their spread a measure of the policy rather than of the scenario.
+            if eval_mode:
+                _eval_idx = len(eval_scores)
+                if steervla_actor is not None and _eval_idx < len(_eval_seeds):
+                    steervla_actor.sampling_seed = int(_eval_seeds[_eval_idx])
+                    print(
+                        f"[main_carla] eval episode {_eval_idx + 1}: carla_seed={_carla_seed} "
+                        f"model seed={_eval_seeds[_eval_idx]}",
+                        flush=True,
+                    )
+                _reset_seed = int(_carla_seed)
+            else:
+                _reset_seed = int(_carla_seed) + episode_count
+            obs_raw, _info = env.reset(seed=_reset_seed)
             if raw_obs_holder is not None:
                 raw_obs_holder["obs"] = obs_raw
                 raw_obs_holder["next_obs"] = obs_raw
@@ -4903,7 +5099,7 @@ def run_online_residual(
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, "train.csv"))
     last_residual: Optional[np.ndarray] = None
 
-    rng = jax.random.PRNGKey(FLAGS.seed)
+    rng = jax.random.PRNGKey(run_train_seed())
     if start_step:
         # Resume: fold the start step into the key so the post-crash sampling stream differs from
         # the pre-crash one (avoids replaying the exact same noise/CoT draws).
@@ -5314,7 +5510,7 @@ def run_online_residual(
                 prev_collision_count = 0
                 episode_traffic_violations = 0
                 prev_traffic_violation_count = 0
-                obs, _info = env.reset(seed=FLAGS.seed + episode_count)
+                obs, _info = env.reset(seed=run_carla_seed() + episode_count)
                 steervla_actor.reset_action_cache()
                 rng, nk = jax.random.split(rng)
                 base_cands, x_cands, base_chunks, cands = _compute_base(
@@ -5427,19 +5623,24 @@ def _run_residual_entry(config):
     if exec_cfg is not None:
         extra_carla["steervla_action_execution"] = exec_cfg
 
+    # The simulator seed is ALWAYS pinned to the run's carla_seed, not only under --eval_only.
+    # Leaving it to carla_config.yaml (a fixed 0) meant the traffic manager was seeded
+    # independently of the run, so two runs with different --seed still drew the same traffic and
+    # a run could not be reproduced from its recorded seed alone.
+    _carla_seed_rc, _, _ = resolve_run_seeds()
+    extra_carla["traffic_manager_seed"] = int(_carla_seed_rc)
     if FLAGS.eval_only:
-        # Deterministic eval: greedy CoT + traffic seed tied to --seed (set before actor/env build).
-        extra_carla["traffic_manager_seed"] = int(FLAGS.seed)
+        # Deterministic eval: greedy CoT on top of the pinned traffic seed.
         steervla_cfg["cot_temperature"] = 0.0
 
     # Bring CARLA up before JAX initializes its thread pool (forking afterwards can deadlock
     # the UE4 RenderThread). The reset below starts the simulator.
     env = _make_carla_env(carla_yaml, FLAGS.route, extra_carla_config=extra_carla or None)
     try:
-        random.seed(FLAGS.seed)
-        np.random.seed(FLAGS.seed)
+        random.seed(run_train_seed())
+        np.random.seed(run_train_seed())
 
-        obs, _info = env.reset(seed=FLAGS.seed)
+        obs, _info = env.reset(seed=run_carla_seed())
         if not isinstance(obs, dict) or "state" not in obs or "image" not in obs:
             raise ValueError("CARLA env must return a Dict obs with 'state' and 'image'.")
 
@@ -5480,7 +5681,7 @@ def _run_residual_entry(config):
                 vla_sample_fn(
                     jnp.zeros((1, 1), dtype=jnp.float32),
                     jax.random.normal(
-                        jax.random.PRNGKey(FLAGS.seed),
+                        jax.random.PRNGKey(run_train_seed()),
                         (1, int(_bm.action_horizon) * int(_bm.action_dim)),
                         dtype=jnp.float32,
                     ),
@@ -5499,7 +5700,7 @@ def _run_residual_entry(config):
 
             from jax_agents.sac_residual import SACResidualAgent
 
-            agent = SACResidualAgent.create(FLAGS.seed, ex_obs, ex_base, config)
+            agent = SACResidualAgent.create(run_train_seed(), ex_obs, ex_base, config)
             if FLAGS.restore_path is not None:
                 agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
 
@@ -5591,13 +5792,13 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, "train.csv"))
 
     select_mode = str(grpo.get("select_mode", "argmax"))
-    select_rng = np.random.default_rng(FLAGS.seed)  # only used when select_mode == "random"
+    select_rng = np.random.default_rng(run_train_seed())  # only used when select_mode == "random"
     if not updates_enabled:
         print(f"[grpo] enable_updates=False: scoring + selection only, no HL updates (n_cand={n_cand}).", flush=True)
 
     base_model = getattr(steervla_actor, "model", None)
     base_noise_dim = int(base_model.action_horizon) * int(base_model.action_dim) if base_model is not None else 40
-    rng = jax.random.PRNGKey(FLAGS.seed)
+    rng = jax.random.PRNGKey(run_train_seed())
     total_steps = int(FLAGS.online_steps)
 
     # Warmup drives the greedy base (cot_temperature=0) so the in-run baseline matches the eval base;
@@ -5814,7 +6015,7 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
             episode_count += 1
             episode_return, episode_steps, last_reward, episode_speed_sum = 0.0, 0, 0.0, 0.0
             frames = []
-            obs, info = env.reset(seed=FLAGS.seed + episode_count)
+            obs, info = env.reset(seed=run_carla_seed() + episode_count)
             steervla_actor.reset_action_cache()
 
         if states_since_update >= update_every:
@@ -5866,9 +6067,9 @@ def _run_grpo_entry(config):
     carla_yaml, extra_carla, exec_cfg = _resolve_carla_env_config(config)
     env = _make_carla_env(carla_yaml, FLAGS.route, extra_carla_config=extra_carla)
     try:
-        random.seed(FLAGS.seed)
-        np.random.seed(FLAGS.seed)
-        obs, _info = env.reset(seed=FLAGS.seed)
+        random.seed(run_train_seed())
+        np.random.seed(run_train_seed())
+        obs, _info = env.reset(seed=run_carla_seed())
         if not isinstance(obs, dict) or "state" not in obs or "image" not in obs:
             raise ValueError("CARLA env must return a Dict obs with 'state' and 'image'.")
 
@@ -6184,13 +6385,13 @@ def build_carla_session(config, env, exec_cfg: Optional[dict] = None) -> CarlaSe
     if FLAGS.expert_debug or FLAGS.expert_recover_debug:
         extra_carla["expert_controller"] = "simlingo_autopilot"
 
-    random.seed(FLAGS.seed)
-    np.random.seed(FLAGS.seed)
+    random.seed(run_train_seed())
+    np.random.seed(run_train_seed())
 
     obs_mode = str(config.get("observation_mode", "state"))
     image_encoder = str(config.get("image_encoder", "impala")).lower()
     tr_rank = int(config.get("training_gpu_rank", -1))
-    obs_dict, _info = env.reset(seed=FLAGS.seed)
+    obs_dict, _info = env.reset(seed=run_carla_seed())
     if not isinstance(obs_dict, dict) or "state" not in obs_dict or "image" not in obs_dict:
         raise ValueError(
             "CARLA env must return a Dict observation with 'state' and 'image'; "
@@ -6316,7 +6517,7 @@ def build_carla_session(config, env, exec_cfg: Optional[dict] = None) -> CarlaSe
         # critic that best-of-N actually depends on. Decoupling removes that risk
         # entirely rather than just clipping around it.
         config.skip_noise_actor_training = bool(FLAGS.bon_critic_ckpt) or bool(FLAGS.bon_online_critic)
-        agent = agent_class.create(FLAGS.seed, ex_obs, ex_actions, config, **create_kwargs)
+        agent = agent_class.create(run_train_seed(), ex_obs, ex_actions, config, **create_kwargs)
 
         if online_training_mode in {"sac_residual", "dagger_residual"}:
             if config["agent_name"] != "dsrl":
@@ -6339,7 +6540,7 @@ def build_carla_session(config, env, exec_cfg: Optional[dict] = None) -> CarlaSe
             if bool(config.get("residual_append_state", False)):
                 embed_dim += int(config.get("residual_obs_dim", 19))
             sac_residual_agent = SACResidualAgent.create(
-                FLAGS.seed, ex_obs, ex_actions, config, embed_dim=embed_dim,
+                run_train_seed(), ex_obs, ex_actions, config, embed_dim=embed_dim,
             )
             agent = agent.attach_sac_residual(sac_residual_agent)
             print(
