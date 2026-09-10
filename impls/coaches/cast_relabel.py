@@ -60,6 +60,7 @@ from coaches.action_chunk_feedback import (
 )
 from coaches.correction_memory import DEFAULT_MAX_WORDS as DEFAULT_MEMORY_WORDS
 from coaches.correction_memory import CorrectionMemory
+from coaches.strategy_memory import collect_episode_corrections, summarize_episode_strategy
 from coaches.online_vlm_coach import write_frames_to_mp4
 
 # Saved/logged video only -- never the frames a model consumes. See main_carla for the rationale.
@@ -1898,6 +1899,11 @@ class OnlineCastRelabelSession:
         # later windows don't reverse earlier ones. ``correction_memory_words`` caps the whole
         # rendered block; 0 disables the cache entirely.
         memory_words = int(self.cfg.get("correction_memory_words", DEFAULT_MEMORY_WORDS))
+        # After each episode, summarise the whole attempt (full rollout video + every correction
+        # made during it + the driving score it earned) into one sentence, and put that in the same
+        # memory bank the window prompts read. Costs one extra VLM call per EPISODE, against one
+        # per window for the reviews themselves. See coaches/strategy_memory.py.
+        self.strategy_memory_enabled = bool(self.cfg.get("strategy_memory", True))
         self._memory: CorrectionMemory | None = (
             CorrectionMemory(
                 self.artifact_dir / "correction_memory.json",
@@ -2014,6 +2020,50 @@ class OnlineCastRelabelSession:
         self._last_collision_step = None
         self._moving_run_start_step = None
         self._moving_run_start_route_m = 0.0
+
+    def end_episode(
+        self,
+        *,
+        driving_score: float,
+        route_completion: float | None = None,
+        video_path: str | Path | None = None,
+        episode_fps: float | None = None,
+        route_goal: str = "",
+    ) -> str:
+        """Summarise the finished episode into the memory bank, and return the sentence.
+
+        Called once per episode, after the score is known. Everything here is best-effort: the
+        episode has already been driven and scored, so a failed summary costs a memory entry and
+        nothing else. Returns ``""`` when disabled or unsuccessful.
+        """
+        if self._memory is None or not self.strategy_memory_enabled:
+            return ""
+        try:
+            corrections = collect_episode_corrections(self.artifact_dir, self.episode_count)
+            sentence = summarize_episode_strategy(
+                self._coach,
+                video_path=video_path,
+                corrections=corrections,
+                route=self.route_id,
+                route_goal=route_goal,
+                driving_score=float(driving_score),
+                route_completion=route_completion,
+                episode_fps=episode_fps,
+            )
+        except Exception as exc:  # noqa: BLE001 - never break a scored episode
+            print(f"[cast_relabel] episode strategy summary failed (non-fatal): {exc}", flush=True)
+            return ""
+        if not sentence:
+            return ""
+        self._memory.add_strategy(
+            sentence, episode=self.episode_count, driving_score=float(driving_score)
+        )
+        print(
+            f"[cast_relabel] episode {self.episode_count} strategy (score "
+            f"{float(driving_score):.2f}, {len(corrections)} corrections reviewed): {sentence}",
+            flush=True,
+        )
+        return sentence
 
     def record_frame(
         self,

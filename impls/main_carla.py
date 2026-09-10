@@ -112,6 +112,7 @@ from utils.datasets import ReplayBuffer
 from utils.flax_utils import save_agent
 
 from coaches.gemini_models import DEFAULT_GEMINI_MODEL, EVAL_MODE_GEMINI_MODEL
+from coaches.vlm_feedback import describe_route_goal
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
 
 FLAGS = flags.FLAGS
@@ -4795,6 +4796,25 @@ def run_online_carla(
 
             # ── stop conditions / frozen evaluation phase ────────────────────────────
             _ep_ds = float(done_info.get("driving_score", 0.0) or 0.0)
+            # Summarise the finished episode into the correction-memory bank: the full rollout
+            # video + every correction made during it + the score it earned, condensed to one
+            # sentence the NEXT episode's labelling can steer by. One extra VLM call per episode
+            # (against one per window for the reviews), and entirely best-effort -- the episode is
+            # already driven and scored, so a failure here costs a memory entry and nothing else.
+            if _cast_relabel is not None:
+                _ep_video = Path(FLAGS.save_dir) / "videos" / f"ep{episode_count:04d}.mp4"
+                try:
+                    _cast_relabel.end_episode(
+                        driving_score=_ep_ds,
+                        route_completion=done_info.get("route_progress_pct"),
+                        video_path=_ep_video if _ep_video.is_file() else None,
+                        route_goal=describe_route_goal(str(FLAGS.route or "")),
+                    )
+                except Exception as _exc:  # noqa: BLE001 - never break a scored episode
+                    print(
+                        f"[main_carla] episode strategy summary failed (non-fatal): {_exc}",
+                        flush=True,
+                    )
             # GRADIENT steps, not update_hl bodies. steervla.py keeps both and they are not the
             # same number: _hl_updates_applied counts one per update_hl call that reached the
             # gradient loop, while _hl_grad_steps is the sum of hl_update_num_steps -- "the real
