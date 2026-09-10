@@ -215,6 +215,35 @@ check("routing commands are in the prompt", "go left at the next intersection" i
 check("executed subtasks are in the prompt", "hold lane and follow traffic" in prompt)
 check("it asks the summary to read strategy off the executed subtasks", "read it off the executed subtasks" in prompt)
 
+print("\n[8] the strategy bank is logged to wandb")
+src = Path("impls/coaches/cast_relabel.py").read_text()
+check("a logger exists", "def _log_strategy_to_wandb" in src)
+check("it fires when a strategy is stored", "self._log_strategy_to_wandb(global_step=global_step)" in src)
+check("the table carries episode, score and sentence",
+      'wandb.Table(columns=["episode", "driving_score", "strategy"])' in src)
+for key in ("cast/strategy_memory", "cast/strategy_episodes", "cast/memory_words", "cast/memory_word_budget"):
+    check(f"logs {key}", f'"{key}"' in src)
+check("the table is rebuilt in full each time (wandb keeps one value per step/key)",
+      "for entry in self._memory.strategies:" in src)
+check("logging can never break a run", "strategy wandb log failed (non-fatal)" in src)
+check("main_carla passes the step so it lands on the run timeline",
+      "global_step=step," in Path("impls/main_carla.py").read_text())
+
+# and it must be a no-op, not a crash, when wandb is disabled
+import tempfile as _tf
+
+from coaches.cast_relabel import OnlineCastRelabelSession as _S
+from configs.steervla_cast_relabel_hl750x25_adaptive_config import get_config as _g
+
+with _tf.TemporaryDirectory() as _td:
+    _s = _S(_g().cast_relabel, save_dir=_td, action_chunk_steps=10)
+    _s._memory.add_strategy("x.", episode=1, driving_score=1.0)
+    try:
+        _s._log_strategy_to_wandb(global_step=10)
+        check("no-op when wandb is disabled", True)
+    except Exception as _e:  # noqa: BLE001 - the point is that NOTHING escapes
+        check("no-op when wandb is disabled", False, str(_e)[:60])
+
 print()
 if FAILURES:
     print(f"FAILED ({len(FAILURES)}): " + ", ".join(FAILURES))
