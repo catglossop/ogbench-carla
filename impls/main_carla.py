@@ -107,6 +107,7 @@ import tqdm
 from ogbench.carla.carla_utils import ego_drive_metrics_from_state_vec
 
 from utils.live_policy_viewer import LivePolicyViewer
+from utils import stall_watchdog
 
 from utils.datasets import ReplayBuffer
 from utils.flax_utils import save_agent
@@ -545,6 +546,23 @@ flags.DEFINE_integer(
     "live_policy_interval",
     5,
     "Rewrite live_policy.mp4 every N env steps.",
+)
+flags.DEFINE_float(
+    "stall_timeout_s",
+    900.0,
+    "Stall watchdog: seconds without a completed env.step()/env.reset() (i.e. without a "
+    "simulator tick) before the run is declared wedged. CARLA's own client timeout is 7200s, "
+    "so a hung world.tick() otherwise holds both GPUs for two hours without crashing -- and "
+    "run_carla.sh's crash-retry loop never fires, because nothing crashed. On a stall the "
+    "process dumps all thread stacks, kills its own CARLA/Xvfb and exits 87; run_carla.sh "
+    "relaunches it under --max-stall-retries. 0 disables. Default: 900 (15 min).",
+)
+flags.DEFINE_float(
+    "stall_cpu_idle_frac",
+    0.05,
+    "Stall watchdog: a tick-less run is only killed when it is also using less than this "
+    "fraction of one CPU core, so a 17-minute Pi0-CoT JIT compile (no ticks, 100% CPU) is "
+    "never mistaken for a wedged simulator. Negative = kill on no-ticks alone.",
 )
 
 config_flags.DEFINE_config_file("agent", "jax_agents/dsrl.py", lock_config=False)
@@ -1225,14 +1243,33 @@ def _make_carla_env(
             extra_carla_config=extra_carla_config,
         )
         env.setup()
-        return env
+        return _install_stall_watchdog(env, {})
 
     from ogbench.carla.carla_utils import CarlaBench2DriveWrapper, load_carla_config
 
     cfg = load_carla_config(carla_config_path)
     if extra_carla_config:
         cfg = {**cfg, **extra_carla_config}
-    return CarlaBench2DriveWrapper(cfg, route=route)
+    return _install_stall_watchdog(CarlaBench2DriveWrapper(cfg, route=route), cfg)
+
+
+def _install_stall_watchdog(env, cfg: dict[str, Any]):
+    """Arm the no-tick watchdog on a freshly built CARLA env (see utils/stall_watchdog.py).
+
+    Done here rather than in each loop because ``_make_carla_env`` is the one place every
+    entry point (``run_online_carla`` / ``run_online_residual`` / ``run_online_grpo``, and
+    ``main_carla_teleop.py``) gets its env from.
+    """
+    stall_watchdog.install(
+        env,
+        timeout_s=float(FLAGS.stall_timeout_s),
+        cpu_idle_frac=float(FLAGS.stall_cpu_idle_frac),
+        # Fallbacks only: 0 in the yaml means "auto-assign", and the watchdog re-reads the
+        # resolved port/display off the evaluator when it actually has to kill something.
+        rpc_port=int(cfg.get("port", 0) or 0) or None,
+        display_num=int(cfg.get("x_display_num", 0) or 0) or None,
+    )
+    return env
 
 
 def _build_vla_sample_fn(
@@ -4527,7 +4564,9 @@ def run_online_carla(
         )
         if _vlm_coach is not None and episode_trajectory:
             _vlm_coach.record_trajectory_step(episode_trajectory[-1])
-            if _vlm_coach.maybe_query(episode_step=episode_steps, done_info=info):
+            with stall_watchdog.paused("vlm coach query"):
+                _queried = _vlm_coach.maybe_query(episode_step=episode_steps, done_info=info)
+            if _queried:
                 _vlm_coach.backfill_buffer(buffer)
         if _cast_relabel is not None and episode_trajectory:
             # Enrich the recorded step with the executed subtask / CoT reasoning / prompt
@@ -4583,9 +4622,13 @@ def run_online_carla(
                 if _pause_offtick:
                     env.pause_for_vla_inference()
                 try:
-                    _cast_relabel.maybe_query(
-                        episode_step=episode_steps, done_info=info, global_step=step
-                    )
+                    # Also hold the stall watchdog: a blocking review is minutes of no ticks
+                    # spent waiting on the network, which is exactly what "idle + not ticking"
+                    # looks like from the outside.
+                    with stall_watchdog.paused("cast_relabel window review"):
+                        _cast_relabel.maybe_query(
+                            episode_step=episode_steps, done_info=info, global_step=step
+                        )
                 finally:
                     if _pause_offtick and hasattr(env, "resume_after_vla_inference"):
                         env.resume_after_vla_inference()
@@ -4808,19 +4851,21 @@ def run_online_carla(
                 flush=True,
             )
             if _vlm_coach is not None:
-                _vlm_coach.maybe_query(
-                    episode_step=done_episode_steps, done_info=done_info, force=True
-                )
+                with stall_watchdog.paused("vlm coach end-of-episode query"):
+                    _vlm_coach.maybe_query(
+                        episode_step=done_episode_steps, done_info=done_info, force=True
+                    )
                 _vlm_coach.backfill_buffer(buffer)
             if _cast_relabel is not None:
                 # The end-of-episode window runs synchronously (``force=True``), so let any
                 # background review land first: windows must stay ordered, and the correction
                 # memory / HL sample dir are single-writer by design.
-                if getattr(_cast_relabel, "async_review", False):
-                    _cast_relabel.wait_for_reviews()
-                _cast_relabel.maybe_query(
-                    episode_step=done_episode_steps, done_info=done_info, force=True, global_step=step
-                )
+                with stall_watchdog.paused("cast_relabel end-of-episode review"):
+                    if getattr(_cast_relabel, "async_review", False):
+                        _cast_relabel.wait_for_reviews()
+                    _cast_relabel.maybe_query(
+                        episode_step=done_episode_steps, done_info=done_info, force=True, global_step=step
+                    )
                 if getattr(_cast_relabel, "async_review", False):
                     _cast_relabel.drain_wandb()
 
@@ -6090,6 +6135,9 @@ def _run_residual_entry(config):
             _write_eval_summary(FLAGS.save_dir, route=str(FLAGS.route), seed=int(FLAGS.seed))
         _mark_run_complete()
     finally:
+        # Before teardown: env.close() and a wandb video upload are tick-free minutes on a run
+        # that is already over, and a stall kill there would relaunch a finished run.
+        stall_watchdog.disarm()
         try:
             env.close()
         except Exception:
@@ -6254,15 +6302,17 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
             # The VLM occasionally returns malformed JSON (worsening as the HL policy degrades and its
             # CoTs garble); retry, then skip the state so one bad reply can't kill a multi-thousand-step run.
             scores = None
-            for attempt in range(vlm_retries):
-                try:
-                    scores = np.asarray(
-                        parse_candidate_scores(coach.complete_image_text(frame, prompt), num=n_cand),
-                        dtype=np.float32,
-                    )
-                    break
-                except Exception as exc:  # noqa: BLE001 - transient VLM/JSON errors are retried below.
-                    print(f"[grpo] VLM scoring attempt {attempt + 1}/{vlm_retries} failed: {exc}", flush=True)
+            # Blocking network wait with no ticks -- hold the stall watchdog across it.
+            with stall_watchdog.paused("grpo candidate scoring"):
+                for attempt in range(vlm_retries):
+                    try:
+                        scores = np.asarray(
+                            parse_candidate_scores(coach.complete_image_text(frame, prompt), num=n_cand),
+                            dtype=np.float32,
+                        )
+                        break
+                    except Exception as exc:  # noqa: BLE001 - transient VLM/JSON errors are retried below.
+                        print(f"[grpo] VLM scoring attempt {attempt + 1}/{vlm_retries} failed: {exc}", flush=True)
             if scores is None:
                 print("[grpo] VLM scoring failed after retries; driving base chunk (state not pooled).", flush=True)
                 scored, scoring_failed, score_fail_count = False, True, score_fail_count + 1
@@ -6450,6 +6500,9 @@ def _run_grpo_entry(config):
         )
         _mark_run_complete()
     finally:
+        # Before teardown: env.close() and a wandb video upload are tick-free minutes on a run
+        # that is already over, and a stall kill there would relaunch a finished run.
+        stall_watchdog.disarm()
         try:
             env.close()
         except Exception:
@@ -6578,6 +6631,9 @@ def _run_dsrl_entry(config):
             _write_eval_summary(FLAGS.save_dir, route=str(FLAGS.route), seed=int(FLAGS.seed))
         _mark_run_complete()
     finally:
+        # Before teardown: env.close() and a wandb video upload are tick-free minutes on a run
+        # that is already over, and a stall kill there would relaunch a finished run.
+        stall_watchdog.disarm()
         try:
             env.close()
         except Exception:

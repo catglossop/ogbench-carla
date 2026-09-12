@@ -68,6 +68,12 @@ There is no unit test suite (`pytest` is a dependency but no `tests/` exists). D
 
 CARLA runs leave orphaned processes (UE4 server, `main_carla`, `Xvfb`, wandb helpers) that hold GPU VRAM and ports. `./reset_carla.sh` SIGKILLs all of them and cleans stale `/tmp/.X*-lock` files. Run it before restarting after any crash. Note its caveat: zombie/`<defunct>` processes and primary/display GPUs can't be reset live — a reboot is the only fix; secondary (headless) GPUs may respond to `sudo nvidia-smi --gpu-reset -i <index>`.
 
+### Stalled runs (no simulator ticks)
+
+A run that *stalls* never crashes, so `run_carla.sh`'s crash-retry loop (exit ≥ 128) never sees it: CARLA's client timeout is 7200 s, so a wedged `world.tick()` holds both GPUs for two hours in silence. `impls/utils/stall_watchdog.py` is the counterpart to what `run_leaderboard.py` does from outside its workers — it treats every returning `env.step()`/`env.reset()` as a tick, and after `--stall_timeout_s` (default 900) without one **while the process is also idle** (`--stall_cpu_idle_frac`, so a 17-minute JIT compile is never mistaken for a stall) it dumps all thread stacks, kills that run's CARLA/Xvfb and exits 87. `run_carla.sh` relaunches with `--resume=true` up to `--max-stall-retries` (default 3), a budget separate from `--max-retries`.
+
+It is armed in `_make_carla_env`, so every entry point gets it. Sections that legitimately go minutes without a tick (blocking VLM reviews, GRPO scoring) wrap themselves in `stall_watchdog.paused(...)`; add that around any new blocking call rather than raising the timeout. A detached shell nanny watching `$OGBENCH_HEARTBEAT_FILE` SIGKILLs the process if the watchdog thread itself goes silent (a stall that holds the GIL); `$OGBENCH_STALL_MARKER` is how `run_carla.sh` tells that SIGKILL apart from a segfault.
+
 ## Required env vars / external state
 
 - `CARLA_ROOT=/home/carla/carla-0-9-16` (or `CARLA_PYTHON_API_ROOT=<root>/PythonAPI/carla`) — `ogbench/carla/carla.py` prepends this to `sys.path` before importing `leaderboard`/`srunner`. Without it the env will not import.

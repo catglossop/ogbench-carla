@@ -139,6 +139,16 @@ STOP_SCORE_STREAK=""
 # Crash supervisor: relaunch main_carla (resuming from checkpoint) after a CARLA native
 # crash (SIGSEGV/SIGABRT, exit code >=128). 0 disables the retry loop.
 MAX_RETRIES="${MAX_RETRIES:-50}"
+# Stall supervisor: a run whose simulator stopped ticking never crashes, so MAX_RETRIES above
+# never sees it -- it just holds both GPUs until someone notices (CARLA's own client timeout is
+# 7200 s). main_carla's stall watchdog exits 87 (or is SIGKILLed by its nanny, leaving
+# $OGBENCH_STALL_MARKER); either is relaunched with --resume=true, up to this many times.
+# Its own budget, deliberately small: a route that stalls three times in a row is broken, and
+# retrying it forever is the GPU-burning failure this is here to stop. 0 disables.
+MAX_STALL_RETRIES="${MAX_STALL_RETRIES:-3}"
+# Seconds without a simulator tick before the run is declared stalled. Empty -> main_carla's
+# default (900). 0 disables the watchdog entirely.
+STALL_TIMEOUT_S=""
 # Optional stable, human-readable run name. Used by sweep launchers so W&B
 # names identify the precise hyperparameter setting instead of only route/seed.
 EXP_NAME_OVERRIDE=""
@@ -208,6 +218,11 @@ Options:
   --state-encoder NAME      pi_prefix|pi_prefix_groups|siglip_pool|rl_token (residual stack).
   --rlt-checkpoint PATH     RLT autoencoder checkpoint (only for --state-encoder rl_token).
   --max-retries N           Auto-restart+resume after a CARLA crash. Default: 50 (0 disables)
+  --max-stall-retries N     Auto-restart+resume after a STALL -- the simulator stopped ticking
+                            but nothing crashed, so --max-retries never fires. Separate, small
+                            budget. Default: 3 (0 disables)
+  --stall-timeout S         Seconds without a simulator tick before the run counts as stalled.
+                            Default: 900 (0 disables stall detection).
   --exp-name NAME           Fixed W&B/artifact run name. Default: route + seed + timestamp.
 
   --agent-config PATH       Base agent config. Default: impls/configs/pi0_residual_sac_config.py
@@ -349,6 +364,8 @@ while [[ $# -gt 0 ]]; do
     --state-encoder) STATE_ENCODER="$2"; shift 2 ;;
     --rlt-checkpoint) RLT_CHECKPOINT="$2"; shift 2 ;;
     --max-retries) MAX_RETRIES="$2"; shift 2 ;;
+    --max-stall-retries|--max_stall_retries) MAX_STALL_RETRIES="$2"; shift 2 ;;
+    --stall-timeout|--stall_timeout|--stall-timeout-s) STALL_TIMEOUT_S="$2"; shift 2 ;;
     --exp-name|--exp_name) EXP_NAME_OVERRIDE="$2"; shift 2 ;;
     --agent-config) BASE_AGENT_CFG="$2"; shift 2 ;;
     --carla-config) BASE_CARLA_CFG="$2"; shift 2 ;;
@@ -664,6 +681,7 @@ echo "[run_carla.sh] exp_name=${EXP_NAME}"
 # relaunch with --resume=true. A clean exit (0), SIGINT (130), or a non-crash error (<128,
 # e.g. a config bug) stops the loop.
 attempt=0
+stall_attempt=0
 RESUME_FLAG="false"
 # Completion marker. CARLA frequently aborts in teardown (std::runtime_error from
 # set_actor_simulate_physics), which is SIGABRT -> exit 134, indistinguishable here from a real
@@ -672,11 +690,20 @@ RESUME_FLAG="false"
 # queued behind it. main_carla writes this file only after the online loop completes.
 DONE_MARKER="$(mktemp -u "${TMPDIR:-/tmp}/ogbench_done_XXXXXX")"
 export OGBENCH_DONE_MARKER="$DONE_MARKER"
-trap 'rm -f "$DONE_MARKER" 2>/dev/null || true' EXIT
+# Stall bookkeeping (impls/utils/stall_watchdog.py): the heartbeat file is rewritten on every
+# simulator tick and watched by main_carla's out-of-process nanny; the marker file is how a
+# SIGKILL from that nanny (exit 137, otherwise indistinguishable from a segfault) is attributed
+# to a stall rather than a crash.
+HEARTBEAT_FILE="$(mktemp -u "${TMPDIR:-/tmp}/ogbench_tick_XXXXXX")"
+STALL_MARKER="$(mktemp -u "${TMPDIR:-/tmp}/ogbench_stall_XXXXXX")"
+export OGBENCH_HEARTBEAT_FILE="$HEARTBEAT_FILE"
+export OGBENCH_STALL_MARKER="$STALL_MARKER"
+trap 'rm -f "$DONE_MARKER" "$HEARTBEAT_FILE" "$STALL_MARKER" 2>/dev/null || true' EXIT
+echo "[run_carla.sh] stall watchdog: timeout=${STALL_TIMEOUT_S:-<default 900>}s max_stall_retries=${MAX_STALL_RETRIES} heartbeat=${HEARTBEAT_FILE}"
 while :; do
   # Clear per attempt: a marker left by an earlier attempt must never make a later crash look
-  # like a completed run.
-  rm -f "$DONE_MARKER" 2>/dev/null || true
+  # like a completed run (or a later crash look like a stall).
+  rm -f "$DONE_MARKER" "$STALL_MARKER" "$HEARTBEAT_FILE" 2>/dev/null || true
   set +e
   WANDB_MODE="${WANDB_MODE}" uv run python impls/main_carla.py \
       --agent="${AGENT_CFG_TMP}" \
@@ -720,6 +747,7 @@ while :; do
     --save_video_local="${SAVE_VIDEO_LOCAL}" \
     --eval_only="${EVAL_ONLY}" \
     --eval_mode="${EVAL_MODE}" \
+    ${STALL_TIMEOUT_S:+--stall_timeout_s="${STALL_TIMEOUT_S}"} \
     --frozen_eval="${FROZEN_EVAL}" \
     ${STOP_SCORE_STREAK:+--stop_on_driving_score_streak="${STOP_SCORE_STREAK}"} \
     ${FROZEN_EVAL_OUT:+--frozen_eval_out="${FROZEN_EVAL_OUT}"} \
@@ -737,6 +765,25 @@ while :; do
   if [[ $CODE -eq 130 ]]; then
     echo "[run_carla.sh] interrupted (SIGINT); not restarting."
     exit 130
+  fi
+  # Stall: either main_carla's watchdog exited 87 itself, or its nanny SIGKILLed a process too
+  # wedged to do that (exit >=128 with the stall marker written). Both mean "the simulator
+  # stopped ticking and nothing crashed", which is invisible to the crash branch below.
+  if [[ $CODE -eq 87 || ( $CODE -ge 128 && -f "$STALL_MARKER" ) ]]; then
+    echo "[run_carla.sh] STALL detected (exit ${CODE}): $(cat "$STALL_MARKER" 2>/dev/null || echo 'no marker detail')"
+    stall_attempt=$((stall_attempt + 1))
+    if [[ "$MAX_STALL_RETRIES" -le 0 || $stall_attempt -gt "$MAX_STALL_RETRIES" ]]; then
+      echo "[run_carla.sh] stall retry budget exhausted (${stall_attempt}/${MAX_STALL_RETRIES}). Giving up."
+      exit "$CODE"
+    fi
+    echo "[run_carla.sh] cleaning up + resuming after stall (stall attempt ${stall_attempt}/${MAX_STALL_RETRIES})."
+    # The watchdog kills its own CARLA/Xvfb, but the nanny path (and any half-started run) may
+    # not have, and a leftover server holds ~7 GB of VRAM and the rpc port the retry needs.
+    pkill -9 -f "CarlaUE4.*-carla-rpc-port=${CARLA_PORT}" 2>/dev/null || true
+    pkill -9 -f "Xvfb :${X_DISPLAY_NUM} " 2>/dev/null || true
+    sleep 8
+    RESUME_FLAG="true"
+    continue
   fi
   if [[ $CODE -lt 128 ]]; then
     echo "[run_carla.sh] exited with code ${CODE} (not a crash signal); not restarting."
