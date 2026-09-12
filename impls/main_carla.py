@@ -403,6 +403,16 @@ flags.DEFINE_integer(
     "the policy keeps learning from the episode that solved the route. --max_hl_updates still "
     "applies as a hard cap, whichever comes first.",
 )
+flags.DEFINE_bool(
+    "fixed_train_carla_seed",
+    False,
+    "Pin the simulator seed to --carla_seed for TRAINING episodes too, instead of walking it as "
+    "carla_seed + episode_index. Off by default (training sees varied traffic). Turn it on to make "
+    "training and eval differ ONLY in the model's sampling seed: eval already replays carla_seed, "
+    "so with this set the two phases measure the same scenario and a train/eval gap can no longer "
+    "be blamed on the scenario distribution. The trade is that the policy only ever sees one "
+    "instance of the route, so vary --carla_seed across runs to recover scenario coverage.",
+)
 flags.DEFINE_integer(
     "stop_on_driving_score_streak", 1,
     "How many CONSECUTIVE episodes must reach --stop_on_driving_score before the stop is armed. "
@@ -5007,6 +5017,8 @@ def run_online_carla(
                         flush=True,
                     )
                 _reset_seed = int(_carla_seed)
+            elif FLAGS.fixed_train_carla_seed:
+                _reset_seed = int(_carla_seed)
             else:
                 _reset_seed = int(_carla_seed) + episode_count
             obs_raw, _info = env.reset(seed=_reset_seed)
@@ -5850,6 +5862,8 @@ def run_online_residual(
                             f"model seed={_sd}",
                             flush=True,
                         )
+                    _reset_seed = int(_carla_seed)
+                elif FLAGS.fixed_train_carla_seed:
                     _reset_seed = int(_carla_seed)
                 else:
                     _reset_seed = run_carla_seed() + episode_count

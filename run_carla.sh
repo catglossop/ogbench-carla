@@ -136,6 +136,7 @@ COT_TEMPERATURE=""
 HL_KL_COEF=""
 # Consecutive qualifying episodes required before --stop-on-score arms. Empty -> 1 (legacy).
 STOP_SCORE_STREAK=""
+FIXED_TRAIN_CARLA_SEED="false"
 # Crash supervisor: relaunch main_carla (resuming from checkpoint) after a CARLA native
 # crash (SIGSEGV/SIGABRT, exit code >=128). 0 disables the retry loop.
 MAX_RETRIES="${MAX_RETRIES:-50}"
@@ -225,6 +226,9 @@ Options:
   --grpo-group-size N       GRPO only: candidates sampled/scored per state (1 = single-sample).
   --grpo-score-temp T       GRPO only: candidate CoT sampling temperature (low/0 = near-greedy BoN).
   --cot-temperature T       Override config.steervla.cot_temperature (e.g. 1.0 to sample base CoTs).
+  --fixed-carla-seed [true|false]  Pin the sim seed to --carla-seed for TRAINING episodes too
+                            (eval already does). Train and eval then differ only in the
+                            model sampling seed. Bare = true. Default false.
   --stop-score-streak N     Require N CONSECUTIVE episodes at --stop-on-score before the
                             stop arms. Default 1 (a single qualifying episode).
   --hl-kl-coef F            KL penalty on the HL update, tethering the CoT policy to the
@@ -366,6 +370,9 @@ while [[ $# -gt 0 ]]; do
     --cot-temperature|--cot_temperature) COT_TEMPERATURE="$2"; shift 2 ;;
     --hl-kl-coef|--hl_kl_coef) HL_KL_COEF="$2"; shift 2 ;;
     --stop-score-streak|--stop_score_streak) STOP_SCORE_STREAK="$2"; shift 2 ;;
+    --fixed-carla-seed|--fixed_carla_seed)
+      if [[ "${2:-}" == "true" || "${2:-}" == "false" ]]; then FIXED_TRAIN_CARLA_SEED="$2"; shift 2;
+      else FIXED_TRAIN_CARLA_SEED="true"; shift 1; fi ;;
     --pretrained-critic|--pretrained_critic) PRETRAINED_CRITIC="$2"; shift 2 ;;
     --qgf-critic-ckpt|--qgf_critic_ckpt) QGF_CRITIC_CKPT="$2"; shift 2 ;;
     --qgf-guidance-weight|--qgf_guidance_weight) QGF_GUIDANCE_WEIGHT="$2"; shift 2 ;;
@@ -721,6 +728,7 @@ while :; do
     --eval_only="${EVAL_ONLY}" \
     --eval_mode="${EVAL_MODE}" \
     --frozen_eval="${FROZEN_EVAL}" \
+    --fixed_train_carla_seed="${FIXED_TRAIN_CARLA_SEED}" \
     ${STOP_SCORE_STREAK:+--stop_on_driving_score_streak="${STOP_SCORE_STREAK}"} \
     ${FROZEN_EVAL_OUT:+--frozen_eval_out="${FROZEN_EVAL_OUT}"} \
     ${POST_STOP_EVAL_EPISODES:+--post_stop_eval_episodes="${POST_STOP_EVAL_EPISODES}"} \
