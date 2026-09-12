@@ -117,6 +117,9 @@ STATE_ENCODER=""
 RLT_CHECKPOINT=""
 # Override the frozen base policy: e.g. deploy a relabelled Stage-1 ckpt. Empty -> config default.
 STEERVLA_CKPT=""
+FROZEN_EVAL="false"
+FROZEN_EVAL_OUT=""
+POST_STOP_EVAL_EPISODES=""
 ACTOR_CONFIG=""
 # GRPO-only: greedy-base warmup steps before scoring/updates begin. Empty -> config default (0).
 GRPO_WARMUP=""
@@ -128,6 +131,11 @@ GRPO_GROUP_SIZE=""
 GRPO_SCORE_TEMP=""
 # Override config.steervla.cot_temperature (e.g. 1.0 to sample the base CoT). Empty -> config default.
 COT_TEMPERATURE=""
+# Override config.steervla.hl_kl_coef: KL penalty tethering the HL CoT policy to its starting
+# checkpoint (loss = bc_loss + coef * KL). Empty -> config default (0.0 = off).
+HL_KL_COEF=""
+# Consecutive qualifying episodes required before --stop-on-score arms. Empty -> 1 (legacy).
+STOP_SCORE_STREAK=""
 # Crash supervisor: relaunch main_carla (resuming from checkpoint) after a CARLA native
 # crash (SIGSEGV/SIGABRT, exit code >=128). 0 disables the retry loop.
 MAX_RETRIES="${MAX_RETRIES:-50}"
@@ -206,12 +214,21 @@ Options:
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
   --max-episode-steps N     Override CARLA's per-episode step cap (0 = no cap).
   --steervla-checkpoint PATH  Override config.steervla.checkpoint (deploy a relabelled ckpt).
+  --frozen-eval [true|false]  Run ONLY frozen eval episodes from the checkpoint: no updates,
+                            no CAST review, no checkpointing. Replays --carla-seed with one
+                            --eval-seeds entry per episode. Writes run_summary_frozen_eval.json
+                            and leaves the original run_summary.json alone. Bare = true.
+  --post-stop-eval-episodes N  Number of frozen eval episodes (default 3).
   --actor-config NAME       Override config.steervla.actor_config (match the ckpt's model).
   --grpo-warmup N           GRPO only: drive the greedy base for N steps before scoring/updates.
   --grpo-select MODE        GRPO only: executed candidate = argmax|random|first. Default: argmax.
   --grpo-group-size N       GRPO only: candidates sampled/scored per state (1 = single-sample).
   --grpo-score-temp T       GRPO only: candidate CoT sampling temperature (low/0 = near-greedy BoN).
   --cot-temperature T       Override config.steervla.cot_temperature (e.g. 1.0 to sample base CoTs).
+  --stop-score-streak N     Require N CONSECUTIVE episodes at --stop-on-score before the
+                            stop arms. Default 1 (a single qualifying episode).
+  --hl-kl-coef F            KL penalty on the HL update, tethering the CoT policy to the
+                            checkpoint it started from (loss = bc_loss + F * KL). 0 = off.
 
   --pretrained-critic PATH  Path to a pretrained critic .pkl from pretrain_critic.py.
                             Injects obs_encoder + critic params before online training begins.
@@ -336,12 +353,19 @@ while [[ $# -gt 0 ]]; do
     --agent-config) BASE_AGENT_CFG="$2"; shift 2 ;;
     --carla-config) BASE_CARLA_CFG="$2"; shift 2 ;;
     --steervla-checkpoint|--steervla_checkpoint) STEERVLA_CKPT="$2"; shift 2 ;;
+    --frozen-eval|--frozen_eval)
+      if [[ "${2:-}" == "true" || "${2:-}" == "false" ]]; then FROZEN_EVAL="$2"; shift 2;
+      else FROZEN_EVAL="true"; shift 1; fi ;;
+    --post-stop-eval-episodes|--post_stop_eval_episodes) POST_STOP_EVAL_EPISODES="$2"; shift 2 ;;
+    --frozen-eval-out|--frozen_eval_out) FROZEN_EVAL_OUT="$2"; shift 2 ;;
     --actor-config|--actor_config) ACTOR_CONFIG="$2"; shift 2 ;;
     --grpo-warmup|--grpo_warmup) GRPO_WARMUP="$2"; shift 2 ;;
     --grpo-select|--grpo_select) GRPO_SELECT="$2"; shift 2 ;;
     --grpo-group-size|--grpo_group_size) GRPO_GROUP_SIZE="$2"; shift 2 ;;
     --grpo-score-temp|--grpo_score_temp) GRPO_SCORE_TEMP="$2"; shift 2 ;;
     --cot-temperature|--cot_temperature) COT_TEMPERATURE="$2"; shift 2 ;;
+    --hl-kl-coef|--hl_kl_coef) HL_KL_COEF="$2"; shift 2 ;;
+    --stop-score-streak|--stop_score_streak) STOP_SCORE_STREAK="$2"; shift 2 ;;
     --pretrained-critic|--pretrained_critic) PRETRAINED_CRITIC="$2"; shift 2 ;;
     --qgf-critic-ckpt|--qgf_critic_ckpt) QGF_CRITIC_CKPT="$2"; shift 2 ;;
     --qgf-guidance-weight|--qgf_guidance_weight) QGF_GUIDANCE_WEIGHT="$2"; shift 2 ;;
@@ -522,6 +546,7 @@ def get_config():
     _STEERVLA_CKPT = r"${STEERVLA_CKPT}"
     _ACTOR_CONFIG = r"${ACTOR_CONFIG}"
     _COT_TEMP = "${COT_TEMPERATURE}"
+    _HL_KL_COEF = "${HL_KL_COEF}"
     if "steervla" in config:
         if _STEERVLA_CKPT != "":
             config.steervla.checkpoint = _STEERVLA_CKPT
@@ -529,6 +554,8 @@ def get_config():
             config.steervla.actor_config = _ACTOR_CONFIG
         if _COT_TEMP != "":
             config.steervla.cot_temperature = float(_COT_TEMP)
+        if _HL_KL_COEF != "":
+            config.steervla.hl_kl_coef = float(_HL_KL_COEF)
         if _HL_CKPT_DIR != "":
             config.steervla.hl_checkpoint_dir = _HL_CKPT_DIR
         if _HL_CKPT_EVERY != "":
@@ -621,6 +648,7 @@ export PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla:${ROOT_DIR}/simlingo-rebuttal${
 
 echo "[run_carla.sh] agent_config=${BASE_AGENT_CFG}${STEERVLA_CKPT:+ steervla_checkpoint=${STEERVLA_CKPT}}${ACTOR_CONFIG:+ actor_config=${ACTOR_CONFIG}}"
 echo "[run_carla.sh] enable_updates=${ENABLE_UPDATES} base_only=${BASE_ONLY:-<config default>} state_encoder=${STATE_ENCODER:-<config default>}${RLT_CHECKPOINT:+ rlt_checkpoint=${RLT_CHECKPOINT}}"
+echo "[run_carla.sh] hl_kl_coef=${HL_KL_COEF:-<config default>}"
 echo "[run_carla.sh] hl_gpu_rank=${HL_TRAIN_GPU_RANK:-<config>} max_retries=${MAX_RETRIES}${GRPO_WARMUP:+ grpo_warmup=${GRPO_WARMUP}}${GRPO_SELECT:+ grpo_select=${GRPO_SELECT}}${GRPO_GROUP_SIZE:+ grpo_group_size=${GRPO_GROUP_SIZE}}${GRPO_SCORE_TEMP:+ grpo_score_temp=${GRPO_SCORE_TEMP}}${COT_TEMPERATURE:+ cot_temperature=${COT_TEMPERATURE}}"
 echo "[run_carla.sh] hl_ckpt_dir=${HL_CKPT_DIR:-<config>} hl_ckpt_every=${HL_CKPT_EVERY:-<config>} hl_ckpt_keep_last=${HL_CKPT_KEEP_LAST:-<config>}"
 
@@ -692,6 +720,10 @@ while :; do
     --save_video_local="${SAVE_VIDEO_LOCAL}" \
     --eval_only="${EVAL_ONLY}" \
     --eval_mode="${EVAL_MODE}" \
+    --frozen_eval="${FROZEN_EVAL}" \
+    ${STOP_SCORE_STREAK:+--stop_on_driving_score_streak="${STOP_SCORE_STREAK}"} \
+    ${FROZEN_EVAL_OUT:+--frozen_eval_out="${FROZEN_EVAL_OUT}"} \
+    ${POST_STOP_EVAL_EPISODES:+--post_stop_eval_episodes="${POST_STOP_EVAL_EPISODES}"} \
     "${EXTRA_ARGS[@]}" \
     --exp_name="${EXP_NAME}" \
     --resume="${RESUME_FLAG}"
