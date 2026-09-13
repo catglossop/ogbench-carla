@@ -660,10 +660,12 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
             # Busy shared hosts can stall UE4's render thread for more than the
             # Linux default of 60 s during initial world/shader setup.  Let that
             # startup finish instead of crashing the simulator watchdog.
-            "-g.TimeoutForBlockOnRenderFence=300000",
+            "-ExecCmds=g.TimeoutForBlockOnRenderFence 300000",
             f"-carla-rpc-port={rpc_port}",
             f"-graphicsadapter={sim_gpu_rank}",
         ]
+        if os.environ.get("CARLA_DISABLE_RENDER_THREAD_TIMEOUT") == "1":
+            cmd.append("-nothreadtimeout")
         streaming_port = int(getattr(args, "streaming_port", 0) or 0)
         if streaming_port > 0:
             cmd.append(f"-carla-streaming-port={streaming_port}")

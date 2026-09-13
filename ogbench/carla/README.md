@@ -44,6 +44,10 @@ WANDB_MODE=disabled .venv/bin/python impls/main_carla.py \
 
 ### Frozen Qwen critic best-of-N
 
+For the current zero-shot image-input setup, exact actor checkpoint, six-term weights,
+and launch commands, use the [Qwen BoN README](https://github.com/celineltan/qwen-critic/blob/main/README.md).
+The adapter-based example below is historical.
+
 `steervla_dsrl_config.py` defaults to the 14000-step commentary policy checkpoint on
 GCS. On machines with a RAID mirror, pass the local checkpoint explicitly when
 launching CARLA to avoid another large download. Start the critic from the
