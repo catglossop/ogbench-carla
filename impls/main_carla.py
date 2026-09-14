@@ -5570,7 +5570,7 @@ def run_online_residual(
     updates_per_step = int(config["updates_per_step"])
     capacity = int(config["buffer_capacity"])
     debug_task = bool(config.get("debug_task", False))
-    enable_updates = bool(FLAGS.enable_updates) if FLAGS.enable_updates is not None else bool(config["enable_updates"])
+    enable_updates = False if FLAGS.eval_only else (bool(FLAGS.enable_updates) if FLAGS.enable_updates is not None else bool(config["enable_updates"]))
     if base_only:
         print("[main_carla] base_only=True: rolling out the frozen base policy (no RL).", flush=True)
     elif not enable_updates:
@@ -6326,9 +6326,10 @@ def _run_residual_entry(config):
         else:
             from vlas.steervla import create_steervla_pi0_cot_sample_fn
 
-            vla_sample_fn, steervla_actor = create_steervla_pi0_cot_sample_fn(
-                steervla_cfg, raw_holder, training_gpu_rank=training_gpu_rank
-            )
+        vla_sample_fn, steervla_actor = create_steervla_pi0_cot_sample_fn(
+            steervla_cfg, raw_holder, training_gpu_rank=training_gpu_rank
+        )
+        steervla_actor.sampling_seed = int(run_train_seed())
 
         _configure_jax_training_device(training_gpu_rank)
 

@@ -7,7 +7,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
 PHYSICAL_GPU="${1:-${EVAL_GPU:-0}}"
-RUN_ROOT="${2:-${EVAL_ROOT:-/raid/users/${USER}/carla_exps/residual_rl_eval}}"
+RUN_ROOT="${2:-${EVAL_ROOT:-/raid/users/${USER}/carla_exps/evals/residual_rl}}"
 EVAL_LABEL="${EVAL_LABEL:-residual-rl-eval-20260908}"
 RUN_GROUP="${EVAL_RUN_GROUP:-ResidualRLEval}"
 # A fresh queue invocation must not collide in W&B with an earlier failed launch.
@@ -89,9 +89,9 @@ max_episode_steps=4000
 agent_config=impls/configs/steervla_residual_eval_config.py
 checkpoint=gs://cat-logs/pi05_steervla_cot_simplified_reasoning_ll_heavy/ll_heavy_unnormed_matchcrop/ll_heavy_unnormed_matchcrop_20260904_152800/6000
 state_encoder=siglip_pool
-residual_accel_scale=0.2
-residual_steer_scale=0.2
-residual_bc_beta=0.1
+residual_accel_scale=0.1
+residual_steer_scale=0.1
+residual_bc_beta=1.0
 residual_warmup_steps=1000
 residual_ramp_steps=1500
 actions_per_model_query=3
@@ -136,6 +136,7 @@ for route in "${ROUTES[@]}"; do
         --tm-port "$TM_PORT" \
         --x-display-num "$X_DISPLAY_NUM" \
         --run-group "$RUN_GROUP" \
+        --eval-mode \
         --save-buffer "$SAVE_BUFFER" \
         --save-video-local "$SAVE_VIDEO_LOCAL" \
         --wandb-mode "$WANDB_MODE" \

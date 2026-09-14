@@ -19,9 +19,9 @@ def get_config():
     # Same residual schedule and hyperparameters as the 10k residual evaluation.
     config.residual_warmup_steps = 1000
     config.residual_ramp_steps = 1500
-    config.residual_accel_scale = 0.2
-    config.residual_steer_scale = 0.2
-    config.residual_bc_beta = 0.1
+    config.residual_accel_scale = 0.1
+    config.residual_steer_scale = 0.1
+    config.residual_bc_beta = 1.0
     config.residual_bc_normalize = False
     config.expo = False
     config.best_of_n = 1
