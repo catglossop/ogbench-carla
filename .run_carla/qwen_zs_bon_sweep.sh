@@ -13,7 +13,9 @@
 # BENCH=b2d (default) reads b2dsubset_fixedcarla_kl005_seed0. For f2d set BENCH=f2d and
 # SOURCE_SWEEP explicitly (two f2d source sweeps exist). GPUs are never defaulted: --arm needs
 # QWEN_GPU (critic) and SWEEP_GPUS (one concurrent route per listed GPU, all sharing the critic).
-# Resumable: a cell with run_summary_frozen_eval.json is skipped on re-arm.
+# QWEN_GPU may also appear in SWEEP_GPUS; that worker then waits for GPU_FREE_MIB_SHARED instead.
+# Resumable: a cell with run_summary_frozen_eval.json is skipped on re-arm. A cell that ends
+# without a summary (e.g. a CARLA segfault) is re-queued from scratch up to CELL_RETRIES times.
 set -uo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
@@ -40,6 +42,7 @@ WATCHDOG_GRACE="${WATCHDOG_GRACE:-900}"
 WATCHDOG_STRIKES="${WATCHDOG_STRIKES:-6}"
 STALL_SECS="${STALL_SECS:-1800}"
 STALL_STRIKES="${STALL_STRIKES:-2}"
+CELL_RETRIES="${CELL_RETRIES:-1}"
 STOP_QWEN_AT_END="${STOP_QWEN_AT_END:-1}"
 
 MODE="dry"
@@ -52,6 +55,36 @@ esac; done
 mkdir -p "$LOG_DIR" "$RESULTS_DIR"
 QUEUE="${LOG_DIR}/queue.txt"; LOCK="${LOG_DIR}/queue.lock"; FAILED="${LOG_DIR}/failed.txt"
 log() { echo "[qzs $(date +%H:%M:%S)] $*" | tee -a "${LOG_DIR}/sweep.log"; }
+
+# Kill whatever a slot's run left behind. Killing the run script's process group is not enough:
+# run_carla.sh starts main_carla (under `uv run`) in its own session, and the CARLA wrapper gives
+# Xvfb and CarlaUE4 sessions of their own. After a CARLA segfault that left main_carla blocked
+# forever, still holding ~22 GB on the GPU. The slot's Xvfb display is the reliable handle: its
+# parent is that run's main_carla, whose session also holds the `uv run` wrapper.
+kill_slot_leftovers() {
+  local slot=$1 display=$((960 + $1)) port=$((17400 + $1 * 20))
+  local x mp sid found=0 sids=() xs=()
+  for x in $(pgrep -u "$USER" -f "^Xvfb :${display} " 2>/dev/null); do
+    xs+=("$x"); found=1
+    mp=$(ps -o ppid= -p "$x" 2>/dev/null | tr -d ' ')
+    if [ -n "$mp" ] && ps -o args= -p "$mp" 2>/dev/null | grep -qF "${ROOT_DIR}/.venv/bin/python3 impls/main_carla.py"; then
+      sid=$(ps -o sid= -p "$mp" 2>/dev/null | tr -d ' ')
+      [ -n "$sid" ] && sids+=("$sid")
+      pkill -TERM -P "$mp" 2>/dev/null
+    fi
+  done
+  pgrep -u "$USER" -f "carla-rpc-port=${port}( |$)" >/dev/null 2>&1 && found=1
+  [ "$found" = 1 ] || { rm -f "/tmp/.X${display}-lock"; return 0; }
+  for sid in "${sids[@]}"; do kill -TERM -- -"$sid" 2>/dev/null; done
+  for x in "${xs[@]}"; do kill -TERM "$x" 2>/dev/null; done
+  pkill -u "$USER" -TERM -f "carla-rpc-port=${port}( |$)" 2>/dev/null
+  sleep 10
+  for sid in "${sids[@]}"; do kill -9 -- -"$sid" 2>/dev/null; done
+  for x in "${xs[@]}"; do kill -9 "$x" 2>/dev/null; done
+  pkill -u "$USER" -9 -f "carla-rpc-port=${port}( |$)" 2>/dev/null
+  rm -f "/tmp/.X${display}-lock"
+  log "slot $slot: cleaned up leftover run processes (sessions: ${sids[*]:-none}, xvfb: ${xs[*]:-none})"
+}
 
 # route <TAB> final checkpoint <TAB> source eval mean, in ROUTES_FILE order. Only runs whose
 # run_summary.json names an existing final checkpoint count; anything else has no end of training.
@@ -128,11 +161,10 @@ if [ "$MODE" = stop ]; then
   for pf in "${LOG_DIR}"/running/*.pid; do
     [ -f "$pf" ] || continue
     kill -TERM -"$(cat "$pf")" 2>/dev/null; sleep 10; kill -9 -"$(cat "$pf")" 2>/dev/null
-    slot=$(basename "$pf" .pid)
-    pkill -u "$USER" -9 -f "carla-rpc-port=$((17400 + slot * 20))" 2>/dev/null
-    rm -f "/tmp/.X$((960 + slot))-lock" "$pf"
-    log "stopped slot $slot"
+    rm -f "$pf" "${pf%.pid}.job"
   done
+  # Slots are 0..7 at most (one per GPU); only this worktree's runs are ever touched.
+  for slot in 0 1 2 3 4 5 6 7; do kill_slot_leftovers "$slot"; done
   log "stopped. Critic left running: QWEN_PORT=${QWEN_PORT} ./.run_carla/qwen_zs_critic_server.sh stop"
   exit 0
 fi
@@ -143,7 +175,7 @@ for line in "${CKPTS[@]}"; do
   IFS=$'\t' read -r route ck _ <<< "$line"
   for s in $CARLA_SEEDS; do
     if [ -f "$(cell_dir "$route" "$s")/run_summary_frozen_eval.json" ]; then DONE=$((DONE + 1)); continue; fi
-    JOBS+=("${route}"$'\t'"${ck}"$'\t'"${s}")
+    JOBS+=("${route}"$'\t'"${ck}"$'\t'"${s}"$'\t'"0")
   done
 done
 
@@ -168,7 +200,7 @@ echo "  routes      : ${#CKPTS[@]} with a final checkpoint (from $ROUTES_FILE)"
 if [ -s "${LOG_DIR}/no_checkpoint.txt" ]; then
   echo "  skipped     : $(cut -f1 "${LOG_DIR}/no_checkpoint.txt" | tr '\n' ' ')(no final checkpoint)"
 fi
-echo "  cells       : $DONE done, ${#JOBS[@]} to run"
+echo "  cells       : $DONE done, ${#JOBS[@]} to run   (failed cells retried up to ${CELL_RETRIES}x)"
 echo "  save_dir    : $OGBENCH_SAVE_DIR"
 echo "  results     : $RESULTS_DIR"
 echo
@@ -180,7 +212,7 @@ echo
 
 if [ "$MODE" = dry ]; then
   if [ "${#JOBS[@]}" -gt 0 ]; then
-    IFS=$'\t' read -r route ck s <<< "${JOBS[0]}"
+    IFS=$'\t' read -r route ck s _ <<< "${JOBS[0]}"
     echo "  first job, as it would launch (GPU/SLOT shown as placeholders 0):"
     BENCH="$BENCH" QWEN_URL="$QWEN_URL" RUN_GROUP="$RUN_GROUP" DRY_RUN=1 \
       ./.run_carla/qwen_zs_bon_run.sh "$route" 0 0 "$ck" "$s" "$(cell_dir "$route" "$s")" | sed 's/^/    /'
@@ -205,16 +237,21 @@ if ! QWEN_PORT="$QWEN_PORT" ./.run_carla/qwen_zs_critic_server.sh status >/dev/n
   QWEN_PORT="$QWEN_PORT" QWEN_GPU="$QWEN_GPU" ./.run_carla/qwen_zs_critic_server.sh start 2>&1 | tee -a "${LOG_DIR}/sweep.log"
   QWEN_PORT="$QWEN_PORT" ./.run_carla/qwen_zs_critic_server.sh status >/dev/null 2>&1 || { log "critic failed to start; aborting"; exit 1; }
   STARTED_QWEN=1
+else
+  log "reusing healthy zero-shot critic at $QWEN_URL"
 fi
 
 next_job() { flock 9; local j; j=$(head -n1 "$QUEUE"); [ -n "$j" ] && sed -i '1d' "$QUEUE"; echo "$j"; } 9>>"$LOCK"
+requeue_job() { flock 9; printf '%s\n' "$1" >> "$QUEUE"; } 9>>"$LOCK"
 
 worker() {
   local slot=$1 gpu=$2 port=$((17400 + $1 * 20))
+  kill_slot_leftovers "$slot"
   while :; do
     local job; job=$(next_job)
     [ -z "$job" ] && { log "w$slot/gpu$gpu: queue empty"; break; }
-    local route ck s; IFS=$'\t' read -r route ck s <<< "$job"
+    local route ck s attempt; IFS=$'\t' read -r route ck s attempt <<< "$job"
+    attempt="${attempt:-0}"
     local tag="${route}__cs${s}" out; out=$(cell_dir "$route" "$s")
     # A worker sharing the critic's GPU starts with the critic's ~75 GB already in use.
     local free_mib="$GPU_FREE_MIB"
@@ -227,8 +264,9 @@ worker() {
     until QWEN_PORT="$QWEN_PORT" ./.run_carla/qwen_zs_critic_server.sh status >/dev/null 2>&1; do
       log "w$slot/gpu$gpu: critic unhealthy; waiting before $tag"; sleep 120
     done
-    log "w$slot/gpu$gpu: START $tag ($(basename "$ck"))"
+    log "w$slot/gpu$gpu: START $tag ($(basename "$ck"))$([ "$attempt" -gt 0 ] && echo " retry $attempt")"
     local rlog="${LOG_DIR}/${tag}.log"
+    [ "$attempt" -gt 0 ] && rlog="${LOG_DIR}/${tag}.retry${attempt}.log"
     BENCH="$BENCH" QWEN_URL="$QWEN_URL" RUN_GROUP="$RUN_GROUP" \
       setsid ./.run_carla/qwen_zs_bon_run.sh "$route" "$gpu" "$slot" "$ck" "$s" "$out" > "$rlog" 2>&1 &
     local rc=$!
@@ -236,14 +274,13 @@ worker() {
     # CARLA dying leaves no process; CARLA deadlocking leaves a silent log. Check both.
     ( sleep "$WATCHDOG_GRACE"; strikes=0; stalls=0
       while kill -0 "$rc" 2>/dev/null; do
-        if pgrep -u "$USER" -f "carla-rpc-port=${port}" >/dev/null 2>&1; then strikes=0; else strikes=$((strikes + 1)); fi
+        if pgrep -u "$USER" -f "carla-rpc-port=${port}( |$)" >/dev/null 2>&1; then strikes=0; else strikes=$((strikes + 1)); fi
         age=$(( $(date +%s) - $(stat -c %Y "$rlog" 2>/dev/null || date +%s) ))
         if [ "$age" -ge "$STALL_SECS" ]; then stalls=$((stalls + 1)); else stalls=0; fi
         if [ "$strikes" -ge "$WATCHDOG_STRIKES" ] || [ "$stalls" -ge "$STALL_STRIKES" ]; then
           log "w$slot/gpu$gpu: !! $tag carla_gone=$strikes stall=${age}s -- aborting"
           kill -TERM -"$rc" 2>/dev/null; sleep 15; kill -9 -"$rc" 2>/dev/null
-          pkill -u "$USER" -9 -f "carla-rpc-port=${port}" 2>/dev/null
-          rm -f "/tmp/.X$((960 + slot))-lock"
+          kill_slot_leftovers "$slot"
           break
         fi
         sleep 60
@@ -251,12 +288,17 @@ worker() {
     local wd=$!
     wait "$rc"; local code=$?
     kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
+    kill_slot_leftovers "$slot"
     rm -f "${LOG_DIR}/running/${slot}.pid" "${LOG_DIR}/running/${slot}.job"
     if [ -f "${out}/run_summary_frozen_eval.json" ]; then
       log "w$slot/gpu$gpu: DONE  $tag (exit $code)"
     else
       log "w$slot/gpu$gpu: FAIL  $tag (exit $code, no summary; log $rlog)"
-      echo "$(date --iso-8601=seconds) $tag exit=$code" >> "$FAILED"
+      echo "$(date --iso-8601=seconds) $tag attempt=$attempt exit=$code" >> "$FAILED"
+      if [ "$attempt" -lt "$CELL_RETRIES" ]; then
+        requeue_job "${route}"$'\t'"${ck}"$'\t'"${s}"$'\t'"$((attempt + 1))"
+        log "w$slot/gpu$gpu: requeued $tag for retry $((attempt + 1))/${CELL_RETRIES}"
+      fi
     fi
   done
 }
