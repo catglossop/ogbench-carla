@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# qwen_zs_bon_sweep.sh -- zero-shot Qwen BoN over the end-of-training checkpoints of a finished
+# CAST/HL sweep. One job per (route with a final checkpoint) x (carla seed); each job is a frozen
+# eval of N_EVAL episodes (qwen_zs_bon_run.sh), so the default 3 carla seeds give 9 episodes/route.
+#
+#   ./.run_carla/qwen_zs_bon_sweep.sh                         # dry run: print the plan
+#   QWEN_GPU=1 SWEEP_GPUS="5 6" nohup ./.run_carla/qwen_zs_bon_sweep.sh --arm \
+#       > .run_carla/jobs/qwen_zs_b2d_arm.log 2>&1 &
+#   ./.run_carla/qwen_zs_bon_sweep.sh --status
+#   ./.run_carla/qwen_zs_bon_sweep.sh --results               # per-route table + summary.csv
+#   ./.run_carla/qwen_zs_bon_sweep.sh --stop                  # workers + their CARLA; critic kept
+#
+# BENCH=b2d (default) reads b2dsubset_fixedcarla_kl005_seed0. For f2d set BENCH=f2d and
+# SOURCE_SWEEP explicitly (two f2d source sweeps exist). GPUs are never defaulted: --arm needs
+# QWEN_GPU (critic) and SWEEP_GPUS (one concurrent route per listed GPU, all sharing the critic).
+# Resumable: a cell with run_summary_frozen_eval.json is skipped on re-arm.
+set -uo pipefail
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+BENCH="${BENCH:-b2d}"
+case "$BENCH" in
+  b2d) SOURCE_SWEEP="${SOURCE_SWEEP:-b2dsubset_fixedcarla_kl005_seed0}"; ROUTES_FILE="${ROUTES_FILE:-b2d_subset.txt}" ;;
+  f2d) SOURCE_SWEEP="${SOURCE_SWEEP:?BENCH=f2d needs SOURCE_SWEEP (f2dsubset_fixedcarla_kl005_seed0 or f2dsubset_fixedcarla_kl001_8k_seed0)}"
+       ROUTES_FILE="${ROUTES_FILE:-f2d_subset.txt}" ;;
+  *) echo "[qzs] BENCH must be b2d or f2d" >&2; exit 2 ;;
+esac
+SOURCE_ROOT="${SOURCE_ROOT:-/raid/users/cglossop/sweeps/${SOURCE_SWEEP}}"
+CARLA_SEEDS="${CARLA_SEEDS:-0 1 2}"
+export N_EVAL="${N_EVAL:-3}"
+RUN_GROUP="${RUN_GROUP:-${SOURCE_SWEEP}_qwenzs_bon}"
+QWEN_PORT="${QWEN_PORT:-18850}"
+QWEN_URL="http://127.0.0.1:${QWEN_PORT}"
+export OGBENCH_SAVE_DIR="${OGBENCH_SAVE_DIR:-/raid/users/cglossop/sweeps/${RUN_GROUP}}"
+RESULTS_DIR="${RESULTS_DIR:-/raid/users/cglossop/sweep_results/${RUN_GROUP}}"
+LOG_DIR=".run_carla/jobs/${RUN_GROUP}"
+GPU_FREE_MIB="${GPU_FREE_MIB:-20000}"
+WATCHDOG_GRACE="${WATCHDOG_GRACE:-900}"
+WATCHDOG_STRIKES="${WATCHDOG_STRIKES:-6}"
+STALL_SECS="${STALL_SECS:-1800}"
+STALL_STRIKES="${STALL_STRIKES:-2}"
+STOP_QWEN_AT_END="${STOP_QWEN_AT_END:-1}"
+
+MODE="dry"
+for a in "$@"; do case "$a" in
+  --arm) MODE=arm ;; --dry-run) MODE=dry ;; --status) MODE=status ;;
+  --results) MODE=results ;; --stop) MODE=stop ;;
+  *) echo "[qzs] unknown arg: $a" >&2; exit 1 ;;
+esac; done
+
+mkdir -p "$LOG_DIR" "$RESULTS_DIR"
+QUEUE="${LOG_DIR}/queue.txt"; LOCK="${LOG_DIR}/queue.lock"; FAILED="${LOG_DIR}/failed.txt"
+log() { echo "[qzs $(date +%H:%M:%S)] $*" | tee -a "${LOG_DIR}/sweep.log"; }
+
+# route <TAB> final checkpoint <TAB> source eval mean, in ROUTES_FILE order. Only runs whose
+# run_summary.json names an existing final checkpoint count; anything else has no end of training.
+list_checkpoints() {
+  python3 - "$SOURCE_ROOT" "$ROUTES_FILE" <<'PY'
+import json, sys
+from pathlib import Path
+root, routes = Path(sys.argv[1]), [r for r in Path(sys.argv[2]).read_text().split() if r]
+best = {}
+for summ in root.rglob("run_summary.json"):
+    if "ckpt_evals" in summ.parts:
+        continue
+    d = json.loads(summ.read_text())
+    ck = (d.get("training") or {}).get("final_checkpoint")
+    if not ck or not (Path(ck) / "params").is_dir():
+        continue
+    prev = best.get(d["route"])
+    if prev is None or summ.stat().st_mtime > prev[0]:
+        best[d["route"]] = (summ.stat().st_mtime, ck, d.get("eval_mean_driving_score"))
+for r in routes:
+    if r in best:
+        _, ck, m = best[r]
+        print(f"{r}\t{ck}\t{'' if m is None else f'{m:.2f}'}")
+    else:
+        print(f"{r}\t-\t", file=sys.stderr)
+PY
+}
+
+cell_dir() { echo "${RESULTS_DIR}/$1/carla_seed_$2"; }
+
+if [ "$MODE" = results ]; then
+  python3 - "$RESULTS_DIR" "$SOURCE_ROOT" "$ROUTES_FILE" "$CARLA_SEEDS" <<'PY'
+import csv, json, sys
+from pathlib import Path
+res, src, routes, seeds = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]).read_text().split(), sys.argv[4].split()
+src_mean = {}
+for s in src.rglob("run_summary.json"):
+    if "ckpt_evals" not in s.parts:
+        d = json.loads(s.read_text()); src_mean[d["route"]] = d.get("eval_mean_driving_score")
+rows, allv = [], []
+print(f"{'route':50s} " + " ".join(f"cs{s:>2s}_mean" for s in seeds) + "   n  qwen_mean  train_eval_mean")
+for r in routes:
+    per, vals = [], []
+    for s in seeds:
+        f = res / r / f"carla_seed_{s}" / "run_summary_frozen_eval.json"
+        if f.exists():
+            e = json.loads(f.read_text()).get("eval") or []
+            sc = [x["driving_score"] for x in e]
+            vals += sc; per.append(sum(sc) / len(sc) if sc else None)
+            rows += [dict(route=r, carla_seed=s, eval_seed=x["eval_seed"], driving_score=x["driving_score"]) for x in e]
+        else:
+            per.append(None)
+    if not vals and r not in src_mean:
+        continue
+    allv += vals
+    fmt = lambda v: f"{v:9.2f}" if v is not None else "        -"
+    m = sum(vals) / len(vals) if vals else None
+    print(f"{r:50s} " + " ".join(fmt(v) for v in per) + f" {len(vals):3d} {fmt(m)}  {fmt(src_mean.get(r))}")
+if allv:
+    print(f"\noverall mean driving score over {len(allv)} episodes: {sum(allv) / len(allv):.2f}")
+with open(res / "summary.csv", "w", newline="") as fh:
+    w = csv.DictWriter(fh, fieldnames=["route", "carla_seed", "eval_seed", "driving_score"])
+    w.writeheader(); w.writerows(rows)
+print(f"per-episode rows -> {res / 'summary.csv'}")
+PY
+  exit 0
+fi
+
+if [ "$MODE" = stop ]; then
+  if [ -f "${LOG_DIR}/sweep.pgid" ]; then
+    kill -TERM -"$(cat "${LOG_DIR}/sweep.pgid")" 2>/dev/null && log "stopped sweep driver pgid $(cat "${LOG_DIR}/sweep.pgid")"
+    rm -f "${LOG_DIR}/sweep.pgid"
+  fi
+  for pf in "${LOG_DIR}"/running/*.pid; do
+    [ -f "$pf" ] || continue
+    kill -TERM -"$(cat "$pf")" 2>/dev/null; sleep 10; kill -9 -"$(cat "$pf")" 2>/dev/null
+    slot=$(basename "$pf" .pid)
+    pkill -u "$USER" -9 -f "carla-rpc-port=$((17400 + slot * 20))" 2>/dev/null
+    rm -f "/tmp/.X$((960 + slot))-lock" "$pf"
+    log "stopped slot $slot"
+  done
+  log "stopped. Critic left running: QWEN_PORT=${QWEN_PORT} ./.run_carla/qwen_zs_critic_server.sh stop"
+  exit 0
+fi
+
+mapfile -t CKPTS < <(list_checkpoints 2>"${LOG_DIR}/no_checkpoint.txt")
+JOBS=(); DONE=0
+for line in "${CKPTS[@]}"; do
+  IFS=$'\t' read -r route ck _ <<< "$line"
+  for s in $CARLA_SEEDS; do
+    if [ -f "$(cell_dir "$route" "$s")/run_summary_frozen_eval.json" ]; then DONE=$((DONE + 1)); continue; fi
+    JOBS+=("${route}"$'\t'"${ck}"$'\t'"${s}")
+  done
+done
+
+if [ "$MODE" = status ]; then
+  total=$(( ${#CKPTS[@]} * $(wc -w <<< "$CARLA_SEEDS") ))
+  echo "run group : $RUN_GROUP   (source $SOURCE_SWEEP, bench $BENCH)"
+  echo "cells     : $DONE / $total done, ${#JOBS[@]} remaining, $([ -f "$QUEUE" ] && wc -l < "$QUEUE" || echo 0) queued"
+  for pf in "${LOG_DIR}"/running/*.pid; do [ -f "$pf" ] && echo "running   : slot $(basename "$pf" .pid): $(cat "${pf%.pid}.job" 2>/dev/null)"; done
+  [ -s "$FAILED" ] && { echo "failed    :"; sed 's/^/  /' "$FAILED"; }
+  QWEN_PORT="$QWEN_PORT" ./.run_carla/qwen_zs_critic_server.sh status 2>&1 | head -1
+  exit 0
+fi
+
+echo
+echo "  run group   : $RUN_GROUP   (W&B entity catherineglossop)"
+echo "  bench       : $BENCH   carla: $([ "$BENCH" = b2d ] && echo '0.9.16 /home/cglossop/carla' || echo '0.9.15 /home/cglossop/f2d_carla')"
+echo "  source      : $SOURCE_ROOT"
+echo "  critic      : zero-shot Qwen3.8-27B (README settings) at $QWEN_URL"
+echo "  actor cfg   : ${ACTOR_CONFIG:-pi05_steervla_cot_simplified_reasoning_ll_heavy}"
+echo "  carla seeds : $CARLA_SEEDS   x ${N_EVAL} eval episodes each (model seeds carla_seed+1001..)"
+echo "  routes      : ${#CKPTS[@]} with a final checkpoint (from $ROUTES_FILE)"
+if [ -s "${LOG_DIR}/no_checkpoint.txt" ]; then
+  echo "  skipped     : $(cut -f1 "${LOG_DIR}/no_checkpoint.txt" | tr '\n' ' ')(no final checkpoint)"
+fi
+echo "  cells       : $DONE done, ${#JOBS[@]} to run"
+echo "  save_dir    : $OGBENCH_SAVE_DIR"
+echo "  results     : $RESULTS_DIR"
+echo
+printf '  %-52s %-7s %s\n' route ckpt train_eval_mean
+for line in "${CKPTS[@]}"; do
+  IFS=$'\t' read -r route ck m <<< "$line"; printf '  %-52s %-7s %s\n' "$route" "$(basename "$ck")" "$m"
+done
+echo
+
+if [ "$MODE" = dry ]; then
+  if [ "${#JOBS[@]}" -gt 0 ]; then
+    IFS=$'\t' read -r route ck s <<< "${JOBS[0]}"
+    echo "  first job, as it would launch (GPU/SLOT shown as placeholders 0):"
+    BENCH="$BENCH" QWEN_URL="$QWEN_URL" RUN_GROUP="$RUN_GROUP" DRY_RUN=1 \
+      ./.run_carla/qwen_zs_bon_run.sh "$route" 0 0 "$ck" "$s" "$(cell_dir "$route" "$s")" | sed 's/^/    /'
+  fi
+  echo; echo "  DRY RUN -- nothing launched. Arm with QWEN_GPU=<gpu> SWEEP_GPUS=\"<gpus>\" ... --arm"
+  exit 0
+fi
+
+# --arm
+: "${QWEN_GPU:?QWEN_GPU must be set to arm (physical GPU for the critic)}"
+: "${SWEEP_GPUS:?SWEEP_GPUS must be set to arm (space-separated physical GPUs, one route each)}"
+GPUS=($SWEEP_GPUS)
+# Own process group, so --stop can end the driver and its watchdogs without touching anyone else.
+if [ "$(ps -o pgid= $$ | tr -d ' ')" != "$$" ]; then exec setsid "$0" "$@"; fi
+echo "$$" > "${LOG_DIR}/sweep.pgid"
+mkdir -p "${LOG_DIR}/running"
+printf '%s\n' "${JOBS[@]}" | grep -v '^$' > "$QUEUE"; : > "$LOCK"
+log "armed: ${#JOBS[@]} cells on gpus ${GPUS[*]}, critic gpu ${QWEN_GPU} port ${QWEN_PORT}"
+
+STARTED_QWEN=0
+if ! QWEN_PORT="$QWEN_PORT" ./.run_carla/qwen_zs_critic_server.sh status >/dev/null 2>&1; then
+  QWEN_PORT="$QWEN_PORT" QWEN_GPU="$QWEN_GPU" ./.run_carla/qwen_zs_critic_server.sh start 2>&1 | tee -a "${LOG_DIR}/sweep.log"
+  QWEN_PORT="$QWEN_PORT" ./.run_carla/qwen_zs_critic_server.sh status >/dev/null 2>&1 || { log "critic failed to start; aborting"; exit 1; }
+  STARTED_QWEN=1
+fi
+
+next_job() { flock 9; local j; j=$(head -n1 "$QUEUE"); [ -n "$j" ] && sed -i '1d' "$QUEUE"; echo "$j"; } 9>>"$LOCK"
+
+worker() {
+  local slot=$1 gpu=$2 port=$((17400 + $1 * 20))
+  while :; do
+    local job; job=$(next_job)
+    [ -z "$job" ] && { log "w$slot/gpu$gpu: queue empty"; break; }
+    local route ck s; IFS=$'\t' read -r route ck s <<< "$job"
+    local tag="${route}__cs${s}" out; out=$(cell_dir "$route" "$s")
+    while :; do
+      local used; used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$gpu" 2>/dev/null | tr -d ' ')
+      [ "${used:-999999}" -lt "$GPU_FREE_MIB" ] && break
+      log "w$slot/gpu$gpu: gpu busy (${used} MiB); waiting before $tag"; sleep 300
+    done
+    until QWEN_PORT="$QWEN_PORT" ./.run_carla/qwen_zs_critic_server.sh status >/dev/null 2>&1; do
+      log "w$slot/gpu$gpu: critic unhealthy; waiting before $tag"; sleep 120
+    done
+    log "w$slot/gpu$gpu: START $tag ($(basename "$ck"))"
+    local rlog="${LOG_DIR}/${tag}.log"
+    BENCH="$BENCH" QWEN_URL="$QWEN_URL" RUN_GROUP="$RUN_GROUP" \
+      setsid ./.run_carla/qwen_zs_bon_run.sh "$route" "$gpu" "$slot" "$ck" "$s" "$out" > "$rlog" 2>&1 &
+    local rc=$!
+    echo "$rc" > "${LOG_DIR}/running/${slot}.pid"; echo "$tag" > "${LOG_DIR}/running/${slot}.job"
+    # CARLA dying leaves no process; CARLA deadlocking leaves a silent log. Check both.
+    ( sleep "$WATCHDOG_GRACE"; strikes=0; stalls=0
+      while kill -0 "$rc" 2>/dev/null; do
+        if pgrep -u "$USER" -f "carla-rpc-port=${port}" >/dev/null 2>&1; then strikes=0; else strikes=$((strikes + 1)); fi
+        age=$(( $(date +%s) - $(stat -c %Y "$rlog" 2>/dev/null || date +%s) ))
+        if [ "$age" -ge "$STALL_SECS" ]; then stalls=$((stalls + 1)); else stalls=0; fi
+        if [ "$strikes" -ge "$WATCHDOG_STRIKES" ] || [ "$stalls" -ge "$STALL_STRIKES" ]; then
+          log "w$slot/gpu$gpu: !! $tag carla_gone=$strikes stall=${age}s -- aborting"
+          kill -TERM -"$rc" 2>/dev/null; sleep 15; kill -9 -"$rc" 2>/dev/null
+          pkill -u "$USER" -9 -f "carla-rpc-port=${port}" 2>/dev/null
+          rm -f "/tmp/.X$((960 + slot))-lock"
+          break
+        fi
+        sleep 60
+      done ) &
+    local wd=$!
+    wait "$rc"; local code=$?
+    kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
+    rm -f "${LOG_DIR}/running/${slot}.pid" "${LOG_DIR}/running/${slot}.job"
+    if [ -f "${out}/run_summary_frozen_eval.json" ]; then
+      log "w$slot/gpu$gpu: DONE  $tag (exit $code)"
+    else
+      log "w$slot/gpu$gpu: FAIL  $tag (exit $code, no summary; log $rlog)"
+      echo "$(date --iso-8601=seconds) $tag exit=$code" >> "$FAILED"
+    fi
+  done
+}
+
+for i in "${!GPUS[@]}"; do worker "$i" "${GPUS[$i]}" & sleep 8; done
+wait
+log "sweep complete"
+./.run_carla/qwen_zs_bon_sweep.sh --results 2>&1 | tee "${RESULTS_DIR}/summary.txt"
+if [ "$STARTED_QWEN" = 1 ] && [ "$STOP_QWEN_AT_END" = 1 ]; then
+  QWEN_PORT="$QWEN_PORT" ./.run_carla/qwen_zs_critic_server.sh stop
+fi
+rm -f "${LOG_DIR}/sweep.pgid"
