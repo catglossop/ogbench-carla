@@ -35,6 +35,7 @@ export OGBENCH_SAVE_DIR="${OGBENCH_SAVE_DIR:-/raid/users/cglossop/sweeps/${RUN_G
 RESULTS_DIR="${RESULTS_DIR:-/raid/users/cglossop/sweep_results/${RUN_GROUP}}"
 LOG_DIR=".run_carla/jobs/${RUN_GROUP}"
 GPU_FREE_MIB="${GPU_FREE_MIB:-20000}"
+GPU_FREE_MIB_SHARED="${GPU_FREE_MIB_SHARED:-100000}"
 WATCHDOG_GRACE="${WATCHDOG_GRACE:-900}"
 WATCHDOG_STRIKES="${WATCHDOG_STRIKES:-6}"
 STALL_SECS="${STALL_SECS:-1800}"
@@ -215,9 +216,12 @@ worker() {
     [ -z "$job" ] && { log "w$slot/gpu$gpu: queue empty"; break; }
     local route ck s; IFS=$'\t' read -r route ck s <<< "$job"
     local tag="${route}__cs${s}" out; out=$(cell_dir "$route" "$s")
+    # A worker sharing the critic's GPU starts with the critic's ~75 GB already in use.
+    local free_mib="$GPU_FREE_MIB"
+    [ "$gpu" = "$QWEN_GPU" ] && free_mib="$GPU_FREE_MIB_SHARED"
     while :; do
       local used; used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$gpu" 2>/dev/null | tr -d ' ')
-      [ "${used:-999999}" -lt "$GPU_FREE_MIB" ] && break
+      [ "${used:-999999}" -lt "$free_mib" ] && break
       log "w$slot/gpu$gpu: gpu busy (${used} MiB); waiting before $tag"; sleep 300
     done
     until QWEN_PORT="$QWEN_PORT" ./.run_carla/qwen_zs_critic_server.sh status >/dev/null 2>&1; do

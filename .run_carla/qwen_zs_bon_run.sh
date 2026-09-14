@@ -90,6 +90,9 @@ CMD=(
   --agent.steervla.actions_per_model_query=3
   --agent.steervla.proprio_norm=false
 )
+# The actor restores inference-only params (no optimizer/train state), which is what lets it share
+# a GPU with the critic: steervla_dsrl_config.py has no load_trainable_params key, so
+# SteerVLAActor's default False applies (and the key cannot be overridden from the command line).
 
 echo "[qwen_zs_run] bench=$BENCH route=$ROUTE gpu=$GPU slot=$SLOT rpc=$CARLA_PORT tm=$TM_PORT display=:$DISPLAY_NUM"
 echo "[qwen_zs_run] carla_root=${CARLA_0915_ROOT:-$CARLA_ROOT} ckpt=$CKPT actor_config=$ACTOR_CONFIG"
