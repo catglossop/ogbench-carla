@@ -4053,6 +4053,9 @@ def run_online_carla(
     _eval_every = max(0, int(FLAGS.eval_every_env_steps))
     _next_periodic_eval = _eval_every
     _periodic_eval_pending = False  # cadence reached: updates frozen, waiting for the episode to end
+    # --eval-mode: the --online_steps TRAINING budget was reached mid-episode. Updates are frozen at
+    # the budget checkpoint; the episode finishes, then the post-stop eval measures those weights.
+    _budget_stop_pending = False
     _periodic_eval_active = False  # frozen eval episodes running
     _periodic_eval_start_step = 0
     _periodic_eval_steps = 0
@@ -4065,9 +4068,18 @@ def run_online_carla(
         if train_step > FLAGS.online_steps:
             # Training budget spent. Identical to the old ``range(1, online_steps + 1)`` bound
             # unless the eval phase is mid-flight, in which case it runs on to finish.
-            if eval_started_step is None:
+            if _budget_stop_pending and eval_started_step is None:
+                # Frozen tail of the episode that crossed the budget; its end starts the eval.
+                if train_step - FLAGS.online_steps > eval_step_budget:
+                    print(
+                        f"[main_carla] episode never ended within {eval_step_budget} steps of the "
+                        f"training budget; stopping without the post-stop eval.",
+                        flush=True,
+                    )
+                    break
+            elif eval_started_step is None:
                 break
-            if step - eval_started_step > eval_step_budget:
+            elif step - eval_started_step > eval_step_budget:
                 print(
                     f"[main_carla] post-stop eval exceeded its {eval_step_budget}-step budget after "
                     f"{len(eval_scores)}/{FLAGS.post_stop_eval_episodes} episodes; stopping.",
@@ -4995,6 +5007,10 @@ def run_online_carla(
                     _set_eval_stuck_cutoff(False)
                     _periodic_eval_steps += step - _periodic_eval_start_step
                     _periodic_eval_active = False
+                    # Weights were frozen from the eval's checkpoint until now, so any threshold crossed
+                    # while waiting for the episode to end would re-evaluate the same weights: skip them.
+                    while _next_periodic_eval <= train_step:
+                        _next_periodic_eval += _eval_every
                     eval_phase = False
                     eval_scores = []
                 elif len(eval_scores) >= max(1, int(FLAGS.post_stop_eval_episodes)):
@@ -5005,6 +5021,22 @@ def run_online_carla(
                         f"({', '.join(f'{v:.2f}' for v in eval_scores)}); stopping.",
                         flush=True,
                     )
+                    try:
+                        with open(os.path.join(FLAGS.save_dir, "periodic_evals.jsonl"), "a") as _pe:
+                            _pe.write(json.dumps({
+                                "route": str(FLAGS.route or ""),
+                                "train_env_step": int(_final_ckpt_step if _final_ckpt_step is not None else train_step),
+                                "env_step": int(step),
+                                "hl_updates_applied": int(_hl_applied),
+                                "carla_seed": int(_carla_seed),
+                                "eval_seeds": [int(x) for x in _eval_seeds[: len(eval_scores)]],
+                                "driving_scores": [float(x) for x in eval_scores],
+                                "mean_driving_score": float(_mean),
+                                "final": True,
+                                "stop_reason": str(stop_reason),
+                            }) + "\n")
+                    except Exception as _exc:  # noqa: BLE001 - never break the run over a results file
+                        print(f"[main_carla] could not write periodic_evals.jsonl: {_exc}", flush=True)
                     wandb.log(
                         {
                             "eval/mean_driving_score": _mean,
@@ -5086,6 +5118,11 @@ def run_online_carla(
                     )
                 elif FLAGS.max_hl_updates > 0 and _hl_applied >= FLAGS.max_hl_updates:
                     stop_reason = f"{_hl_applied} HL updates applied >= cap {FLAGS.max_hl_updates}"
+                elif _budget_stop_pending:
+                    stop_reason = (
+                        f"training budget of {FLAGS.online_steps} train steps reached "
+                        f"at {_hl_applied} HL updates"
+                    )
                 if stop_reason:
                     eval_phase = True
                     eval_started_step = step
@@ -5097,8 +5134,12 @@ def run_online_carla(
                         # count happens to be. Without this a run that stopped at, say, 3100 steps
                         # would leave only the 2000-step checkpoint on disk and the trained policy
                         # would be unrecoverable.
-                        _save_steervla_ckpt(int(train_step), final=True)
-                        _final_ckpt_step = int(train_step)
+                        # A budget stop froze the weights at the --online_steps checkpoint; when the
+                        # periodic ladder already wrote it, point at that file instead of a copy.
+                        _final_tag = int(FLAGS.online_steps) if _budget_stop_pending else int(train_step)
+                        if not (_budget_stop_pending and _hl_ckpt_on and _final_tag % _hl_ckpt_every == 0):
+                            _save_steervla_ckpt(_final_tag, final=True)
+                        _final_ckpt_step = _final_tag
                     # Freeze everything: these gates are read live further down the loop.
                     rl_updates_on = bc_updates_on = hl_updates_on = any_updates_on = False
                     # Drop the CAST reviewer too -- every use of it is None-guarded. Otherwise the
@@ -5283,11 +5324,36 @@ def run_online_carla(
             if agent is not None and (rl_updates_on or bc_updates_on) and step % FLAGS.save_interval == 0:
                 save_agent(agent, FLAGS.save_dir, step)
             # Named by TRAINING step, so periodic-eval env steps never shift the checkpoint ladder.
-            _save_steervla_ckpt(train_step)
-            if _eval_every > 0 and not _periodic_eval_pending and train_step >= _next_periodic_eval:
+            # Not in a budget stop's frozen tail: those would be copies of the budget checkpoint.
+            if not _budget_stop_pending:
+                _save_steervla_ckpt(train_step)
+            if FLAGS.eval_mode and not _budget_stop_pending and train_step >= FLAGS.online_steps:
+                # Training budget reached: stop here rather than breaking out with no eval. Freeze the
+                # just-checkpointed weights, drop any pending periodic eval (the post-stop eval measures
+                # the same weights) and the CAST reviewer (nothing will train on its samples); the
+                # stop fires when this episode ends.
+                _budget_stop_pending = True
+                _periodic_eval_pending = False
+                _periodic_saved_gates = None
+                rl_updates_on = bc_updates_on = hl_updates_on = any_updates_on = False
+                _cast_relabel = None
+                print(
+                    f"[main_carla] training budget reached at train step {train_step}: updates frozen; "
+                    f"{FLAGS.post_stop_eval_episodes} eval episodes run when this episode ends.",
+                    flush=True,
+                )
+            elif (
+                _eval_every > 0
+                and not _budget_stop_pending
+                and not _periodic_eval_pending
+                and train_step >= _next_periodic_eval
+            ):
                 # Freeze now so the eval measures exactly the weights just checkpointed; the eval
                 # episodes start at the next episode boundary.
-                _next_periodic_eval += _eval_every
+                # Skip every threshold already passed: an episode that outlives a threshold would
+                # otherwise leave it behind and re-trigger an eval of the same frozen weights.
+                while _next_periodic_eval <= train_step:
+                    _next_periodic_eval += _eval_every
                 _periodic_eval_pending = True
                 _periodic_saved_gates = (rl_updates_on, bc_updates_on, hl_updates_on, any_updates_on)
                 rl_updates_on = bc_updates_on = hl_updates_on = any_updates_on = False

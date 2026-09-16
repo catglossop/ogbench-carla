@@ -16,6 +16,9 @@
 # (ckpt_evals/<step>/run_summary_frozen_eval.json), is reported from its LATEST such checkpoint and
 # marked as such -- those are different weights from every other row's final checkpoint.
 #
+# Optional RESULT_TRAIN_STEP (e.g. 10000): a run that trained past that many train steps is reported
+# by the frozen eval of its checkpoint at that step (from periodic_evals.jsonl), not its final one.
+#
 # Re-runnable at any time; the sweep calls it after every route so the folder is current mid-run.
 set -uo pipefail
 SAVE_DIR="${OGBENCH_SAVE_DIR:?set OGBENCH_SAVE_DIR}"
@@ -24,7 +27,8 @@ SWEEP="${SWEEP:-$(basename "$SAVE_DIR")}"
 ROUTES_FILE="${ROUTES_FILE:-}"
 mkdir -p "$RESULTS_DIR/summaries"
 
-SAVE_DIR="$SAVE_DIR" RESULTS_DIR="$RESULTS_DIR" SWEEP="$SWEEP" ROUTES_FILE="$ROUTES_FILE" python3 - <<'PY'
+SAVE_DIR="$SAVE_DIR" RESULTS_DIR="$RESULTS_DIR" SWEEP="$SWEEP" ROUTES_FILE="$ROUTES_FILE" \
+RESULT_TRAIN_STEP="${RESULT_TRAIN_STEP:-}" python3 - <<'PY'
 import json, os, re, shutil
 from pathlib import Path
 
@@ -35,6 +39,7 @@ if _rf:
     if not Path(_rf).is_file():
         raise SystemExit(f"[sweep_results] ROUTES_FILE {_rf} does not exist")
     ALLOWED = {l.strip() for l in open(_rf) if l.strip() and not l.lstrip().startswith("#")}
+RESULT_TRAIN_STEP = int(os.environ.get("RESULT_TRAIN_STEP", "") or 0)
 
 
 def _eval_cutoff(run_dir):
@@ -47,6 +52,32 @@ def _eval_cutoff(run_dir):
     except Exception:
         return None
     return "60s" if (v is not None and int(v) > 0) else "1s"
+
+
+def _eval_at_train_step(run_dir, training):
+    """With RESULT_TRAIN_STEP set and a run whose final checkpoint is past it: the frozen eval of its
+    RESULT_TRAIN_STEP checkpoint, i.e. the first periodic_evals.jsonl record at or after that train step
+    (updates stay frozen from a checkpoint until its periodic eval). None when not applicable."""
+    if not RESULT_TRAIN_STEP:
+        return None
+    last = str(training.get("final_checkpoint") or "").rsplit("/", 1)[-1]
+    if not last.isdigit() or int(last) <= RESULT_TRAIN_STEP:
+        return None
+    pj = Path(run_dir) / "periodic_evals.jsonl"
+    if not pj.exists():
+        return None
+    for line in pj.read_text().splitlines():
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if int(r.get("train_env_step", -1)) >= RESULT_TRAIN_STEP:
+            return dict(
+                eval=[{"eval_seed": s, "driving_score": v}
+                      for s, v in zip(r.get("eval_seeds", []), r.get("driving_scores", []))],
+                hl_updates=r.get("hl_updates_applied"),
+            )
+    return None
 
 
 def _sd(vals):
@@ -72,12 +103,16 @@ for p in sorted(save.rglob("run_summary.json")):
         continue
     shutil.copy2(p, out / "summaries" / f"{d.get('route','unknown')}.json")
     t, ev = d.get("training", {}), list(d.get("eval", []))
+    _at = _eval_at_train_step(p.parent, t)
+    if _at is not None:
+        ev = list(_at["eval"])
     # Extra eval seeds run later against the same final checkpoint (frozen_eval_sweep.sh) live
     # beside the original summary. Pool them: they evaluate the same weights with the same
     # carla_seed, differing only in model seed, so 1001-1003 and 1004-1006 are interchangeable
     # draws and the pooled mean is simply a better-estimated version of the same quantity.
     fe = p.parent / "run_summary_frozen_eval.json"
-    if fe.exists():
+    # Extra seeds evaluate the final checkpoint, so they never pool into a RESULT_TRAIN_STEP row.
+    if fe.exists() and _at is None:
         try:
             ev += list(json.loads(fe.read_text()).get("eval", []))
             shutil.copy2(fe, out / "summaries" / f"{d.get('route','unknown')}.frozen_eval.json")
@@ -90,7 +125,7 @@ for p in sorted(save.rglob("run_summary.json")):
             continue
         seen_sd.add(sd); ev_u.append(e)
     ev = ev_u
-    n_orig = len(d.get("eval", []))
+    n_orig = len(ev) if _at is not None else len(d.get("eval", []))
     ev_old, ev_new = ev[:n_orig], ev[n_orig:]
     # Intermediate-checkpoint eval (ckpt_eval_at_step.sh). Reported ALONGSIDE the headline, never
     # pooled into it: these are different weights, so averaging them with the final checkpoint's
@@ -110,8 +145,12 @@ for p in sorted(save.rglob("run_summary.json")):
     rows.append(dict(
         route=d.get("route", "?"),
         seeds=f"{d.get('seeds',{}).get('carla_seed','?')}/{d.get('seeds',{}).get('train_seed','?')}",
-        stop="score" if "past driving_score" in str(t.get("stop_reason", "")) else "cap",
-        grad=t.get("hl_updates_applied"), env=t.get("env_steps"),
+        stop=(f"@{RESULT_TRAIN_STEP}" if _at is not None
+              else "score" if "past driving_score" in str(t.get("stop_reason", ""))
+              else "budget" if "training budget" in str(t.get("stop_reason", ""))
+              else "manual" if "stopped manually" in str(t.get("stop_reason", ""))
+              else "cap"),
+        grad=_at["hl_updates"] if _at is not None else t.get("hl_updates_applied"), env=t.get("env_steps"),
         train_ds=t.get("final_driving_score"),
         evals=[e.get("driving_score") for e in ev],
         eval_seeds=[e.get("eval_seed") for e in ev],
@@ -129,7 +168,7 @@ for p in sorted(save.rglob("run_summary.json")):
         # them under --fixed_train_carla_seed, so this is spread attributable to the model's
         # sampling seed alone. Needs >= 2 episodes.
         eval_sd=_sd([e.get("driving_score") for e in ev]),
-        ckpt=str(t.get("final_checkpoint") or "").rsplit("/", 1)[-1],
+        ckpt=str(RESULT_TRAIN_STEP) if _at is not None else str(t.get("final_checkpoint") or "").rsplit("/", 1)[-1],
         from_ckpt="",
         eval_cutoff=_eval_cutoff(p.parent),
     ))
@@ -245,6 +284,10 @@ md = [f"# {sweep}", "",
       f"Extra eval seeds run so far: {n_new}/{len(rows)} routes. Same final checkpoint, same "
       f"carla_seed, different model seed -- pooled with the originals as interchangeable draws.",
       "", ]
+if RESULT_TRAIN_STEP:
+    md += [f"Scored at {RESULT_TRAIN_STEP} train steps: a run that trained past it is reported by the frozen "
+           f"eval of its {RESULT_TRAIN_STEP} checkpoint (stop `@{RESULT_TRAIN_STEP}`; grad = HL updates at that "
+           f"checkpoint), not by its final checkpoint.", ""]
 if ALLOWED is not None:
     md += [f"Routes restricted to `{_rf}` ({len(ALLOWED)} listed).", ""]
 def _succ(rs):
