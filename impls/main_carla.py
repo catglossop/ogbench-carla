@@ -3141,6 +3141,14 @@ def run_online_carla(
                 for j, line in enumerate(wrapped):
                     rendered.append((line, color, swatch if j == 0 else None))
 
+            scene_description = candidates.get("scene_description") or ""
+            if isinstance(scene_description, dict):
+                scene_description = scene_description.get("text") or ""
+            if scene_description:
+                _append_wrapped(
+                    f"Qwen scene (last query): {_clean_overlay_text(str(scene_description))}",
+                    heading,
+                )
             _append_wrapped("Best-of-N candidates:", heading)
             has_term_scores = len(qwen_scores) == n
             for i in range(n):
@@ -3162,6 +3170,11 @@ def run_online_carla(
                         f"P(offroad)={float(scores['offroad']):.3f}  "
                         f"P(traffic)={float(scores['traffic_violation']):.3f}  "
                         f"E(progress)={float(scores['progress']):.3f}"
+                    )
+                    expert_probability = scores.get("correctness")
+                    score_line += (
+                        f"  P(expert)={float(expert_probability):.3f}"
+                        if expert_probability is not None else "  P(expert)=n/a"
                     )
                     status_color = (120, 255, 120) if accepted_text == "ACCEPT" else (120, 120, 255)
                     _append_wrapped(score_line, status_color)
@@ -3709,6 +3722,7 @@ def run_online_carla(
             "subtasks": candidate_subtasks,
             "chunks": chunks_np,
             "qwen_scores": result["scores"],
+            "scene_description": result.get("scene_description"),
             "accepted": result["accepted"],
             "qwen_timings": result.get("timings", {}),
         }
