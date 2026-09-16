@@ -557,6 +557,9 @@ def get_config():
     if "steervla" in config:
         if _STEERVLA_CKPT != "":
             config.steervla.checkpoint = _STEERVLA_CKPT
+            if str(config.steervla.get("vla", "steervla")) == "simlingo_steervla":
+                # SimLingo reloads only the (trained) HL; the LL stays at steervla.ll_checkpoint.
+                config.steervla.hl_checkpoint = _STEERVLA_CKPT
         if _ACTOR_CONFIG != "":
             config.steervla.actor_config = _ACTOR_CONFIG
         if _COT_TEMP != "":
