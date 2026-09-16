@@ -24,10 +24,8 @@ HL_UPDATE_NUM_STEPS = 10
 ACTIONS_PER_MODEL_QUERY = 3
 
 
-def get_config():
-    config = get_cast_relabel_train_config()
-    s = config.steervla
-
+def apply_simlingo_steervla(s):
+    """Point a ``config.steervla`` block at the SimLingo HL -> LL policy (shared with the residual config)."""
     s.vla = "simlingo_steervla"
     s.simlingo_source_root = "/home/cglossop/simlingo-steervla"
     s.hl_checkpoint = f"{_CKPT_ROOT}/2026_05_24_06_52_33_simlingo_seed1_bellman/checkpoints/epoch=019.ckpt"
@@ -38,6 +36,15 @@ def get_config():
     # Native 1024x512 rgb_front; same mount/fov as SimLingo's rgb_simlingo camera. Also the frame
     # cast_relabel stores in HL samples (main_carla reads steervla.image_key there).
     s.image_key = "image_viz"
+    # HL CoT decoding: 0 = greedy (run_carla.sh --cot-temperature overrides).
+    s.cot_temperature = 0.0
+    s.actions_per_model_query = ACTIONS_PER_MODEL_QUERY
+    return s
+
+
+def get_config():
+    config = get_cast_relabel_train_config()
+    s = apply_simlingo_steervla(config.steervla)
 
     # HL (torch) update. hl_training_gpu_rank (inherited) places the HL model on its own GPU.
     # ``hl_update_every`` counts update_with_vla calls, not env steps -- converted exactly as in
@@ -67,8 +74,6 @@ def get_config():
     s.hl_online_precursor_fraction = 60.0 / 90.0
     s.use_adaptive_sampling = False  # kl005 had it on; off by choice for the SimLingo runs.
 
-    # HL CoT decoding: 0 = greedy (run_carla.sh --cot-temperature overrides). The HL (actions_per_cot, inherited 5) is only re-planned on
-    # an LL query step once it is that old, so with the LL every 3 steps the HL refreshes every 6.
-    s.cot_temperature = 0.0
-    s.actions_per_model_query = ACTIONS_PER_MODEL_QUERY
+    # The HL (actions_per_cot, inherited 5) is only re-planned on an LL query step once it is that old,
+    # so with the LL every 3 steps the HL refreshes every 6.
     return config

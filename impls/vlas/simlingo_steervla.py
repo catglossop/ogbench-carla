@@ -877,6 +877,13 @@ def create_simlingo_steervla_sample_fn(
     for key in ("hl_checkpoint", "ll_checkpoint", "simlingo_source_root"):
         if not steervla_cfg.get(key):
             raise ValueError(f"steervla.vla='simlingo_steervla' requires steervla.{key}")
+    generic_ckpt = str(steervla_cfg.get("checkpoint") or "")
+    if generic_ckpt and generic_ckpt != str(steervla_cfg["hl_checkpoint"]):
+        print(
+            f"[simlingo_steervla] steervla.checkpoint={generic_ckpt} is not used; the HL loads from "
+            f"steervla.hl_checkpoint={steervla_cfg['hl_checkpoint']}",
+            flush=True,
+        )
     actor = SimLingoSteerVLAActor(
         hl_checkpoint=str(steervla_cfg["hl_checkpoint"]),
         ll_checkpoint=str(steervla_cfg["ll_checkpoint"]),

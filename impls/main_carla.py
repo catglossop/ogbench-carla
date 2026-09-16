@@ -1264,6 +1264,41 @@ def _make_carla_env(
     return CarlaBench2DriveWrapper(cfg, route=route)
 
 
+def _is_simlingo_steervla(steervla_cfg) -> bool:
+    return steervla_cfg is not None and str(steervla_cfg.get("vla", "steervla")).strip().lower() == "simlingo_steervla"
+
+
+def _check_simlingo_steervla_support(config, *, residual_entry: bool) -> None:
+    """Fail at startup on options that read OpenPI Pi0 internals the SimLingo actor does not have.
+
+    ``vlas/simlingo_steervla.py`` implements the rollout contract (``vla_sample_fn``, text stashes,
+    ``update_hl``, ``save_checkpoint``) but no Pi0 prefix/suffix features, candidate batches or policy
+    embeddings, so these options would otherwise die with an AttributeError mid-run.
+    """
+    if not _is_simlingo_steervla(config.get("steervla", None)):
+        return
+    bad: list[str] = []
+    if residual_entry:
+        # agent_name='sac_residual' -> run_online_residual.
+        if not bool(config.get("base_only", False)):
+            encoder = str(config.get("state_encoder", "pi_prefix"))
+            if encoder != "siglip_pool":
+                bad.append(f"state_encoder={encoder!r} (only 'siglip_pool' is Pi0-independent)")
+            if bool(config.get("expo", True)):
+                bad.append("expo=True (EXPO best-of-N samples Pi0 CoT candidates; set expo=False)")
+    else:
+        if str(config.get("observation_mode", "state")) == "policy_embed":
+            bad.append("observation_mode='policy_embed'")
+        for key in ("residual_use_pi_image_features", "critic_use_pi_prefix_features"):
+            if bool(config.get(key, False)):
+                bad.append(f"{key}=True")
+        for flag in ("bon_critic_ckpt", "bon_online_critic", "bon_gemini_select"):
+            if getattr(FLAGS, flag, None):
+                bad.append(f"--{flag}")
+    if bad:
+        raise ValueError("steervla.vla='simlingo_steervla' does not support: " + "; ".join(bad) + ".")
+
+
 def _build_vla_sample_fn(
     steervla_cfg,
     raw_carla_obs_holder: dict | None,
@@ -6133,6 +6168,7 @@ def _run_residual_entry(config):
     steervla_cfg = config.get("steervla", None)
     if steervla_cfg is None or not steervla_cfg.get("enabled"):
         raise ValueError("config.steervla.enabled must be true: residual RL needs a base policy.")
+    _check_simlingo_steervla_support(config, residual_entry=True)
 
     extra_carla: dict[str, Any] = {}
     exec_cfg = _steervla_action_execution_cfg(steervla_cfg)
@@ -6164,11 +6200,16 @@ def _run_residual_entry(config):
         raw_holder: dict = {"obs": obs}
         training_gpu_rank = int(config.get("training_gpu_rank", -1))
 
-        from vlas.steervla import create_steervla_pi0_cot_sample_fn
+        if _is_simlingo_steervla(steervla_cfg):
+            vla_sample_fn, steervla_actor = _build_vla_sample_fn(
+                steervla_cfg, raw_holder, training_gpu_rank=training_gpu_rank
+            )
+        else:
+            from vlas.steervla import create_steervla_pi0_cot_sample_fn
 
-        vla_sample_fn, steervla_actor = create_steervla_pi0_cot_sample_fn(
-            steervla_cfg, raw_holder, training_gpu_rank=training_gpu_rank
-        )
+            vla_sample_fn, steervla_actor = create_steervla_pi0_cot_sample_fn(
+                steervla_cfg, raw_holder, training_gpu_rank=training_gpu_rank
+            )
 
         _configure_jax_training_device(training_gpu_rank)
 
@@ -6581,6 +6622,8 @@ def _run_grpo_entry(config):
     with open(os.path.join(FLAGS.save_dir, "flags.json"), "w") as f:
         json.dump(get_flag_dict(), f)
 
+    if _is_simlingo_steervla(steervla_cfg):
+        raise NotImplementedError("GRPO samples Pi0 CoT candidates; steervla.vla='simlingo_steervla' is not supported.")
     carla_yaml, extra_carla, exec_cfg = _resolve_carla_env_config(config)
     env = _make_carla_env(carla_yaml, FLAGS.route, extra_carla_config=extra_carla)
     try:
@@ -6818,6 +6861,7 @@ def build_carla_session(config, env, exec_cfg: Optional[dict] = None) -> CarlaSe
     place (``critic_action_dim``, ``language_label_dim``), matching the prior behavior.
     """
     steervla_cfg = config.get("steervla", None)
+    _check_simlingo_steervla_support(config, residual_entry=False)
     online_training_mode = str(config.get("online_training_mode", "rl")).strip().lower()
     _VALID_TRAIN_MODES = {"rl", "dagger", "sac_residual", "dagger_residual"}
     if online_training_mode not in _VALID_TRAIN_MODES:
