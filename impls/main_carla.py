@@ -5616,6 +5616,50 @@ def run_online_residual(
     video_every = max(1, int(config.get("episode_video_every", 2)))
     episode_frames: list[np.ndarray] = []
 
+    # Optional simultaneous CAST path. This deliberately lives in the standalone
+    # SAC-residual loop: CAST trains only SteerVLA, while SAC keeps its independent
+    # replay/update schedule and remains active after CAST freezes.
+    cast_cfg = config.get("cast_relabel")
+    cast_relabel: OnlineCastRelabelSession | None = None
+    cast_score_streak = 0
+    cast_target_after_score: int | None = None
+    cast_ckpt_every = int((config.get("steervla") or {}).get("hl_checkpoint_every_steps", 0))
+    cast_ckpt_dir = str((config.get("steervla") or {}).get("hl_checkpoint_dir", "") or "")
+    cast_ckpt_keep = int((config.get("steervla") or {}).get("hl_checkpoint_keep_last", 0))
+
+    def _save_cast_checkpoint(step_tag: int, *, final: bool = False) -> None:
+        if (
+            cast_relabel is None
+            or steervla_actor is None
+            or not getattr(steervla_actor, "load_trainable_params", False)
+            or cast_ckpt_every <= 0
+            or (not final and step_tag % cast_ckpt_every != 0)
+        ):
+            return
+        steervla_actor.save_checkpoint(
+            cast_ckpt_dir or os.path.join(FLAGS.save_dir, "checkpoints"),
+            int(step_tag), keep_last=cast_ckpt_keep,
+        )
+
+    if cast_cfg is not None and bool(cast_cfg.get("enabled", False)):
+        cast_relabel = OnlineCastRelabelSession(
+            cast_cfg, save_dir=FLAGS.save_dir,
+            action_chunk_steps=int(config["steervla"]["action_horizon"]),
+            run_tag=str(FLAGS.exp_name or "residual-cast"),
+        )
+        if not getattr(steervla_actor, "load_trainable_params", False):
+            raise ValueError("simultaneous CAST requires steervla.load_trainable_params=True")
+        steervla_actor.hl_dataset_dir = cast_relabel.hl_dataset_dir
+        cast_relabel.begin_episode(
+            episode_count=max(1, episode_count_start + 1),
+            route_name=str(obs.get("routing_command", "?")),
+            route_id=str(FLAGS.route or "?"),
+        )
+        print(
+            f"[main_carla] simultaneous CAST enabled; HL dataset={cast_relabel.hl_dataset_dir}",
+            flush=True,
+        )
+
     live_viewer: LivePolicyViewer | None = None
     if FLAGS.live_policy_view:
         live_viewer = LivePolicyViewer(
@@ -5852,6 +5896,9 @@ def run_online_residual(
                 winner_x = None if x_cands is None else x_cands[0]
             # Winner's raw VLA chunk drives the waypoint overlay in accel_steer mode.
             base_chunk = base_chunks[winner_idx % n_cand]
+            # _compute_base(next_obs, ...) replaces raw_holder["obs"], so retain the
+            # actual pre-action model input for the CAST sample before taking the next step.
+            cast_input_obs = raw_holder.get("obs", obs)
 
             t_step_start = time.time()
             next_obs, reward, terminated, truncated, info = env.step(final)
@@ -5925,7 +5972,7 @@ def run_online_residual(
                     "ep_step": episode_steps,
                     "ep_return": episode_return,
                 }
-            _maybe_capture_frame(
+            captured_frame = _maybe_capture_frame(
                 episode_frames, next_obs, debug_step_reward if debug_task else reward,
                 episode_steps=episode_steps, done=done,
                 log_video=log_video, video_every=video_every,
@@ -5939,6 +5986,45 @@ def run_online_residual(
             )
             if live_viewer is not None and episode_frames:
                 live_viewer.publish_frames(episode_frames, step)
+
+            if cast_relabel is not None and not eval_phase:
+                cast_raw = cast_input_obs
+                subtask = _format_text_field(cast_raw, "subtask_text") or _format_text_field(cast_raw, "subtask")
+                reasoning = _format_text_field(cast_raw, "reasoning_text") or _format_text_field(cast_raw, "reasoning")
+                prompt = _format_text_field(cast_raw, "openpi_prompt_raw_text") or _format_text_field(cast_raw, "openpi_prompt_text")
+                if captured_frame is not None:
+                    cast_relabel.record_frame(
+                        _viz_image_from_raw(next_obs) if getattr(cast_relabel, "raw_video", True) else captured_frame,
+                        annotated=captured_frame, subtask_text=subtask, episode_step=episode_steps,
+                    )
+                cast_relabel.record_trajectory_step({
+                    "step": int(step), "episode_step": int(episode_steps),
+                    "ego_speed_mps": float(_ego_speed_mps(next_obs)),
+                    "collision": bool(collision_delta), "collision_delta": float(collision_delta),
+                    "outside_route_delta": float(info.get("outside_route_delta", 0.0)),
+                    "route_deviation_delta": float(info.get("route_deviation_delta", 0.0)),
+                    "crash_stuck_ticks": int(info.get("crash_stuck_ticks", 0)),
+                    "termination_reason": info.get("termination_reason"),
+                    "route_progress_pct": float(info.get("route_progress_pct", 0.0)),
+                    "route_distance_m": float(info.get("route_distance_m", 0.0)),
+                    "route_total_distance_m": float(info.get("route_total_distance_m", 0.0)),
+                    "routing_command": str(cast_raw.get("routing_command", "")),
+                    "reward_total": float(reward), "in_video": captured_frame is not None,
+                })
+                cast_relabel.record_model_input(
+                    episode_step=episode_steps, image=cast_raw.get("image"), state=cast_raw.get("state"),
+                    current_speed=float(_ego_speed_mps(cast_raw)), prompt=prompt, subtask=subtask,
+                    reasoning=reasoning, action_chunk=base_chunk,
+                    routing_command=str(cast_raw.get("routing_command", "")), global_step=step,
+                )
+                if cast_relabel.should_query(episode_steps):
+                    cast_relabel.maybe_query(episode_step=episode_steps, done_info=info, global_step=step)
+                if getattr(cast_relabel, "async_review", False):
+                    cast_relabel.drain_wandb()
+                cast_info = steervla_actor.update_hl(global_step=step)
+                if cast_info:
+                    wandb.log({f"cast/{k}": float(v) for k, v in cast_info.items()}, step=step)
+                _save_cast_checkpoint(step)
 
             train_info: dict[str, Any] = {}
             # Hold updates until warmup ends: at scale=0 the residual can't affect the executed
@@ -6056,6 +6142,37 @@ def run_online_residual(
                 )
                 episode_count += 1
                 _ep_ds = float(info.get("driving_score", 0.0) or 0.0)
+                if cast_relabel is not None and not eval_phase:
+                    if getattr(cast_relabel, "async_review", False):
+                        cast_relabel.wait_for_reviews()
+                    cast_relabel.maybe_query(
+                        episode_step=episode_steps, done_info=info, force=True, global_step=step,
+                    )
+                    cast_info = steervla_actor.update_hl(global_step=step)
+                    if cast_info:
+                        wandb.log({f"cast/{k}": float(v) for k, v in cast_info.items()}, step=step)
+                    try:
+                        cast_relabel.end_episode(
+                            driving_score=_ep_ds,
+                            route_completion=info.get("route_progress_pct"),
+                            route_goal=describe_route_goal(str(FLAGS.route or "")), global_step=step,
+                        )
+                    except Exception as exc:  # Episode is already complete; memory is best-effort.
+                        print(f"[main_carla] CAST strategy summary failed (non-fatal): {exc}", flush=True)
+                    cast_updates = int(getattr(steervla_actor, "_hl_grad_steps", 0) or 0)
+                    if FLAGS.stop_on_driving_score > 0:
+                        cast_score_streak = cast_score_streak + 1 if _ep_ds >= FLAGS.stop_on_driving_score else 0
+                    if cast_target_after_score is None and cast_score_streak >= max(1, int(FLAGS.stop_on_driving_score_streak)):
+                        cast_target_after_score = cast_updates + max(0, int(FLAGS.updates_after_driving_score))
+                    cast_stop = (
+                        (cast_target_after_score is not None and cast_updates >= cast_target_after_score)
+                        or (FLAGS.max_hl_updates > 0 and cast_updates >= FLAGS.max_hl_updates)
+                    )
+                    if cast_stop:
+                        _save_cast_checkpoint(step, final=True)
+                        cast_relabel = None
+                        wandb.log({"cast/frozen_at_env_step": float(step), "cast/frozen_at_hl_grad_steps": float(cast_updates)}, step=step)
+                        print("[main_carla] CAST frozen; continuing standalone SAC-residual.", flush=True)
                 if eval_phase:
                     # Frozen eval on the weights training produced: collect, then report and exit.
                     eval_scores.append(_ep_ds)
@@ -6172,6 +6289,13 @@ def run_online_residual(
                     _reset_seed = run_carla_seed() + episode_count
                 obs, _info = env.reset(seed=_reset_seed)
                 steervla_actor.reset_action_cache()
+                if cast_relabel is not None and not eval_phase:
+                    cast_relabel.reset_episode()
+                    cast_relabel.begin_episode(
+                        episode_count=episode_count + 1,
+                        route_name=str(obs.get("routing_command", "?")),
+                        route_id=str(FLAGS.route or "?"),
+                    )
                 rng, nk = jax.random.split(rng)
                 base_cands, x_cands, base_chunks, cands = _compute_base(
                     obs, use_otf and step + 1 > warmup, nk
@@ -6182,6 +6306,8 @@ def run_online_residual(
                     next_base_cands, next_x_cands, next_base_chunks, next_cands,
                 )
     finally:
+        if cast_relabel is not None:
+            _save_cast_checkpoint(last_step or FLAGS.online_steps, final=True)
         train_logger.close()
         # Training already exported its final weights when the stop fired; the eval episodes that
         # followed changed nothing, so a second export here would only add a checkpoint at a

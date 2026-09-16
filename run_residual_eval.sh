@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Sequential 3-seed residual-RL evaluation queue.
-# Each route/seed has its own stable W&B name and resumable status marker.
+# Restartable B2D + F2D residual-RL evaluation queue.
+# Each route trains for 10k steps, then --eval-mode freezes the final policy
+# and rolls it out for three model seeds in the same CARLA process.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,14 +9,19 @@ cd "$ROOT_DIR"
 
 PHYSICAL_GPU="${1:-${EVAL_GPU:-0}}"
 RUN_ROOT="${2:-${EVAL_ROOT:-/raid/users/${USER}/carla_exps/evals/residual_rl}}"
-EVAL_LABEL="${EVAL_LABEL:-residual-rl-eval-20260908}"
-RUN_GROUP="${EVAL_RUN_GROUP:-ResidualRLEval}"
+EVAL_LABEL="${EVAL_LABEL:-residual-rl-b2d-f2d-evalmode-v3-20260914}"
+RUN_GROUP="${EVAL_RUN_GROUP:-ResidualRLB2DF2DEvalModeV3}"
 # A fresh queue invocation must not collide in W&B with an earlier failed launch.
 # Supply EVAL_RUN_NONCE=<number> to deliberately retain names across invocations.
 if [[ -n "${EVAL_RUN_NONCE:-}" ]]; then
   RUN_NONCE="$EVAL_RUN_NONCE"
 else
-  printf -v RUN_NONCE '%05d%05d' "$RANDOM" "$RANDOM"
+  NONCE_FILE="$RUN_ROOT/status/$EVAL_LABEL/run_nonce"
+  if [[ -f "$NONCE_FILE" ]]; then
+    RUN_NONCE="$(<"$NONCE_FILE")"
+  else
+    printf -v RUN_NONCE '%05d%05d' "$RANDOM" "$RANDOM"
+  fi
 fi
 [[ "$RUN_NONCE" =~ ^[0-9]+$ ]] || { echo 'EVAL_RUN_NONCE must be numeric.' >&2; exit 2; }
 SEEDS="${SEEDS:-0 1 2}"
@@ -42,24 +48,35 @@ ROUTES=(
   signalized-junction-left-turn-enter-flow-003
   non-signalized-junction-left-turn-002
   signalized-junction-right-turn-004
-  parked-obstacle-004
-  accident-two-ways-002
-  construction-obstacle-003
-  highway-exit-002
   pedestrian-crossing-004
-  parking-exit-002
   # Sheet shorthand: "stat-in-001"; canonical registry name:
-  static-cut-in-001
   vanilla-signalized-turn-encounter-red-light-002
-  accident-005
   crossing-bicycle-flow-004
   vanilla-signalized-turn-encounter-green-light-004
   # Sheet label omits the registry's "r" in "merger".
-  merger-into-slow-traffic-001
+  merger-into-slow-traffic-v2-001
   vehicle-turning-route-pedestrian-005
   vehicle-opens-door-two-ways-005
   sequential-lane-change-005
   interurban-actor-flow-004
+  generalization-construction-permutations-1019
+  generalization-custom-obstacles-1020
+  generalization-pedestrians-on-road-1085
+  generalization-construction-pedestrian-1011
+  generalization-pedestrian-crowd-1069
+  generalization-custom-obstacles-1024
+  generalization-fully-blocked-1032
+  generalization-hard-brake-1036
+  generalization-bad-parking-1009
+  generalization-pedestrian-other-blocker-1072
+  generalization-right-construction-1093
+  generalization-right-of-way-1056
+  generalization-wall-1095
+  generalization-image-on-object-1041
+  generalization-obscured-stop-1048
+  generalization-bad-parking-1004
+  generalization-animals-1083
+  generalization-wall-1097
 )
 
 read -r -a SEED_LIST <<< "$SEEDS"
@@ -72,6 +89,7 @@ for seed in "${SEED_LIST[@]}"; do
 done
 
 mkdir -p "$RUN_ROOT/logs/$EVAL_LABEL" "$RUN_ROOT/status/$EVAL_LABEL" "$RUN_ROOT/runs/$EVAL_LABEL"
+[[ -f "${NONCE_FILE:-}" ]] || printf '%s\n' "$RUN_NONCE" > "$RUN_ROOT/status/$EVAL_LABEL/run_nonce"
 cat > "$RUN_ROOT/eval_spec_${EVAL_LABEL}.txt" <<SPEC
 created=$(date --iso-8601=seconds)
 eval_label=$EVAL_LABEL
@@ -99,10 +117,48 @@ actions_per_cot=5
 proprio_norm=false
 SPEC
 
+WATCHDOG_GRACE="${EVAL_WATCHDOG_GRACE:-600}"
+STALL_SECS="${EVAL_STALL_SECS:-900}"
+STALL_STRIKES="${EVAL_STALL_STRIKES:-2}"
+CARLA_GONE_STRIKES="${EVAL_CARLA_GONE_STRIKES:-6}"
+run_with_watchdog() {
+  local log_file="$1" failure_file="$2"; shift 2
+  : > "$log_file"
+  setsid "$@" > >(tee "$log_file") 2>&1 &
+  local run_pid=$!
+  (
+    sleep "$WATCHDOG_GRACE"
+    local stalls=0 gone=0 age
+    while kill -0 "$run_pid" 2>/dev/null; do
+      if ! pgrep -u "$USER" -f "carla-rpc-port=${CARLA_PORT}" >/dev/null 2>&1; then gone=$((gone + 1)); else gone=0; fi
+      age=$(( $(date +%s) - $(stat -c %Y "$log_file" 2>/dev/null || date +%s) ))
+      if [[ "$age" -ge "$STALL_SECS" ]]; then stalls=$((stalls + 1)); else stalls=0; fi
+      if [[ "$gone" -ge "$CARLA_GONE_STRIKES" || "$stalls" -ge "$STALL_STRIKES" ]]; then
+        local reason="carla_missing"
+        [[ "$stalls" -ge "$STALL_STRIKES" ]] && reason="no_log_progress_${age}s"
+        printf 'stage=run\nreason=%s\ntimestamp=%s\n' "$reason" "$(date --iso-8601=seconds)" > "$failure_file"
+        echo "[watchdog] aborting pid $run_pid: $reason" >> "$log_file"
+        kill -TERM -"$run_pid" 2>/dev/null || true
+        sleep 15
+        kill -KILL -"$run_pid" 2>/dev/null || true
+        pgrep -u "$USER" -f "carla-rpc-port=${CARLA_PORT}" | xargs -r kill -KILL 2>/dev/null || true
+        rm -f "/tmp/.X${X_DISPLAY_NUM}-lock" 2>/dev/null || true
+        break
+      fi
+      sleep 60
+    done
+  ) &
+  local watchdog_pid=$!
+  wait "$run_pid"; local run_code=$?
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  return "$run_code"
+}
+
 total=$(( ${#ROUTES[@]} * ${#SEED_LIST[@]} ))
 index=0
-for route in "${ROUTES[@]}"; do
-  for seed in "${SEED_LIST[@]}"; do
+for seed in "${SEED_LIST[@]}"; do
+  for route in "${ROUTES[@]}"; do
     index=$((index + 1))
     tag="${route}__seed-${seed}"
     done_file="$RUN_ROOT/status/$EVAL_LABEL/${tag}.done"
@@ -121,10 +177,14 @@ for route in "${ROUTES[@]}"; do
     run_dir="$RUN_ROOT/runs/$EVAL_LABEL/$tag"
     mkdir -p "$run_dir"
     set +e
-    CUDA_VISIBLE_DEVICES="$PHYSICAL_GPU" OGBENCH_SAVE_DIR="$run_dir" \
+    eval_seeds="$((seed + 1001)),$((seed + 1002)),$((seed + 1003))"
+    run_with_watchdog "$log_file" "$failure_file" env CUDA_VISIBLE_DEVICES="$PHYSICAL_GPU" OGBENCH_SAVE_DIR="$run_dir" \
       ./run_carla.sh \
         --agent-config impls/configs/steervla_residual_eval_config.py \
         --route "$route" \
+        --carla-seed "$seed" \
+        --train-seed "$seed" \
+        --eval-seeds "$eval_seeds" \
         --seed "$seed" \
         --exp-name "$exp_name" \
         --online-steps 10000 \
@@ -133,6 +193,7 @@ for route in "${ROUTES[@]}"; do
         --render-adapter "$PHYSICAL_GPU" \
         --carla-port "$CARLA_PORT" \
         --carla-streaming-port "$CARLA_STREAMING_PORT" \
+        --post-stop-eval-episodes 3 \
         --tm-port "$TM_PORT" \
         --x-display-num "$X_DISPLAY_NUM" \
         --run-group "$RUN_GROUP" \
@@ -140,9 +201,8 @@ for route in "${ROUTES[@]}"; do
         --save-buffer "$SAVE_BUFFER" \
         --save-video-local "$SAVE_VIDEO_LOCAL" \
         --wandb-mode "$WANDB_MODE" \
-        --max-retries "$MAX_RETRIES" \
-        2>&1 | tee "$log_file"
-    run_code=${PIPESTATUS[0]} tee_code=${PIPESTATUS[1]}
+        --max-retries "$MAX_RETRIES"
+    run_code=$?; tee_code=0
     set -e
     if [[ "$run_code" -eq 0 && "$tee_code" -eq 0 ]]; then
       touch "$done_file"
