@@ -1,7 +1,7 @@
 """VLM coaches that review driving rollout videos and annotate good/bad moments.
 
 Supports:
-  - Google Gemini (``gemini-2.0-flash`` by default)
+  - Google Gemini (see ``coaches.gemini_models.DEFAULT_GEMINI_MODEL``)
   - Perceptron video QA API
 
 Run from ``impls/``::
@@ -33,7 +33,7 @@ ProviderName = Literal["gemini", "perceptron"]
 # Placeholders — override via environment variables in real runs.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
 PERCEPTRON_API_KEY = os.environ.get("PERCEPTRON_API_KEY", "YOUR_PERCEPTRON_API_KEY_HERE")
-DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
+from coaches.gemini_models import DEFAULT_GEMINI_MODEL  # noqa: F401  (re-exported)
 
 DEFAULT_ACTION_CHUNK_STEPS = 10
 DEFAULT_CHUNK_DURATION_SEC = 0.5
@@ -459,9 +459,9 @@ def build_coaching_prompt(
     )
 
     # Bounded record of what earlier windows of this run already corrected, so successive reviews
-    # don't flip the same behaviour back and forth. Written by coaches.correction_memory; absent
+    # don't flip the same behaviour back and forth. Written by coaches.strategy_memory; absent
     # until something has actually been corrected.
-    memory_block = str(metadata.get("correction_memory") or "")
+    memory_block = str(metadata.get("strategy_memory") or "")
 
     _header = textwrap.dedent(
         f"""
@@ -639,6 +639,28 @@ def build_coaching_prompt(
           stopped climbing, you MUST emit at least one event about it — BAD with a corrective
           instruction if the vehicle was free to move, GOOD naming the specific hazard or signal
           if the halt was genuinely required. Silence about a stall is not an option.
+        - MANDATORY: check the executed SUBTASK against the vehicle's own REASONING and against
+          the ROUTING COMMAND in force at that moment, and report any disagreement between the
+          three. All three are in the per-timestamp trajectory data (``subtask``, ``reasoning``,
+          and ``prompt``, which carries the routing command) and in the routing-command plan at
+          the top. They are supposed to describe the SAME intent; when they do not, the policy is
+          about to act on a subtask that contradicts what it reasoned or what the route asked, and
+          that is a defect to report even if the vehicle happened to drive acceptably.
+          The authority order is: ROUTING COMMAND first (it is the route's instruction and is
+          never wrong), then REASONING, then SUBTASK. So:
+            * subtask disagrees with reasoning AND routing command -> the SUBTASK is wrong. Emit a
+              BAD event whose correction is the subtask that matches them. Example: the subtask
+              says "turn right", the reasoning says "turn left" and the routing command says
+              "turn left" -> the subtask must be corrected to turning left.
+            * subtask and reasoning agree with each other but disagree with the routing command ->
+              BOTH are wrong; the correction is the subtask that follows the routing command.
+            * subtask matches the routing command but the reasoning contradicts it -> report it as
+              BAD naming the inconsistent reasoning; the correction keeps the routing command's
+              maneuver.
+          Judge against the command in force AT THAT TIMESTAMP, not the one at the end of the
+          window. Ignore pure wording differences -- "go left at the next intersection" and "turn
+          left at the junction" are the same intent; only a genuine conflict of maneuver,
+          direction, or target counts.
         - MANDATORY: any event whose description mentions a red/green light, a stop light, a
           signal or a stop sign MUST also state the traffic-flow evidence that established that
           state (cross-traffic moving, the queue discharging, the lead vehicle pulling away or
@@ -835,6 +857,15 @@ class VLMCOach(ABC):
         """Single-image + text completion (used by the GRPO VLM critic to score candidates)."""
         raise NotImplementedError(f"{type(self).__name__} does not support image+text completion.")
 
+    def analyze_video_text(self, video_path: str | Path, prompt: str) -> str:
+        """Free-form question about a whole video, returning raw text.
+
+        Distinct from :meth:`analyze`, which imposes the CAST window prompt and parses the reply
+        into events. This one asks whatever it is given -- used by ``strategy_memory`` to review a
+        FULL episode rather than a window.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support video+text completion.")
+
 
 # ── Gemini REST API helpers (Python-3.8-compatible; no google-genai package needed) ──
 
@@ -868,7 +899,11 @@ def _gemini_upload_file(path: Path, api_key: str) -> dict[str, Any]:
         json={"file": {"display_name": path.name}},
         timeout=30,
     )
-    start_resp.raise_for_status()
+    if not start_resp.ok:
+        raise RuntimeError(
+            f"Gemini upload: session start failed HTTP {start_resp.status_code} "
+            f"for {path.name} ({file_size} bytes, {mime_type}): {start_resp.text[:1000]}"
+        )
     upload_url = start_resp.headers.get("X-Goog-Upload-URL")
     if not upload_url:
         raise RuntimeError("Gemini upload: missing X-Goog-Upload-URL in response headers.")
@@ -887,10 +922,26 @@ def _gemini_upload_file(path: Path, api_key: str) -> dict[str, Any]:
         data=data,
         timeout=120,
     )
-    upload_resp.raise_for_status()
+    if not upload_resp.ok:
+        raise RuntimeError(
+            f"Gemini upload: content POST failed HTTP {upload_resp.status_code} "
+            f"for {path.name} ({file_size} bytes, {mime_type}): {upload_resp.text[:1000]}"
+        )
     body = upload_resp.json()
     # The Files API wraps the metadata under a "file" key on upload.
     return body.get("file", body)
+
+
+def _gemini_delete_file_quiet(name: str | None, api_key: str) -> None:
+    """Best-effort delete of an uploaded File. Never raises -- it is cleanup, not the task."""
+    if not name:
+        return
+    try:
+        import requests
+
+        requests.delete(f"{_GEMINI_API_BASE}/{name}", params={"key": api_key}, timeout=15)
+    except Exception:  # noqa: BLE001 - a failed cleanup must not fail the upload
+        pass
 
 
 def _gemini_get_file(name: str, api_key: str) -> dict[str, Any]:
@@ -902,11 +953,25 @@ def _gemini_get_file(name: str, api_key: str) -> dict[str, Any]:
         params={"key": api_key},
         timeout=15,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        raise RuntimeError(
+            f"Gemini get-file failed HTTP {resp.status_code} for {name}: {resp.text[:1000]}"
+        )
     return resp.json()
 
 
 _GEMINI_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+# google.rpc.Code values that mean "the file was fine, the service faltered", so re-sending the
+# identical bytes has a real chance of working. Observed 2026-09-10: a ~70% window-drop rate whose
+# File resources all read {"code": 13, "message": "The file failed to be processed."} -- INTERNAL,
+# after the upload itself had succeeded (correct sizeBytes, sha256Hash present, mime video/mp4).
+#   13 INTERNAL, 14 UNAVAILABLE, 4 DEADLINE_EXCEEDED, 8 RESOURCE_EXHAUSTED
+# Deliberately NOT 3 INVALID_ARGUMENT or 9 FAILED_PRECONDITION: those mean the file itself is
+# unacceptable, and resending it just burns the retry budget and another upload.
+_GEMINI_RETRYABLE_FILE_ERROR_CODES = {4, 8, 13, 14}
+_GEMINI_UPLOAD_MAX_RETRIES = 4
+
 
 
 def _gemini_generate_content(model: str, contents: list[Any], api_key: str, max_retries: int = 5) -> str:
@@ -1024,18 +1089,81 @@ class GeminiVLMCOach(VLMCOach):
         path = Path(video_path)
         if not path.is_file():
             raise FileNotFoundError(f"Video not found: {path}")
+        import mimetypes
 
-        # Upload video and wait for it to become ACTIVE.
-        # The upload response may omit "state" when the file is already ready;
-        # in that case do a GET to get the authoritative status.
-        uploaded = _gemini_upload_file(path, self.api_key)
-        if uploaded.get("state") is None:
-            uploaded = _gemini_get_file(uploaded["name"], self.api_key)
-        while uploaded.get("state") == "PROCESSING":
-            time.sleep(1.0)
-            uploaded = _gemini_get_file(uploaded["name"], self.api_key)
-        if uploaded.get("state") != "ACTIVE":
-            raise RuntimeError(f"Gemini file upload failed with state={uploaded.get('state')!r}.")
+        mime_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+
+        # Upload video and wait for it to become ACTIVE, retrying a service-side failure.
+        # The upload response may omit "state" when the file is already ready; in that case do a
+        # GET for the authoritative status.
+        #
+        # The retry exists because the failure we actually see is INTERNAL *after* a successful
+        # upload -- the bytes arrive intact and Gemini's own processing falls over. Without it a
+        # single such blip discards the whole window: no review, no HL samples, no debug video,
+        # and only a non-fatal log line to show for it.
+        uploaded = None
+        last_exc: Exception | None = None
+        for attempt in range(_GEMINI_UPLOAD_MAX_RETRIES + 1):
+            try:
+                uploaded = _gemini_upload_file(path, self.api_key)
+                if uploaded.get("state") is None:
+                    uploaded = _gemini_get_file(uploaded["name"], self.api_key)
+                _poll_start = time.time()
+                _polls = 0
+                while uploaded.get("state") == "PROCESSING":
+                    time.sleep(1.0)
+                    _polls += 1
+                    uploaded = _gemini_get_file(uploaded["name"], self.api_key)
+                if uploaded.get("state") == "ACTIVE":
+                    if attempt:
+                        print(
+                            f"[vlm_feedback] upload of {path.name} succeeded on attempt "
+                            f"{attempt + 1}/{_GEMINI_UPLOAD_MAX_RETRIES + 1}.",
+                            flush=True,
+                        )
+                    break
+
+                err = uploaded.get("error") or {}
+                code = err.get("code")
+                try:
+                    detail = json.dumps(uploaded, indent=2, sort_keys=True)[:2000]
+                except Exception:  # noqa: BLE001 - diagnostics must not mask the failure
+                    detail = repr(uploaded)[:2000]
+                last_exc = RuntimeError(
+                    f"Gemini file upload failed with state={uploaded.get('state')!r} "
+                    f"after {_polls} poll(s) / {time.time() - _poll_start:.1f}s. "
+                    f"error.code={code!r} error.status={err.get('status')!r} "
+                    f"error.message={err.get('message')!r}. "
+                    f"local_file={path.name} size={path.stat().st_size} bytes mime={mime_type!r}. "
+                    f"full File resource:\n{detail}"
+                )
+                # A failed File still occupies the account's quota until it expires; drop it
+                # rather than leaving one behind per attempt.
+                _gemini_delete_file_quiet(uploaded.get("name"), self.api_key)
+                if code not in _GEMINI_RETRYABLE_FILE_ERROR_CODES:
+                    raise last_exc
+            except RuntimeError as exc:
+                if exc is last_exc and (uploaded or {}).get("error", {}).get(
+                    "code"
+                ) not in _GEMINI_RETRYABLE_FILE_ERROR_CODES:
+                    raise
+                last_exc = exc
+            except Exception as exc:  # noqa: BLE001 - transport errors are retryable too
+                last_exc = exc
+
+            if attempt == _GEMINI_UPLOAD_MAX_RETRIES:
+                assert last_exc is not None
+                raise last_exc
+            delay = 2.0 * (2 ** attempt)
+            print(
+                f"[vlm_feedback] upload of {path.name} failed "
+                f"(attempt {attempt + 1}/{_GEMINI_UPLOAD_MAX_RETRIES + 1}); "
+                f"retrying in {delay:.0f}s -- {str(last_exc).splitlines()[0][:160]}",
+                flush=True,
+            )
+            time.sleep(delay)
+
+        assert uploaded is not None and uploaded.get("state") == "ACTIVE"
 
         parts: list[Any] = [
             {
@@ -1077,6 +1205,11 @@ class GeminiVLMCOach(VLMCOach):
             [{"parts": [{"text": prompt}]}],
             self.api_key,
         )
+
+    def analyze_video_text(self, video_path: str | Path, prompt: str) -> str:
+        """Ask ``prompt`` about a whole video. Goes through the same retrying upload as reviews."""
+        parts = self._upload_media(video_path, None, False) + [{"text": prompt}]
+        return _gemini_generate_content(self.model, [{"parts": parts}], self.api_key)
 
     def complete_image_text(self, image: Any, prompt: str) -> str:
         """Single-frame + text completion via an inline JPEG part."""

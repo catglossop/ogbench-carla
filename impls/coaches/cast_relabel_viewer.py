@@ -462,7 +462,7 @@ def build_window_payload(
         "route_command_plan": metadata.get("route_command_plan") or [],
         # Cross-window correction memory as it stood when this window was reviewed (empty for
         # windows recorded before the memory existed).
-        "memory": str(metadata.get("correction_memory") or "").strip(),
+        "memory": str(metadata.get("strategy_memory") or "").strip(),
         "collision_events": metadata.get("collision_events") or [],
         "fps": fps,
         "duration": duration_sec,

@@ -63,7 +63,9 @@ def get_config():
         dict(
             enabled=True,
             provider="gemini",
-            gemini_model="gemini-3.5-flash",
+            # Keep in step with coaches/gemini_models.py :: DEFAULT_GEMINI_MODEL; main_carla forces
+            # EVAL_MODE_GEMINI_MODEL for --eval-mode runs regardless of what a stale config says.
+            gemini_model="gemini-3.7-flash",
             # Print each intervention (original -> corrected) as it fires.
             debug=True,
             # Append every query (prompt + raw response + verdict) to yay_robot/queries.jsonl.
@@ -86,11 +88,13 @@ def get_config():
             # How many recent subtasks the prompt shows as continuity context, so the judge can
             # tell a sensible continuation from an abrupt switch.
             subtask_history_len=4,
-            # Cross-query correction memory ("remain stopped -> accelerate: 7x"), injected into
-            # the prompt so a per-frame stateless judge does not flip the same decision back and
-            # forth and teach the backbone both directions of it. Word budget for the whole
-            # rendered block; 0 disables it.
-            correction_memory_words=300,
+            # Episode-level strategy bank (coaches/strategy_memory.py), shared with cast_relabel:
+            # after each episode one VLM call condenses the whole rollout, its interventions and
+            # its driving score into a sentence, and the bank of the last N sentences is injected
+            # into the foresight prompt. That is what stops a per-frame stateless judge from
+            # flipping the same decision back and forth across episodes. 0 disables the bank.
+            # Replaced ``correction_memory_words``; coaches/correction_memory.py no longer exists.
+            strategy_memory_entries=8,
             # ── the 2 s lead-up ────────────────────────────────────────────────────────
             # When a correction fires at step S, the frames covering this many seconds before S
             # are stored with the SAME corrected language, labeled BAD/precursor. That is what

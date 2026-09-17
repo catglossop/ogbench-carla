@@ -81,8 +81,9 @@ from coaches.cast_relabel import (
     strip_cot_sentinels,
     write_hl_samples,
 )
-from coaches.correction_memory import DEFAULT_MAX_WORDS as DEFAULT_MEMORY_WORDS
-from coaches.correction_memory import CorrectionMemory
+from coaches.gemini_models import DEFAULT_GEMINI_MODEL
+from coaches.strategy_memory import DEFAULT_MAX_ENTRIES as DEFAULT_STRATEGY_ENTRIES
+from coaches.strategy_memory import StrategyMemory, summarize_episode_strategy
 from coaches.vlm_feedback import create_coach
 
 # One CARLA env step at the 20 Hz the leaderboard wrapper ticks. Only used to convert
@@ -318,7 +319,9 @@ class OnlineYayRobotSession:
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
 
         self.provider = str(self.cfg.get("provider", "gemini"))
-        self.gemini_model = str(self.cfg.get("gemini_model", "gemini-3.5-flash"))
+        # One source of truth for the model (coaches/gemini_models.py); main_carla additionally
+        # forces EVAL_MODE_GEMINI_MODEL for --eval-mode runs, whose numbers get reported.
+        self.gemini_model = str(self.cfg.get("gemini_model") or DEFAULT_GEMINI_MODEL)
         self.action_chunk_steps = max(1, int(self.cfg.get("action_chunk_steps", action_chunk_steps)))
         self.hl_action_dim = int(self.cfg.get("hl_action_dim", DEFAULT_HL_ACTION_DIM))
         self.ego_history_len = max(1, int(self.cfg.get("ego_history_len", DEFAULT_EGO_HISTORY_LEN)))
@@ -390,17 +393,16 @@ class OnlineYayRobotSession:
         )
 
         self._coach = create_coach(self.provider, model=self.gemini_model)
-        memory_words = int(self.cfg.get("correction_memory_words", DEFAULT_MEMORY_WORDS))
-        # Bounded cross-query memory of corrections already made. Even more necessary here than in
-        # cast_relabel: a per-frame stateless judge will otherwise flip the same decision back and
-        # forth every couple of seconds and teach the backbone both directions of it.
-        self._memory: CorrectionMemory | None = (
-            CorrectionMemory(
-                self.artifact_dir / "correction_memory.json",
-                max_words=memory_words,
-                coach=self._coach,
-            )
-            if memory_words > 0
+        # Episode-level strategy bank (coaches/strategy_memory.py), the same one cast_relabel uses.
+        # Its rendered block goes into the foresight prompt, so each episode's corrections are
+        # written knowing how the previous episodes actually turned out ("last time we crept to
+        # every junction and scored 27") instead of re-deciding from scratch every frame. This
+        # replaced the per-correction ``CorrectionMemory``, which no longer exists.
+        # ``strategy_memory_entries: 0`` is the single off switch.
+        memory_entries = int(self.cfg.get("strategy_memory_entries", DEFAULT_STRATEGY_ENTRIES))
+        self._memory: StrategyMemory | None = (
+            StrategyMemory(self.artifact_dir / "strategy_memory.json", max_entries=memory_entries)
+            if memory_entries > 0
             else None
         )
         if self.provider == "gemini" and not os.environ.get("GEMINI_API_KEY", ""):
@@ -439,6 +441,11 @@ class OnlineYayRobotSession:
         # Sample dirs written this episode, so finalize_episode can patch their outcome tag.
         self._episode_sample_dirs: list[Path] = []
         self._kept_seen = 0
+        # This episode's interventions and executed-subtask spans, in the shapes
+        # ``coaches.strategy_memory`` renders. Consumed and cleared by :meth:`end_episode`.
+        self._episode_corrections: list[dict[str, Any]] = []
+        self._episode_chunks: list[dict[str, Any]] = []
+        self._last_chunk_step = 0
 
         # ── counters (surfaced to wandb by main_carla) ─────────────────────────────────
         self.num_queries = 0
@@ -455,6 +462,7 @@ class OnlineYayRobotSession:
         episode_count: int = 0,
         route_id: str = "",
         route_name: str = "",
+        route_command_plan: list[dict[str, Any]] | None = None,
         **_: Any,
     ) -> None:
         """Signature mirrors ``OnlineCastRelabelSession.begin_episode`` so the call sites match.
@@ -465,6 +473,9 @@ class OnlineYayRobotSession:
         """
         self.episode = int(episode_count)
         self.route = str(route_id or route_name or "")
+        # The routing commands this episode was given, in order. The strategy summary judges the
+        # episode against the task it was actually set, not against the route name alone.
+        self.route_command_plan = list(route_command_plan) if route_command_plan else []
 
     def reset_episode(self) -> None:
         self._recent.clear()
@@ -473,6 +484,8 @@ class OnlineYayRobotSession:
         self._pending = None
         self._episode_sample_dirs = []
         self._episode_step = 0
+        self._episode_corrections = []
+        self._episode_chunks = []
 
     def set_step(self, *, episode_step: int, global_step: int) -> None:
         """Stamp the env step the actor is about to act on.
@@ -545,29 +558,21 @@ class OnlineYayRobotSession:
             return None
 
         self.num_interventions += 1
-        if self._memory is not None:
-            # Same cross-call ledger cast_relabel keeps, so successive frames do not undo each
-            # other ("remain stopped -> accelerate: 7x"). ``CorrectionMemory`` is written against
-            # the CAST window schema, so one correction is fed to it as a one-chunk window; the
-            # env step stands in for the window index, which is what the rendered notes show
-            # ("w1234: 1x remain stopped -> accelerate"). It records only *longitudinal* intent
-            # changes, so a purely lateral correction is (deliberately) not remembered.
-            try:
-                self._memory.observe_window(
-                    {
-                        "action_chunks": [
-                            {
-                                "label": LABEL_INTERVENTION,
-                                "original_subtask": subtask,
-                                "suggested_subtasks": [correction.subtask],
-                            }
-                        ]
-                    },
-                    window_index=int(self._episode_step),
-                    route=self.route,
-                )
-            except Exception:  # noqa: BLE001 - memory is an aid, never a hard dependency.
-                pass
+        # Keep the intervention for this episode's strategy summary. ``strategy_memory`` renders
+        # these as the corrections table of its end-of-episode review, so the field names are its
+        # (``label`` / ``description`` / ``correction`` / ``episode_step``), not ours.
+        self._episode_corrections.append(
+            {
+                "label": "INTERVENTION",
+                "episode_step": int(self._episode_step),
+                "window_index": 0,
+                "window_time_sec": 0.0,
+                "description": f"policy said \"{subtask}\"" + (
+                    f" — {correction.rationale}" if correction.rationale else ""
+                ),
+                "correction": correction.subtask,
+            }
+        )
         # Overwrite the history entry: what the vehicle is about to do is the corrected subtask,
         # not the one the model proposed, so the next query's continuity context must show that.
         if self._subtask_history:
@@ -663,6 +668,30 @@ class OnlineYayRobotSession:
             )
 
     # ── parking a decision until the executed action exists ────────────────────────────
+    def _note_executed_chunk(
+        self, *, executed: str, corrected: str, label: str, credit_source: str
+    ) -> None:
+        """Record one CoT query's executed-subtask span for the episode strategy summary.
+
+        One entry per query is the right granularity: that span is exactly what a single CoT drove.
+        ``strategy_memory.format_executed_block`` then collapses consecutive identical spans, so a
+        long stretch on one subtask reads as a single run rather than as noise.
+        """
+        step = int(self._episode_step)
+        if self._episode_chunks:
+            prev = self._episode_chunks[-1]
+            prev["episode_step_end"] = max(step - 1, int(prev["episode_step_start"]))
+        self._episode_chunks.append(
+            {
+                "episode_step_start": step,
+                "episode_step_end": step,
+                "executed_subtask": executed,
+                "corrected_subtask": corrected,
+                "label": label,
+                "credit_source": credit_source,
+            }
+        )
+
     def _park_correction(
         self,
         query: dict[str, Any],
@@ -670,6 +699,12 @@ class OnlineYayRobotSession:
         reasoning: str,
         correction: CotCorrection,
     ) -> None:
+        self._note_executed_chunk(
+            executed=subtask,
+            corrected=correction.subtask,
+            label=LABEL_INTERVENTION,
+            credit_source=CREDIT_DIRECT,
+        )
         with self._lock:
             self._pending = {
                 "kind": "intervention",
@@ -684,6 +719,12 @@ class OnlineYayRobotSession:
             }
 
     def _park_kept(self, query: dict[str, Any], subtask: str, reasoning: str) -> None:
+        # Tracked before the storage gates below: the executed span belongs in the episode summary
+        # whether or not this frame is also written as a reinforce sample.
+        if subtask:
+            self._note_executed_chunk(
+                executed=subtask, corrected="", label=LABEL_KEPT, credit_source=""
+            )
         if not (self.store_hl_dataset and self.store_kept_samples) or not subtask:
             return
         self._kept_seen += 1
@@ -967,6 +1008,81 @@ class OnlineYayRobotSession:
                 fh.write(json.dumps(record) + "\n")
         except Exception:  # noqa: BLE001 - artifacts are never worth failing a rollout over.
             pass
+
+    def end_episode(
+        self,
+        *,
+        driving_score: float,
+        route_completion: float | None = None,
+        video_path: str | Path | None = None,
+        episode_fps: float | None = None,
+        route_goal: str = "",
+        global_step: int | None = None,
+    ) -> str:
+        """Summarise the finished episode into the strategy bank, and return the sentence.
+
+        The twin of ``OnlineCastRelabelSession.end_episode``, and deliberately the same signature
+        so both sit at one call site in ``main_carla``. One extra VLM call per episode, over the
+        whole rollout video plus this episode's interventions and executed subtasks, in the context
+        of the score it earned. The sentence is injected into the NEXT episode's foresight prompt,
+        which is what gives a per-frame judge any memory of how an approach actually turned out.
+
+        Everything here is best-effort: the episode is already driven and scored, so a failure
+        costs a memory entry and nothing else.
+        """
+        corrections, chunks = self._episode_corrections, self._episode_chunks
+        self._episode_corrections, self._episode_chunks = [], []
+        # ``strategy_memory_entries: 0`` is the single off switch.
+        if self._memory is None:
+            return ""
+        try:
+            sentence = summarize_episode_strategy(
+                self._coach,
+                video_path=video_path,
+                corrections=corrections,
+                chunks=chunks,
+                route_command_plan=self.route_command_plan,
+                route=self.route,
+                route_goal=route_goal,
+                driving_score=float(driving_score),
+                route_completion=route_completion,
+                episode_fps=episode_fps,
+            )
+        except Exception as exc:  # noqa: BLE001 - never break a scored episode
+            print(f"[yay_robot] episode strategy summary failed (non-fatal): {exc}", flush=True)
+            return ""
+        if not sentence:
+            return ""
+        self._memory.add_strategy(
+            sentence, episode=self.episode, driving_score=float(driving_score)
+        )
+        self._log_strategy_to_wandb(global_step=global_step)
+        print(
+            f"[yay_robot] episode {self.episode} strategy (score {float(driving_score):.2f}, "
+            f"{len(corrections)} interventions): {sentence}",
+            flush=True,
+        )
+        return sentence
+
+    def _log_strategy_to_wandb(self, *, global_step: int | None = None) -> None:
+        """Push the strategy bank to W&B as a growing table plus a couple of scalars."""
+        if self._memory is None or not self._memory.strategies:
+            return
+        try:
+            import wandb
+
+            if wandb.run is None:
+                return
+            table = wandb.Table(columns=["episode", "driving_score", "strategy"])
+            for e in self._memory.strategies:
+                table.add_data(int(e["episode"]), float(e["driving_score"]), str(e["sentence"]))
+            payload = {
+                "yay/strategy_memory": table,
+                "yay/strategy_episodes": float(len(self._memory.strategies)),
+            }
+            wandb.log(payload, step=global_step) if global_step is not None else wandb.log(payload)
+        except Exception as exc:  # noqa: BLE001 - logging must never break a scored episode
+            print(f"[yay_robot] strategy wandb log failed (non-fatal): {exc}", flush=True)
 
     def finalize_episode(self, *, metadata: dict[str, Any] | None = None) -> str:
         """Stamp the episode's outcome onto every manifest written during it.

@@ -73,7 +73,7 @@ def get_config():
             raw_video=True,
             async_review=False,
             provider="gemini",
-            gemini_model="gemini-3.5-flash",
+            gemini_model="gemini-3.7-flash",
             # Must match the rollout's action chunk length (config.action_horizon).
             action_chunk_steps=10,
             # How many subtasks to suggest per chunk that needs improvement.
@@ -87,13 +87,14 @@ def get_config():
             # channels are thinned to every 2nd timestamp -- so the plot is where their shape over
             # the window is actually legible. Set False for a video-and-text-only review.
             include_plots_in_prompt=True,
-            # Cross-window correction memory: a bounded record of the longitudinal changes earlier
-            # windows already made ("stop -> accelerate: 7x"), injected into BOTH the review and
-            # the credit prompt so successive windows don't reverse each other and the HL dataset
-            # doesn't end up teaching both directions of the same decision. This is the whole
-            # rendered block's word budget -- it is pruned oldest-note-first and, if still over,
-            # summarized by the coach. Persisted to cast_relabel/correction_memory.json. 0 = off.
-            correction_memory_words=300,
+            # How many previous-episode strategy summaries to carry in the memory bank that is
+            # injected into BOTH the review and the credit prompt (coaches/strategy_memory.py).
+            # Each is one sentence plus the score it earned. 0 disables the bank.
+            # Replaced ``correction_memory_words``: the old bank tracked longitudinal mode
+            # transitions, notes, vehicle-state carry-over and crash ageing, then pruned and
+            # coach-summarised itself to fit a word budget -- five interacting mechanisms to say
+            # what one episode summary says directly, so it was removed rather than tuned.
+            strategy_memory_entries=8,
             save_artifacts=True,
             # Persist every BAD/relabeled chunk as a SteerVLA high-level (VLM-backbone) training
             # sample in the steervla_hl_dataset_format schema (image + ego state + prompt +

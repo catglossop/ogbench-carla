@@ -69,6 +69,40 @@ check(
     "the weights training produced are exported at the stop",
     "_save_steervla_ckpt(int(step), final=True)" in src,
 )
+# --max_hl_updates must count GRADIENT STEPS, not update_hl calls. steervla keeps both and they
+# differ whenever hl_update_num_steps > 1: a burst config did 6 x 50 = 300 gradient steps while
+# _hl_updates_applied read 6, so a 150 cap never tripped and the run used its whole budget.
+check(
+    "the stop condition counts gradient steps",
+    '_hl_applied = int(getattr(steervla_actor, "_hl_grad_steps", 0) or 0)' in src,
+)
+check(
+    "it no longer reads the per-call counter",
+    'getattr(steervla_actor, "_hl_updates_applied"' not in src,
+)
+check(
+    "periodic checkpointing stops once the eval phase begins",
+    "        if not eval_phase:\n            if agent is not None and any_updates_on" in src
+    and "            _save_steervla_ckpt(step)" in src,
+)
+# The end-of-training export must be the LAST checkpoint written: eval-phase saves are
+# byte-identical copies and, under hl_checkpoint_keep_last, rotate the real one off disk.
+_stop_at = src.index("final_train_driving_score = _ep_ds")
+_periodic_at = src.index("        if not eval_phase:\n            if agent is not None")
+check(
+    "the final export happens before the gated periodic save in the same iteration",
+    _stop_at < _periodic_at,
+)
+# ...and the exit-time export must not fire on top of it. It is tagged with --online_steps, a step
+# the run never reached when a stop condition fired, and lands AFTER the real export.
+check(
+    "the exit export is skipped when training already exported",
+    "if _final_ckpt_step is None:\n        _save_steervla_ckpt(FLAGS.online_steps, final=True)" in src,
+)
+check(
+    "and says so rather than failing silently",
+    "skipping exit checkpoint" in src,
+)
 
 # ── 2b. ... but only under --eval-mode ────────────────────────────────────────────────
 print("\n[2b] everything is gated behind --eval_mode")

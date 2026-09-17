@@ -112,6 +112,8 @@ from utils.live_policy_viewer import LivePolicyViewer
 from utils.datasets import ReplayBuffer
 from utils.flax_utils import save_agent
 
+from coaches.gemini_models import DEFAULT_GEMINI_MODEL, EVAL_MODE_GEMINI_MODEL
+from coaches.vlm_feedback import describe_route_goal
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
 
 FLAGS = flags.FLAGS
@@ -247,7 +249,7 @@ flags.DEFINE_bool(
     "--bon_online_critic.",
 )
 flags.DEFINE_string(
-    "gemini_model", "gemini-3.6-flash",
+    "gemini_model", DEFAULT_GEMINI_MODEL,
     "Gemini model used for --bon_gemini_select.",
 )
 flags.DEFINE_bool("bon_qwen_select", False, "Select candidates with a local Qwen service.")
@@ -387,22 +389,62 @@ flags.DEFINE_float(
 )
 flags.DEFINE_integer(
     "max_hl_updates", 0,
-    "Stop TRAINING once this many HL (VLM-backbone) gradient updates have actually been APPLIED "
-    "-- SteerVLAActor._hl_updates_applied, not the throttled call count -- then run "
+    "Stop TRAINING once this many HL (VLM-backbone) GRADIENT STEPS have actually been applied "
+    "-- SteerVLAActor._hl_grad_steps, i.e. the sum of hl_update_num_steps over every update that "
+    "ran, NOT the number of update_hl calls -- then run "
     "--post_stop_eval_episodes frozen evaluation episodes and exit. <= 0 disables. Checked at "
     "episode end, so the effective count can overshoot slightly within the final episode.",
 )
 flags.DEFINE_integer(
     "updates_after_driving_score", 10,
-    "How many further HL gradient updates to APPLY after --stop_on_driving_score is first met. "
+    "How many further HL GRADIENT STEPS to apply after --stop_on_driving_score is first met. "
+    "Quantised to hl_update_num_steps, since the countdown is only checked between update_hl "
+    "calls and each call applies all of its steps. "
     "Reaching the score does not stop training; it arms a countdown of this many more updates, so "
     "the policy keeps learning from the episode that solved the route. --max_hl_updates still "
     "applies as a hard cap, whichever comes first.",
+)
+flags.DEFINE_bool(
+    "fixed_train_carla_seed",
+    False,
+    "Pin the simulator seed to --carla_seed for TRAINING episodes too, instead of walking it as "
+    "carla_seed + episode_index. Off by default (training sees varied traffic). Turn it on to make "
+    "training and eval differ ONLY in the model's sampling seed: eval already replays carla_seed, "
+    "so with this set the two phases measure the same scenario and a train/eval gap can no longer "
+    "be blamed on the scenario distribution. The trade is that the policy only ever sees one "
+    "instance of the route, so vary --carla_seed across runs to recover scenario coverage.",
+)
+flags.DEFINE_integer(
+    "stop_on_driving_score_streak", 1,
+    "How many CONSECUTIVE episodes must reach --stop_on_driving_score before the stop is armed. "
+    "1 (default) is the historical behaviour: a single qualifying episode arms it. Raise it to "
+    "require the score to be reproducible -- a single 100 is weak evidence when eval scores on a "
+    "route swing between ~30 and 100, and stopping on it selects a lucky episode rather than a "
+    "converged policy. The streak resets to 0 on any episode below the threshold.",
 )
 flags.DEFINE_integer(
     "post_stop_eval_episodes", 3,
     "Frozen (no-update, no-CAST-review) episodes to run after either stop condition fires. Their "
     "mean driving score is printed and logged as eval/mean_driving_score.",
+)
+flags.DEFINE_integer(
+    "eval_every_env_steps", 0,
+    "Periodic frozen evaluation DURING training. Each time this many TRAINING env steps pass "
+    "(set it to the checkpoint cadence, e.g. 2000, to evaluate every checkpoint), updates freeze, "
+    "the current training episode finishes, and --post_stop_eval_episodes frozen episodes run with "
+    "the end-of-training eval's seeds (carla_seed replayed, --eval_seeds as model seeds) and no CAST "
+    "review. Their mean is logged as eval/mean_driving_score (with eval/train_env_step), then training "
+    "resumes. Env steps spent in these evals do not count toward --online_steps or the checkpoint / "
+    "eval cadence, and checkpoints are named by training step. 0 disables.",
+)
+flags.DEFINE_integer(
+    "eval_crash_stuck_steps", 10**9,
+    "Wrapper post-collision stuck cutoff (ticks below crash_stuck_speed_threshold after a collision) "
+    "used for FROZEN EVAL episodes: the periodic evals, the post-stop eval and --frozen_eval. The "
+    "default is run_leaderboard.py's sentinel, which hands the decision to the leaderboard's own "
+    "AgentBlockedTest (min_speed=0.1, max_time=60 s), so eval scores are leaderboard-faithful instead "
+    "of being cut by the 1 s training cutoff (carla_config crash_stuck_steps: 20). Training episodes "
+    "keep the carla_config value. <= 0 keeps the training cutoff for evals too.",
 )
 flags.DEFINE_integer(
     "max_episodes", 0,
@@ -457,6 +499,23 @@ flags.DEFINE_bool(
     "eval_only",
     False,
     "If true, skip training. With --steervla_checkpoint, only load OpenPI SteerVLA weights.",
+)
+flags.DEFINE_bool(
+    "frozen_eval",
+    False,
+    "Run ONLY frozen eval episodes from --steervla_checkpoint: no gradient updates, no CAST "
+    "review, no checkpointing. Replays --carla_seed with one --eval_seeds entry per episode, "
+    "exactly like the post-training eval phase. Used to add eval seeds to a run that already "
+    "finished, so results are written to run_summary_frozen_eval.json and the original "
+    "run_summary.json is left untouched.",
+)
+flags.DEFINE_string(
+    "frozen_eval_out",
+    "",
+    "Directory to write run_summary_frozen_eval.json into. Defaults to this run's own save_dir. "
+    "Set it to an ALREADY-FINISHED run's directory to file extra eval seeds alongside that run's "
+    "run_summary.json -- the run dir name embeds a timestamp, so a new process can never land in "
+    "an old run's folder on its own.",
 )
 flags.DEFINE_string(
     "steervla_actor_config",
@@ -1206,6 +1265,41 @@ def _make_carla_env(
     return CarlaBench2DriveWrapper(cfg, route=route)
 
 
+def _is_simlingo_steervla(steervla_cfg) -> bool:
+    return steervla_cfg is not None and str(steervla_cfg.get("vla", "steervla")).strip().lower() == "simlingo_steervla"
+
+
+def _check_simlingo_steervla_support(config, *, residual_entry: bool) -> None:
+    """Fail at startup on options that read OpenPI Pi0 internals the SimLingo actor does not have.
+
+    ``vlas/simlingo_steervla.py`` implements the rollout contract (``vla_sample_fn``, text stashes,
+    ``update_hl``, ``save_checkpoint``) but no Pi0 prefix/suffix features, candidate batches or policy
+    embeddings, so these options would otherwise die with an AttributeError mid-run.
+    """
+    if not _is_simlingo_steervla(config.get("steervla", None)):
+        return
+    bad: list[str] = []
+    if residual_entry:
+        # agent_name='sac_residual' -> run_online_residual.
+        if not bool(config.get("base_only", False)):
+            encoder = str(config.get("state_encoder", "pi_prefix"))
+            if encoder != "siglip_pool":
+                bad.append(f"state_encoder={encoder!r} (only 'siglip_pool' is Pi0-independent)")
+            if bool(config.get("expo", True)):
+                bad.append("expo=True (EXPO best-of-N samples Pi0 CoT candidates; set expo=False)")
+    else:
+        if str(config.get("observation_mode", "state")) == "policy_embed":
+            bad.append("observation_mode='policy_embed'")
+        for key in ("residual_use_pi_image_features", "critic_use_pi_prefix_features"):
+            if bool(config.get(key, False)):
+                bad.append(f"{key}=True")
+        for flag in ("bon_critic_ckpt", "bon_online_critic", "bon_gemini_select"):
+            if getattr(FLAGS, flag, None):
+                bad.append(f"--{flag}")
+    if bad:
+        raise ValueError("steervla.vla='simlingo_steervla' does not support: " + "; ".join(bad) + ".")
+
+
 def _build_vla_sample_fn(
     steervla_cfg,
     raw_carla_obs_holder: dict | None,
@@ -1218,6 +1312,20 @@ def _build_vla_sample_fn(
         return None
     if raw_carla_obs_holder is None:
         raise ValueError("SteerVLA requires raw_carla_obs_holder for full gym obs (image + state + prompt fields).")
+
+    # ``steervla.vla`` picks the actor behind the shared VLA contract (sample_fn, update_hl, save_checkpoint).
+    vla_kind = str(steervla_cfg.get("vla", "steervla")).strip().lower()
+    if vla_kind == "simlingo_steervla":
+        from vlas.simlingo_steervla import create_simlingo_steervla_sample_fn
+
+        return create_simlingo_steervla_sample_fn(
+            steervla_cfg,
+            raw_carla_obs_holder,
+            training_gpu_rank=training_gpu_rank,
+            noise_scale=noise_scale,
+        )
+    if vla_kind != "steervla":
+        raise ValueError(f"steervla.vla must be 'steervla' or 'simlingo_steervla', got {vla_kind!r}")
 
     actor_url = steervla_cfg.get("actor_url")
     if actor_url and str(actor_url).strip():
@@ -1952,6 +2060,7 @@ def write_run_summary(
     hl_updates_applied: int,
     env_steps: int,
     final_checkpoint: str | None,
+    filename: str = "run_summary.json",
 ) -> dict:
     """Write ``run_summary.json``: what the run achieved and exactly how to reproduce it.
 
@@ -1978,7 +2087,7 @@ def write_run_summary(
             float(sum(eval_scores) / len(eval_scores)) if eval_scores else None
         ),
     }
-    path = os.path.join(save_dir, "run_summary.json")
+    path = os.path.join(save_dir, filename)
     try:
         with open(path, "w") as f:
             json.dump(summary, f, indent=2)
@@ -2483,6 +2592,18 @@ def run_online_carla(
                 f"cast_relabel.prompt_version must be 1 (the _v2 prompt copies were removed), "
                 f"got {_prompt_version}"
             )
+        # A run whose numbers get reported must not silently inherit an older reviewer from a
+        # stale config: the model that wrote the corrections is part of the result. Forced here,
+        # immediately before the session is built, so it applies whatever the config said.
+        if FLAGS.eval_mode:
+            _cfg_model = str(cast_cfg.get("gemini_model", "") or "")
+            if _cfg_model != EVAL_MODE_GEMINI_MODEL:
+                print(
+                    f"[main_carla] --eval-mode: forcing cast_relabel.gemini_model "
+                    f"{_cfg_model or '<unset>'} -> {EVAL_MODE_GEMINI_MODEL}",
+                    flush=True,
+                )
+                cast_cfg["gemini_model"] = EVAL_MODE_GEMINI_MODEL
         _cast_relabel = OnlineCastRelabelSession(
             cast_cfg,
             save_dir=FLAGS.save_dir,
@@ -2516,6 +2637,17 @@ def run_online_carla(
     _yay_robot: OnlineYayRobotSession | None = None
     yay_cfg = agent_config.get("yay_robot")
     if yay_cfg is not None and bool(yay_cfg.get("enabled", False)):
+        if FLAGS.eval_mode:
+            # Same rule as cast_relabel above: a reported run must not inherit an older reviewer
+            # model from a stale config, since that changes the corrections the policy drives on.
+            _yay_model = str(yay_cfg.get("gemini_model", "") or "")
+            if _yay_model != EVAL_MODE_GEMINI_MODEL:
+                print(
+                    f"[main_carla] --eval-mode: forcing yay_robot.gemini_model "
+                    f"{_yay_model or '<unset>'} -> {EVAL_MODE_GEMINI_MODEL}",
+                    flush=True,
+                )
+                yay_cfg["gemini_model"] = EVAL_MODE_GEMINI_MODEL
         if _cast_relabel is not None:
             # Both write ``steervla_hl_dataset_format`` samples and both want to own
             # ``steervla_actor.hl_dataset_dir``; whichever was wired second would silently take the
@@ -3076,6 +3208,14 @@ def run_online_carla(
                 for j, line in enumerate(wrapped):
                     rendered.append((line, color, swatch if j == 0 else None))
 
+            scene_description = candidates.get("scene_description") or ""
+            if isinstance(scene_description, dict):
+                scene_description = scene_description.get("text") or ""
+            if scene_description:
+                _append_wrapped(
+                    f"Qwen scene (last query): {_clean_overlay_text(str(scene_description))}",
+                    heading,
+                )
             _append_wrapped("Best-of-N candidates:", heading)
             has_term_scores = len(qwen_scores) == n
             for i in range(n):
@@ -3097,6 +3237,11 @@ def run_online_carla(
                         f"P(offroad)={float(scores['offroad']):.3f}  "
                         f"P(traffic)={float(scores['traffic_violation']):.3f}  "
                         f"E(progress)={float(scores['progress']):.3f}"
+                    )
+                    expert_probability = scores.get("correctness")
+                    score_line += (
+                        f"  P(expert)={float(expert_probability):.3f}"
+                        if expert_probability is not None else "  P(expert)=n/a"
                     )
                     status_color = (120, 255, 120) if accepted_text == "ACCEPT" else (120, 120, 255)
                     _append_wrapped(score_line, status_color)
@@ -3644,6 +3789,7 @@ def run_online_carla(
             "subtasks": candidate_subtasks,
             "chunks": chunks_np,
             "qwen_scores": result["scores"],
+            "scene_description": result.get("scene_description"),
             "accepted": result["accepted"],
             "qwen_timings": result.get("timings", {}),
         }
@@ -3958,14 +4104,54 @@ def run_online_carla(
     # condition fires we do NOT exit immediately: updates and the CAST reviewer are switched off and
     # the policy is rolled out frozen for --post_stop_eval_episodes episodes so the reported number
     # is the performance of the weights that training actually produced.
+    # Eval episodes use the leaderboard's blocked-agent rule (--eval_crash_stuck_steps) instead of the
+    # wrapper's 1 s post-collision training cutoff; training episodes keep the carla_config value.
+    _train_crash_stuck_steps = getattr(env, "_crash_stuck_steps", None)
+
+    def _set_eval_stuck_cutoff(eval_on: bool) -> None:
+        if int(FLAGS.eval_crash_stuck_steps) <= 0:
+            return
+        if _train_crash_stuck_steps is None:
+            print(
+                "[main_carla] WARNING: env has no _crash_stuck_steps (subprocess env?); eval episodes "
+                "keep the training stuck cutoff.",
+                flush=True,
+            )
+            return
+        value = int(FLAGS.eval_crash_stuck_steps) if eval_on else int(_train_crash_stuck_steps)
+        env._crash_stuck_steps = value
+        env._crash_stuck_ticks = 0
+        print(
+            f"[main_carla] stuck cutoff for {'EVAL' if eval_on else 'TRAINING'} episodes: "
+            f"crash_stuck_steps={value}"
+            + (" (defers to leaderboard AgentBlockedTest, 60 s)" if eval_on else ""),
+            flush=True,
+        )
+
     eval_phase = False
     eval_scores: list[float] = []
     stop_reason = ""
+    # Consecutive episodes at or above --stop_on_driving_score (see the flag's docstring).
+    _score_streak = 0
+    # --frozen_eval starts where a finished run would end: policy loaded from a checkpoint and
+    # never updated. The stop-condition block below is what normally freezes the run, and it
+    # never executes here, so apply exactly the same freeze up front.
+    if FLAGS.frozen_eval:
+        eval_phase = True
+        stop_reason = "frozen eval from checkpoint (no training)"
+        rl_updates_on = bc_updates_on = hl_updates_on = any_updates_on = False
+        _cast_relabel = None
+        _set_eval_stuck_cutoff(True)
+        print(
+            f"[main_carla] FROZEN EVAL: {FLAGS.post_stop_eval_episodes} episodes from "
+            f"{FLAGS.steervla_checkpoint or '<config checkpoint>'}; no updates, no CAST review.",
+            flush=True,
+        )
     # Driving score of the last TRAINING episode (the one that tripped the stop), and the env step
     # of the final weights export. Both land in run_summary.json.
     final_train_driving_score = 0.0
     _final_ckpt_step: int | None = None
-    # Set when --stop_on_driving_score is first met: the _hl_updates_applied count at which
+    # Set when --stop_on_driving_score is first met: the _hl_grad_steps count at which
     # training should stop. None until the score is reached.
     hl_target_after_score: int | None = None
     # Env step at which the eval phase began. The eval episodes are rolled out AFTER the
@@ -3977,14 +4163,39 @@ def run_online_carla(
     # terminates cannot spin here forever.
     eval_started_step: int | None = None
     eval_step_budget = 2 * int(FLAGS.online_steps)
+    # --eval_every_env_steps: periodic frozen evals inside training. ``train_step`` is the loop step
+    # minus env steps spent in those evals; it drives the --online_steps budget, checkpoint names and
+    # the eval cadence, so an eval never eats training budget or shifts the checkpoint ladder.
+    _eval_every = max(0, int(FLAGS.eval_every_env_steps))
+    _next_periodic_eval = _eval_every
+    _periodic_eval_pending = False  # cadence reached: updates frozen, waiting for the episode to end
+    # --eval-mode: the --online_steps TRAINING budget was reached mid-episode. Updates are frozen at
+    # the budget checkpoint; the episode finishes, then the post-stop eval measures those weights.
+    _budget_stop_pending = False
+    _periodic_eval_active = False  # frozen eval episodes running
+    _periodic_eval_start_step = 0
+    _periodic_eval_steps = 0
+    _periodic_saved_gates: tuple | None = None  # (rl, bc, hl, any) update gates to restore
+    _periodic_saved_cast = None
+    train_step = 0
 
     for step in tqdm.tqdm(itertools.count(1), total=FLAGS.online_steps, smoothing=0.1, dynamic_ncols=True):
-        if step > FLAGS.online_steps:
+        train_step = step - _periodic_eval_steps - ((step - _periodic_eval_start_step) if _periodic_eval_active else 0)
+        if train_step > FLAGS.online_steps:
             # Training budget spent. Identical to the old ``range(1, online_steps + 1)`` bound
             # unless the eval phase is mid-flight, in which case it runs on to finish.
-            if eval_started_step is None:
+            if _budget_stop_pending and eval_started_step is None:
+                # Frozen tail of the episode that crossed the budget; its end starts the eval.
+                if train_step - FLAGS.online_steps > eval_step_budget:
+                    print(
+                        f"[main_carla] episode never ended within {eval_step_budget} steps of the "
+                        f"training budget; stopping without the post-stop eval.",
+                        flush=True,
+                    )
+                    break
+            elif eval_started_step is None:
                 break
-            if step - eval_started_step > eval_step_budget:
+            elif step - eval_started_step > eval_step_budget:
                 print(
                     f"[main_carla] post-stop eval exceeded its {eval_step_budget}-step budget after "
                     f"{len(eval_scores)}/{FLAGS.post_stop_eval_episodes} episodes; stopping.",
@@ -4560,7 +4771,8 @@ def run_online_carla(
             # session keeps only chunk-start steps, so calling this every step is cheap.
             _cast_relabel.record_model_input(
                 episode_step=episode_steps,
-                image=cot_obs_raw.get("image"),
+                # The frame the VLA consumed (``steervla.image_key``; SimLingo uses the native 1024x512).
+                image=cot_obs_raw.get(str((agent_config.get("steervla") or {}).get("image_key", "image"))),
                 state=cot_obs_raw.get("state"),
                 current_speed=float(_ego_speed_mps_from_raw(cot_obs_raw)),
                 prompt=_cast_step_record["prompt"],
@@ -4873,7 +5085,52 @@ def run_online_carla(
 
             # ── stop conditions / frozen evaluation phase ────────────────────────────
             _ep_ds = float(done_info.get("driving_score", 0.0) or 0.0)
-            _hl_applied = int(getattr(steervla_actor, "_hl_updates_applied", 0) or 0) if steervla_actor else 0
+            # Summarise the finished episode into the correction-memory bank: the full rollout
+            # video + every correction made during it + the score it earned, condensed to one
+            # sentence the NEXT episode's labelling can steer by. One extra VLM call per episode
+            # (against one per window for the reviews), and entirely best-effort -- the episode is
+            # already driven and scored, so a failure here costs a memory entry and nothing else.
+            if _cast_relabel is not None:
+                _ep_video = Path(FLAGS.save_dir) / "videos" / f"ep{episode_count:04d}.mp4"
+                try:
+                    _cast_relabel.end_episode(
+                        driving_score=_ep_ds,
+                        route_completion=done_info.get("route_progress_pct"),
+                        video_path=_ep_video if _ep_video.is_file() else None,
+                        route_goal=describe_route_goal(str(FLAGS.route or "")),
+                        global_step=step,
+                    )
+                except Exception as _exc:  # noqa: BLE001 - never break a scored episode
+                    print(
+                        f"[main_carla] episode strategy summary failed (non-fatal): {_exc}",
+                        flush=True,
+                    )
+            # YAY-Robot keeps the same per-episode strategy bank, from its own interventions rather
+            # than from window reviews. Only one of the two sessions can be enabled at a time.
+            if _yay_robot is not None:
+                _yay_video = Path(FLAGS.save_dir) / "videos" / f"ep{episode_count:04d}.mp4"
+                try:
+                    _yay_robot.end_episode(
+                        driving_score=_ep_ds,
+                        route_completion=done_info.get("route_progress_pct"),
+                        video_path=_yay_video if _yay_video.is_file() else None,
+                        route_goal=describe_route_goal(str(FLAGS.route or "")),
+                        global_step=step,
+                    )
+                except Exception as _exc:  # noqa: BLE001 - never break a scored episode
+                    print(
+                        f"[main_carla] yay_robot strategy summary failed (non-fatal): {_exc}",
+                        flush=True,
+                    )
+            # GRADIENT steps, not update_hl bodies. steervla.py keeps both and they are not the
+            # same number: _hl_updates_applied counts one per update_hl call that reached the
+            # gradient loop, while _hl_grad_steps is the sum of hl_update_num_steps -- "the real
+            # number of updates to the policy", in that module's own words. With
+            # hl_update_num_steps=1 they coincide, which is why this went unnoticed; with the
+            # hl1500x50 recipe a run did 6 bursts x 50 = 300 gradient steps while this counter
+            # read 6, so --max_hl_updates=150 never tripped and the run silently used its whole
+            # step budget with no stop condition and no run_summary.json.
+            _hl_applied = int(getattr(steervla_actor, "_hl_grad_steps", 0) or 0) if steervla_actor else 0
             if eval_phase:
                 eval_scores.append(_ep_ds)
                 print(
@@ -4881,7 +5138,53 @@ def run_online_carla(
                     f"driving_score={_ep_ds:.2f}",
                     flush=True,
                 )
-                if len(eval_scores) >= max(1, int(FLAGS.post_stop_eval_episodes)):
+                if _periodic_eval_active and len(eval_scores) >= max(1, int(FLAGS.post_stop_eval_episodes)):
+                    _mean = sum(eval_scores) / len(eval_scores)
+                    print(
+                        f"[main_carla] PERIODIC EVAL at train step {train_step}: mean driving_score={_mean:.2f} "
+                        f"over {len(eval_scores)} episodes ({', '.join(f'{v:.2f}' for v in eval_scores)}); "
+                        f"resuming training.",
+                        flush=True,
+                    )
+                    _eval_log = {
+                        "eval/mean_driving_score": _mean,
+                        "eval/episodes": float(len(eval_scores)),
+                        "eval/train_env_step": float(train_step),
+                        "eval/hl_updates_applied": float(_hl_applied),
+                    }
+                    for _sd, _sc in zip(_eval_seeds, eval_scores):
+                        _eval_log[f"eval/driving_score_seed{_sd}"] = float(_sc)
+                    wandb.log(_eval_log, step=step)
+                    # On disk too, so sweep_results.sh can tabulate the eval curve per route.
+                    try:
+                        with open(os.path.join(FLAGS.save_dir, "periodic_evals.jsonl"), "a") as _pe:
+                            _pe.write(json.dumps({
+                                "route": str(FLAGS.route or ""),
+                                "train_env_step": int(train_step),
+                                "env_step": int(step),
+                                "hl_updates_applied": int(_hl_applied),
+                                "carla_seed": int(_carla_seed),
+                                "eval_seeds": [int(x) for x in _eval_seeds[: len(eval_scores)]],
+                                "driving_scores": [float(x) for x in eval_scores],
+                                "mean_driving_score": float(_mean),
+                            }) + "\n")
+                    except Exception as _exc:  # noqa: BLE001 - never break training over a results file
+                        print(f"[main_carla] could not write periodic_evals.jsonl: {_exc}", flush=True)
+                    # Back to training: restore the frozen gates and the CAST reviewer before the reset
+                    # below, so the next episode is a normal training episode with training seeds.
+                    rl_updates_on, bc_updates_on, hl_updates_on, any_updates_on = _periodic_saved_gates
+                    _cast_relabel = _periodic_saved_cast
+                    _periodic_saved_gates = _periodic_saved_cast = None
+                    _set_eval_stuck_cutoff(False)
+                    _periodic_eval_steps += step - _periodic_eval_start_step
+                    _periodic_eval_active = False
+                    # Weights were frozen from the eval's checkpoint until now, so any threshold crossed
+                    # while waiting for the episode to end would re-evaluate the same weights: skip them.
+                    while _next_periodic_eval <= train_step:
+                        _next_periodic_eval += _eval_every
+                    eval_phase = False
+                    eval_scores = []
+                elif len(eval_scores) >= max(1, int(FLAGS.post_stop_eval_episodes)):
                     _mean = sum(eval_scores) / len(eval_scores)
                     print(
                         f"[main_carla] EVAL DONE after {stop_reason}: "
@@ -4889,6 +5192,22 @@ def run_online_carla(
                         f"({', '.join(f'{v:.2f}' for v in eval_scores)}); stopping.",
                         flush=True,
                     )
+                    try:
+                        with open(os.path.join(FLAGS.save_dir, "periodic_evals.jsonl"), "a") as _pe:
+                            _pe.write(json.dumps({
+                                "route": str(FLAGS.route or ""),
+                                "train_env_step": int(_final_ckpt_step if _final_ckpt_step is not None else train_step),
+                                "env_step": int(step),
+                                "hl_updates_applied": int(_hl_applied),
+                                "carla_seed": int(_carla_seed),
+                                "eval_seeds": [int(x) for x in _eval_seeds[: len(eval_scores)]],
+                                "driving_scores": [float(x) for x in eval_scores],
+                                "mean_driving_score": float(_mean),
+                                "final": True,
+                                "stop_reason": str(stop_reason),
+                            }) + "\n")
+                    except Exception as _exc:  # noqa: BLE001 - never break the run over a results file
+                        print(f"[main_carla] could not write periodic_evals.jsonl: {_exc}", flush=True)
                     wandb.log(
                         {
                             "eval/mean_driving_score": _mean,
@@ -4898,9 +5217,11 @@ def run_online_carla(
                         step=step,
                     )
                     _ckpt_root = _hl_ckpt_dir or os.path.join(FLAGS.save_dir, "checkpoints")
-                    if FLAGS.eval_mode:
+                    if FLAGS.eval_mode or FLAGS.frozen_eval:
                         write_run_summary(
-                            FLAGS.save_dir,
+                            (FLAGS.frozen_eval_out or FLAGS.save_dir)
+                            if FLAGS.frozen_eval
+                            else FLAGS.save_dir,
                             route=str(FLAGS.route or ""),
                             carla_seed=_carla_seed,
                             train_seed=_train_seed,
@@ -4911,36 +5232,68 @@ def run_online_carla(
                             hl_updates_applied=_hl_applied,
                             env_steps=int(step),
                             final_checkpoint=(
-                                os.path.join(_ckpt_root, str(_final_ckpt_step))
-                                if _final_ckpt_step is not None
-                                else None
+                                # run_carla.sh's --steervla-checkpoint sets config.steervla.checkpoint,
+                                # not the flag, so read whichever actually carries the path.
+                                str(
+                                    FLAGS.steervla_checkpoint
+                                    or (_steervla_cfg.get("checkpoint", "") if _steervla_cfg else "")
+                                )
+                                if FLAGS.frozen_eval
+                                else (
+                                    os.path.join(_ckpt_root, str(_final_ckpt_step))
+                                    if _final_ckpt_step is not None
+                                    else None
+                                )
+                            ),
+                            filename=(
+                                "run_summary_frozen_eval.json"
+                                if FLAGS.frozen_eval
+                                else "run_summary.json"
                             ),
                         )
                     break
             else:
                 # Reaching the score ARMS a countdown rather than stopping: the episode that
                 # solved the route is exactly the one worth learning from, so keep updating.
+                _streak_need = max(1, int(FLAGS.stop_on_driving_score_streak))
+                if FLAGS.stop_on_driving_score > 0:
+                    if _ep_ds >= FLAGS.stop_on_driving_score:
+                        _score_streak += 1
+                    else:
+                        if _score_streak:
+                            print(
+                                f"[main_carla] driving_score {_ep_ds:.2f} broke a streak of "
+                                f"{_score_streak}/{_streak_need} at {FLAGS.stop_on_driving_score:g}.",
+                                flush=True,
+                            )
+                        _score_streak = 0
+                    wandb.log({"training/score_streak": float(_score_streak)}, step=step)
                 if (
                     hl_target_after_score is None
                     and FLAGS.stop_on_driving_score > 0
-                    and _ep_ds >= FLAGS.stop_on_driving_score
+                    and _score_streak >= _streak_need
                 ):
                     hl_target_after_score = _hl_applied + max(0, int(FLAGS.updates_after_driving_score))
                     print(
-                        f"[main_carla] driving_score {_ep_ds:.2f} >= {FLAGS.stop_on_driving_score:g} "
-                        f"at {_hl_applied} HL updates; continuing for "
-                        f"{FLAGS.updates_after_driving_score} more (target {hl_target_after_score}).",
+                        f"[main_carla] {_score_streak} consecutive episodes >= "
+                        f"{FLAGS.stop_on_driving_score:g} at {_hl_applied} HL updates; continuing "
+                        f"for {FLAGS.updates_after_driving_score} more (target {hl_target_after_score}).",
                         flush=True,
                     )
                     wandb.log({"training/score_reached_at_hl_update": float(_hl_applied)}, step=step)
                 if hl_target_after_score is not None and _hl_applied >= hl_target_after_score:
                     stop_reason = (
                         f"{_hl_applied} HL updates applied >= {hl_target_after_score} "
-                        f"({FLAGS.updates_after_driving_score} past driving_score "
-                        f"{FLAGS.stop_on_driving_score:g})"
+                        f"({FLAGS.updates_after_driving_score} past {_streak_need} consecutive "
+                        f"episodes at driving_score {FLAGS.stop_on_driving_score:g})"
                     )
                 elif FLAGS.max_hl_updates > 0 and _hl_applied >= FLAGS.max_hl_updates:
                     stop_reason = f"{_hl_applied} HL updates applied >= cap {FLAGS.max_hl_updates}"
+                elif _budget_stop_pending:
+                    stop_reason = (
+                        f"training budget of {FLAGS.online_steps} train steps reached "
+                        f"at {_hl_applied} HL updates"
+                    )
                 if stop_reason:
                     eval_phase = True
                     eval_started_step = step
@@ -4952,14 +5305,19 @@ def run_online_carla(
                         # count happens to be. Without this a run that stopped at, say, 3100 steps
                         # would leave only the 2000-step checkpoint on disk and the trained policy
                         # would be unrecoverable.
-                        _save_steervla_ckpt(int(step), final=True)
-                        _final_ckpt_step = int(step)
+                        # A budget stop froze the weights at the --online_steps checkpoint; when the
+                        # periodic ladder already wrote it, point at that file instead of a copy.
+                        _final_tag = int(FLAGS.online_steps) if _budget_stop_pending else int(train_step)
+                        if not (_budget_stop_pending and _hl_ckpt_on and _final_tag % _hl_ckpt_every == 0):
+                            _save_steervla_ckpt(_final_tag, final=True)
+                        _final_ckpt_step = _final_tag
                     # Freeze everything: these gates are read live further down the loop.
                     rl_updates_on = bc_updates_on = hl_updates_on = any_updates_on = False
                     # Drop the CAST reviewer too -- every use of it is None-guarded. Otherwise the
                     # eval episodes would keep paying for Gemini window reviews whose HL samples
                     # nothing will ever train on.
                     _cast_relabel = None
+                    _set_eval_stuck_cutoff(True)
                     # Detach the YAY-Robot correction hook as well, for a different reason: it is
                     # not an observer, it drives. The deployable artifact is the fine-tuned
                     # backbone WITHOUT a VLM in the loop -- the whole point is that it learns to
@@ -4977,6 +5335,25 @@ def run_online_carla(
                     )
                     wandb.log({"training/stopped_at_step": float(step),
                                "training/hl_updates_at_stop": float(_hl_applied)}, step=step)
+                    # A stop supersedes a pending periodic eval: the post-stop eval measures the same
+                    # frozen weights, and its gates are already off.
+                    _periodic_eval_pending = False
+                elif _periodic_eval_pending:
+                    # Cadence reached earlier (updates frozen since the checkpoint); this training
+                    # episode is over, so run the frozen eval episodes now, with no CAST review.
+                    _periodic_eval_pending = False
+                    _periodic_eval_active = True
+                    eval_phase = True
+                    eval_scores = []
+                    _periodic_eval_start_step = step
+                    _periodic_saved_cast = _cast_relabel
+                    _cast_relabel = None
+                    _set_eval_stuck_cutoff(True)
+                    print(
+                        f"[main_carla] PERIODIC EVAL starting at train step {train_step}: "
+                        f"{FLAGS.post_stop_eval_episodes} frozen episodes at {_hl_applied} HL updates.",
+                        flush=True,
+                    )
 
             if FLAGS.max_episodes > 0 and episode_count >= FLAGS.max_episodes:
                 print(f"[main_carla] Reached --max_episodes={FLAGS.max_episodes}; stopping.", flush=True)
@@ -4995,6 +5372,8 @@ def run_online_carla(
                         f"model seed={_eval_seeds[_eval_idx]}",
                         flush=True,
                     )
+                _reset_seed = int(_carla_seed)
+            elif FLAGS.fixed_train_carla_seed:
                 _reset_seed = int(_carla_seed)
             else:
                 _reset_seed = int(_carla_seed) + episode_count
@@ -5133,10 +5512,57 @@ def run_online_carla(
             wandb.log(metrics, step=step)
             train_logger.log(metrics, step=step)
 
-        if agent is not None and any_updates_on and step % FLAGS.save_interval == 0:
-            save_agent(agent, FLAGS.save_dir, step)
-
-        _save_steervla_ckpt(step)
+        # Checkpoint only while TRAINING. Once the stop condition fires, eval_phase freezes the
+        # weights, so every further periodic save is a byte-identical ~10 GB copy of the final
+        # export -- and with hl_checkpoint_keep_last those copies ROTATE THE FINAL EXPORT OUT.
+        # Observed 2026-09-09: generalization-wall-1095 exported its trained policy at step 5961,
+        # then wrote 6000/8000/10000 during eval and evicted 5961, leaving run_summary.json
+        # pointing at a checkpoint that no longer existed. Stopping here makes the end-of-training
+        # export the last checkpoint written, which is what it should always have been.
+        if not eval_phase:
+            # Only when the DSRL agent itself trains (RL or BC). In an HL-only run its params never
+            # change, so params_<step>.pkl would be an identical ~85 MB copy every save_interval.
+            if agent is not None and (rl_updates_on or bc_updates_on) and step % FLAGS.save_interval == 0:
+                save_agent(agent, FLAGS.save_dir, step)
+            # Named by TRAINING step, so periodic-eval env steps never shift the checkpoint ladder.
+            # Not in a budget stop's frozen tail: those would be copies of the budget checkpoint.
+            if not _budget_stop_pending:
+                _save_steervla_ckpt(train_step)
+            if FLAGS.eval_mode and not _budget_stop_pending and train_step >= FLAGS.online_steps:
+                # Training budget reached: stop here rather than breaking out with no eval. Freeze the
+                # just-checkpointed weights, drop any pending periodic eval (the post-stop eval measures
+                # the same weights) and the CAST reviewer (nothing will train on its samples); the
+                # stop fires when this episode ends.
+                _budget_stop_pending = True
+                _periodic_eval_pending = False
+                _periodic_saved_gates = None
+                rl_updates_on = bc_updates_on = hl_updates_on = any_updates_on = False
+                _cast_relabel = None
+                print(
+                    f"[main_carla] training budget reached at train step {train_step}: updates frozen; "
+                    f"{FLAGS.post_stop_eval_episodes} eval episodes run when this episode ends.",
+                    flush=True,
+                )
+            elif (
+                _eval_every > 0
+                and not _budget_stop_pending
+                and not _periodic_eval_pending
+                and train_step >= _next_periodic_eval
+            ):
+                # Freeze now so the eval measures exactly the weights just checkpointed; the eval
+                # episodes start at the next episode boundary.
+                # Skip every threshold already passed: an episode that outlives a threshold would
+                # otherwise leave it behind and re-trigger an eval of the same frozen weights.
+                while _next_periodic_eval <= train_step:
+                    _next_periodic_eval += _eval_every
+                _periodic_eval_pending = True
+                _periodic_saved_gates = (rl_updates_on, bc_updates_on, hl_updates_on, any_updates_on)
+                rl_updates_on = bc_updates_on = hl_updates_on = any_updates_on = False
+                print(
+                    f"[main_carla] periodic eval due at train step {train_step}: updates frozen until "
+                    f"this episode ends and {FLAGS.post_stop_eval_episodes} eval episodes run.",
+                    flush=True,
+                )
 
     # online_steps was exhausted without the current episode ever hitting `done`
     # (no collision/success/off-route termination) -- the video/frame logging
@@ -5180,8 +5606,20 @@ def run_online_carla(
         # request would otherwise hold process exit open until its socket timeout expires.
         _yay_robot.close()
 
-    # Final export of the fine-tuned backbone at exit (in addition to the periodic saves above).
-    _save_steervla_ckpt(FLAGS.online_steps, final=True)
+    # Final export of the fine-tuned backbone at exit -- but ONLY if a stop condition did not
+    # already export it. When --eval-mode stops training at, say, step 3884, the weights are
+    # frozen from then on, so this would write a byte-identical copy tagged with --online_steps
+    # (10000): a step number the run never trained to, landing AFTER the real export and, under
+    # hl_checkpoint_keep_last, able to rotate it off disk. Observed on generalization-wall-1095,
+    # which stopped at 5030 env steps and still produced a "10000" checkpoint.
+    if _final_ckpt_step is None:
+        _save_steervla_ckpt(FLAGS.online_steps, final=True)
+    else:
+        print(
+            f"[main_carla] skipping exit checkpoint: training already exported its final weights "
+            f"at step {_final_ckpt_step}; nothing has changed since.",
+            flush=True,
+        )
 
     if FLAGS.save_buffer:
         buffer_path = FLAGS.buffer_path or os.path.join(FLAGS.save_dir, "buffer.npz")
@@ -5254,6 +5692,41 @@ def run_online_residual(
         print("[main_carla] base_only=True: rolling out the frozen base policy (no RL).", flush=True)
     elif not enable_updates:
         print("[main_carla] enable_updates=False: rollout-only (no RL gradient updates).", flush=True)
+
+    # --- Reportable-run machinery (--eval_mode), mirroring run_online_carla ----------------------
+    # This loop trains a model online just as the CAST/HL loop does, so it owes the same four
+    # guarantees: 2k-step checkpoints, both seeds pinned, a frozen multi-seed eval on the weights
+    # training produced, and a run_summary.json recording all of it. Without these a residual run
+    # is not reproducible or reportable, and until now it had only the seeds.
+    _carla_seed, _train_seed, _eval_seeds = resolve_run_seeds()
+    eval_phase = False
+    eval_scores: list[float] = []
+    stop_reason = ""
+    _score_streak = 0
+    final_train_driving_score = 0.0
+    _final_ckpt_step: int | None = None
+    # Gradient steps actually applied to the residual actor -- the residual analogue of
+    # _hl_grad_steps, and what run_summary.json reports as the training effort.
+    _updates_applied = 0
+    _n_eval_eps = max(1, int(FLAGS.post_stop_eval_episodes))
+    if (
+        FLAGS.eval_mode
+        and agent is not None
+        and enable_updates
+        and FLAGS.save_interval > DEFAULT_ONLINE_CKPT_EVERY_STEPS
+    ):
+        print(
+            f"[main_carla] --save_interval={FLAGS.save_interval} is coarser than the "
+            f"{DEFAULT_ONLINE_CKPT_EVERY_STEPS}-step online checkpoint cadence; tightening it.",
+            flush=True,
+        )
+        FLAGS.save_interval = DEFAULT_ONLINE_CKPT_EVERY_STEPS
+    if FLAGS.eval_mode:
+        print(
+            f"[main_carla] residual seeds: carla={_carla_seed} train={_train_seed} "
+            f"eval={_eval_seeds} (eval replays carla={_carla_seed} with each model seed)",
+            flush=True,
+        )
 
     log_video = bool(config.get("log_episode_video", True))
     video_fps = float(config.get("episode_video_fps", 10.0))
@@ -5430,8 +5903,29 @@ def run_online_residual(
 
     last_step = start_step
     try:
-        for step in tqdm.tqdm(range(first_step, FLAGS.online_steps + 1), dynamic_ncols=True):
+        # Unbounded in --eval_mode: the frozen eval episodes run AFTER the step budget is spent,
+        # so the range cannot be the hard stop. Every exit is an explicit break below; without
+        # --eval_mode the first one reproduces the old `range(first_step, online_steps + 1)`.
+        _budget_end = FLAGS.online_steps
+        for step in tqdm.tqdm(
+            itertools.count(first_step),
+            initial=first_step,
+            total=_budget_end + 1,
+            dynamic_ncols=True,
+        ):
             last_step = step
+            if step > _budget_end and not eval_phase:
+                if not (FLAGS.eval_mode and agent is not None):
+                    break
+                # Budget spent mid-episode: finish this episode, then the block at episode end
+                # arms the eval phase. Bounded so a never-ending episode cannot hang the run.
+                if step > _budget_end + 5000:
+                    print(
+                        "[main_carla] step budget exceeded by 5000 with no episode end; "
+                        "stopping without a frozen eval.",
+                        flush=True,
+                    )
+                    break
             scale_now = _residual_scale(step)
             scale_j = jnp.asarray(scale_now, dtype=jnp.float32)
             # OTF selection needs a training critic -> active only past warmup (else execute base).
@@ -5573,6 +6067,7 @@ def run_online_residual(
             ):
                 for _ in range(updates_per_step):
                     agent, train_info = agent.update(buffer.sample(batch_size), scale_j)
+                    _updates_applied += 1
             t_update_end = time.time()
 
             if step % FLAGS.log_interval == 0:
@@ -5654,7 +6149,10 @@ def run_online_residual(
             # write is the only thing that survives; resume_state is written LAST as the commit
             # marker (a crash mid-save leaves the previous consistent checkpoint intact).
             recover = agent is not None and FLAGS.resume_interval > 0 and step % FLAGS.resume_interval == 0
-            if agent is not None and (milestone or recover):
+            # Checkpoint only while TRAINING. Once eval_phase freezes the weights, further writes
+            # only add files at post-training steps that no run_summary.json references -- and in
+            # the HL loop the equivalent saves rotated the final export off disk entirely.
+            if agent is not None and (milestone or recover) and not eval_phase:
                 save_agent(agent, FLAGS.save_dir, step)
             if recover:
                 if FLAGS.save_buffer and buffer is not None:
@@ -5674,6 +6172,90 @@ def run_online_residual(
                     debug_task=debug_task, debug_return=debug_return,
                 )
                 episode_count += 1
+                _ep_ds = float(info.get("driving_score", 0.0) or 0.0)
+                if eval_phase:
+                    # Frozen eval on the weights training produced: collect, then report and exit.
+                    eval_scores.append(_ep_ds)
+                    print(
+                        f"[main_carla] eval episode {len(eval_scores)}/{_n_eval_eps}: "
+                        f"driving_score={_ep_ds:.2f}",
+                        flush=True,
+                    )
+                    if len(eval_scores) >= _n_eval_eps:
+                        _mean = sum(eval_scores) / len(eval_scores)
+                        print(
+                            f"[main_carla] EVAL DONE after {stop_reason}: mean driving_score="
+                            f"{_mean:.2f} over {len(eval_scores)} episodes "
+                            f"({', '.join(f'{v:.2f}' for v in eval_scores)}); stopping.",
+                            flush=True,
+                        )
+                        wandb.log({
+                            "eval/mean_driving_score": _mean,
+                            "eval/episodes": float(len(eval_scores)),
+                            "eval/updates_applied": float(_updates_applied),
+                        }, step=step)
+                        write_run_summary(
+                            FLAGS.save_dir,
+                            route=str(FLAGS.route or ""),
+                            carla_seed=_carla_seed,
+                            train_seed=_train_seed,
+                            eval_seeds=list(_eval_seeds[: len(eval_scores)]),
+                            eval_scores=list(eval_scores),
+                            final_train_driving_score=final_train_driving_score,
+                            stop_reason=stop_reason,
+                            hl_updates_applied=_updates_applied,
+                            env_steps=int(step),
+                            final_checkpoint=(
+                                # save_agent writes params_<step>.pkl (flax_utils.save_agent),
+                                # not a step-named directory like the OpenPI HL checkpoints.
+                                os.path.join(FLAGS.save_dir, f"params_{_final_ckpt_step}.pkl")
+                                if _final_ckpt_step is not None
+                                else None
+                            ),
+                        )
+                        break
+                elif FLAGS.eval_mode and agent is not None:
+                    # Same two stop conditions the CAST/HL loop uses, counted in residual
+                    # gradient steps: a reproducible score, or the step budget running out.
+                    _streak_need = max(1, int(FLAGS.stop_on_driving_score_streak))
+                    if FLAGS.stop_on_driving_score > 0:
+                        if _ep_ds >= FLAGS.stop_on_driving_score:
+                            _score_streak += 1
+                        else:
+                            if _score_streak:
+                                print(
+                                    f"[main_carla] driving_score {_ep_ds:.2f} broke a streak of "
+                                    f"{_score_streak}/{_streak_need}.",
+                                    flush=True,
+                                )
+                            _score_streak = 0
+                        wandb.log({"training/score_streak": float(_score_streak)}, step=step)
+                        if _score_streak >= _streak_need:
+                            stop_reason = (
+                                f"{_score_streak} consecutive episodes at driving_score "
+                                f">= {FLAGS.stop_on_driving_score:g} after {_updates_applied} "
+                                f"residual updates"
+                            )
+                    if not stop_reason and step > _budget_end:
+                        stop_reason = (
+                            f"reached --online_steps={FLAGS.online_steps} after "
+                            f"{_updates_applied} residual updates"
+                        )
+                    if stop_reason:
+                        final_train_driving_score = _ep_ds
+                        # Export the weights training actually produced, whatever the step count.
+                        _flush_checkpoint(int(step))
+                        _final_ckpt_step = int(step)
+                        enable_updates = False   # freeze: read live by the update gate above
+                        print(
+                            f"[main_carla] STOP TRAINING ({stop_reason}); running "
+                            f"{_n_eval_eps} frozen eval episodes.",
+                            flush=True,
+                        )
+                        wandb.log({"training/stopped_at_step": float(step)}, step=step)
+                        eval_phase = True
+                elif step > _budget_end:
+                    break
                 if 0 < FLAGS.max_episodes <= episode_count:
                     break  # bounded eval: stop after exactly --max_episodes episodes
                 episode_return = 0.0
@@ -5684,7 +6266,28 @@ def run_online_residual(
                 prev_collision_count = 0
                 episode_traffic_violations = 0
                 prev_traffic_violation_count = 0
-                obs, _info = env.reset(seed=run_carla_seed() + episode_count)
+                # Training episodes walk the sim seed for varied traffic; eval episodes REPLAY the
+                # training carla_seed and change only the model seed, so their spread measures the
+                # policy rather than the scenario. Reseeding `rng` covers the residual actor's own
+                # sampling; sampling_seed covers the SteerVLA base policy's CoT/action sampling.
+                if eval_phase and FLAGS.eval_mode:
+                    _eval_idx = len(eval_scores)
+                    if _eval_idx < len(_eval_seeds):
+                        _sd = int(_eval_seeds[_eval_idx])
+                        rng = jax.random.PRNGKey(_sd)
+                        if steervla_actor is not None:
+                            steervla_actor.sampling_seed = _sd
+                        print(
+                            f"[main_carla] eval episode {_eval_idx + 1}: carla_seed={_carla_seed} "
+                            f"model seed={_sd}",
+                            flush=True,
+                        )
+                    _reset_seed = int(_carla_seed)
+                elif FLAGS.fixed_train_carla_seed:
+                    _reset_seed = int(_carla_seed)
+                else:
+                    _reset_seed = run_carla_seed() + episode_count
+                obs, _info = env.reset(seed=_reset_seed)
                 steervla_actor.reset_action_cache()
                 rng, nk = jax.random.split(rng)
                 base_cands, x_cands, base_chunks, cands = _compute_base(
@@ -5697,7 +6300,17 @@ def run_online_residual(
                 )
     finally:
         train_logger.close()
-        _flush_checkpoint(last_step or FLAGS.online_steps)
+        # Training already exported its final weights when the stop fired; the eval episodes that
+        # followed changed nothing, so a second export here would only add a checkpoint at a
+        # post-eval step that no run_summary.json references.
+        if _final_ckpt_step is None:
+            _flush_checkpoint(last_step or FLAGS.online_steps)
+        else:
+            print(
+                f"[main_carla] skipping exit checkpoint: training already exported its final "
+                f"weights at step {_final_ckpt_step}.",
+                flush=True,
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -5791,6 +6404,7 @@ def _run_residual_entry(config):
     steervla_cfg = config.get("steervla", None)
     if steervla_cfg is None or not steervla_cfg.get("enabled"):
         raise ValueError("config.steervla.enabled must be true: residual RL needs a base policy.")
+    _check_simlingo_steervla_support(config, residual_entry=True)
 
     extra_carla: dict[str, Any] = {}
     exec_cfg = _steervla_action_execution_cfg(steervla_cfg)
@@ -5822,11 +6436,16 @@ def _run_residual_entry(config):
         raw_holder: dict = {"obs": obs}
         training_gpu_rank = int(config.get("training_gpu_rank", -1))
 
-        from vlas.steervla import create_steervla_pi0_cot_sample_fn
+        if _is_simlingo_steervla(steervla_cfg):
+            vla_sample_fn, steervla_actor = _build_vla_sample_fn(
+                steervla_cfg, raw_holder, training_gpu_rank=training_gpu_rank
+            )
+        else:
+            from vlas.steervla import create_steervla_pi0_cot_sample_fn
 
-        vla_sample_fn, steervla_actor = create_steervla_pi0_cot_sample_fn(
-            steervla_cfg, raw_holder, training_gpu_rank=training_gpu_rank
-        )
+            vla_sample_fn, steervla_actor = create_steervla_pi0_cot_sample_fn(
+                steervla_cfg, raw_holder, training_gpu_rank=training_gpu_rank
+            )
 
         _configure_jax_training_device(training_gpu_rank)
 
@@ -6239,6 +6858,8 @@ def _run_grpo_entry(config):
     with open(os.path.join(FLAGS.save_dir, "flags.json"), "w") as f:
         json.dump(get_flag_dict(), f)
 
+    if _is_simlingo_steervla(steervla_cfg):
+        raise NotImplementedError("GRPO samples Pi0 CoT candidates; steervla.vla='simlingo_steervla' is not supported.")
     carla_yaml, extra_carla, exec_cfg = _resolve_carla_env_config(config)
     env = _make_carla_env(carla_yaml, FLAGS.route, extra_carla_config=extra_carla)
     try:
@@ -6262,7 +6883,7 @@ def _run_grpo_entry(config):
         vlm_cfg = config.get("vlm_coach") or {}
         coach = create_coach(
             str(vlm_cfg.get("provider", "gemini")),
-            model=str(vlm_cfg.get("gemini_model", "gemini-2.0-flash")),
+            model=str(vlm_cfg.get("gemini_model", DEFAULT_GEMINI_MODEL)),
         )
 
         run_online_grpo(
@@ -6476,6 +7097,7 @@ def build_carla_session(config, env, exec_cfg: Optional[dict] = None) -> CarlaSe
     place (``critic_action_dim``, ``language_label_dim``), matching the prior behavior.
     """
     steervla_cfg = config.get("steervla", None)
+    _check_simlingo_steervla_support(config, residual_entry=False)
     online_training_mode = str(config.get("online_training_mode", "rl")).strip().lower()
     _VALID_TRAIN_MODES = {"rl", "dagger", "sac_residual", "dagger_residual"}
     if online_training_mode not in _VALID_TRAIN_MODES:
