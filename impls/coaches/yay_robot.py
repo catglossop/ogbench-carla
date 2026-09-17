@@ -175,6 +175,16 @@ def build_foresight_correction_prompt(
         evidence about it. Where the CoT contradicts the image, that is a correction, and the
         replacement must describe what the image actually shows.
 
+        AGREEMENT CHECK. Before deciding, check these three against each other and say which one
+        is wrong when they disagree:
+          1. the subtask (what the vehicle is about to do),
+          2. the reasoning (why it says it is doing that), and
+          3. the routing command (the task it is actually carrying out).
+        A subtask that is safe but carries out a DIFFERENT instruction than the routing command is
+        wrong and must be corrected -- e.g. holding the lane when the command is to turn, or
+        turning when the command is to go straight. Likewise a reasoning that justifies something
+        the subtask does not do: correct the pair so they describe one consistent action.
+
         Routing command (the instruction the vehicle is following): {routing_command or "Follow the route."}
 
         Current ego telemetry:
