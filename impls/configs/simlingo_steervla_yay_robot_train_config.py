@@ -65,10 +65,13 @@ def get_config():
     s.hl_online_precursor_fraction = 60.0 / 90.0
     s.use_adaptive_sampling = False
 
-    # Thin the corrections back to the OpenPI arm's rate (see the module docstring). The HL is
-    # re-planned every ``actions_per_cot`` LL queries and the LL runs every
-    # ``actions_per_model_query`` env steps, so that product is the CoT query period.
-    _cot_period = max(1, int(s.get("actions_per_cot", 5)) * int(s.get("actions_per_model_query", 3)))
+    # Thin the corrections back to the OpenPI arm's rate (see the module docstring). SimLingo ages
+    # the held CoT by one per ENV step but can only re-plan on an LL query, so the CoT period is
+    # the ``actions_per_model_query`` multiple at or above ``actions_per_cot`` -- 6 env steps at
+    # 5/3. NOT their product: that reads as 15 and thins the corrections to half the intended rate.
+    _ll_period = max(1, int(s.get("actions_per_model_query", 3)))
+    _cot_age = max(1, int(s.get("actions_per_cot", 5)))
+    _cot_period = -(-_cot_age // _ll_period) * _ll_period
     config.yay_robot.query_every_n_cot_queries = max(
         1, round(TARGET_ENV_STEPS_PER_CORRECTION / _cot_period)
     )
