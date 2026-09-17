@@ -4820,7 +4820,11 @@ def run_online_carla(
             # intervention, so on an intervention step these already hold the corrected language.
             _yay_robot.record_model_input(
                 episode_step=episode_steps,
-                image=cot_obs_raw.get("image"),
+                # The frame the VLA consumed (``steervla.image_key``), resolved exactly as for
+                # cast_relabel above. Hardcoding "image" silently broke the SimLingo actor, which
+                # uses the native 1024x512 ``image_viz``: the key is absent, so every HL sample was
+                # dropped rather than stored against the wrong frame.
+                image=cot_obs_raw.get(str((agent_config.get("steervla") or {}).get("image_key", "image"))),
                 state=cot_obs_raw.get("state"),
                 current_speed=float(_ego_speed_mps_from_raw(cot_obs_raw)),
                 prompt=(
