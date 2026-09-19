@@ -26,12 +26,15 @@ def main():
         if hl.dataset_cfg.get('use_history_image', False):
             raise ValueError('History images are not supported by this HL bridge.')
         original_sample = hl.model.language_model.greedy_sample
+        # Per-request HL sampling temperature (0 = greedy, the default). Best-of-N needs > 0 so each
+        # candidate gets its own subtask; a per-request seed keeps those draws reproducible.
+        sampling = dict(temperature=0.0)
 
-        def greedy(*args, **kwargs):
-            kwargs['temperature'] = 0.0
+        def sample(*args, **kwargs):
+            kwargs['temperature'] = sampling['temperature']
             return original_sample(*args, **kwargs)
 
-        hl.model.language_model.greedy_sample = greedy
+        hl.model.language_model.greedy_sample = sample
         conn.send(dict(ready=True, weights=str(hl.weights),
                        use_ego_history=bool(hl.dataset_cfg.get('use_ego_state_history', False)),
                        history_count=int(hl.dataset_cfg.get('ego_state_history_count', 3))))
@@ -39,6 +42,9 @@ def main():
             request = conn.recv()
             if request is None:
                 break
+            sampling['temperature'] = float(request.get('temperature', 0.0))
+            if request.get('seed') is not None:
+                torch.manual_seed(int(request['seed']))
             _, _, language = hl.generate(request['image'], request['prompt'])
             output = str(language[0] if language else '')
             reasoning, subtask = split_hl_output(output)

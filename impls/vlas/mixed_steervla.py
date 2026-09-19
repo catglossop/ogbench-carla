@@ -85,7 +85,12 @@ class MixedSteerVLAActor(SteerVLAActor):
                   f"Command: {raw.get('routing_command') or self.routing_command}")
         # The native camera is for InternVL2 only. The superclass still constructs
         # pi05's Observation from raw['image'] and encodes it with pi05's backbone.
-        self._hl_conn.send(dict(image=np.asarray(raw['image_viz'], dtype=np.uint8), prompt=prompt))
+        # Sample the HL at the actor's CoT temperature (Best-of-N sets 1.0 so each candidate slot gets
+        # its own subtask; 0 keeps the original greedy HL). The seed comes from this call's JAX key, so
+        # every sequential BoN slot draws independently yet reproducibly.
+        seed = int(jax.random.randint(rng, (), 0, np.iinfo(np.int32).max))
+        self._hl_conn.send(dict(image=np.asarray(raw['image_viz'], dtype=np.uint8), prompt=prompt,
+                                temperature=float(self.cot_temperature), seed=seed))
         result = self._receive_hl()
         raw['simlingo_hl_output'] = result['output']
         raw['simlingo_hl_prompt'] = prompt

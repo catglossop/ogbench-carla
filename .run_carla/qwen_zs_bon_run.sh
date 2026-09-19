@@ -147,8 +147,10 @@ case "$ACTOR" in
     # every GPU stays visible and --train-gpu is the physical index.
     [ -f "$CKPT/pytorch_model.bin" ] && [ -f "$CKPT/.hydra/config.yaml" ] \
       || { echo "[qwen_zs_run] ABORT: $CKPT is not a SimLingo HL export" >&2; exit 1; }
-    MIXED_LL_CHECKPOINT="${MIXED_LL_CHECKPOINT:-/raid/users/cglossop/steervla_pi_ckpts/ll_heavy_unnormed_matchcrop/6000}"
-    MIXED_LL_ACTOR_CONFIG="${MIXED_LL_ACTOR_CONFIG:-pi05_steervla_cot_simplified_reasoning_ll_heavy}"
+    # Default LL = steervla_mixed_eval_config's own pi05 (no_ego_history v1 @ 6000), from the local
+    # OpenPI cache; its 200/64/64 prompt/subtask/reasoning budget does not truncate InternVL2 text.
+    MIXED_LL_CHECKPOINT="${MIXED_LL_CHECKPOINT:-/raid/users/cglossop/openpi/cat-logs/pi05_steervla_cot_simplified_reasoning_no_ego_history/pi05_steervla_simplified_reasoning_no_ego_history_v1/pi05_steervla_simplified_reasoning_no_ego_history_v1_20260718_201640/6000}"
+    MIXED_LL_ACTOR_CONFIG="${MIXED_LL_ACTOR_CONFIG:-pi05_steervla_cot_simplified_reasoning_no_ego_history}"
     MIXED_HL_PYTHON="${MIXED_HL_PYTHON:?MIXED_HL_PYTHON must point at a python with the SimLingo deps}"
     SIMLINGO_SOURCE_ROOT="${SIMLINGO_SOURCE_ROOT:-/home/cglossop/simlingo-steervla}"
     [ -d "$MIXED_LL_CHECKPOINT/params" ] || { echo "[qwen_zs_run] ABORT: no params/ under $MIXED_LL_CHECKPOINT" >&2; exit 1; }
