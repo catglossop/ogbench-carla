@@ -28,6 +28,17 @@ cd "$ROOT_DIR"
 ROUTE="${1:?route}"; GPU="${2:?gpu}"; SLOT="${3:?slot}"
 CKPT="${4:?checkpoint}"; CARLA_SEED="${5:?carla seed}"; OUT_DIR="${6:?out dir}"
 
+# Hand-queued extra evals (e.g. an intermediate checkpoint) pass CHECKPOINT as "<dir>#<tag>". The
+# tag keeps them out of the route's own cell: results go to <route>__<tag>/carla_seed_N instead of
+# overwriting <route>/carla_seed_N, and the tag is added to the W&B run name.
+EXTRA_TAG=""
+case "$CKPT" in
+  *'#'*)
+    EXTRA_TAG="${CKPT##*#}"; CKPT="${CKPT%%#*}"
+    OUT_DIR="$(dirname "$(dirname "$OUT_DIR")")/${ROUTE}__${EXTRA_TAG}/$(basename "$OUT_DIR")"
+    ;;
+esac
+
 BENCH="${BENCH:?BENCH must be b2d or f2d}"
 QWEN_URL="${QWEN_URL:?QWEN_URL must be set}"
 RUN_GROUP="${RUN_GROUP:?RUN_GROUP must be set}"
@@ -72,7 +83,7 @@ export CARLA_DISABLE_RENDER_THREAD_TIMEOUT=1 CARLA_DISABLE_RHI_THREAD=1
 export WANDB_API_KEY="$(cat /home/cglossop/.wandb_school_key)"
 export WANDB_ENTITY=catherineglossop
 
-EXP_NAME="${ROUTE}-cs${CARLA_SEED}-qwenzs_$(date +%Y%m%d_%H%M%S)"
+EXP_NAME="${ROUTE}-cs${CARLA_SEED}${EXTRA_TAG:+-$EXTRA_TAG}-qwenzs_$(date +%Y%m%d_%H%M%S)"
 COMMON=(
   --route "$ROUTE" --carla-config impls/configs/carla_config.yaml
   --online-steps "$ONLINE_STEPS" --max-episode-steps "$MAX_EPISODE_STEPS"
