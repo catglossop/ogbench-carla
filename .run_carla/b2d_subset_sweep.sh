@@ -16,7 +16,10 @@
 # so budget ~10-20 GB per route. That is why save_dir defaults to /raid (3.2T free) rather than
 # /home (298G) -- 23 routes of checkpoints will not fit on the root filesystem.
 set -uo pipefail
-cd /home/cglossop/ogbench-carla
+# Run from the checkout this script lives in (a worktree runs its own code).
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Port/display bases, shared with eval_subset_run.sh; override to run beside another sweep.
+export CARLA_PORT_BASE="${CARLA_PORT_BASE:-16400}" TM_PORT_BASE="${TM_PORT_BASE:-16500}" DISPLAY_BASE="${DISPLAY_BASE:-940}"
 
 SEED="${SEED:-0}"
 GPUS=(${SWEEP_GPUS:-5 6})
@@ -41,6 +44,8 @@ STOP_SCORE_STREAK="${STOP_SCORE_STREAK:-}"
 FIXED_CARLA_SEED="${FIXED_CARLA_SEED:-}"
 ONLINE_STEPS="${ONLINE_STEPS:-10000}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+# Periodic frozen eval every N training env steps (main_carla --eval_every_env_steps). Empty = off.
+export EVAL_EVERY="${EVAL_EVERY:-}"
 WATCHDOG_GRACE="${WATCHDOG_GRACE:-600}"
 WATCHDOG_STRIKES="${WATCHDOG_STRIKES:-6}"
 # A live run writes [RC-PID] lines every tick, so silence means hung, not slow.
@@ -53,6 +58,7 @@ for a in "$@"; do case "$a" in
 esac; done
 
 QUEUE="${LOG_DIR}/queue.txt"
+PIDFILE="${LOG_DIR}/sweep.pid"
 LOCK="${LOG_DIR}/queue.lock"
 DIED="${LOG_DIR}/carla_died.txt"
 mkdir -p "$LOG_DIR" "$RESULTS_DIR"
@@ -72,15 +78,19 @@ fi
 if [ "$MODE" = stop ]; then
   # Scoped to this sweep's own workers, by the script name AND the sweep tag -- never a bare
   # pkill on run_carla.sh, which would match every other tenant's runs on this box.
-  for p in $(pgrep -u "$USER" -f "b2d_subset_sweep.sh --arm" 2>/dev/null); do
+  # Prefer this sweep's own recorded process group, so stopping it never touches a sweep armed
+  # from another checkout; fall back to the name match for sweeps armed before the pid file existed.
+  if [ -s "$PIDFILE" ]; then
+    log "killing sweep pgid $(cat "$PIDFILE")"; kill -TERM -"$(cat "$PIDFILE")" 2>/dev/null; rm -f "$PIDFILE"
+  else for p in $(pgrep -u "$USER" -f "b2d_subset_sweep.sh --arm" 2>/dev/null); do
     log "killing sweep worker pgid $(ps -o pgid= -p "$p" | tr -d ' ')"
     kill -TERM -"$(ps -o pgid= -p "$p" | tr -d ' ')" 2>/dev/null
-  done
+  done; fi
   sleep 10
   for i in "${!GPUS[@]}"; do
-    port=$((16400 + i * 20))
+    port=$((CARLA_PORT_BASE + i * 20))
     for q in $(pgrep -u "$USER" -f "carla-rpc-port=${port}" 2>/dev/null); do kill -9 "$q" 2>/dev/null; done
-    rm -f "/tmp/.X$((940 + i))-lock"
+    rm -f "/tmp/.X$((DISPLAY_BASE + i))-lock"
   done
   log "stopped. Other users' jobs untouched."
   exit 0
@@ -108,6 +118,7 @@ echo "  gpus       : ${GPUS[*]}   (one route per gpu at a time)"
 echo "  checkpoints: ON (--eval-mode; every 2000 env steps + end-of-training export)"
   echo "  recipe     : max_hl_updates=$MAX_HL_UPDATES stop_on_score=$STOP_ON_SCORE streak=${STOP_SCORE_STREAK:-1} updates_after=$UPDATES_AFTER_SCORE"
   echo "               fixed_carla_seed=${FIXED_CARLA_SEED:-false} online_steps=$ONLINE_STEPS extra=\"${EXTRA_ARGS}\""
+  echo "               eval_every=${EVAL_EVERY:-off} ports=${CARLA_PORT_BASE}+20k displays=:${DISPLAY_BASE}+k"
 echo "  save_dir   : $OGBENCH_SAVE_DIR   ($(df -h "$(dirname "$OGBENCH_SAVE_DIR")" 2>/dev/null | tail -1 | awk '{print $4}') free)"
 echo "  results    : $RESULTS_DIR"
 echo "  logs       : $LOG_DIR"
@@ -118,13 +129,14 @@ if [ "$MODE" = dry ]; then
 fi
 
 : > "$LOCK"
+echo "$$" > "$PIDFILE"
 : "${GEMINI_API_KEY:?GEMINI_API_KEY must be exported — CAST relabel is a Gemini client}"
 log "armed: $N routes, seed $SEED, gpus ${GPUS[*]}"
 
 next_route() { flock 9; local r; r=$(head -n1 "$QUEUE"); [ -n "$r" ] && sed -i '1d' "$QUEUE"; echo "$r"; } 9>>"$LOCK"
 
 worker() {
-  local slot=$1 gpu=$2 port=$((16400 + $1 * 20))
+  local slot=$1 gpu=$2 port=$((CARLA_PORT_BASE + $1 * 20))
   while :; do
     local route; route=$(next_route)
     [ -z "$route" ] && { log "w$slot/gpu$gpu: queue empty"; break; }
@@ -171,7 +183,7 @@ worker() {
               echo "$route" >> "$DIED"; kill -TERM -"$rc" 2>/dev/null; sleep 15; kill -9 -"$rc" 2>/dev/null
               # Reclaim the display/CARLA this route was holding so the next route can start.
               pkill -u "$USER" -9 -f "carla-rpc-port=${port}" 2>/dev/null
-              rm -f "/tmp/.X$((940 + slot))-lock" 2>/dev/null
+              rm -f "/tmp/.X$((DISPLAY_BASE + slot))-lock" 2>/dev/null
               break; }
           else stalls=0; fi
         fi

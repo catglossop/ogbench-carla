@@ -186,3 +186,17 @@ def test_batched_cot_reuse_uses_env_steps_and_resets_on_episode_change():
     assert 'cot_out' not in actor.calls[3][1]
     assert len(actor.calls) == 4  # Reusing text never reuses action chunks.
     assert not np.array_equal(actor.calls[0][1]['noise'], actor.calls[1][1]['noise'])
+
+
+def test_candidate_batch_preserves_actor_history():
+    actor = _FakeActor(_valid_result())
+    actor.history = [1, 2, 3]
+    def episode_reset():
+        actor.history.clear()
+    def candidate_reset():
+        actor.reset_calls += 1
+    actor.reset_action_cache = episode_reset
+    actor.reset_candidate_cache = candidate_reset
+    _sample(actor)
+    assert actor.history == [1, 2, 3]
+    assert actor.reset_calls == 1

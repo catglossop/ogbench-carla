@@ -220,6 +220,118 @@ Change your user name in line 10 of `launch_steervla.sh`.
 
 Set the `actor_url` in the steervla config (see `impls/configs/steervla_dsrl_config.py` for an example)
 
+### SimLingo SteerVLA as the base VLA
+
+`steervla.vla` picks the base policy behind the shared VLA contract (`vla_sample_fn`, the text stashes, `update_hl`, `save_checkpoint`). The default `"steervla"` is the OpenPI Pi0-CoT actor. `"simlingo_steervla"` (`impls/vlas/simlingo_steervla.py`) runs the SimLingo SteerVLA stack in-process under torch:
+- an HL planner (InternVL2-1B + LoRA) that writes `<reasoning>\n\nDriving Behavior: <meta action>`
+- followed by the meta-action-conditioned LL waypoint policy
+
+The LL waypoints are converted to the same 40-D `DELTA_XY_T_DELTA_XY_SPACE` chunk the Pi0 actor emits, so the env, PID decoding and replay buffers are unchanged. The flow-noise input is ignored.
+
+Setup:
+
+```
+uv sync --extra all-gpu --extra simlingo      # peft, hydra-core, pytorch-lightning, timm, ...
+git clone <simlingo-steervla repo> /home/<you>/simlingo-steervla   # source only; its py3.8 env is not needed
+```
+
+The sweeps on this machine leave the shared `.venv` untouched. They install the `simlingo` extra into `/raid/users/cglossop/ogbench-simlingo-deps` and launch with `PYTHONPATH=<checkout>:/raid/users/cglossop/ogbench-simlingo-deps`.
+
+Configs:
+
+| Config | What it runs |
+| --- | --- |
+| `impls/configs/simlingo_steervla_cast_relabel_train_config.py` | CAST-relabel HL training (DSRL rollout, RL/BC off, `update_hl` 10 steps every 200 env steps, kl005 batch mix with adaptive sampling off) |
+| `impls/configs/simlingo_steervla_residual_config.py` | Residual SAC on a frozen SimLingo base (see below) |
+
+#### Swapping the VLA in any config
+
+`steervla.vla` is the whole switch, but `config_flags` can only override keys a config already has — `--agent.steervla.vla=simlingo_steervla` fails with `Unknown command line flag`, since the Pi0 configs have no `vla` / `hl_checkpoint` / `simlingo_source_root` keys to override. So the swap is a small config file, not a CLI flag:
+
+```python
+# impls/configs/<your>_simlingo_config.py
+from configs.simlingo_steervla_cast_relabel_train_config import apply_simlingo_steervla
+from configs.<your>_config import get_config as _base_get_config
+
+
+def get_config():
+    config = _base_get_config()
+    apply_simlingo_steervla(config.steervla)   # vla + checkpoints + source root + image_key + cadence
+    return config
+```
+
+Run it with `--agent-config impls/configs/<your>_simlingo_config.py`; routes, seeds, sweeps and the `run_carla.sh` flags are unchanged. Once the helper has created the keys, per-run overrides work as usual: `--steervla-checkpoint <dir>` (which sets `hl_checkpoint` for this VLA), `--cot-temperature`, or any `--agent.steervla.<key>=...` after the `--`.
+
+**Residual RL, the worked example.** `impls/configs/simlingo_steervla_residual_config.py` is that recipe over `steervla_residual_config.py`, plus the two options this path needs on a non-Pi0 base:
+
+```python
+def get_config():
+    config = get_steervla_residual_config()
+    config.state_encoder = "siglip_pool"   # pi_prefix / pi_prefix_groups / rl_token read Pi0 internals
+    config.expo = False                    # EXPO best-of-N samples Pi0 CoT candidates
+    apply_simlingo_steervla(config.steervla)
+    config.steervla.actions_per_cot = 5    # HL re-plan cadence of the CAST runs
+    return config
+```
+
+That pattern is the same for any other entry point: start from the config you would have run, apply the helper, then set whatever that path needs from the support table below (e.g. `observation_mode` `state` / `image` and no `--bon_*` on the DSRL-attached residual modes). Anything unsupported is rejected at startup, not mid-run.
+
+`apply_simlingo_steervla` sets:
+
+| `steervla.` key | Value / meaning |
+| --- | --- |
+| `vla` | `"simlingo_steervla"` |
+| `simlingo_source_root` | simlingo-steervla checkout; `simlingo_training` is imported from here |
+| `hl_checkpoint`, `ll_checkpoint` | A run dir, a DeepSpeed `epoch=XXX.ckpt` dir (converted or not), or a saved `<run>/checkpoints/<step>` dir. A `.hydra/config.yaml` must sit above the weights. |
+| `checkpoint` | Set to `hl_checkpoint`; only the generic "VLA configured" gate reads it |
+| `image_key` | `image_viz` (native 1024x512 front camera, SimLingo's mount/fov) |
+| `actions_per_model_query` | LL query cadence in env steps (3); the chunk is held and re-anchored in between |
+| `actions_per_cot` | The HL re-plans on an LL query step once its CoT is this old (5 → every 6 env steps) |
+| `cot_temperature` | HL decoding temperature (0 = greedy; `run_carla.sh --cot-temperature` overrides it) |
+
+The HL replay pool (`hl_replay_pools=[simlingo_hl_simplified]`) holds SimLingo training frames in the SimLingo HL prompt/answer format. Build it once:
+
+```
+.venv/bin/python impls/vlas/extract_simlingo_hl_replay.py \
+  --data-path /raid/datasets/simlingo/database/simlingo \
+  --simlingo-source-root /home/cglossop/simlingo-steervla \
+  --out-root /raid/users/cglossop/simlingo_hl_pools --name simlingo_hl_simplified --n 4000
+```
+
+CAST-relabel sweep, with a frozen 3-seed eval every 2k steps logged to `eval/mean_driving_score` and saved to `periodic_evals.jsonl`. This is the `b2dsteervla_simlingo_fixedcarla_kl005_seed0` recipe:
+
+```
+SWEEP_NAME=b2dsteervla_simlingo_fixedcarla_kl005_seed0 ROUTES_FILE=b2d_steervla_subset.txt \
+AGENT_CFG=impls/configs/simlingo_steervla_cast_relabel_train_config.py SWEEP_GPUS="5 6" SEED=0 \
+ONLINE_STEPS=20000 MAX_HL_UPDATES=500 STOP_ON_SCORE=100 STOP_SCORE_STREAK=3 UPDATES_AFTER_SCORE=0 \
+FIXED_CARLA_SEED=true EVAL_EVERY=2000 POST_STOP_EVAL_EPISODES=3 \
+EXTRA_ARGS="--cot-temperature 0.1 --hl-kl-coef 0.05 --hl-ckpt-keep-last 5" \
+nohup ./.run_carla/b2d_subset_sweep.sh --arm &
+```
+
+Each HL checkpoint is about 2.6 GB (`pytorch_model.bin` + `.hydra/config.yaml`). Frozen evals use the leaderboard's 60 s `AgentBlockedTest` (`EVAL_CRASH_STUCK_STEPS`, default `10**9`); training episodes keep the 1 s post-collision cutoff. Results: `./.run_carla/sweep_results.sh` → `RESULTS.md`.
+
+#### Residual RL on SimLingo
+
+Both SimLingo models stay frozen; only the residual agent trains.
+
+```
+./run_carla.sh --agent-config impls/configs/simlingo_steervla_residual_config.py \
+  --route <route> --online-steps 10000 --train-gpu 0 --render-adapter <gpu>
+# deploy a CAST-trained HL instead of the base one (sets steervla.hl_checkpoint for this VLA):
+#   --steervla-checkpoint <cast_run>/checkpoints/<step>
+```
+
+SimLingo implements no Pi0 prefix/suffix features, candidate batches or policy embeddings. Options that need them fail at startup instead of mid-run:
+
+| Path | Works with `simlingo_steervla` | Rejected |
+| --- | --- | --- |
+| `agent_name="sac_residual"` (`steervla_residual_*` configs) | `base_only=True`; `state_encoder="siglip_pool"` with `expo=False`; either `residual_action_space` | `pi_prefix`, `pi_prefix_groups`, `rl_token`, `expo=True` |
+| DSRL `--train-mode sac_residual` / `dagger_residual` | `observation_mode` `state` / `image` | `policy_embed`, `residual_use_pi_image_features`, `critic_use_pi_prefix_features`, `--bon_*` |
+| GRPO (`--train-mode grpo_hl`) | – | everything |
+
+DSRL noise-space RL (`--train-mode rl` with RL updates on) also needs the Pi0 flow forward. With SimLingo, only the HL-only CAST setup (RL/BC updates off) is supported. `run_residual_sweep.sh` and `run_cast_to_residual.sh` hard-code the Pi0 residual configs; pass the SimLingo config to `run_carla.sh` directly, or point those scripts at it.
+
 ### CARLA config
 
 The carla config is located in `impls/config/carla_config.yaml`. This can be used to set the port for the sim (if using a remote sim), the timeout for the sim etc. 

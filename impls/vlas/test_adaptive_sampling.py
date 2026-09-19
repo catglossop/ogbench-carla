@@ -317,7 +317,9 @@ check("known key accepted by the stand-in table", ok_override)
 check(
     "constructor rejects unknown keys",
     "unknown category" in (SteerVLAActor.__init__.__doc__ or "")
-    or "unknown category" in Path("impls/vlas/steervla.py").read_text(),
+    or "unknown category" in Path("impls/vlas/steervla.py").read_text()
+    # The validation moved with the pool-sampling state into HLPoolSamplingMixin._init_hl_pool_sampling.
+    or "unknown category" in Path("impls/vlas/hl_pool_sampling.py").read_text(),
 )
 
 # ── 8. end-to-end: does the tag survive the trip through disk? ────────────────────────

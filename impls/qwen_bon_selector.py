@@ -6,6 +6,7 @@ import io
 import json
 import urllib.error
 import urllib.request
+import time
 
 import numpy as np
 from PIL import Image
@@ -43,6 +44,7 @@ class QwenActionSelector:
             f"{self.url}/score", payload, {"Content-Type": "application/json"}, method="POST"
         )
         try:
+            request_started = time.perf_counter()
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 result = json.loads(response.read())
         except urllib.error.HTTPError as exc:
@@ -52,6 +54,7 @@ class QwenActionSelector:
             ) from exc
         if "error" in result:
             raise RuntimeError(result["error"])
+        result.setdefault("timings", {})["client_roundtrip_s"] = time.perf_counter() - request_started
         choice = int(result["choice"])
         if not 0 <= choice < len(subtasks):
             raise ValueError(f"Qwen choice {choice} outside candidate range")

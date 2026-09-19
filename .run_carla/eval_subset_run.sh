@@ -19,7 +19,8 @@
 #   ./.run_carla/eval_subset_run.sh signalized-junction-left-turn-001 5 0
 #   SEED=1 ./.run_carla/eval_subset_run.sh generalization-wall-1095 6 1
 set -uo pipefail
-cd /home/cglossop/ogbench-carla
+# Run from the checkout this script lives in (a worktree runs its own code).
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 ROUTE="${1:?usage: eval_subset_run.sh ROUTE GPU SLOT [extra args]}"
 GPU="${2:?need a GPU index}"
@@ -38,11 +39,15 @@ STOP_ON_SCORE="${STOP_ON_SCORE:-100}"
 STOP_SCORE_STREAK="${STOP_SCORE_STREAK:-}"
 FIXED_CARLA_SEED="${FIXED_CARLA_SEED:-}"
 UPDATES_AFTER_SCORE="${UPDATES_AFTER_SCORE:-20}"
+# Eval episodes stop a stuck agent like the leaderboard (AgentBlockedTest, 60 s), not with the 1 s
+# training cutoff. Passed explicitly so every reportable run records it in flags.json.
+EVAL_CRASH_STUCK_STEPS="${EVAL_CRASH_STUCK_STEPS:-1000000000}"
 RUN_GROUP="${RUN_GROUP:-hl16_adaptive_evalmode}"
 
-CARLA_PORT=$((16400 + SLOT * 20))
-TM_PORT=$((16500 + SLOT * 20))
-DISPLAY_NUM=$((940 + SLOT))
+# Bases are overridable so a second sweep can run beside the default one without colliding.
+CARLA_PORT=$((${CARLA_PORT_BASE:-16400} + SLOT * 20))
+TM_PORT=$((${TM_PORT_BASE:-16500} + SLOT * 20))
+DISPLAY_NUM=$((${DISPLAY_BASE:-940} + SLOT))
 
 export CARLA_ROOT="${CARLA_ROOT:-/home/cglossop/carla}"
 export OGBENCH_SAVE_DIR="${OGBENCH_SAVE_DIR:-/home/cglossop/carla_exps}"
@@ -97,4 +102,7 @@ CUDA_VISIBLE_DEVICES="$GPU" exec bash run_carla.sh \
   ${FIXED_CARLA_SEED:+--fixed-carla-seed "$FIXED_CARLA_SEED"} \
   -- --max_hl_updates="$MAX_HL_UPDATES" \
      --stop_on_driving_score="$STOP_ON_SCORE" \
-     --updates_after_driving_score="$UPDATES_AFTER_SCORE"
+     --updates_after_driving_score="$UPDATES_AFTER_SCORE" \
+     ${EVAL_EVERY:+--eval_every_env_steps="$EVAL_EVERY"} \
+     ${POST_STOP_EVAL_EPISODES:+--post_stop_eval_episodes="$POST_STOP_EVAL_EPISODES"} \
+     --eval_crash_stuck_steps="${EVAL_CRASH_STUCK_STEPS:-1000000000}"
