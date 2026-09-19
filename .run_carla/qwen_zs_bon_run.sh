@@ -84,6 +84,9 @@ export WANDB_API_KEY="$(cat /home/cglossop/.wandb_school_key)"
 export WANDB_ENTITY=catherineglossop
 
 EXP_NAME="${ROUTE}-cs${CARLA_SEED}${EXTRA_TAG:+-$EXTRA_TAG}-qwenzs_$(date +%Y%m%d_%H%M%S)"
+# Batched candidate sampling; the mixed actor must sample sequentially (see its case below).
+BON_BATCH="${BON_BATCH:-true}"
+[ "$ACTOR" = mixed ] && BON_BATCH=false
 COMMON=(
   --route "$ROUTE" --carla-config impls/configs/carla_config.yaml
   --online-steps "$ONLINE_STEPS" --max-episode-steps "$MAX_EPISODE_STEPS"
@@ -97,7 +100,7 @@ COMMON=(
   --critic-mode none --train-mode rl
   --enable-updates false --max-retries 0
   --bon-num-candidates "$N_CANDIDATES" --bon-max-sample-attempts 1
-  --bon-batch-policy-candidates true --bon-cot-temperature 1.0
+  --bon-batch-policy-candidates "$BON_BATCH" --bon-cot-temperature 1.0
   --bon-candidates-log-every 20 --bon-candidates-wandb false
   --bon-qwen-select true --qwen-bon-url "$QWEN_URL"
   --bon-qwen-cadence 3 --qwen-online-train false
@@ -134,7 +137,36 @@ case "$ACTOR" in
     GPU_ENV=()
     unset CUDA_VISIBLE_DEVICES
     ;;
-  *) echo "[qwen_zs_run] ABORT: ACTOR must be pi05 or simlingo, got '$ACTOR'" >&2; exit 2 ;;
+  mixed)
+    # steervla_mixed_eval_config.py: frozen InternVL2 HL (run as a torch worker process by
+    # MixedSteerVLAActor) + pi05 vision backbone / action expert. The HL is the route's fine-tuned
+    # CAST-relabel export; the LL defaults to the ll_heavy 6000 checkpoint with its training config.
+    # The mixed actor only swaps the HL on the batch-1 rollout path (_sample_cot_checked); batched
+    # BoN goes through pi05's own _sample_cot and would bypass InternVL2, so candidates must be
+    # sampled sequentially. The HL worker's CUDA_VISIBLE_DEVICES is set to training_gpu_rank, so
+    # every GPU stays visible and --train-gpu is the physical index.
+    [ -f "$CKPT/pytorch_model.bin" ] && [ -f "$CKPT/.hydra/config.yaml" ] \
+      || { echo "[qwen_zs_run] ABORT: $CKPT is not a SimLingo HL export" >&2; exit 1; }
+    MIXED_LL_CHECKPOINT="${MIXED_LL_CHECKPOINT:-/raid/users/cglossop/steervla_pi_ckpts/ll_heavy_unnormed_matchcrop/6000}"
+    MIXED_LL_ACTOR_CONFIG="${MIXED_LL_ACTOR_CONFIG:-pi05_steervla_cot_simplified_reasoning_ll_heavy}"
+    MIXED_HL_PYTHON="${MIXED_HL_PYTHON:?MIXED_HL_PYTHON must point at a python with the SimLingo deps}"
+    SIMLINGO_SOURCE_ROOT="${SIMLINGO_SOURCE_ROOT:-/home/cglossop/simlingo-steervla}"
+    [ -d "$MIXED_LL_CHECKPOINT/params" ] || { echo "[qwen_zs_run] ABORT: no params/ under $MIXED_LL_CHECKPOINT" >&2; exit 1; }
+    export QWEN_RECORD_PDM_PLAN=0
+    CMD=(bash run_carla.sh "${COMMON[@]}"
+         --train-gpu "$GPU" --render-adapter "$GPU"
+         --agent-config impls/configs/steervla_mixed_eval_config.py
+         --steervla-checkpoint "$MIXED_LL_CHECKPOINT" --actor-config "$MIXED_LL_ACTOR_CONFIG" --
+         --bon_qwen_label_source=subtask --bon_include_brake_candidate=false
+         --agent.steervla.hl_checkpoint="$CKPT"
+         --agent.steervla.simlingo_source_root="$SIMLINGO_SOURCE_ROOT"
+         --agent.steervla.hl_python="$MIXED_HL_PYTHON"
+         --agent.steervla.actions_per_cot=5 --agent.steervla.actions_per_model_query=3
+         --agent.steervla.proprio_norm=false)
+    GPU_ENV=()
+    unset CUDA_VISIBLE_DEVICES
+    ;;
+  *) echo "[qwen_zs_run] ABORT: ACTOR must be pi05, simlingo or mixed, got '$ACTOR'" >&2; exit 2 ;;
 esac
 
 echo "[qwen_zs_run] actor=$ACTOR bench=$BENCH route=$ROUTE gpu=$GPU slot=$SLOT rpc=$CARLA_PORT tm=$TM_PORT display=:$DISPLAY_NUM"

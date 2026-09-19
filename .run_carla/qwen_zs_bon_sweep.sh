@@ -197,6 +197,8 @@ echo "  source      : $SOURCE_ROOT"
 echo "  critic      : zero-shot Qwen3.8-27B (README settings) at $QWEN_URL"
 if [ "${ACTOR:-pi05}" = simlingo ]; then
   echo "  actor       : hierarchical SimLingo SteerVLA (HL = route checkpoint, frozen training LL), ${N_CANDIDATES:-8} candidates"
+elif [ "${ACTOR:-pi05}" = mixed ]; then
+  echo "  actor       : mixed -- InternVL2 HL = route checkpoint, pi05 LL ${MIXED_LL_CHECKPOINT:-ll_heavy_unnormed_matchcrop/6000}, ${N_CANDIDATES:-8} candidates (sequential)"
 else
   echo "  actor       : pi05 ${ACTOR_CONFIG:-pi05_steervla_cot_simplified_reasoning_ll_heavy}, ${N_CANDIDATES:-8} candidates"
 fi
@@ -227,30 +229,46 @@ if [ "$MODE" = dry ]; then
 fi
 
 # --arm
-: "${QWEN_GPU:?QWEN_GPU must be set to arm (physical GPU for the critic)}"
 : "${SWEEP_GPUS:?SWEEP_GPUS must be set to arm (space-separated physical GPUs, one route each)}"
 GPUS=($SWEEP_GPUS)
+# Critics per worker: QWEN_GPUS / QWEN_PORTS line up with SWEEP_GPUS (worker i uses entry i), so one
+# worker can share its GPU with its critic while another keeps the critic on a separate card.
+# Unset entries fall back to QWEN_GPU / QWEN_PORT -- the original single shared critic.
+QGPUS=(${QWEN_GPUS:-}); QPORTS=(${QWEN_PORTS:-})
+WQGPU=(); WQPORT=()
+for i in "${!GPUS[@]}"; do
+  WQGPU[$i]="${QGPUS[$i]:-${QWEN_GPU:-}}"; WQPORT[$i]="${QPORTS[$i]:-$QWEN_PORT}"
+  [ -n "${WQGPU[$i]}" ] || { echo "[qzs] no critic GPU for worker $i: set QWEN_GPU or QWEN_GPUS" >&2; exit 2; }
+done
 # Own process group, so --stop can end the driver and its watchdogs without touching anyone else.
 if [ "$(ps -o pgid= $$ | tr -d ' ')" != "$$" ]; then exec setsid "$0" "$@"; fi
 echo "$$" > "${LOG_DIR}/sweep.pgid"
 mkdir -p "${LOG_DIR}/running"
 printf '%s\n' "${JOBS[@]}" | grep -v '^$' > "$QUEUE"; : > "$LOCK"
-log "armed: ${#JOBS[@]} cells on gpus ${GPUS[*]}, critic gpu ${QWEN_GPU} port ${QWEN_PORT}"
+_plan=""; for i in "${!GPUS[@]}"; do _plan+=" w$i:gpu${GPUS[$i]}->critic gpu${WQGPU[$i]}:${WQPORT[$i]}"; done
+log "armed: ${#JOBS[@]} cells;${_plan}"
 
-STARTED_QWEN=0
-if ! QWEN_PORT="$QWEN_PORT" ./.run_carla/qwen_zs_critic_server.sh status >/dev/null 2>&1; then
-  QWEN_PORT="$QWEN_PORT" QWEN_GPU="$QWEN_GPU" ./.run_carla/qwen_zs_critic_server.sh start 2>&1 | tee -a "${LOG_DIR}/sweep.log"
-  QWEN_PORT="$QWEN_PORT" ./.run_carla/qwen_zs_critic_server.sh status >/dev/null 2>&1 || { log "critic failed to start; aborting"; exit 1; }
-  STARTED_QWEN=1
-else
-  log "reusing healthy zero-shot critic at $QWEN_URL"
-fi
+STARTED_PORTS=()
+declare -A _SEEN_PORT=()
+for i in "${!GPUS[@]}"; do
+  _p="${WQPORT[$i]}"; _g="${WQGPU[$i]}"
+  [ -n "${_SEEN_PORT[$_p]:-}" ] && continue
+  _SEEN_PORT[$_p]=1
+  if ! QWEN_PORT="$_p" ./.run_carla/qwen_zs_critic_server.sh status >/dev/null 2>&1; then
+    QWEN_PORT="$_p" QWEN_GPU="$_g" ./.run_carla/qwen_zs_critic_server.sh start 2>&1 | tee -a "${LOG_DIR}/sweep.log"
+    QWEN_PORT="$_p" ./.run_carla/qwen_zs_critic_server.sh status >/dev/null 2>&1 || { log "critic on gpu $_g port $_p failed to start; aborting"; exit 1; }
+    STARTED_PORTS+=("$_p")
+  else
+    log "reusing healthy zero-shot critic at port $_p"
+  fi
+done
 
 next_job() { flock 9; local j; j=$(head -n1 "$QUEUE"); [ -n "$j" ] && sed -i '1d' "$QUEUE"; echo "$j"; } 9>>"$LOCK"
 requeue_job() { flock 9; printf '%s\n' "$1" >> "$QUEUE"; } 9>>"$LOCK"
 
 worker() {
-  local slot=$1 gpu=$2 port=$((17400 + $1 * 20))
+  local slot=$1 gpu=$2 qport=$3 qgpu=$4 port=$((17400 + $1 * 20))
+  local qurl="http://127.0.0.1:${qport}"
   kill_slot_leftovers "$slot"
   while :; do
     local job; job=$(next_job)
@@ -260,19 +278,19 @@ worker() {
     local tag="${route}__cs${s}" out; out=$(cell_dir "$route" "$s")
     # A worker sharing the critic's GPU starts with the critic's ~75 GB already in use.
     local free_mib="$GPU_FREE_MIB"
-    [ "$gpu" = "$QWEN_GPU" ] && free_mib="$GPU_FREE_MIB_SHARED"
+    [ "$gpu" = "$qgpu" ] && free_mib="$GPU_FREE_MIB_SHARED"
     while :; do
       local used; used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$gpu" 2>/dev/null | tr -d ' ')
       [ "${used:-999999}" -lt "$free_mib" ] && break
       log "w$slot/gpu$gpu: gpu busy (${used} MiB); waiting before $tag"; sleep 300
     done
-    until QWEN_PORT="$QWEN_PORT" ./.run_carla/qwen_zs_critic_server.sh status >/dev/null 2>&1; do
-      log "w$slot/gpu$gpu: critic unhealthy; waiting before $tag"; sleep 120
+    until QWEN_PORT="$qport" ./.run_carla/qwen_zs_critic_server.sh status >/dev/null 2>&1; do
+      log "w$slot/gpu$gpu: critic unhealthy (port $qport); waiting before $tag"; sleep 120
     done
     log "w$slot/gpu$gpu: START $tag ($(basename "$ck"))$([ "$attempt" -gt 0 ] && echo " retry $attempt")"
     local rlog="${LOG_DIR}/${tag}.log"
     [ "$attempt" -gt 0 ] && rlog="${LOG_DIR}/${tag}.retry${attempt}.log"
-    BENCH="$BENCH" QWEN_URL="$QWEN_URL" RUN_GROUP="$RUN_GROUP" \
+    BENCH="$BENCH" QWEN_URL="$qurl" RUN_GROUP="$RUN_GROUP" \
       setsid ./.run_carla/qwen_zs_bon_run.sh "$route" "$gpu" "$slot" "$ck" "$s" "$out" > "$rlog" 2>&1 &
     local rc=$!
     echo "$rc" > "${LOG_DIR}/running/${slot}.pid"; echo "$tag" > "${LOG_DIR}/running/${slot}.job"
@@ -308,11 +326,11 @@ worker() {
   done
 }
 
-for i in "${!GPUS[@]}"; do worker "$i" "${GPUS[$i]}" & sleep 8; done
+for i in "${!GPUS[@]}"; do worker "$i" "${GPUS[$i]}" "${WQPORT[$i]}" "${WQGPU[$i]}" & sleep 8; done
 wait
 log "sweep complete"
 ./.run_carla/qwen_zs_bon_sweep.sh --results 2>&1 | tee "${RESULTS_DIR}/summary.txt"
-if [ "$STARTED_QWEN" = 1 ] && [ "$STOP_QWEN_AT_END" = 1 ]; then
-  QWEN_PORT="$QWEN_PORT" ./.run_carla/qwen_zs_critic_server.sh stop
+if [ "$STOP_QWEN_AT_END" = 1 ]; then
+  for _p in "${STARTED_PORTS[@]}"; do QWEN_PORT="$_p" ./.run_carla/qwen_zs_critic_server.sh stop; done
 fi
 rm -f "${LOG_DIR}/sweep.pgid"
