@@ -48,9 +48,15 @@ ACTOR_CONFIG="${ACTOR_CONFIG:-pi05_steervla_cot_simplified_reasoning_ll_heavy}"
 N_EVAL="${N_EVAL:-3}"
 N_CANDIDATES="${N_CANDIDATES:-8}"
 EVAL_SEED_OFFSET="${EVAL_SEED_OFFSET:-1001}"
-MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-4000}"
-# Frozen eval stops at --online-steps even mid-episode, so budget every episode to its cap.
-ONLINE_STEPS="${ONLINE_STEPS:-$((N_EVAL * MAX_EPISODE_STEPS + 1000))}"
+# Leaderboard-faithful episode ends: no wrapper step cap (0) -- the route ends only on the
+# leaderboard's own criteria (AgentBlockedTest 60 s, InRouteTest, completion, ...). Frozen eval
+# still stops at --online-steps even mid-episode, so that budget is a far-off safety net.
+MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-0}"
+if [ "$MAX_EPISODE_STEPS" -gt 0 ]; then
+  ONLINE_STEPS="${ONLINE_STEPS:-$((N_EVAL * MAX_EPISODE_STEPS + 1000))}"
+else
+  ONLINE_STEPS="${ONLINE_STEPS:-$((N_EVAL * 20000 + 1000))}"
+fi
 
 FIRST_EVAL_SEED=$((CARLA_SEED + EVAL_SEED_OFFSET))
 EVAL_SEEDS=$(seq -s, "$FIRST_EVAL_SEED" $((FIRST_EVAL_SEED + N_EVAL - 1)))
@@ -84,11 +90,15 @@ export WANDB_API_KEY="$(cat /home/cglossop/.wandb_school_key)"
 export WANDB_ENTITY=catherineglossop
 
 EXP_NAME="${ROUTE}-cs${CARLA_SEED}${EXTRA_TAG:+-$EXTRA_TAG}-qwenzs_$(date +%Y%m%d_%H%M%S)"
+# Per-job CARLA config with the wrapper's post-collision stuck cutoff disabled, so a blocked ego
+# gets the leaderboard's own AgentBlockedTest (0.1 m/s for 60 s). main_carla's --eval_crash_stuck_steps
+# does this in-process, but cannot reach the 0.9.15 env subprocess; the yaml is read by both.
+LB_CARLA_CONFIG="$OUT_DIR/carla_config_leaderboard_eval.yaml"
 # Batched candidate sampling; the mixed actor must sample sequentially (see its case below).
 BON_BATCH="${BON_BATCH:-true}"
 [ "$ACTOR" = mixed ] && BON_BATCH=false
 COMMON=(
-  --route "$ROUTE" --carla-config impls/configs/carla_config.yaml
+  --route "$ROUTE" --carla-config "$LB_CARLA_CONFIG"
   --online-steps "$ONLINE_STEPS" --max-episode-steps "$MAX_EPISODE_STEPS"
   --seed "$CARLA_SEED" --carla-seed "$CARLA_SEED" --train-seed "$TRAIN_SEED"
   --eval-seeds "$EVAL_SEEDS" --eval-mode --frozen-eval true
@@ -204,4 +214,10 @@ if [ -e "$LOCK" ]; then
 fi
 
 mkdir -p "$OUT_DIR"
+sed -E -e 's/^crash_stuck_steps:.*/crash_stuck_steps: 1000000000/' \
+       -e "s/^max_episode_steps:.*/max_episode_steps: ${MAX_EPISODE_STEPS}/" \
+       impls/configs/carla_config.yaml > "$LB_CARLA_CONFIG"
+grep -q '^crash_stuck_steps: 1000000000$' "$LB_CARLA_CONFIG" \
+  && grep -q "^max_episode_steps: ${MAX_EPISODE_STEPS}\$" "$LB_CARLA_CONFIG" \
+  || { echo "[qwen_zs_run] ABORT: could not write leaderboard eval config $LB_CARLA_CONFIG" >&2; exit 1; }
 if [ "${#GPU_ENV[@]}" -gt 0 ]; then exec env "${GPU_ENV[@]}" "${CMD[@]}"; else exec "${CMD[@]}"; fi
