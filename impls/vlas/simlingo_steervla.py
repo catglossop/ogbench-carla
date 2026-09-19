@@ -243,6 +243,52 @@ class _SimLingoModel:
         label = self.question_label([prompt], int(tiles.shape[0]))
         return self.model(self.driving_input(tiles[None, None], label))
 
+    @torch.no_grad()
+    def generate_batch(self, rgb_hwc: np.ndarray, prompts: list[str]):
+        """Batch one scene's candidate queries without the upstream HL row loop."""
+        tiles = self.pixel_tiles(rgb_hwc)
+        label = self.question_label(prompts, int(tiles.shape[0]))
+        inputs = self.driving_input(tiles[None, None].expand(len(prompts), -1, -1, -1, -1, -1), label)
+        model = self.model
+        if model.model_type != "hl":
+            # Match single-query positional indexing. Padding different-length LL
+            # prompts shifts the upstream model's positions and changes waypoints.
+            lengths = label.phrase_valid.sum(dim=1).cpu().tolist()
+            groups = {}
+            for i, length in enumerate(lengths):
+                groups.setdefault(length, []).append(i)
+            outputs = [None] * len(prompts)
+            for indices in groups.values():
+                group_label = self.question_label([prompts[i] for i in indices], int(tiles.shape[0]))
+                group_input = self.driving_input(
+                    tiles[None, None].expand(len(indices), -1, -1, -1, -1, -1), group_label)
+                speed, route, _ = model(group_input)
+                if speed is None or route is None:
+                    raise RuntimeError('Batched LL returned no waypoints.')
+                for j, i in enumerate(indices):
+                    outputs[i] = (speed[j], route[j])
+            return (torch.stack([x[0] for x in outputs]), torch.stack([x[1] for x in outputs]), []), None
+        if not model.predict_language or model.adaptors.driving is not None:
+            raise RuntimeError("Batched HL requires the language-only planner.")
+        adaptor = model.adaptors(inputs, inference=True)
+        adaptor = model.vision_model.image_encoder.replace_placeholder_tokens(
+            adaptor_dict=adaptor, pixel_values=inputs.camera_images,
+            placeholder_values=inputs.prompt_inference.placeholder_values,
+            camera_images_history=inputs.camera_images_history,
+        )
+        variant = model.language_model.variant
+        eos = (model.tokenizer.added_tokens_encoder['<|end|>'] if variant == 'OpenGVLab/InternVL2-4B'
+               else model.tokenizer.added_tokens_encoder['<|im_end|>'] if variant == 'OpenGVLab/InternVL2-2B'
+               else model.tokenizer.eos_token_id)
+        tokens, _ = model.language_model.greedy_sample(
+            adaptor['language_inputs'], eos_token_id=eos, max_new_tokens=512,
+            input_embed_matrix=model.adaptors.language.embed_tokens.weight,
+            logit_matrix=model.adaptors.language.lm_head.weight,
+            attention_mask=adaptor['language_inputs_mask'],
+        )
+        overflow = ~(tokens == eos).any(dim=1)
+        return (None, None, model.tokenizer.batch_decode(tokens, skip_special_tokens=True)), overflow.cpu().numpy()
+
 
 # --------------------------------------------------------------------------------------------- #
 # Actor                                                                                          #
@@ -436,6 +482,10 @@ class SimLingoSteerVLAActor(HLPoolSamplingMixin):
         return raw if isinstance(raw, dict) else None
 
     def _push_ego_history(self, raw: dict[str, Any]) -> None:
+        # BoN queries several candidates from the same observation. Record it once.
+        if getattr(self, "_last_history_raw", None) is raw:
+            return
+        self._last_history_raw = raw
         state = np.asarray(raw.get("state"), dtype=np.float32).reshape(-1)
         if state.size > _EGO_IDX_SPEED:
             self._ego_hist.append((float(state[_EGO_IDX_SPEED]), float(state[_EGO_IDX_YAW_DEG])))
@@ -529,6 +579,39 @@ class SimLingoSteerVLAActor(HLPoolSamplingMixin):
             speed_wps[0].float().cpu().numpy(), route[0].float().cpu().numpy(), self.action_horizon
         ).reshape(1, -1)
 
+    @torch.no_grad()
+    def sample_candidates(self, n: int, *, temperature: float, raw: dict[str, Any], **kwargs):
+        """Fresh independent HL samples followed by a batched LL waypoint pass."""
+        self._push_ego_history(raw)
+        prompt = self.hl_prompt(raw)
+        previous_temperature = self.cot_temperature
+        self.cot_temperature = float(temperature)
+        started = time.monotonic()
+        try:
+            (_, _, texts), overflow = self.hl.generate_batch(self._image(raw), [prompt] * n)
+        finally:
+            self.cot_temperature = previous_temperature
+        hl_seconds = time.monotonic() - started
+        parsed = [split_hl_output(text) for text in texts]
+        subtasks = [subtask or _TRAINING_HL_FALLBACK for _, subtask in parsed]
+        state = np.asarray(raw.get('state'), dtype=np.float32).reshape(-1)
+        speed = round(float(state[_EGO_IDX_SPEED]), 1) if state.size > _EGO_IDX_SPEED else 0.0
+        prompts = [f'Current speed: {speed} m/s. Command: {subtask} Predict the waypoints.' for subtask in subtasks]
+        started = time.monotonic()
+        (speed_wps, routes, _), _ = self.ll.generate_batch(self._image(raw), prompts)
+        if speed_wps is None or routes is None:
+            raise RuntimeError('Batched SimLingo LL returned no waypoints.')
+        speed_wps = speed_wps.float().cpu().numpy()
+        routes = routes.float().cpu().numpy()
+        chunks = np.stack([self.waypoints_to_chunk(w, r, self.action_horizon).reshape(-1)
+                           for w, r in zip(speed_wps, routes)])
+        self._cot = dict(prompt=prompt, output=texts[0], reasoning=parsed[0][0], subtask=subtasks[0])
+        self._stash_cot_in_raw(raw)
+        self.last_candidate_timings = dict(hl_s=hl_seconds, ll_s=time.monotonic() - started, candidates=n)
+        print(f'[hierarchical-batch] {self.last_candidate_timings}', flush=True)
+        return dict(actions_normalized=chunks, subtask_texts=subtasks,
+                    reasoning_texts=[x[0] for x in parsed], reasoning_overflowed=overflow)
+
     def _next_cached_action(self, batch_size: int) -> np.ndarray | None:
         """Serve a held chunk, shifted one row per ``env_steps_per_chunk_row`` and re-anchored (see steervla)."""
         if self.actions_per_model_query <= 1 or batch_size != 1 or self._cached_action_chunk is None:
@@ -567,6 +650,22 @@ class SimLingoSteerVLAActor(HLPoolSamplingMixin):
         self._stash_cot_in_raw(raw)
         return jnp.asarray(out, dtype=jnp.float32)
 
+    def decode_last_batch_subtasks(self) -> list[str]:
+        """Expose the sampled meta-action through main_carla's BoN label contract."""
+        return [self._cot["subtask"]] if self._cot is not None else []
+
+    def decode_last_batch_reasoning(self) -> list[str]:
+        """Expose the text before ``Driving Behavior:`` for diagnostics."""
+        return [self._cot["reasoning"]] if self._cot is not None else []
+
+    def reset_candidate_cache(self) -> None:
+        """Draw a fresh HL/LL candidate while preserving observed ego history."""
+        history = self._ego_hist.copy()
+        last_raw = getattr(self, "_last_history_raw", None)
+        self.reset_action_cache()
+        self._ego_hist.extend(history)
+        self._last_history_raw = last_raw
+
     def reset_action_cache(self) -> None:
         """Episode reset: drop the held chunk, the held CoT and the ego history."""
         self._cached_action_chunk = None
@@ -575,6 +674,7 @@ class SimLingoSteerVLAActor(HLPoolSamplingMixin):
         self._cot = None
         self._cot_age = 0
         self._ego_hist.clear()
+        self._last_history_raw = None
 
     # ---- online HL update --------------------------------------------------------------------- #
 

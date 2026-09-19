@@ -111,6 +111,7 @@ def _obs_to_wire(obs: Dict[str, Any], include_simlingo: bool) -> Dict[str, Any]:
         "routing_command": obs["routing_command"],
         "target_points": tp.tolist() if tp is not None else [[0.0, 0.0], [0.0, 0.0]],
         "expert_action": expert_action.tolist() if expert_action is not None else None,
+        **({"pdm_plan": obs["pdm_plan"]} if "pdm_plan" in obs else {}),
         "scene_context": {
             "vehicle_ahead": bool(scene_ctx.get("vehicle_ahead", False)),
             "vehicle_ahead_dist_m": float(scene_ctx.get("vehicle_ahead_dist_m", -1.0)),

@@ -54,12 +54,12 @@ CARLA_SEED=""
 TRAIN_SEED=""
 EVAL_SEEDS=""
 BON_CRITIC_CKPT=""
-BON_NUM_CANDIDATES="8"
+BON_NUM_CANDIDATES="4"
 BON_ONLINE_CRITIC="false"
 BON_CANDIDATES_LOG_EVERY="20"
 BON_CANDIDATES_WANDB="false"
-BON_MAX_SAMPLE_ATTEMPTS="6"
-BON_BATCH_POLICY_CANDIDATES="false"
+BON_MAX_SAMPLE_ATTEMPTS="1"
+BON_BATCH_POLICY_CANDIDATES="true"
 # 0.0 (the base config's default) makes subtask decoding greedy/deterministic, so every
 # candidate would decode to the identical subtask text and the diversity search in
 # _sample_diverse_candidates could never find a different one. run_carla_teleop.sh's
@@ -247,7 +247,7 @@ Options:
                             used to score N candidate action chunks sampled straight from the
                             frozen pi0 base policy (no residual actor); the highest-Q candidate
                             is executed each step. Requires --train-mode=rl.
-  --bon-num-candidates N    Number of candidates to sample/score per step. Default: 8.
+  --bon-num-candidates N    Number of candidates to sample/score per step. Default: 4.
   --bon-online-critic BOOL  true|false. Best-of-N scored with the live online critic instead
                             of a frozen --bon-critic-ckpt; keeps training via update_with_vla()
                             on collected transitions. Warm-start with --pretrained-critic.
@@ -272,10 +272,10 @@ Options:
   --bon-max-sample-attempts N
                             Best-of-N diverse-subtask search: max resample attempts per
                             candidate slot (beyond the first). Each attempt is a full VLA
-                            forward pass; lower this to trade diversity for speed. Default: 6.
+                            forward pass; higher values use sequential diversity search. Default: 1.
   --bon-batch-policy-candidates BOOL
                             Batch all policy candidates in one SteerVLA call when Qwen BoN
-                            and --bon-max-sample-attempts=1 are active. Default: false.
+                            and --bon-max-sample-attempts=1 are active. Default: true.
   --bon-cot-temperature F   CoT/subtask sampling temperature when best-of-N is active. The
                             base config defaults to 0.0 (greedy -- every candidate would
                             decode to the same subtask), so this defaults to 1.0 here,

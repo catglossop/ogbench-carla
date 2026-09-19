@@ -81,7 +81,7 @@ def sample_batched_policy_candidates(
     )
     cot_kwargs = {"cot_out": cached[2]} if reuse else {}
     actor._bon_cot_cache = None  # Invalid results must never seed later reuse.
-    reset_cache = getattr(actor, "reset_action_cache", None)
+    reset_cache = getattr(actor, "reset_candidate_cache", None) or getattr(actor, "reset_action_cache", None)
     if callable(reset_cache):
         reset_cache()
     result = actor.sample_candidates(

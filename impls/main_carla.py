@@ -224,7 +224,7 @@ flags.DEFINE_string(
     "rather than feeding it).",
 )
 flags.DEFINE_integer(
-    "bon_num_candidates", 8,
+    "bon_num_candidates", 4,
     "Number of pi0 action-chunk candidates sampled per env step when --bon_critic_ckpt "
     "or --bon_online_critic is set; the candidate with the highest-Q value is executed.",
 )
@@ -307,18 +307,18 @@ flags.DEFINE_bool(
     "images are large; local panels are still saved when --save_video_local is true.",
 )
 flags.DEFINE_integer(
-    "bon_max_sample_attempts", 6,
+    "bon_max_sample_attempts", 1,
     "Best-of-N candidate diversity search: max resample attempts per candidate slot "
     "(beyond the first) when hunting for a subtask that's diverse from already-accepted "
     "candidates. Worst-case draws per step is roughly 1 + (N-1) * this. Lower this (e.g. "
     "2-3) to trade diversity guarantee for speed -- each draw is a full VLA forward pass.",
 )
 flags.DEFINE_bool(
-    "bon_batch_policy_candidates", False,
+    "bon_batch_policy_candidates", True,
     "When Qwen BoN is active and --bon_max_sample_attempts=1, sample all policy "
     "candidates in one SteerVLA batch. Preserves the normal bounded full-model flow "
     "noise and requires normalized chunks; malformed or overflowed batches fall back "
-    "to the checked sequential sampler. Disabled by default for controlled A/B testing.",
+    "to the checked sequential sampler. Enabled by default; set false for sequential sampling.",
 )
 flags.DEFINE_bool(
     "bon_shadow_only", False,
@@ -1078,6 +1078,7 @@ class CarlaEnvSubprocess:
             "routing_command": wire["routing_command"],
             "target_points": np.array(wire["target_points"], dtype=np.float32),
             "expert_action": np.array(ea, dtype=np.float32) if ea is not None else None,
+            **({"pdm_plan": wire["pdm_plan"]} if "pdm_plan" in wire else {}),
         }
 
     def _read_obs_msg(self):
@@ -2432,18 +2433,16 @@ def run_online_carla(
 
         _qwen_selector = QwenActionSelector(FLAGS.qwen_bon_url)
         if FLAGS.bon_batch_policy_candidates and int(FLAGS.bon_max_sample_attempts) != 1:
-            raise ValueError(
-                "--bon_batch_policy_candidates requires --bon_max_sample_attempts=1; "
-                "adaptive per-slot diversity resampling remains sequential."
+            print(
+                "[main_carla] adaptive diversity resampling remains sequential; "
+                "set --bon_max_sample_attempts=1 to batch candidates.", flush=True,
             )
         print(
             f"[main_carla] Qwen rejection-sampling BoN enabled: url={FLAGS.qwen_bon_url} "
             f"N={_bon_n} cadence={FLAGS.bon_qwen_cadence} online_critic={_bon_online} "
-            f"batched_policy_candidates={FLAGS.bon_batch_policy_candidates}",
+            f"batched_policy_candidates={FLAGS.bon_batch_policy_candidates and int(FLAGS.bon_max_sample_attempts) == 1}",
             flush=True,
         )
-    elif FLAGS.bon_batch_policy_candidates:
-        raise ValueError("--bon_batch_policy_candidates is only supported with --bon_qwen_select=true.")
 
     _bon_last_q_best: list[float] = [0.0]
     _bon_last_q_mean: list[float] = [0.0]
@@ -3511,6 +3510,7 @@ def run_online_carla(
                     flush=True,
                 )
         reset_cache = getattr(getattr(agent, "vla_sample_fn", None), "reset_action_cache", None)
+        reset_cache = getattr(steervla_actor, "reset_candidate_cache", reset_cache)
         chunks: list[np.ndarray] = []
         subtasks: list[str] = []
         accepted_cats: list[frozenset] = []
@@ -3706,6 +3706,13 @@ def run_online_carla(
             if FLAGS.bon_include_brake_candidate
             else None,
         )
+        if os.environ.get("QWEN_RECORD_PDM_PLAN") == "1":
+            from ogbench.carla.expert_plan_record import save_query_comparison
+            save_query_comparison(
+                FLAGS.save_dir, int(step), obs_raw.get("pdm_plan"),
+                base_frame, chunks_np, candidate_subtasks, routing_command, result,
+                state_vec, int(FLAGS.bon_qwen_cadence),
+            )
         best_idx = int(result["choice"])
         utility = np.asarray(result["utility"], dtype=np.float32)
         if step == 1:
@@ -4795,6 +4802,11 @@ def run_online_carla(
         _bon_metrics = getattr(_bon_actor, "last_bon_metrics", None) if _bon_actor is not None else None
         if _bon_metrics:
             step_wb.update(_bon_metrics)
+        if _bon_last_candidates[0] is not None:
+            _qwen_timings = _bon_last_candidates[0].get("qwen_timings", {})
+            for _name, _value in _qwen_timings.items():
+                if isinstance(_value, (int, float)) and not isinstance(_value, bool):
+                    step_wb[f"bon/qwen_inference_{_name}"] = float(_value)
         if _bon_viz_img is not None:
             step_wb["rollout/bon_candidates"] = _bon_viz_img
         # The reward/* and rollout/{lane_offset_m,heading_error_rad,speed_norm,centering_factor,
@@ -4921,6 +4933,33 @@ def run_online_carla(
             )
             if FLAGS.expert_recover_debug:
                 rollout_log["rollout/vla_steps_budget"] = float(_vla_steps_budget)
+            # Keep an authoritative, machine-readable result in stdout before any
+            # W&B or video I/O, so a sync failure cannot hide the terminal score.
+            _terminal_result = {
+                "episode": int(episode_count),
+                "route": done_route,
+                "driving_score": (
+                    float(done_info["driving_score"])
+                    if done_info.get("driving_score") is not None
+                    else None
+                ),
+                "route_completion": (
+                    float(done_info["route_progress_pct"])
+                    if done_info.get("route_progress_pct") is not None
+                    else None
+                ),
+                "collisions": done_collision_count,
+                "collision_events": done_collision_events,
+                "traffic_violations": int(
+                    done_info.get("traffic_violation_count", episode_traffic_violations) or 0
+                ),
+                "termination_reason": str(done_info.get("termination_reason", "?")),
+            }
+            print(
+                "[main_carla] FINAL_EPISODE_RESULT "
+                + json.dumps(_terminal_result, sort_keys=True),
+                flush=True,
+            )
             # NOTE: master's per-episode trajectory JSON is intentionally omitted here --
             # routing-commands has no _append_trajectory_step/episode_trajectory accumulation,
             # so the payload would always be empty. It keeps its own richer per-step capture
