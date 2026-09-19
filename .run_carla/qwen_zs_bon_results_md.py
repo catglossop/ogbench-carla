@@ -58,7 +58,7 @@ def main():
             continue
         d = json.loads(p.read_text())
         ck = (d.get("training") or {}).get("final_checkpoint")
-        if not ck or not (Path(ck) / "params").is_dir():
+        if not ck or not ((Path(ck) / "params").is_dir() or (Path(ck) / "pytorch_model.bin").is_file()):
             continue
         if d["route"] not in src or p.stat().st_mtime > src[d["route"]][0]:
             src[d["route"]] = (p.stat().st_mtime, d)

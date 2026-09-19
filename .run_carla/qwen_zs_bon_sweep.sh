@@ -99,7 +99,8 @@ for summ in root.rglob("run_summary.json"):
         continue
     d = json.loads(summ.read_text())
     ck = (d.get("training") or {}).get("final_checkpoint")
-    if not ck or not (Path(ck) / "params").is_dir():
+    # OpenPI checkpoints hold params/; SimLingo HL exports hold pytorch_model.bin + .hydra/.
+    if not ck or not ((Path(ck) / "params").is_dir() or (Path(ck) / "pytorch_model.bin").is_file()):
         continue
     prev = best.get(d["route"])
     if prev is None or summ.stat().st_mtime > prev[0]:
@@ -194,8 +195,12 @@ echo "  run group   : $RUN_GROUP   (W&B entity catherineglossop)"
 echo "  bench       : $BENCH   carla: $([ "$BENCH" = b2d ] && echo '0.9.16 /home/cglossop/carla' || echo '0.9.15 /home/cglossop/f2d_carla')"
 echo "  source      : $SOURCE_ROOT"
 echo "  critic      : zero-shot Qwen3.8-27B (README settings) at $QWEN_URL"
-echo "  actor cfg   : ${ACTOR_CONFIG:-pi05_steervla_cot_simplified_reasoning_ll_heavy}"
-echo "  carla seeds : $CARLA_SEEDS   x ${N_EVAL} eval episodes each (model seeds carla_seed+1001..)"
+if [ "${ACTOR:-pi05}" = simlingo ]; then
+  echo "  actor       : hierarchical SimLingo SteerVLA (HL = route checkpoint, frozen training LL), ${N_CANDIDATES:-8} candidates"
+else
+  echo "  actor       : pi05 ${ACTOR_CONFIG:-pi05_steervla_cot_simplified_reasoning_ll_heavy}, ${N_CANDIDATES:-8} candidates"
+fi
+echo "  carla seeds : $CARLA_SEEDS   x ${N_EVAL} episode(s) each (model seeds carla_seed+${EVAL_SEED_OFFSET:-1001}..)"
 echo "  routes      : ${#CKPTS[@]} with a final checkpoint (from $ROUTES_FILE)"
 if [ -s "${LOG_DIR}/no_checkpoint.txt" ]; then
   echo "  skipped     : $(cut -f1 "${LOG_DIR}/no_checkpoint.txt" | tr '\n' ' ')(no final checkpoint)"
