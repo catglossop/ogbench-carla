@@ -5275,10 +5275,23 @@ def create_steervla_pi0_cot_sample_fn(
         t_context_max=float(steervla_cfg.get("t_context_max", 1.0)),
     )
 
+    actor_cls = SteerVLAActor
+    if steervla_cfg.get("hl_provider") == "internvl2":
+        if url_clean:
+            raise ValueError("InternVL2 + pi05 requires a local pi05 actor.")
+        from vlas.mixed_steervla import MixedSteerVLAActor
+
+        actor_cls = MixedSteerVLAActor
+        ctor_kw.update(
+            hl_checkpoint=str(steervla_cfg["hl_checkpoint"]),
+            simlingo_source_root=str(steervla_cfg["simlingo_source_root"]),
+            hl_python=str(steervla_cfg["hl_python"]),
+        )
+
     if url_clean:
         actor = SteerVLAActor(actor_url=url_clean, actor_config=None, checkpoint_path=None, **ctor_kw)
     else:
-        actor = SteerVLAActor(
+        actor = actor_cls(
             actor_config=str(steervla_cfg["actor_config"]),
             checkpoint_path=str(steervla_cfg["checkpoint"]),
             **ctor_kw,
