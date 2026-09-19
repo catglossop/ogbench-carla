@@ -6452,9 +6452,9 @@ def _run_residual_entry(config):
         else:
             from vlas.steervla import create_steervla_pi0_cot_sample_fn
 
-        vla_sample_fn, steervla_actor = create_steervla_pi0_cot_sample_fn(
-            steervla_cfg, raw_holder, training_gpu_rank=training_gpu_rank
-        )
+            vla_sample_fn, steervla_actor = create_steervla_pi0_cot_sample_fn(
+                steervla_cfg, raw_holder, training_gpu_rank=training_gpu_rank
+            )
         steervla_actor.sampling_seed = int(run_train_seed())
 
         _configure_jax_training_device(training_gpu_rank)

@@ -9,19 +9,14 @@ cd "$ROOT_DIR"
 
 PHYSICAL_GPU="${1:-${EVAL_GPU:-0}}"
 RUN_ROOT="${2:-${EVAL_ROOT:-/raid/users/${USER}/carla_exps/evals/residual_rl}}"
-EVAL_LABEL="${EVAL_LABEL:-residual-rl-b2d-f2d-evalmode-v3-20260914}"
-RUN_GROUP="${EVAL_RUN_GROUP:-ResidualRLB2DF2DEvalModeV3}"
-# A fresh queue invocation must not collide in W&B with an earlier failed launch.
-# Supply EVAL_RUN_NONCE=<number> to deliberately retain names across invocations.
+EVAL_LABEL="${EVAL_LABEL:-steervla-residual-rl-b2d-f2d-evalmode-v1-20260916}"
+RUN_GROUP="${EVAL_RUN_GROUP:-SteerVLAResidualRLB2DF2DEvalModeV1}"
+# A retry gets a fresh W&B name; completed routes still skip via their .done markers.
+# Supply EVAL_RUN_NONCE=<number> only to deliberately reuse names.
 if [[ -n "${EVAL_RUN_NONCE:-}" ]]; then
   RUN_NONCE="$EVAL_RUN_NONCE"
 else
-  NONCE_FILE="$RUN_ROOT/status/$EVAL_LABEL/run_nonce"
-  if [[ -f "$NONCE_FILE" ]]; then
-    RUN_NONCE="$(<"$NONCE_FILE")"
-  else
-    printf -v RUN_NONCE '%05d%05d' "$RANDOM" "$RANDOM"
-  fi
+  printf -v RUN_NONCE '%05d%05d' "$RANDOM" "$RANDOM"
 fi
 [[ "$RUN_NONCE" =~ ^[0-9]+$ ]] || { echo 'EVAL_RUN_NONCE must be numeric.' >&2; exit 2; }
 SEEDS="${SEEDS:-0 1 2}"
@@ -43,21 +38,19 @@ X_DISPLAY_NUM="${EVAL_X_DISPLAY_NUM:-$((600 + PHYSICAL_GPU))}"
 ROUTES=(
   signalized-junction-left-turn-001
   enter-actor-flow-004
-  non-signalized-junction-right-turn-001
+  non-signalized-junction-right-turn-003
   non-signalized-junction-left-turn-enter-flow-002
-  signalized-junction-left-turn-enter-flow-003
-  non-signalized-junction-left-turn-002
+  signalized-junction-left-turn-enter-flow-001
+  non-signalized-junction-left-turn-001
   signalized-junction-right-turn-004
   pedestrian-crossing-004
-  # Sheet shorthand: "stat-in-001"; canonical registry name:
-  vanilla-signalized-turn-encounter-red-light-002
+  t-junction-002
   crossing-bicycle-flow-004
-  vanilla-signalized-turn-encounter-green-light-004
-  # Sheet label omits the registry's "r" in "merger".
-  merger-into-slow-traffic-v2-001
-  vehicle-turning-route-pedestrian-005
-  vehicle-opens-door-two-ways-005
-  sequential-lane-change-005
+  hazard-at-side-lane-002
+  merger-into-slow-traffic-v2-005
+  vehicle-turning-route-pedestrian-003
+  highway-exit-002
+  accident-two-ways-002
   interurban-actor-flow-004
   generalization-construction-permutations-1019
   generalization-custom-obstacles-1020
@@ -67,15 +60,13 @@ ROUTES=(
   generalization-custom-obstacles-1024
   generalization-fully-blocked-1032
   generalization-hard-brake-1036
-  generalization-bad-parking-1009
   generalization-pedestrian-other-blocker-1072
   generalization-right-construction-1093
   generalization-right-of-way-1056
-  generalization-wall-1095
   generalization-image-on-object-1041
-  generalization-obscured-stop-1048
+  generalization-obscured-stop-1046
   generalization-bad-parking-1004
-  generalization-animals-1083
+  generalization-animals-1076
   generalization-wall-1097
 )
 
@@ -89,7 +80,6 @@ for seed in "${SEED_LIST[@]}"; do
 done
 
 mkdir -p "$RUN_ROOT/logs/$EVAL_LABEL" "$RUN_ROOT/status/$EVAL_LABEL" "$RUN_ROOT/runs/$EVAL_LABEL"
-[[ -f "${NONCE_FILE:-}" ]] || printf '%s\n' "$RUN_NONCE" > "$RUN_ROOT/status/$EVAL_LABEL/run_nonce"
 cat > "$RUN_ROOT/eval_spec_${EVAL_LABEL}.txt" <<SPEC
 created=$(date --iso-8601=seconds)
 eval_label=$EVAL_LABEL
@@ -104,8 +94,9 @@ seeds=${SEED_LIST[*]}
 routes=${ROUTES[*]}
 online_steps=10000
 max_episode_steps=4000
-agent_config=impls/configs/steervla_residual_eval_config.py
-checkpoint=gs://cat-logs/pi05_steervla_cot_simplified_reasoning_ll_heavy/ll_heavy_unnormed_matchcrop/ll_heavy_unnormed_matchcrop_20260904_152800/6000
+agent_config=impls/configs/simlingo_steervla_residual_config.py
+hl_checkpoint=/raid/users/celine/steervla-ckpts/2026_05_24_06_52_33_simlingo_seed1_bellman/checkpoints/epoch=019.ckpt
+ll_checkpoint=/raid/users/celine/steervla-ckpts/2026_05_23_21_39_41_simlingo_ll_vla_meta_conditioned/checkpoints/epoch=029.ckpt
 state_encoder=siglip_pool
 residual_accel_scale=0.1
 residual_steer_scale=0.1
@@ -164,7 +155,7 @@ for seed in "${SEED_LIST[@]}"; do
     done_file="$RUN_ROOT/status/$EVAL_LABEL/${tag}.done"
     failure_file="$RUN_ROOT/status/$EVAL_LABEL/${tag}.failed"
     log_file="$RUN_ROOT/logs/$EVAL_LABEL/${tag}.log"
-    exp_name="residual-rl-eval_${EVAL_LABEL}_sd-${seed}_${route}_${RUN_NONCE}"
+    exp_name="simlingo-steervla-residual-rl_${RUN_NONCE}_sd-${seed}_${route}"
     if [[ "$SKIP_COMPLETED" == "1" && -f "$done_file" ]]; then
       echo "[$index/$total] SKIP completed: $tag"
       continue
@@ -180,7 +171,7 @@ for seed in "${SEED_LIST[@]}"; do
     eval_seeds="$((seed + 1001)),$((seed + 1002)),$((seed + 1003))"
     run_with_watchdog "$log_file" "$failure_file" env CUDA_VISIBLE_DEVICES="$PHYSICAL_GPU" OGBENCH_SAVE_DIR="$run_dir" \
       ./run_carla.sh \
-        --agent-config impls/configs/steervla_residual_eval_config.py \
+        --agent-config impls/configs/simlingo_steervla_residual_config.py \
         --route "$route" \
         --carla-seed "$seed" \
         --train-seed "$seed" \

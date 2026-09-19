@@ -124,6 +124,12 @@ class _SimLingoModel:
         model_type = str(cfg.model.get("model_type", "ll"))
         if model_type != expect_type:
             raise ValueError(f"{self.weights} is a model_type={model_type!r} checkpoint, expected {expect_type!r}")
+        self.model_type = model_type
+        # The source DrivingModel constructs a waypoint adaptor even for an HL-only checkpoint.
+        # Give that unused adaptor a valid shape; ``generate`` bypasses it for the HL path below.
+        if model_type == "hl" and not cfg.model.predict_route_as_wps and not cfg.model.speed_wps_mode:
+            cfg.model.speed_wps_mode = "2d"
+            cfg.model.predict_route_as_wps = True
         cfg.model.vision_model.use_global_img = cfg.data_module.use_global_img
         self.cfg = cfg
         self.dataset_cfg = cfg.data_module.base_dataset
@@ -241,7 +247,32 @@ class _SimLingoModel:
     def generate(self, rgb_hwc: np.ndarray, prompt: str):
         tiles = self.pixel_tiles(rgb_hwc)
         label = self.question_label([prompt], int(tiles.shape[0]))
-        return self.model(self.driving_input(tiles[None, None], label))
+        driving_input = self.driving_input(tiles[None, None], label)
+        if self.model_type != "hl":
+            return self.model(driving_input)
+
+        adaptor_dict = self.model.adaptors(driving_input, inference=True)
+        adaptor_dict = self.model.vision_model.image_encoder.replace_placeholder_tokens(
+            adaptor_dict=adaptor_dict,
+            pixel_values=driving_input.camera_images,
+            placeholder_values=driving_input.prompt_inference.placeholder_values,
+            wp_encoder=self.model.wp_encoder,
+        )
+        if self.variant == "OpenGVLab/InternVL2-4B":
+            eos = self.tokenizer.added_tokens_encoder["<|end|>"]
+        elif self.variant == "OpenGVLab/InternVL2-2B":
+            eos = self.tokenizer.added_tokens_encoder["<|im_end|>"]
+        else:
+            eos = self.tokenizer.eos_token_id
+        tokens, _ = self.model.language_model.greedy_sample(
+            adaptor_dict["language_inputs"],
+            eos_token_id=eos,
+            max_new_tokens=100,
+            input_embed_matrix=self.model.adaptors.language.embed_tokens.weight,
+            logit_matrix=self.model.adaptors.language.lm_head.weight,
+            attention_mask=adaptor_dict["language_inputs_mask"],
+        )
+        return None, None, self.tokenizer.batch_decode(tokens, skip_special_tokens=True)
 
     @torch.no_grad()
     def generate_batch(self, rgb_hwc: np.ndarray, prompts: list[str]):

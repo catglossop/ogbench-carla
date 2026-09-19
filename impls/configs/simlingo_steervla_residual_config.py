@@ -22,6 +22,12 @@ from configs.steervla_residual_config import get_config as get_steervla_residual
 def get_config():
     config = get_steervla_residual_config()
     config.state_encoder = "siglip_pool"
+    config.residual_warmup_steps = 1000
+    config.residual_ramp_steps = 1500
+    config.residual_accel_scale = 0.1
+    config.residual_steer_scale = 0.1
+    config.residual_bc_beta = 1.0
+    config.residual_bc_normalize = False
     config.expo = False
     config.best_of_n = 1
     config.otf_td_backup = False
@@ -30,4 +36,6 @@ def get_config():
     # HL re-plan cadence of the SimLingo CAST runs (HL every 6 env steps with the LL every 3), so a
     # CAST-trained HL is deployed the way it was trained.
     s.actions_per_cot = 5
+    s.actions_per_model_query = 3
+    s.proprio_norm = False
     return config
