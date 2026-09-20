@@ -290,6 +290,7 @@ worker() {
     log "w$slot/gpu$gpu: START $tag ($(basename "$ck"))$([ "$attempt" -gt 0 ] && echo " retry $attempt")"
     local rlog="${LOG_DIR}/${tag}.log"
     [ "$attempt" -gt 0 ] && rlog="${LOG_DIR}/${tag}.retry${attempt}.log"
+    local started; started=$(date +%s)
     BENCH="$BENCH" QWEN_URL="$qurl" RUN_GROUP="$RUN_GROUP" \
       setsid ./.run_carla/qwen_zs_bon_run.sh "$route" "$gpu" "$slot" "$ck" "$s" "$out" > "$rlog" 2>&1 &
     local rc=$!
@@ -315,6 +316,14 @@ worker() {
     rm -f "${LOG_DIR}/running/${slot}.pid" "${LOG_DIR}/running/${slot}.job"
     if [ -f "${out}/run_summary_frozen_eval.json" ]; then
       log "w$slot/gpu$gpu: DONE  $tag (exit $code)"
+    elif [ "$(( $(date +%s) - started ))" -lt "${SLOT_ERROR_SECS:-120}" ]; then
+      # Died before it could even reach CARLA: a slot problem (port still listening, stale display,
+      # unhealthy critic), not a bad cell. Clean the slot and put the cell back WITHOUT spending its
+      # retry, or a single stuck port burns the whole queue in seconds (observed 2026-09-19).
+      log "w$slot/gpu$gpu: SLOT-ERROR $tag (exit $code after $(( $(date +%s) - started ))s); cleaning slot and requeueing"
+      kill_slot_leftovers "$slot"
+      requeue_job "${route}"$'\t'"${ck}"$'\t'"${s}"$'\t'"${attempt}"
+      sleep 30
     else
       log "w$slot/gpu$gpu: FAIL  $tag (exit $code, no summary; log $rlog)"
       echo "$(date --iso-8601=seconds) $tag attempt=$attempt exit=$code" >> "$FAILED"
