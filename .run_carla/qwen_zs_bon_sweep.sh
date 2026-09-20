@@ -90,7 +90,7 @@ kill_slot_leftovers() {
 # run_summary.json names an existing final checkpoint count; anything else has no end of training.
 list_checkpoints() {
   python3 - "$SOURCE_ROOT" "$ROUTES_FILE" <<'PY'
-import json, sys
+import json, os, sys
 from pathlib import Path
 root, routes = Path(sys.argv[1]), [r for r in Path(sys.argv[2]).read_text().split() if r]
 best = {}
@@ -105,6 +105,20 @@ for summ in root.rglob("run_summary.json"):
     prev = best.get(d["route"])
     if prev is None or summ.stat().st_mtime > prev[0]:
         best[d["route"]] = (summ.stat().st_mtime, ck, d.get("eval_mean_driving_score"))
+# A training run that died before writing run_summary.json leaves checkpoints but no record of a
+# final one, so the route would be skipped. CKPT_OVERRIDES (route <TAB> checkpoint per line) names
+# one by hand; it only fills routes that have no checkpoint of their own.
+ov = os.environ.get("CKPT_OVERRIDES", "")
+if ov and Path(ov).is_file():
+    for line in Path(ov).read_text().splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 2 or parts[0] in best:
+            continue
+        r, ck = parts
+        if (Path(ck) / "params").is_dir() or (Path(ck) / "pytorch_model.bin").is_file():
+            best[r] = (0.0, ck, None)
 for r in routes:
     if r in best:
         _, ck, m = best[r]
