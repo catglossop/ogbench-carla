@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from multiprocessing.connection import Connection
+import os
 from pathlib import Path
 import traceback
 
@@ -35,6 +36,15 @@ def main():
             return original_sample(*args, **kwargs)
 
         hl.model.language_model.greedy_sample = sample
+        # HL_KV_CACHE=1 swaps in a KV-cached loop instead (hl_kv_cache.py). Same model, same
+        # positions -- step 0 is bitwise identical -- but bf16 attention takes a different
+        # reduction path once the cache is in play, so a step whose top-1/top-2 margin is inside
+        # that noise can flip. Sampled text is therefore a valid draw, not a reproducible one.
+        if os.environ.get('HL_KV_CACHE') == '1':
+            from hl_kv_cache import install_kv_cache
+
+            install_kv_cache(hl, sampling)
+            print('[internvl2-hl] KV-cached greedy_sample enabled (HL_KV_CACHE=1)', flush=True)
         conn.send(dict(ready=True, weights=str(hl.weights),
                        use_ego_history=bool(hl.dataset_cfg.get('use_ego_state_history', False)),
                        history_count=int(hl.dataset_cfg.get('ego_state_history_count', 3))))
