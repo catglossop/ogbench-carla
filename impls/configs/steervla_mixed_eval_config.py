@@ -13,8 +13,5 @@ def get_config():
     config.steervla.simlingo_source_root = '/home/celinet/simlingo-steervla'
     config.steervla.hl_python = '/home/celinet/miniconda3/envs/simlingo/bin/python'
     config.steervla.actions_per_model_query = 3
-    # 1 = one HL call per Best-of-N candidate. Set to the candidate count to draw a scene's
-    # candidates in a single batched HL pass instead (see MixedSteerVLAActor._hl_sample).
-    config.steervla.hl_batch_candidates = 1
     config.steervla.debug_noise = False
     return config

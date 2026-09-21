@@ -45,26 +45,12 @@ def main():
             sampling['temperature'] = float(request.get('temperature', 0.0))
             if request.get('seed') is not None:
                 torch.manual_seed(int(request['seed']))
-            # num_samples > 1 draws that many candidates for one scene in a single batched pass.
-            # Absent (or 1) this is the original one-request-one-sample path, unchanged.
-            num_samples = int(request.get('num_samples', 1) or 1)
-            if num_samples > 1:
-                _, _, language = hl.generate_batch(request['image'], request['prompt'], num_samples)
-            else:
-                _, _, language = hl.generate(request['image'], request['prompt'])
-            outputs = [str(text) for text in (language or [])]
-            if len(outputs) != num_samples:
-                raise ValueError(f'InternVL2 returned {len(outputs)} samples, expected {num_samples}')
-            samples = []
-            for output in outputs:
-                reasoning, subtask = split_hl_output(output)
-                if not subtask.strip():
-                    raise ValueError(f'InternVL2 returned an empty subtask: {output!r}')
-                samples.append(dict(reasoning=reasoning, subtask=subtask, output=output))
-            if num_samples > 1:
-                conn.send(dict(samples=samples))
-            else:
-                conn.send(samples[0])
+            _, _, language = hl.generate(request['image'], request['prompt'])
+            output = str(language[0] if language else '')
+            reasoning, subtask = split_hl_output(output)
+            if not subtask.strip():
+                raise ValueError(f'InternVL2 returned an empty subtask: {output!r}')
+            conn.send(dict(reasoning=reasoning, subtask=subtask, output=output))
     except EOFError:
         pass
     except Exception:
