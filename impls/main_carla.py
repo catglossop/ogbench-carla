@@ -302,6 +302,20 @@ flags.DEFINE_integer(
     "0 disables candidate panels entirely.",
 )
 flags.DEFINE_bool(
+    "bon_call_log", False,
+    "Qwen best-of-N: record every critic call to <save_dir>/bon_calls/calls.jsonl -- each "
+    "candidate's raw action chunk, HL subtask/reasoning/full output, Qwen scores and utility, "
+    "the selected index and the ego pose it was queried from -- plus a per-env-step "
+    "steps.jsonl (executed chunk, pose) and clean camera frames, so candidates can be "
+    "re-rendered offline without re-running.",
+)
+flags.DEFINE_integer(
+    "bon_call_log_frames_every", 1,
+    "With --bon_call_log, save a clean (unannotated) camera frame every N env steps to "
+    "<save_dir>/bon_calls/frames/. Frames at critic calls are always saved. 0 = calls only.",
+)
+flags.DEFINE_integer("bon_call_log_jpeg_quality", 92, "JPEG quality for --bon_call_log frames.")
+flags.DEFINE_bool(
     "bon_candidates_wandb", False,
     "Also upload candidate-panel images to W&B. Disabled by default because these "
     "images are large; local panels are still saved when --save_video_local is true.",
@@ -3206,6 +3220,74 @@ def run_online_carla(
 
     _candidates_dir = Path(FLAGS.save_dir) / "videos" / "candidates"
 
+    # --bon_call_log: raw per-critic-call record for offline candidate rendering. Pure
+    # observation -- nothing here feeds back into sampling, RNG or selection.
+    _bon_call_dir = Path(FLAGS.save_dir) / "bon_calls"
+    _bon_call_index: list = [0]
+    _bon_call_last: list = [None]  # (call_index, env_step) of the chunk now executing
+    _bon_last_draw_info: list = [None]  # per-candidate HL text from the last sampling pass
+
+    def _bon_json_safe(x: Any) -> Any:
+        if isinstance(x, np.ndarray):
+            return x.tolist()
+        if isinstance(x, (np.floating, np.integer, np.bool_)):
+            return x.item()
+        if isinstance(x, dict):
+            return {str(k): _bon_json_safe(v) for k, v in x.items()}
+        if isinstance(x, (list, tuple)):
+            return [_bon_json_safe(v) for v in x]
+        if hasattr(x, "shape") and hasattr(x, "dtype"):  # jax arrays
+            return np.asarray(jax.device_get(x)).tolist()
+        if x is None or isinstance(x, (str, int, float, bool)):
+            return x
+        return str(x)
+
+    def _bon_log_append(name: str, record: dict) -> None:
+        _bon_call_dir.mkdir(parents=True, exist_ok=True)
+        with open(_bon_call_dir / name, "a") as fh:
+            fh.write(json.dumps(_bon_json_safe(record)) + "\n")
+
+    def _bon_log_frame(raw: Any, env_step: int, force: bool = False) -> str | None:
+        """Save the clean camera frame for ``env_step``; return its path relative to bon_calls/."""
+        every = int(FLAGS.bon_call_log_frames_every)
+        if not force and (every <= 0 or env_step % every != 0):
+            return None
+        rel = f"frames/step{env_step:06d}.jpg"
+        path = _bon_call_dir / rel
+        if not path.exists():
+            import cv2  # type: ignore
+
+            path.parent.mkdir(parents=True, exist_ok=True)
+            frame = _as_video_frame(_viz_image_from_raw(raw))
+            cv2.imwrite(
+                str(path), frame[:, :, ::-1],  # RGB -> BGR
+                [int(cv2.IMWRITE_JPEG_QUALITY), int(FLAGS.bon_call_log_jpeg_quality)],
+            )
+        return rel
+
+    def _bon_log_step(executed_flat: Any, replay_step: int) -> None:
+        """One steps.jsonl row: the chunk executed at this env step and the call it came from."""
+        if not FLAGS.bon_call_log:
+            return
+        try:
+            last = _bon_call_last[0]
+            state = np.asarray(obs_raw.get("state", []), dtype=np.float32).reshape(-1) \
+                if isinstance(obs_raw, dict) else np.zeros(0, dtype=np.float32)
+            _bon_log_append("steps.jsonl", {
+                "env_step": int(step),
+                "episode": int(episode_count),
+                "episode_step": int(episode_steps),
+                "from_call": None if last is None else last[0],
+                "call_env_step": None if last is None else last[1],
+                "replay_step": int(replay_step),  # 0 = fresh critic call, k = k-th re-anchored replay
+                "executed_actions": np.asarray(executed_flat, dtype=np.float32),
+                "state": state,
+                "pose": _current_chunk_pose(),
+                "frame": _bon_log_frame(obs_raw, int(step), force=replay_step == 0),
+            })
+        except Exception as exc:  # logging must never end a run
+            print(f"[bon_call_log] step record failed at step {step}: {exc!r}", flush=True)
+
     def _plot_bon_candidates(frame: np.ndarray, cand: dict, step: int):
         """W&B image: the frame + all best-of-N candidate action trajectories.
 
@@ -3480,6 +3562,7 @@ def run_online_carla(
 
         max_attempts = max(1, int(FLAGS.bon_max_sample_attempts))
         label_source = FLAGS.bon_qwen_label_source if _qwen_selector is not None else "subtask"
+        _bon_last_draw_info[0] = None
         if FLAGS.bon_batch_policy_candidates and _qwen_selector is not None and max_attempts == 1:
             from vlas.batched_candidates import (
                 BatchedCandidateValidationError,
@@ -3514,9 +3597,11 @@ def run_online_carla(
         chunks: list[np.ndarray] = []
         subtasks: list[str] = []
         accepted_cats: list[frozenset] = []
+        draw_infos: list[dict] = []
         rng_local = subkey
         for slot in range(n):
             best = None
+            best_info = None
             best_score = -1.0
             attempts = 1 if slot == 0 else max_attempts
             for _attempt in range(attempts):
@@ -3549,14 +3634,36 @@ def run_online_carla(
                         subtask = _decoded[0] if _decoded else ""
                 cats = subtask_categories(subtask)
                 score = diversity_score(cats, accepted_cats)
+                info = None
+                if FLAGS.bon_call_log and steervla_actor is not None:
+                    # Read-only decodes of the draw that just ran; the mixed actor also leaves
+                    # InternVL2's full output and prompt on the raw obs.
+                    try:
+                        _raw_now = getattr(steervla_actor, "raw_obs_holder", {}).get("obs") or {}
+                        _st = steervla_actor.decode_last_batch_subtasks() or [""]
+                        _rs = steervla_actor.decode_last_batch_reasoning() or [""]
+                        info = {
+                            "subtask": _st[0],
+                            "reasoning": _rs[0],
+                            "hl_output": _raw_now.get("simlingo_hl_output"),
+                            "hl_prompt": _raw_now.get("simlingo_hl_prompt"),
+                            "slot": slot,
+                            "attempt": _attempt,
+                            "diversity_score": float(score),
+                        }
+                    except Exception as exc:  # logging must never end a run
+                        info = {"slot": slot, "attempt": _attempt, "log_error": repr(exc)}
                 if score > best_score:
-                    best, best_score = (chunk_np, subtask, cats), score
+                    best, best_score, best_info = (chunk_np, subtask, cats), score, info
                 if score >= (1.0 - DIVERSITY_JACCARD_THRESHOLD):
                     break
             chunk_np, subtask, cats = best
             chunks.append(chunk_np)
             subtasks.append(subtask)
             accepted_cats.append(cats)
+            draw_infos.append(best_info)
+        if FLAGS.bon_call_log:
+            _bon_last_draw_info[0] = draw_infos
         return np.stack(chunks, axis=0), subtasks
 
     def _score_candidates_with_critic(rng_key):
@@ -3733,6 +3840,54 @@ def run_online_carla(
             "accepted": result["accepted"],
             "qwen_timings": result.get("timings", {}),
         }
+        if FLAGS.bon_call_log:
+            try:
+                _call = _bon_call_index[0]
+                _bon_call_index[0] += 1
+                _bon_call_last[0] = (_call, int(step))
+                _infos = _bon_last_draw_info[0] or []
+                _ah = int(agent._env_action_horizon())
+                _ad = int(agent._env_action_dim())
+                _accepted = list(result["accepted"]) if result.get("accepted") is not None else []
+                _bon_log_append("calls.jsonl", {
+                    "call_index": _call,
+                    "env_step": int(step),
+                    "episode": int(episode_count),
+                    "episode_step": int(episode_steps),
+                    "route": _qwen_route_id,
+                    "routing_command": routing_command,
+                    "speed_mps": speed,
+                    "state": state_vec,
+                    "query_pose": _current_chunk_pose(),
+                    "frame": _bon_log_frame(obs_raw, int(step), force=True),
+                    "cadence": int(FLAGS.bon_qwen_cadence),
+                    "label_source": FLAGS.bon_qwen_label_source,
+                    "action_format": {
+                        "horizon": _ah,
+                        "dim": _ad,
+                        "exec_cfg": _steervla_exec_cfg,
+                    },
+                    "selected_index": best_idx,
+                    "fallback_index": len(candidate_subtasks) - 1 if FLAGS.bon_include_brake_candidate else None,
+                    "scene_description": result.get("scene_description"),
+                    "timings": result.get("timings", {}),
+                    "candidates": [
+                        {
+                            "index": i,
+                            "selected": i == best_idx,
+                            "label": candidate_subtasks[i],
+                            **(_infos[i] if i < len(_infos) and _infos[i] else {}),
+                            "actions": chunks_np[i],  # raw flat chunk, (horizon*dim,)
+                            "utility": float(utility[i]),
+                            "accepted": _accepted[i] if i < len(_accepted) else None,
+                            "qwen_scores": result["scores"][i] if i < len(result["scores"]) else None,
+                        }
+                        for i in range(chunks_np.shape[0])
+                    ],
+                    "qwen_result": {k: v for k, v in result.items() if k not in ("scores",)},
+                })
+            except Exception as exc:  # logging must never end a run
+                print(f"[bon_call_log] call record failed at step {step}: {exc!r}", flush=True)
         if FLAGS.qwen_online_train:
             _qwen_online_window[0] = {
                 "frame": np.asarray(base_frame, dtype=np.uint8),
@@ -3908,6 +4063,7 @@ def run_online_carla(
                     shifted = _replay_flat_chunk(
                         _qwen_rollout_chunk[0], _qwen_rollout_step[0], _qwen_rollout_pose[0]
                     )
+                    _bon_log_step(shifted, _qwen_rollout_step[0])
                     _qwen_rollout_step[0] += 1
                     best_chunk = jax.numpy.asarray(shifted[None])
                     _last_vla_chunk_holder[0] = shifted
@@ -3915,6 +4071,7 @@ def run_online_carla(
                 chunks, _scores, best_idx = _score_candidates_with_qwen(subkey)
                 best_chunk = chunks[best_idx][None]
                 selected = np.asarray(best_chunk[0], dtype=np.float32)
+                _bon_log_step(selected, 0)
                 _last_vla_chunk_holder[0] = selected
                 _qwen_rollout_chunk[0] = selected
                 _qwen_rollout_step[0] = 1

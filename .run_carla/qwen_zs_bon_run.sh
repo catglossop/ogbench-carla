@@ -181,6 +181,13 @@ case "$ACTOR" in
   *) echo "[qwen_zs_run] ABORT: ACTOR must be pi05, simlingo or mixed, got '$ACTOR'" >&2; exit 2 ;;
 esac
 
+# Extra main_carla flags, appended after the `--` every actor's CMD ends with
+# (e.g. EXTRA_MAIN_FLAGS="--bon_call_log=true").
+if [ -n "${EXTRA_MAIN_FLAGS:-}" ]; then
+  read -r -a _extra_main_flags <<< "$EXTRA_MAIN_FLAGS"
+  CMD+=("${_extra_main_flags[@]}")
+fi
+
 echo "[qwen_zs_run] actor=$ACTOR bench=$BENCH route=$ROUTE gpu=$GPU slot=$SLOT rpc=$CARLA_PORT tm=$TM_PORT display=:$DISPLAY_NUM"
 echo "[qwen_zs_run] carla_root=$CARLA_ROOT carla_0915_root=${CARLA_0915_ROOT:-<unset>} ckpt=$CKPT candidates=$N_CANDIDATES"
 [ "$ACTOR" = simlingo ] && echo "[qwen_zs_run] simlingo hl=$SIMLINGO_HL_CHECKPOINT ll=$SIMLINGO_LL_CHECKPOINT src=$SIMLINGO_SOURCE_ROOT"
