@@ -1,0 +1,11 @@
+generalization-wall-1097
+generalization-animals-1076
+generalization-bad-parking-1004
+generalization-obscured-stop-1046
+generalization-image-on-object-1041
+generalization-right-of-way-1056
+generalization-right-construction-1094
+generalization-pedestrian-other-blocker-1072
+generalization-hard-brake-1036
+generalization-fully-blocked-1032
+generalization-custom-obstacles-1024

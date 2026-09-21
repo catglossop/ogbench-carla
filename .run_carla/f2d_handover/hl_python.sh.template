@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Python for the mixed actor's InternVL2 HL worker (steervla.hl_python). MixedSteerVLAActor strips
+# PYTHONPATH from the worker's env, so the SimLingo deps (peft, hydra, lightning, timm, accelerate)
+# are put back here; torch/transformers come from the repo's main .venv.
+#
+# Copy to hl_python.sh, fill in the two paths for this machine, chmod +x.
+export PYTHONPATH=__SIMLINGO_DEPS__
+exec __REPO__/.venv/bin/python "$@"

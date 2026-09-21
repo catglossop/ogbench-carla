@@ -85,8 +85,12 @@ export UV_NO_SYNC=1
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export QWEN_VIDEO_HISTORY=0 QWEN_SPEED_HISTORY=0
 export CARLA_DISABLE_RENDER_THREAD_TIMEOUT=1 CARLA_DISABLE_RHI_THREAD=1
-# W&B identity: the school account, never the ~/.netrc (catglossop) fallthrough.
-export WANDB_API_KEY="$(cat /home/cglossop/.wandb_school_key)"
+# W&B identity: the school account, never the ~/.netrc (catglossop) fallthrough. WANDB_KEY_FILE lets
+# another machine point at its copy of the key; a missing or empty key is fatal, because an empty
+# WANDB_API_KEY makes W&B fall back to that machine's ~/.netrc and log under the wrong account.
+WANDB_KEY_FILE="${WANDB_KEY_FILE:-/home/cglossop/.wandb_school_key}"
+[ -s "$WANDB_KEY_FILE" ] || { echo "[qwen_zs_run] ABORT: W&B key file $WANDB_KEY_FILE is missing or empty" >&2; exit 1; }
+export WANDB_API_KEY="$(cat "$WANDB_KEY_FILE")"
 export WANDB_ENTITY=catherineglossop
 
 EXP_NAME="${ROUTE}-cs${CARLA_SEED}${EXTRA_TAG:+-$EXTRA_TAG}-qwenzs_$(date +%Y%m%d_%H%M%S)"
