@@ -16,6 +16,7 @@ worker GPU from the job logs. Re-run any time; unfinished routes show as pending
 """
 import argparse
 import json
+import os
 import re
 import statistics
 from datetime import datetime
@@ -33,14 +34,17 @@ PROTOCOL = {
     ],
     "mixed": [
         "**Actor:** mixed SteerVLA (`steervla_mixed_eval_config.py`): the route's end-of-training InternVL2 HL export "
-        "(CAST-relabel fine-tuned) generates reasoning + subtask; the pi05 `ll_heavy_unnormed_matchcrop/6000` "
-        "checkpoint (`pi05_steervla_cot_simplified_reasoning_ll_heavy`) conditions on that text with its own vision "
+        "(CAST-relabel fine-tuned) generates reasoning + subtask; the pi05 "
+        "`pi05_steervla_simplified_reasoning_no_ego_history_v1/6000` checkpoint "
+        "(`pi05_steervla_cot_simplified_reasoning_no_ego_history`) conditions on that text with its own vision "
         "backbone and action expert.",
-        "**HL decoding is greedy** (forced in `internvl2_hl_worker.py`), so all candidates share one subtask; "
-        "candidates differ only in the pi05 action samples.",
+        "**HL decoding is sampled at temperature 1.0**, seeded per request from the calling JAX key, so each "
+        "Best-of-N candidate gets its own subtask (greedy HL made all 4 candidates identical, defeating BoN).",
         "**BoN:** 4 candidates sampled **sequentially** (the batched path would bypass the InternVL2 HL), re-query "
         "every 3 env steps, no brake candidate.",
-        "**Critics:** worker on GPU 5 used a critic on GPU 5 (shared card); worker on GPU 6 used a critic on GPU 7.",
+        "**Critics:** one zero-shot critic per worker, both on the worker's own GPU (5 and 6).",
+        "**Episode ends are leaderboard-faithful:** no wrapper step cap and no stuck cutoff, so an episode ends only "
+        "on the leaderboard's own criteria (AgentBlockedTest 60 s below 0.1 m/s, InRouteTest, route completion).",
     ],
 }
 
@@ -89,6 +93,8 @@ def main():
     ap.add_argument("--actor", default="pi05", choices=sorted(PROTOCOL))
     ap.add_argument("--jobs-dir", default=None, help="job log dir for the timing table (default: .run_carla/jobs/<group>)")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--notes-file", default=None,
+                    help="markdown appended verbatim at the end (cells aborted on purpose, caveats)")
     args = ap.parse_args()
 
     root = Path(__file__).resolve().parent.parent
@@ -113,6 +119,22 @@ def main():
         if d["route"] not in src or p.stat().st_mtime > src[d["route"]][0]:
             src[d["route"]] = (p.stat().st_mtime, d)
     src = {r: d for r, (_, d) in src.items()}
+
+    # A training run that died before writing run_summary.json leaves checkpoints but no record of a
+    # final one, so the route would be reported as "not evaluated" even though its cells ran.
+    # CKPT_OVERRIDES (route <TAB> checkpoint) names one by hand, as qwen_zs_bon_sweep.sh does. Such a
+    # route has no post-training eval, so its baseline columns stay empty.
+    ov = os.environ.get("CKPT_OVERRIDES", "")
+    if ov and Path(ov).is_file():
+        for line in Path(ov).read_text().splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) != 2 or parts[0] in src:
+                continue
+            r, ck = parts
+            if (Path(ck) / "params").is_dir() or (Path(ck) / "pytorch_model.bin").is_file():
+                src[r] = {"route": r, "training": {"final_checkpoint": ck}, "eval_driving_scores": []}
 
     cells = {}
     for r in routes:
@@ -182,7 +204,12 @@ def main():
         L.append("|---|---:|---:|")
         L.append(f"| Qwen BoN | {statistics.fmean(bon_m):.2f} | {fmt(statistics.fmean(bon_s) if bon_s else None)}"
                  + (f" ({len(bon_s)} routes with ≥2 episodes)" if len(bon_s) != len(bon_m) else "") + " |")
-        L.append(f"| Baseline (same routes) | {statistics.fmean(base_m):.2f} | "
+        # A route recovered via CKPT_OVERRIDES has no post-training eval, so it contributes a
+        # BoN mean but no baseline; average the baseline only over routes that actually have one.
+        paired = [b for b in base_m if b is not None]
+        label = "Baseline (same routes)" if len(paired) == len(bon_m) else \
+            f"Baseline ({len(paired)} of those routes; the rest have no post-training eval)"
+        L.append(f"| {label} | {fmt(statistics.fmean(paired) if paired else None)} | "
                  f"{fmt(statistics.fmean(base_s) if base_s else None)} |")
         allv = [x for v in cells.values() for _, x in v]
         L.append("")
@@ -219,9 +246,11 @@ def main():
              "wording), BF16 eager; risk thresholds 0.8; utility = 0.5·goal + progress + 0.5·correctness − crash "
              "− 0.5·off-road − 0.5·traffic.")
     L.append(f"- **Eval:** frozen eval, CARLA seeds {', '.join(map(str, seeds))}; see the per-route columns for the "
-             "episodes per seed. 4000-step episode cap.")
+             "episodes per seed.")
     L.append("")
 
+    if args.notes_file and Path(args.notes_file).is_file():
+        L += ["", Path(args.notes_file).read_text().rstrip()]
     out.write_text("\n".join(L))
     print(out)
 
