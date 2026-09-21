@@ -44,6 +44,7 @@ STALL_SECS="${STALL_SECS:-1800}"
 STALL_STRIKES="${STALL_STRIKES:-2}"
 CELL_RETRIES="${CELL_RETRIES:-1}"
 STOP_QWEN_AT_END="${STOP_QWEN_AT_END:-1}"
+export WANDB_KEY_FILE="${WANDB_KEY_FILE:-/home/cglossop/.wandb_school_key}"
 
 MODE="dry"
 for a in "$@"; do case "$a" in
@@ -301,6 +302,23 @@ worker() {
     until QWEN_PORT="$qport" ./.run_carla/qwen_zs_critic_server.sh status >/dev/null 2>&1; do
       log "w$slot/gpu$gpu: critic unhealthy (port $qport); waiting before $tag"; sleep 120
     done
+    # Two machines on one sweep (HANDOVER_qwen_zs_bon_second_machine.md): skip any cell another
+    # machine already claimed on W&B. Checked here, after the waits, so the answer is fresh.
+    # An unreachable W&B is retried, never read as "free".
+    if [ "${SKIP_WANDB_CLAIMED:-0}" = 1 ]; then
+      local claimed
+      while :; do
+        WANDB_API_KEY="$(cat "$WANDB_KEY_FILE")" "${ROOT_DIR}/.venv/bin/python" \
+          .run_carla/wandb_claimed_cells.py "$RUN_GROUP" "$route" "$s" 2>>"${LOG_DIR}/sweep.log"
+        claimed=$?
+        [ "$claimed" -ne 2 ] && break
+        log "w$slot/gpu$gpu: W&B claim check failed for $tag; retrying in 120 s"; sleep 120
+      done
+      if [ "$claimed" -eq 0 ]; then
+        log "w$slot/gpu$gpu: SKIP  $tag (claimed on W&B by another machine)"
+        continue
+      fi
+    fi
     log "w$slot/gpu$gpu: START $tag ($(basename "$ck"))$([ "$attempt" -gt 0 ] && echo " retry $attempt")"
     local rlog="${LOG_DIR}/${tag}.log"
     [ "$attempt" -gt 0 ] && rlog="${LOG_DIR}/${tag}.retry${attempt}.log"

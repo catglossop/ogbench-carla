@@ -86,7 +86,7 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export QWEN_VIDEO_HISTORY=0 QWEN_SPEED_HISTORY=0
 export CARLA_DISABLE_RENDER_THREAD_TIMEOUT=1 CARLA_DISABLE_RHI_THREAD=1
 # W&B identity: the school account, never the ~/.netrc (catglossop) fallthrough.
-export WANDB_API_KEY="$(cat /home/cglossop/.wandb_school_key)"
+export WANDB_API_KEY="$(cat "${WANDB_KEY_FILE:-/home/cglossop/.wandb_school_key}")"
 export WANDB_ENTITY=catherineglossop
 
 EXP_NAME="${ROUTE}-cs${CARLA_SEED}${EXTRA_TAG:+-$EXTRA_TAG}-qwenzs_$(date +%Y%m%d_%H%M%S)"
