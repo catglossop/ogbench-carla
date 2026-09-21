@@ -20,6 +20,13 @@ CKPT="${CKPT:-/raid/users/cglossop/sweeps/b2dsteervla_simlingo_fixedcarla_kl005_
 SEEDS="${SEEDS:-0 1 2}"
 WORKER_GPU="${WORKER_GPU:?WORKER_GPU (physical index for policy + CARLA) must be set}"
 QWEN_GPU="${QWEN_GPU:?QWEN_GPU (physical index for the critic) must be set}"
+# CARLA can render on a different GPU than the policy (qwen_zs_bon_run.sh RENDER_GPU).
+export RENDER_GPU="${RENDER_GPU:-$WORKER_GPU}"
+CARLA_BAD_GPUS="${CARLA_BAD_GPUS:-7}"   # bellman: UE4 cannot run on GPU 7
+RENDER_NEED_MIB="${RENDER_NEED_MIB:-10000}"
+for g in $CARLA_BAD_GPUS; do
+  [ "$RENDER_GPU" = "$g" ] && { echo "[candlog] ABORT: CARLA cannot run on GPU $g; set RENDER_GPU" >&2; exit 2; }
+done
 QWEN_PORT="${QWEN_PORT:-18860}"
 SLOT="${SLOT:-2}"                        # rpc 17440, tm 17540, display :962 -- clear of the sweep's 0/1
 WORKER_NEED_MIB="${WORKER_NEED_MIB:-40000}"  # policy ~22 GB + HL worker ~8 GB + CARLA ~5 GB
@@ -60,7 +67,7 @@ cleanup_slot() {
   rm -f "/tmp/.X${DISPLAY_NUM}-lock"
 }
 
-log "route=$ROUTE seeds=[$SEEDS] worker gpu=$WORKER_GPU slot=$SLOT (rpc $CARLA_PORT, :$DISPLAY_NUM) critic gpu=$QWEN_GPU port=$QWEN_PORT"
+log "route=$ROUTE seeds=[$SEEDS] worker gpu=$WORKER_GPU render gpu=$RENDER_GPU slot=$SLOT (rpc $CARLA_PORT, :$DISPLAY_NUM) critic gpu=$QWEN_GPU port=$QWEN_PORT"
 log "run group $RUN_GROUP; extra flags: $EXTRA_MAIN_FLAGS"
 
 STARTED_QWEN=0
@@ -82,8 +89,9 @@ for s in $SEEDS; do
     [ -f "${out}/run_summary_frozen_eval.json" ] && { log "seed $s already done; skipping"; break; }
     while :; do
       free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$WORKER_GPU" | tr -d ' ')
-      [ "${free:-0}" -ge "$WORKER_NEED_MIB" ] && break
-      log "gpu $WORKER_GPU has ${free} MiB free (< $WORKER_NEED_MIB); waiting before seed $s"; sleep 300
+      rfree=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$RENDER_GPU" | tr -d ' ')
+      [ "${free:-0}" -ge "$WORKER_NEED_MIB" ] && [ "${rfree:-0}" -ge "$RENDER_NEED_MIB" ] && break
+      log "gpu $WORKER_GPU ${free} MiB free (need $WORKER_NEED_MIB), render gpu $RENDER_GPU ${rfree} MiB (need $RENDER_NEED_MIB); waiting before seed $s"; sleep 300
     done
     rlog="${LOG_DIR}/${ROUTE}__cs${s}$([ "$attempt" -gt 0 ] && echo ".retry${attempt}").log"
     log "START seed $s (attempt $attempt) -> $rlog"

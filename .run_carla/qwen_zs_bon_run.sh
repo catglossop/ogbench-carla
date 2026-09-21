@@ -27,6 +27,10 @@ cd "$ROOT_DIR"
 
 ROUTE="${1:?route}"; GPU="${2:?gpu}"; SLOT="${3:?slot}"
 CKPT="${4:?checkpoint}"; CARLA_SEED="${5:?carla seed}"; OUT_DIR="${6:?out dir}"
+# CARLA's render GPU (-graphicsadapter; Vulkan order == nvidia-smi order on bellman). Defaults to
+# the policy GPU; set it when the policy GPU cannot host CARLA (on bellman CARLA cannot run on
+# GPU 7, and UE4 died with VK_ERROR_DEVICE_LOST on GPU 0 on 2026-09-21).
+RENDER_GPU="${RENDER_GPU:-$GPU}"
 
 # Hand-queued extra evals (e.g. an intermediate checkpoint) pass CHECKPOINT as "<dir>#<tag>". The
 # tag keeps them out of the route's own cell: results go to <route>__<tag>/carla_seed_N instead of
@@ -122,7 +126,7 @@ case "$ACTOR" in
     [ -d "$CKPT/params" ] || { echo "[qwen_zs_run] ABORT: no params/ under checkpoint $CKPT" >&2; exit 1; }
     export QWEN_RECORD_PDM_PLAN=0
     # The actor restores inference-only params (SteerVLAActor default load_trainable_params=False).
-    CMD=(bash run_carla.sh "${COMMON[@]}" --train-gpu 0 --render-adapter "$GPU"
+    CMD=(bash run_carla.sh "${COMMON[@]}" --train-gpu 0 --render-adapter "$RENDER_GPU"
          --base-only true --eval-only true
          --steervla-checkpoint "$CKPT" --actor-config "$ACTOR_CONFIG" --
          --bon_qwen_label_source=subtask --bon_include_brake_candidate=false
@@ -140,7 +144,7 @@ case "$ACTOR" in
     export PYTHONPATH="$ROOT_DIR:${SIMLINGO_DEPS:-/raid/users/cglossop/ogbench-simlingo-deps}"
     export QWEN_RECORD_PDM_PLAN="${QWEN_RECORD_PDM_PLAN:-1}"
     # README: keep every GPU visible so --train-gpu is the physical index.
-    CMD=(bash run_carla.sh "${COMMON[@]}" --train-gpu "$GPU" --render-adapter "$GPU"
+    CMD=(bash run_carla.sh "${COMMON[@]}" --train-gpu "$GPU" --render-adapter "$RENDER_GPU"
          --agent-config impls/configs/simlingo_steervla_qwen_bon_eval_config.py
          --cot-temperature 1.0 --
          --bon_qwen_label_source=subtask --bon_include_brake_candidate=false)
@@ -166,7 +170,7 @@ case "$ACTOR" in
     [ -d "$MIXED_LL_CHECKPOINT/params" ] || { echo "[qwen_zs_run] ABORT: no params/ under $MIXED_LL_CHECKPOINT" >&2; exit 1; }
     export QWEN_RECORD_PDM_PLAN=0
     CMD=(bash run_carla.sh "${COMMON[@]}"
-         --train-gpu "$GPU" --render-adapter "$GPU"
+         --train-gpu "$GPU" --render-adapter "$RENDER_GPU"
          --agent-config impls/configs/steervla_mixed_eval_config.py
          --steervla-checkpoint "$MIXED_LL_CHECKPOINT" --actor-config "$MIXED_LL_ACTOR_CONFIG" --
          --bon_qwen_label_source=subtask --bon_include_brake_candidate=false
@@ -188,7 +192,7 @@ if [ -n "${EXTRA_MAIN_FLAGS:-}" ]; then
   CMD+=("${_extra_main_flags[@]}")
 fi
 
-echo "[qwen_zs_run] actor=$ACTOR bench=$BENCH route=$ROUTE gpu=$GPU slot=$SLOT rpc=$CARLA_PORT tm=$TM_PORT display=:$DISPLAY_NUM"
+echo "[qwen_zs_run] actor=$ACTOR bench=$BENCH route=$ROUTE gpu=$GPU render_gpu=$RENDER_GPU slot=$SLOT rpc=$CARLA_PORT tm=$TM_PORT display=:$DISPLAY_NUM"
 echo "[qwen_zs_run] carla_root=$CARLA_ROOT carla_0915_root=${CARLA_0915_ROOT:-<unset>} ckpt=$CKPT candidates=$N_CANDIDATES"
 [ "$ACTOR" = simlingo ] && echo "[qwen_zs_run] simlingo hl=$SIMLINGO_HL_CHECKPOINT ll=$SIMLINGO_LL_CHECKPOINT src=$SIMLINGO_SOURCE_ROOT"
 echo "[qwen_zs_run] carla_seed=$CARLA_SEED train_seed=$TRAIN_SEED eval_seeds=$EVAL_SEEDS online_steps=$ONLINE_STEPS"

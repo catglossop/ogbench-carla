@@ -166,6 +166,14 @@ and it runs exactly those cells, because finished cells are skipped.
   too.
 - **Stale plan label.** The dry-run prints "pi05 LL ll_heavy_unnormed_matchcrop/6000"; the command
   it actually runs uses the no_ego_history v1 @ 6000 LL, same as A.
+- **Always pass `QWEN_PORT` to `qwen_zs_critic_server.sh`.** Its `start`/`stop`/`status` default
+  to port 18850, and the pid files are shared across worktrees under
+  `sweep_results/qwen_zs_critic/`. A bare `stop` kills whatever critic owns 18850: on
+  2026-09-21 that was A's live GPU-5 critic, and its in-flight cell died.
+- **Not every GPU can host CARLA.** On bellman UE4 cannot run on GPU 7, and it died with
+  `VK_ERROR_DEVICE_LOST` on GPU 0. The sweep renders CARLA on the worker's own GPU, so leave any
+  such card out of `SWEEP_GPUS`; it can still hold a critic via `QWEN_GPUS`. Vulkan's adapter
+  order matched `nvidia-smi` on bellman (check B with `vulkaninfo --summary`).
 - **Cleanup.** Use `launch_f2d_mixed_reverse.sh --stop` (only this worktree's workers and their
   CARLA; the critics keep running) or `qwen_zs_critic_server.sh stop`. **Not** `reset_carla.sh`,
   which kills every CARLA on the box. On bellman, `qwen_zs_bon_sweep.sh --stop` also pkills slot
