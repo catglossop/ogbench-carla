@@ -1,4 +1,5 @@
 generalization-construction-permutations-1019
+generalization-custom-obstacles-1020
 generalization-pedestrians-on-road-1085
 generalization-construction-pedestrian-1011
 generalization-pedestrian-crowd-1069
@@ -9,6 +10,7 @@ generalization-bad-parking-1009
 generalization-pedestrian-other-blocker-1072
 generalization-right-construction-1093
 generalization-right-of-way-1056
+generalization-wall-1095
 generalization-image-on-object-1041
 generalization-obscured-stop-1048
 generalization-bad-parking-1004
