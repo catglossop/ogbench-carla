@@ -29,7 +29,10 @@ STALL_SECS="${STALL_SECS:-1800}"; STALL_STRIKES="${STALL_STRIKES:-2}"
 
 export BENCH=b2d ACTOR=mixed N_CANDIDATES=4 N_EVAL=1 EVAL_SEED_OFFSET=0
 export MIXED_HL_PYTHON="${MIXED_HL_PYTHON:-/raid/users/cglossop/sweep_results/qwenzs_mixed_b2d_sources/hl_python.sh}"
-export RUN_GROUP="${RUN_GROUP:-b2dsteervla_simlingo_fixedcarla_kl005_seed0_qwenzs_bon_mixed_t1_candlog}"
+export RUN_GROUP="${RUN_GROUP:-b2dsteervla_simlingo_kl005_qwenzs_bon_mixed_t1_candlog}"
+# main_carla also tags the W&B run with the run group, and W&B rejects tags over 64 characters at
+# wandb.init -- every cell then dies in seconds (hit 2026-09-21 with a 71-char group).
+[ "${#RUN_GROUP}" -le 64 ] || { echo "[candlog] ABORT: RUN_GROUP is ${#RUN_GROUP} chars; W&B tags max 64" >&2; exit 2; }
 export OGBENCH_SAVE_DIR="${OGBENCH_SAVE_DIR:-/raid/users/cglossop/sweeps/${RUN_GROUP}}"
 export QWEN_URL="http://127.0.0.1:${QWEN_PORT}"
 export EXTRA_MAIN_FLAGS="--bon_call_log=true ${EXTRA_MAIN_FLAGS:-}"
