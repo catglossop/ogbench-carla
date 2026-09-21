@@ -5286,6 +5286,7 @@ def create_steervla_pi0_cot_sample_fn(
             hl_checkpoint=str(steervla_cfg["hl_checkpoint"]),
             simlingo_source_root=str(steervla_cfg["simlingo_source_root"]),
             hl_python=str(steervla_cfg["hl_python"]),
+            hl_batch_candidates=int(steervla_cfg.get("hl_batch_candidates", 1) or 1),
         )
 
     if url_clean:

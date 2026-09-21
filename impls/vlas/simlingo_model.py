@@ -192,6 +192,20 @@ class _SimLingoModel:
         label = self.question_label([prompt], int(tiles.shape[0]))
         return self.model(self.driving_input(tiles[None, None], label))
 
+    @torch.no_grad()
+    def generate_batch(self, rgb_hwc: np.ndarray, prompt: str, num_samples: int):
+        """``num_samples`` independent continuations of one scene, in a single forward pass.
+
+        Every Best-of-N candidate at an env step is sampled from the same image and the same
+        prompt -- only the drawn tokens differ -- so the tiling, the vision tower and the prompt
+        encoding are shared here instead of being repeated once per candidate. greedy_sample
+        already samples row-wise and tracks per-row completion, so the rows stay independent.
+        """
+        tiles = self.pixel_tiles(rgb_hwc)
+        label = self.question_label([prompt] * int(num_samples), int(tiles.shape[0]))
+        batched = tiles[None, None].expand(int(num_samples), -1, -1, -1, -1, -1).contiguous()
+        return self.model(self.driving_input(batched, label))
+
 
 # --------------------------------------------------------------------------------------------- #
 # Actor                                                                                          #

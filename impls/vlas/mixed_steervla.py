@@ -17,9 +17,15 @@ from vlas.steervla import SteerVLAActor
 
 
 class MixedSteerVLAActor(SteerVLAActor):
-    def __init__(self, *, hl_checkpoint, simlingo_source_root, hl_python, **kwargs):
+    def __init__(self, *, hl_checkpoint, simlingo_source_root, hl_python, hl_batch_candidates=1,
+                 **kwargs):
         if kwargs.get('load_trainable_params') or kwargs.get('fixed_subtask_text'):
             raise ValueError('Mixed SteerVLA is an inference-only, live-HL actor.')
+        # > 1 draws a scene's Best-of-N subtasks in one batched HL call instead of one per
+        # candidate. 1 keeps the original call-per-candidate path.
+        self._hl_batch = max(1, int(hl_batch_candidates))
+        self._hl_cache_key = None
+        self._hl_cache = deque()
         self._hl_history = deque(maxlen=402)
         super().__init__(**kwargs)
         parent, child = socket.socketpair()
@@ -68,6 +74,29 @@ class MixedSteerVLAActor(SteerVLAActor):
     def reset_action_cache(self):
         super().reset_action_cache()
         self._hl_history.clear()
+        self._hl_cache.clear()
+        self._hl_cache_key = None
+
+    def _hl_sample(self, image, prompt, seed):
+        """One HL sample for the current scene.
+
+        With hl_batch_candidates == 1 this is one worker round-trip per call, as before. Above 1,
+        a scene's candidates are drawn together -- same image, same prompt, same temperature -- and
+        served one at a time from a queue, so the vision tower runs once per scene rather than once
+        per candidate. The queue is keyed on the scene, so a new observation always refills it.
+        """
+        if self._hl_batch <= 1:
+            self._hl_conn.send(dict(image=image, prompt=prompt,
+                                    temperature=float(self.cot_temperature), seed=seed))
+            return self._receive_hl()
+        key = (prompt, image.shape, image[::37, ::37].tobytes())
+        if key != self._hl_cache_key or not self._hl_cache:
+            self._hl_conn.send(dict(image=image, prompt=prompt,
+                                    temperature=float(self.cot_temperature), seed=seed,
+                                    num_samples=self._hl_batch))
+            self._hl_cache = deque(self._receive_hl()['samples'])
+            self._hl_cache_key = key
+        return self._hl_cache.popleft()
 
     def _sample_cot_checked(self, rng, obs_jax):
         if obs_jax.tokenized_prompt.shape[0] != 1:
@@ -89,9 +118,7 @@ class MixedSteerVLAActor(SteerVLAActor):
         # its own subtask; 0 keeps the original greedy HL). The seed comes from this call's JAX key, so
         # every sequential BoN slot draws independently yet reproducibly.
         seed = int(jax.random.randint(rng, (), 0, np.iinfo(np.int32).max))
-        self._hl_conn.send(dict(image=np.asarray(raw['image_viz'], dtype=np.uint8), prompt=prompt,
-                                temperature=float(self.cot_temperature), seed=seed))
-        result = self._receive_hl()
+        result = self._hl_sample(np.asarray(raw['image_viz'], dtype=np.uint8), prompt, seed)
         raw['simlingo_hl_output'] = result['output']
         raw['simlingo_hl_prompt'] = prompt
         print(f"[mixed-steervla] InternVL2 subtask: {result['subtask']}", flush=True)
