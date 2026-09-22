@@ -433,6 +433,11 @@ class SimLingoSteerVLAActor(HLPoolSamplingMixin):
         self.last_reanchor: dict[str, float] | None = None
         self._reanchor_disabled_reason: str | None = None
 
+        # Foresight correction hook, assigned by main_carla for YAY-Robot runs.
+        self.cot_intervention_fn: Callable[[dict[str, Any]], Any] | None = None
+        self._cot_interventions: int = 0
+        self._last_cot_intervention: dict[str, str] | None = None
+
         self.hl_dataset_dir: Path | None = Path(hl_dataset_dir) if hl_dataset_dir is not None else None
         self.hl_update_every = max(1, int(hl_update_every))
         self.hl_update_batch_size = max(1, int(hl_update_batch_size))
@@ -554,12 +559,48 @@ class SimLingoSteerVLAActor(HLPoolSamplingMixin):
         _, _, language = self.hl.generate(self._image(raw), prompt)
         text = str(language[0] if language else "")
         reasoning, subtask = split_hl_output(text)
-        return {
+        cot = {
             "prompt": prompt,
             "output": text,
             "reasoning": reasoning,
             "subtask": subtask or _TRAINING_HL_FALLBACK,
         }
+        return self._maybe_intervene_on_cot(cot, raw)
+
+    def _maybe_intervene_on_cot(self, cot: dict[str, str], raw: dict[str, Any]) -> dict[str, str]:
+        """Apply an optional foresight correction before the LL consumes the subtask."""
+        hook = self.cot_intervention_fn
+        if hook is None:
+            return cot
+        try:
+            state = np.asarray(raw.get("state"), dtype=np.float32).reshape(-1)
+            speed = float(state[_EGO_IDX_SPEED]) if state.size > _EGO_IDX_SPEED else 0.0
+            corrected = hook({
+                "subtask": cot["subtask"],
+                "reasoning": cot["reasoning"],
+                "image": self._image(raw),
+                "state": state,
+                "current_speed": speed,
+                "routing_command": self.routing_command,
+                "prompt": cot["prompt"],
+            })
+        except Exception as exc:  # never let a coach failure stop the car
+            print(f"[simlingo_steervla] cot intervention failed ({exc}); keeping sampled CoT.", flush=True)
+            return cot
+        if not corrected:
+            self._last_cot_intervention = None
+            return cot
+        subtask, reasoning = (str(value).strip() for value in corrected)
+        if not subtask or not reasoning:
+            self._last_cot_intervention = None
+            return cot
+        self._cot_interventions += 1
+        self._last_cot_intervention = {
+            "original_subtask": cot["subtask"], "original_reasoning": cot["reasoning"],
+            "subtask": subtask, "reasoning": reasoning,
+        }
+        return {**cot, "subtask": subtask, "reasoning": reasoning,
+                "output": f"{reasoning}\n\n{DRIVING_BEHAVIOR_MARKER} {subtask}"}
 
     def _stash_cot_in_raw(self, raw: dict[str, Any] | None) -> None:
         if raw is None or self._cot is None:
@@ -573,6 +614,12 @@ class SimLingoSteerVLAActor(HLPoolSamplingMixin):
         # ego-history line pushes the full prompt past SigLIP's 64-token text limit.
         raw["openpi_prompt_text"] = self._cot["prompt"].rsplit("\n", 1)[-1]
         raw["simlingo_hl_output"] = self._cot["output"]
+        if self._last_cot_intervention is not None:
+            raw["yay_intervention"] = True
+            raw["yay_original_subtask"] = self._last_cot_intervention["original_subtask"]
+            raw["yay_original_reasoning"] = self._last_cot_intervention["original_reasoning"]
+        else:
+            raw["yay_intervention"] = False
 
     @staticmethod
     def waypoints_to_chunk(speed_wps: np.ndarray, route: np.ndarray, horizon: int) -> np.ndarray:
@@ -705,6 +752,7 @@ class SimLingoSteerVLAActor(HLPoolSamplingMixin):
         self._cot = None
         self._cot_age = 0
         self._ego_hist.clear()
+        self._last_cot_intervention = None
         self._last_history_raw = None
 
     # ---- online HL update --------------------------------------------------------------------- #
@@ -829,15 +877,15 @@ class SimLingoSteerVLAActor(HLPoolSamplingMixin):
             )
 
         b = len(records)
+        speed_waypoint_count = int(m.model.adaptors.driving.future_speed_waypoints)
         example = DrivingExample(
             driving_input=m.driving_input(pixels, label(conv, loss_mask), label(question, None)),
             driving_label=DrivingLabel(
-                waypoints=torch.zeros(b, 11, 2, device=m.device),
+                waypoints=torch.zeros(b, speed_waypoint_count, 2, device=m.device),
                 path=torch.zeros(b, 20, 2, device=m.device),
                 answer=LanguageLabel(None, None, None, None, [self.hl_answer(r) for r in records], None),
                 image_ff_org=torch.zeros(b, 1, device=m.device),
                 eval_infos=None,
-                refined_commentary=None,
             ),
             run_id=None,
         )

@@ -93,6 +93,7 @@ from coaches.critic_feedback import (
 )
 from impls.coaches.online_vlm_coach import OnlineVLMSession
 from impls.coaches.cast_relabel import OnlineCastRelabelSession
+from impls.coaches.yay_robot import OnlineYayRobotSession
 
 _IMPLS_ROOT = Path(__file__).resolve().parent
 if str(_IMPLS_ROOT) not in sys.path:
@@ -2628,6 +2629,30 @@ def run_online_carla(
             )
         capture_rollout_video = True
 
+    # YAY-Robot is a foresight corrector: corrections condition the next LL query and become
+    # online HL supervision. It is mutually exclusive with CAST because both own one dataset dir.
+    _yay_robot: OnlineYayRobotSession | None = None
+    yay_cfg = agent_config.get("yay_robot")
+    if yay_cfg is not None and bool(yay_cfg.get("enabled", False)):
+        if _cast_relabel is not None:
+            raise ValueError("cast_relabel and yay_robot are alternative HL-data producers; enable only one.")
+        if FLAGS.eval_mode:
+            _cfg_model = str(yay_cfg.get("gemini_model", "") or "")
+            if _cfg_model != EVAL_MODE_GEMINI_MODEL:
+                print(f"[main_carla] --eval-mode: forcing yay_robot.gemini_model {_cfg_model} -> {EVAL_MODE_GEMINI_MODEL}", flush=True)
+                yay_cfg["gemini_model"] = EVAL_MODE_GEMINI_MODEL
+        _yay_robot = OnlineYayRobotSession(
+            yay_cfg, save_dir=FLAGS.save_dir,
+            action_chunk_steps=int(agent_config.get("action_horizon", 10)), run_tag=exp_name,
+        )
+        if steervla_actor is None:
+            raise ValueError("yay_robot requires a SteerVLA actor.")
+        steervla_actor.cot_intervention_fn = _yay_robot.cot_intervention
+        if getattr(steervla_actor, "load_trainable_params", False):
+            steervla_actor.hl_dataset_dir = _yay_robot.hl_dataset_dir
+        print(f"[main_carla] YAY-Robot enabled: every {_yay_robot.query_every_n_cot_queries} CoT queries; HL data={_yay_robot.hl_dataset_dir}", flush=True)
+        capture_rollout_video = True
+
     # Pooled CAST run: this process is one of N rollout workers feeding a shared sample pool that a
     # separate trainer consumes (impls/train_hl_pooled.py). The worker takes no gradient steps -- it
     # only produces relabeled samples and hot-reloads whatever policy version the trainer publishes.
@@ -2845,6 +2870,13 @@ def run_online_carla(
             route_id=str(FLAGS.route or "?"),
         )
 
+    if _yay_robot is not None:
+        _yay_robot.begin_episode(
+            episode_count=max(1, episode_count),
+            route_name=str(obs_raw.get("routing_command", "?") if isinstance(obs_raw, dict) else "?"),
+            route_id=str(FLAGS.route or "?"),
+        )
+
     # Video annotation for this loop (routing-commands / cast_relabel): candidates panel,
     # waypoint overlay, text panel and the violation banners. These nested helpers shadow the
     # module-level _viz_image_from_raw / _annotate_text_panel / _annotate_full_frame pipeline
@@ -3050,6 +3082,9 @@ def run_online_carla(
                 f"Reasoning: {reasoning}",
                 f"Subtask: {subtask}",
             ]
+            if isinstance(raw, dict) and raw.get("yay_intervention"):
+                original = _clean_overlay_text(str(raw.get("yay_original_subtask", "")))
+                lines.append(f"YAY correction: {original or '?'} -> {subtask}")
             if base_action is not None or composed_action is not None:
                 res_np = (np.asarray(composed_action) - np.asarray(base_action)) if (base_action is not None and composed_action is not None) else None
                 lines.append(
@@ -4178,6 +4213,8 @@ def run_online_carla(
             obs = _extract_agent_obs(env, obs_raw, obs_mode, **_extract_obs_kwargs)
         if steervla_actor is not None and steervla_actor.debug_noise:
             steervla_actor.debug_noise_episode_step = episode_steps + 1
+        if _yay_robot is not None:
+            _yay_robot.set_step(episode_step=episode_steps + 1, global_step=step)
         # Figure capture: record every env step's action + Q-value for the whole trajectory.
         # Saved to disk at episode end (or run end). The figure script picks the
         # interesting window post-hoc rather than guessing it upfront.
@@ -4584,8 +4621,10 @@ def run_online_carla(
             should_sample_periodic = episode_steps % episode_video_every == 0
             had_collision_this_step = collision_delta > 0
             had_violation_this_step = traffic_violation_delta > 0
+            had_yay_intervention = bool(cot_obs_raw.get("yay_intervention", False))
             step_in_video = (
                 should_sample_periodic or had_collision_this_step or had_violation_this_step
+                or had_yay_intervention
             )
             if step_in_video:
                 step_video_frame_index = episode_video_frame_index
@@ -4744,6 +4783,20 @@ def run_online_carla(
             if getattr(_cast_relabel, "async_review", False):
                 _cast_relabel.drain_wandb()
 
+        if _yay_robot is not None:
+            _yay_robot.record_model_input(
+                episode_step=episode_steps,
+                image=cot_obs_raw.get(str((agent_config.get("steervla") or {}).get("image_key", "image"))),
+                state=cot_obs_raw.get("state"),
+                current_speed=float(_ego_speed_mps_from_raw(cot_obs_raw)),
+                prompt=_format_text_field(cot_obs_raw, "openpi_prompt_raw_text") or _format_text_field(cot_obs_raw, "openpi_prompt_text"),
+                subtask=_format_text_field(cot_obs_raw, "subtask_text") or _format_text_field(cot_obs_raw, "subtask"),
+                reasoning=_format_text_field(cot_obs_raw, "reasoning_text") or _format_text_field(cot_obs_raw, "reasoning"),
+                action_chunk=replay_action,
+                routing_command=_format_text_field(cot_obs_raw, "routing_command"),
+                global_step=step,
+            )
+
         # Pooled run: pick up a newly published policy version mid-episode (see CastPoolWatcher).
         if _cast_pool_watcher is not None and _cast_pool_watcher.maybe_reload(env, step):
             wandb.log(
@@ -4780,6 +4833,8 @@ def run_online_carla(
 
         step_wb: dict[str, Any] = {f"rollout/{k}": v for k, v in drive_metrics.items()}
         step_wb.update(_reward_breakdown_log(info))
+        if _yay_robot is not None:
+            step_wb.update(_yay_robot.wandb_metrics())
         if _bon_q_fn is not None or _bon_online or _gemini_selector is not None:
             step_wb["bon/q_best"] = _bon_last_q_best[0]
             step_wb["bon/q_mean"] = _bon_last_q_mean[0]
@@ -5039,6 +5094,19 @@ def run_online_carla(
                         f"[main_carla] episode strategy summary failed (non-fatal): {_exc}",
                         flush=True,
                     )
+            if _yay_robot is not None:
+                _ep_video = Path(FLAGS.save_dir) / "videos" / f"ep{episode_count:04d}.mp4"
+                _yay_robot.end_episode(
+                    driving_score=_ep_ds, route_completion=done_info.get("route_progress_pct"),
+                    video_path=_ep_video if _ep_video.is_file() else None,
+                    route_goal=describe_route_goal(str(FLAGS.route or "")), global_step=step,
+                )
+                _yay_robot.finalize_episode(metadata={
+                    "termination_reason": done_info.get("termination_reason"),
+                    "success": done_info.get("success"),
+                    "route_completed": float(done_info.get("route_progress_pct", 0.0) or 0.0) >= 99.5,
+                })
+
             # GRADIENT steps, not update_hl bodies. steervla.py keeps both and they are not the
             # same number: _hl_updates_applied counts one per update_hl call that reached the
             # gradient loop, while _hl_grad_steps is the sum of hl_update_num_steps -- "the real
@@ -5234,6 +5302,10 @@ def run_online_carla(
                     # eval episodes would keep paying for Gemini window reviews whose HL samples
                     # nothing will ever train on.
                     _cast_relabel = None
+                    if _yay_robot is not None:
+                        steervla_actor.cot_intervention_fn = None
+                        _yay_robot.close()
+                        _yay_robot = None
                     _set_eval_stuck_cutoff(True)
                     print(
                         f"[main_carla] STOP TRAINING ({stop_reason}); running "
@@ -5326,6 +5398,12 @@ def run_online_carla(
                     route_name=done_route,
                     # ``done_route`` is the env's own scenario name (info["route"]); fall back to
                     # the launched route if the leaderboard did not report one.
+                    route_id=str(done_route if done_route != "?" else (FLAGS.route or "?")),
+                )
+            if _yay_robot is not None:
+                _yay_robot.reset_episode()
+                _yay_robot.begin_episode(
+                    episode_count=episode_count, route_name=done_route,
                     route_id=str(done_route if done_route != "?" else (FLAGS.route or "?")),
                 )
             _sync_steervla_debug_noise_context(done_route)
@@ -5425,6 +5503,10 @@ def run_online_carla(
                 _periodic_saved_gates = None
                 rl_updates_on = bc_updates_on = hl_updates_on = any_updates_on = False
                 _cast_relabel = None
+                if _yay_robot is not None:
+                    steervla_actor.cot_intervention_fn = None
+                    _yay_robot.close()
+                    _yay_robot = None
                 print(
                     f"[main_carla] training budget reached at train step {train_step}: updates frozen; "
                     f"{FLAGS.post_stop_eval_episodes} eval episodes run when this episode ends.",
@@ -5488,6 +5570,8 @@ def run_online_carla(
         )
 
     train_logger.close()
+    if _yay_robot is not None:
+        _yay_robot.close()
 
     # Final export of the fine-tuned backbone at exit -- but ONLY if a stop condition did not
     # already export it. When --eval-mode stops training at, say, step 3884, the weights are
@@ -6988,8 +7072,12 @@ def _run_dsrl_entry(config):
     _exp_name_parts.extend(
         [_coach_tag(), _updates_tag(), _slug(_route_name), get_exp_name(FLAGS.seed)]
     )
-    exp_name = "_".join(_exp_name_parts)
-    setup_wandb(project="OGBench-CARLA", group=FLAGS.run_group, name=exp_name, mode=wandb_mode)
+    exp_name = FLAGS.exp_name or "_".join(_exp_name_parts)
+    wandb_id = re.sub(r"[^A-Za-z0-9_-]+", "-", exp_name).strip("-")[:128] or None
+    setup_wandb(
+        project="OGBench-CARLA", group=FLAGS.run_group, name=exp_name, mode=wandb_mode,
+        id=wandb_id, resume=("allow" if FLAGS.resume else None),
+    )
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
     with open(os.path.join(FLAGS.save_dir, "flags.json"), "w") as f:
