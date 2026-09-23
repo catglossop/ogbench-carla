@@ -660,10 +660,14 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
             # Busy shared hosts can stall UE4's render thread for more than the
             # Linux default of 60 s during initial world/shader setup.  Let that
             # startup finish instead of crashing the simulator watchdog.
-            "-g.TimeoutForBlockOnRenderFence=300000",
+            "-ExecCmds=g.TimeoutForBlockOnRenderFence 300000",
             f"-carla-rpc-port={rpc_port}",
             f"-graphicsadapter={sim_gpu_rank}",
         ]
+        if os.environ.get("CARLA_DISABLE_RENDER_THREAD_TIMEOUT") == "1":
+            cmd.append("-nothreadtimeout")
+        if os.environ.get("CARLA_DISABLE_RHI_THREAD") == "1":
+            cmd.append("-norhithread")
         streaming_port = int(getattr(args, "streaming_port", 0) or 0)
         if streaming_port > 0:
             cmd.append(f"-carla-streaming-port={streaming_port}")
@@ -1089,6 +1093,18 @@ class SteppableScenarioManager(ScenarioManager):
         status = self.scenario_tree.status if self.scenario_tree is not None else None
         return bool(self._running), status
 
+    def capture_initial_sensors(self) -> None:
+        """Read the frame queued during sensor setup without advancing the world."""
+        timestamp = CarlaDataProvider.get_world().get_snapshot().timestamp
+        GameTime.on_carla_tick(timestamp)
+        CarlaDataProvider.on_carla_tick()
+        _sync_pseudo_sensors_for_tick(self._agent_wrapper)
+        agent = self._agent_wrapper._agent
+        self.last_agent_input = agent.sensor_interface.get_data(GameTime.get_frame())
+        agent.last_input_data = self.last_agent_input
+        # Sensor setup precedes the episode; exclude its clock alignment.
+        self.start_game_time = GameTime.get_time()
+
     def build_scenarios_loop(self, debug: bool) -> None:
         """No-op idle thread.
 
@@ -1164,11 +1180,41 @@ class SteppableScenarioManager(ScenarioManager):
             self._build_scenarios_tick += 1
             if self._build_scenarios_tick >= self._BUILD_SCENARIOS_INTERVAL:
                 self._build_scenarios_tick = 0
+                # DEADLOCK GUARD -- do not remove without reading this.
+                #
+                # RouteScenario.__init__ sets CarlaDataProvider.set_runtime_init_mode(True)
+                # right after building its first batch of scenarios. With that flag on,
+                # BasicScenario.__init__ (basic_scenario.py:67) waits for the world instead
+                # of ticking it:
+                #     if CarlaDataProvider.is_runtime_init_mode(): world.wait_for_tick()
+                #     elif CarlaDataProvider.is_sync_mode():       world.tick()
+                # Upstream can afford that because it builds scenarios on a *separate*
+                # thread (ScenarioManager.build_scenarios_loop) while the main thread ticks.
+                # We deliberately build on the main thread instead, to keep every CARLA RPC
+                # single-threaded -- so wait_for_tick() would block forever waiting for a
+                # tick that only this very call stack can produce. With the leaderboard's
+                # 7200 s client timeout that is a ~2 h hang, and it silently bit every route
+                # carrying a second scenario (the first batch is built before the flag is
+                # set, so single-scenario routes never hit it).
+                #
+                # Clearing the flag for the duration of our build makes BasicScenario take
+                # the sync-mode branch and tick the world itself, which is exactly what it
+                # does for the first batch during RouteScenario construction.
+                _prev_runtime_init = CarlaDataProvider.is_runtime_init_mode()
+                CarlaDataProvider.set_runtime_init_mode(False)
                 try:
                     self.scenario.build_scenarios(self.ego_vehicles[0], debug=self._debug_mode > 0)
                     self.scenario.spawn_parked_vehicles(self.ego_vehicles[0])
-                except Exception:
-                    pass
+                except Exception as exc:  # never let scenario spawning kill the route
+                    if not getattr(self, "_build_scenarios_warned", False):
+                        self._build_scenarios_warned = True
+                        print(
+                            f"[carla] build_scenarios raised {type(exc).__name__}: {exc} "
+                            f"(suppressed; further occurrences silent)",
+                            flush=True,
+                        )
+                finally:
+                    CarlaDataProvider.set_runtime_init_mode(_prev_runtime_init)
 
 
 def _default_config_path() -> Path:
@@ -1473,19 +1519,30 @@ def _install_carla_physics_guard() -> None:
     """
     if getattr(carla.Actor, "_physics_guard_installed", False):
         return
-    _orig_set_simulate_physics = carla.Actor.set_simulate_physics
-
     def guarded_set_simulate_physics(self, enabled=True):
         try:
-            if hasattr(self, "is_alive") and not self.is_alive:
+            client = CarlaDataProvider.get_client()
+            if client is None:
                 return
-        except Exception:
+            response = client.apply_batch([
+                carla.command.SetSimulatePhysics(self.id, bool(enabled))
+            ])[0]
+            if response.error:
+                print(
+                    f"[carla physics guard] skipped missing actor {self.id}: {response.error}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                f"[carla physics guard] skipped physics change for actor "
+                f"{getattr(self, 'id', '?')}: {exc}",
+                flush=True,
+            )
             return
-        return _orig_set_simulate_physics(self, enabled)
 
     carla.Actor.set_simulate_physics = guarded_set_simulate_physics
     carla.Actor._physics_guard_installed = True
-    print("[carla physics guard] installed set_simulate_physics liveness guard", flush=True)
+    print("[carla physics guard] installed batch set_simulate_physics guard", flush=True)
 
 
 class CarlaBench2DriveWrapper(gymnasium.Env):
@@ -1563,6 +1620,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._failure_bonus = float(self.carla_config.get("failure_bonus", FAILURE_BONUS))
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
+        self._prev_route_deviation_value = 0.0
         self._prev_route_progress_pct = 0.0
         self._max_episode_steps = int(
             self.carla_config.get("max_episode_steps", DEFAULT_MAX_EPISODE_STEPS)
@@ -1926,6 +1984,25 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         CarlaDataProvider.set_runtime_init_mode(False)
         ev._load_and_wait_for_world(args, config.town)
         ev.route_scenario = RouteScenario(world=ev.world, config=config, debug_mode=args.debug)
+
+        # RouteScenario.build_scenarios() removes entries from
+        # missing_scenario_configurations while iterating that same list.  Routes
+        # with multiple nearby scenarios therefore initialize only alternating
+        # entries during construction.  The skipped entry would otherwise be
+        # initialized by our main-thread periodic builder in runtime-init mode,
+        # where request_new_actor() waits for a world tick that this same thread
+        # is responsible for issuing.  Drain every currently-near scenario now,
+        # before the episode and while runtime-init mode is disabled.
+        while ev.route_scenario.missing_scenario_configurations:
+            before = len(ev.route_scenario.missing_scenario_configurations)
+            CarlaDataProvider.set_runtime_init_mode(False)
+            ev.route_scenario.build_scenarios(
+                ev.route_scenario.ego_vehicles[0], debug=args.debug > 0
+            )
+            after = len(ev.route_scenario.missing_scenario_configurations)
+            if after >= before:
+                break
+        CarlaDataProvider.set_runtime_init_mode(True)
         ev.statistics_manager.set_scenario(ev.route_scenario)
 
         ev._agent_watchdog = Watchdog(args.timeout)
@@ -1972,8 +2049,12 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         ev.manager.last_agent_input = {}
         ev.manager.begin_scenario()
         self._expert_agent = None
-        if self._expert_controller_kind == "simlingo_autopilot":
+        if self._expert_controller_kind == "simlingo_autopilot" or os.environ.get("QWEN_RECORD_PDM_PLAN") == "1":
             self._expert_agent = self._build_simlingo_autopilot()
+            if os.environ.get("QWEN_RECORD_PDM_PLAN") == "1" and self._expert_agent is None:
+                raise RuntimeError("PDM plan recording requested but expert initialization failed")
+        self._pdm_plan_time = None
+        self._pdm_plan_error = None
         self._cached_world_map = None
         self._current_routing_command = 4
         self._routing_last_command_tmp = -1
@@ -1999,6 +2080,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         self._crash_stuck_ticks = 0
         self._prev_collision_count = 0
         self._prev_outside_route_value = 0.0
+        self._prev_route_deviation_value = 0.0
         self._prev_route_progress_pct = 0.0
         self._prev_traffic_violation_count = 0
         self._raw_collision_active = False
@@ -2699,9 +2781,12 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             return
         try:
             sensors = self._get_expert_input_data()
-            self._expert_agent.run_step(sensors, GameTime.get_time())
-        except Exception:
-            pass
+            control = self._expert_agent.run_step(sensors, GameTime.get_time())
+            self._pdm_plan_time = float(GameTime.get_time())
+            self._pdm_plan_error = None
+            self._pdm_plan_control = {"steer": float(control.steer), "throttle": float(control.throttle), "brake": float(control.brake)}
+        except Exception as exc:
+            self._pdm_plan_error = repr(exc)
 
     def _reset_simlingo_autopilot_state(self, agent: Any) -> None:
         """Clear controller history without discarding the expert's live route/planner state."""
@@ -2809,9 +2894,12 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
 
         collision_delta = max(0, collision_count - self._prev_collision_count)
         outside_route_delta = max(0.0, outside_route_value - self._prev_outside_route_value)
+        route_deviation_value = self._route_deviation_value()
+        route_deviation_delta = max(0.0, route_deviation_value - self._prev_route_deviation_value)
         traffic_violation_delta = max(0, traffic_violation_count - self._prev_traffic_violation_count)
         self._prev_collision_count = collision_count
         self._prev_outside_route_value = outside_route_value
+        self._prev_route_deviation_value = route_deviation_value
         self._prev_traffic_violation_count = traffic_violation_count
 
         collision_contact_active = self._raw_collision_active
@@ -2843,6 +2931,10 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         info["outside_route_value"] = outside_route_value
         info["collision_delta"] = float(collision_delta)
         info["outside_route_delta"] = float(outside_route_delta)
+        # Distinct from outside_route_delta: that is OutsideRouteLanesTest (drove outside
+        # the lane markings); this is InRouteTest (left the planned route altogether).
+        info["route_deviation_value"] = float(route_deviation_value)
+        info["route_deviation_delta"] = float(route_deviation_delta)
         info["traffic_violation_count"] = traffic_violation_count
         info["traffic_violation_delta"] = float(traffic_violation_delta)
         info["lane_offset_m"] = lane_offset_m
@@ -2968,6 +3060,9 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         return self._obs_dict(), float(reward), terminated, False, info
 
     def _obs_dict(self) -> Dict[str, np.ndarray]:
+        record_pdm = os.environ.get("QWEN_RECORD_PDM_PLAN") == "1"
+        if record_pdm and getattr(self, "_pdm_plan_time", None) != float(GameTime.get_time()):
+            self.tick_expert()
         sensors = getattr(self.evaluator.manager, "last_agent_input", None) or {}
         expert_action = self._compute_expert_action()
         commentary_text, language_label = self._compute_language_label(expert_action=expert_action)
@@ -2981,6 +3076,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             "language_label": language_label,
             "commentary_text": commentary_text,
             "expert_action": expert_action,
+            **({"pdm_plan": self._pdm_plan_snapshot()} if record_pdm else {}),
             "scene_context": scene_context,
             "routing_command": format_routing_command(
                 self._current_routing_command,
@@ -2994,6 +3090,21 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
             "route_command_plan": self._route_command_plan,
             "target_points": self._target_points_ego,
         }
+
+    def _pdm_plan_snapshot(self):
+        from ogbench.carla.expert_plan_record import plan_record
+        expert = self._expert_agent
+        ego = self._ego_actor()
+        planner = getattr(expert, "_waypoint_planner", None)
+        return plan_record(
+            data=getattr(expert, "last_driving_data", None),
+            control=getattr(self, "_pdm_plan_control", None),
+            sim_time=float(GameTime.get_time()),
+            plan_time=getattr(self, "_pdm_plan_time", None),
+            error=getattr(self, "_pdm_plan_error", None),
+            ego_matrix=ego.get_transform().get_matrix() if ego else None,
+            route_index=getattr(planner, "route_index", None),
+        )
 
     def _info_with_sensors(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         info: Dict[str, Any] = {
@@ -3082,6 +3193,31 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 min_speed_val = max(min_speed_val, value)
 
         return outside_route_val, min_speed_val
+
+    def _route_deviation_value(self) -> float:
+        """Cumulative count from the leaderboard's ``InRouteTest`` criterion.
+
+        This is the criterion behind the ``route_dev`` infraction and the "Agent deviated from
+        the route" status: it increments ``actual_value`` every time the ego is judged to have
+        left the planned route. It is deliberately *slow* -- ``MAX_ROUTE_PERCENTAGE = 30`` means
+        it only fires once 30% of the route's total length has been accumulated off-route -- so
+        it is authoritative but very late. cast_relabel pairs it with a much earlier behavioural
+        check; see ``_maybe_trip_hl_cutoff``.
+        """
+        scenario = getattr(self.evaluator, "route_scenario", None)
+        if scenario is None:
+            return 0.0
+        for criterion in scenario.get_criteria():
+            name = str(getattr(criterion, "name", "")).lower()
+            # "inroute" is the class name (InRouteTest); the route+deviat pair is a fallback in
+            # case a fork renames it. Must NOT match OutsideRouteLanesTest -- that is a different
+            # failure (drove outside the lane markings), already carried by outside_route_delta.
+            if "inroute" in name or ("route" in name and "deviat" in name):
+                try:
+                    return float(getattr(criterion, "actual_value", 0.0))
+                except Exception:
+                    return 0.0
+        return 0.0
 
     def _criteria_snapshot(self) -> list[dict[str, Any]]:
         scenario = getattr(self.evaluator, "route_scenario", None)
@@ -3281,6 +3417,7 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
         config = self._get_single_route_config()
         try:
             self._load_route_and_begin_stepping(config)
+            self.evaluator.manager.capture_initial_sensors()
         except SensorConfigurationInvalid as e:
             entry_status, crash_message = FAILURE_MESSAGES["Sensors"]
             self.evaluator.statistics_manager.save_entry_status(entry_status)

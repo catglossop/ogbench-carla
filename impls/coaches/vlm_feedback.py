@@ -1,7 +1,7 @@
 """VLM coaches that review driving rollout videos and annotate good/bad moments.
 
 Supports:
-  - Google Gemini (``gemini-2.0-flash`` by default)
+  - Google Gemini (see ``coaches.gemini_models.DEFAULT_GEMINI_MODEL``)
   - Perceptron video QA API
 
 Run from ``impls/``::
@@ -33,7 +33,7 @@ ProviderName = Literal["gemini", "perceptron"]
 # Placeholders — override via environment variables in real runs.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
 PERCEPTRON_API_KEY = os.environ.get("PERCEPTRON_API_KEY", "YOUR_PERCEPTRON_API_KEY_HERE")
-DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
+from coaches.gemini_models import DEFAULT_GEMINI_MODEL  # noqa: F401  (re-exported)
 
 DEFAULT_ACTION_CHUNK_STEPS = 10
 DEFAULT_CHUNK_DURATION_SEC = 0.5
@@ -79,6 +79,85 @@ def load_metadata(metadata_path: str | Path) -> dict[str, Any]:
     return data
 
 
+# -- the episode's high-level objective ------------------------------------------------
+# What each Bench2Drive scenario family is actually ASKING the ego to accomplish. The routing
+# commands say which maneuvers to execute; they do not say why. "follow the road" -> "lane change
+# right" -> "follow the road" on ``highway-exit-002`` is the ego LEAVING THE HIGHWAY AT ITS EXIT,
+# and a reviewer that does not know that will happily mark a missed exit as fine because every
+# individual command looked obeyed. Stating the objective up front is what lets the review judge
+# whether the episode achieved anything, not merely whether it drove tidily.
+#
+# Keyed by scenario family (the route name with its trailing index stripped). Anything absent --
+# a new family, or the Fail2Drive ``base-*`` / ``generalization-*`` routes -- falls back to the
+# humanised family name, which is still enough to reason from together with the plan.
+ROUTE_GOAL_BY_FAMILY: dict[str, str] = {
+    "accident": "get past a crash blocking the lane, using the adjacent lane once it is clear",
+    "accident-two-ways": "get past a crash blocking the lane on a two-way road, briefly using the oncoming lane only when it is clear",
+    "blocked-intersection": "get through a junction that a stopped vehicle is obstructing",
+    "construction-obstacle": "get past a construction zone blocking the lane",
+    "construction-obstacle-two-ways": "get past a construction zone by briefly using the oncoming lane when it is clear",
+    "control-loss": "recover from a loss of vehicle control and stay on the route",
+    "crossing-bicycle-flow": "turn across a flow of cyclists without hitting one",
+    "dynamic-object-crossing": "avoid an object or pedestrian that suddenly crosses the ego's path",
+    "enter-actor-flow": "join a stream of moving traffic from a side road",
+    "hard-break-route": "keep a safe distance when the lead vehicle brakes hard",
+    "hazard-at-side-lane": "get past a hazard occupying part of the lane",
+    "hazard-at-side-lane-two-ways": "get past a hazard occupying part of the lane on a two-way road",
+    "highway-cut-in": "handle a vehicle cutting into the ego's lane on a highway",
+    "highway-exit": "LEAVE THE HIGHWAY at the correct exit -- change into the exit lane in time and take the ramp",
+    "interurban-actor-flow": "join or cross a flow of interurban traffic",
+    "interurban-advanced-actor-flow": "join or cross a fast flow of interurban traffic",
+    "invading-turn": "hold the lane when an oncoming vehicle cuts the corner into it",
+    "merger-into-slow-traffic": "merge into slower-moving traffic",
+    "merger-into-slow-traffic-v2": "merge into slower-moving traffic",
+    "non-signalized-junction-left-turn": "turn left at an unsignalised junction, yielding to cross traffic",
+    "non-signalized-junction-left-turn-enter-flow": "turn left at an unsignalised junction and merge into the traffic flow",
+    "non-signalized-junction-right-turn": "turn right at an unsignalised junction, yielding to cross traffic",
+    "opposite-vehicle-running-red-light": "avoid a vehicle running a red light through the junction",
+    "opposite-vehicle-taking-priority": "yield to an oncoming vehicle that takes priority, then continue",
+    "parked-obstacle": "get past a parked vehicle blocking the lane",
+    "parked-obstacle-two-ways": "get past a parked vehicle by briefly using the oncoming lane when it is clear",
+    "parking-crossing-pedestrian": "avoid a pedestrian emerging from between parked cars",
+    "parking-cut-in": "handle a vehicle pulling out of a parking space into the lane",
+    "parking-exit": "pull out of a parking space and join the road",
+    "pedestrian-crossing": "yield to pedestrians on a crossing, then continue",
+    "sequential-lane-change": "complete a sequence of lane changes",
+    "signalized-junction-left-turn": "turn left at a signalised junction",
+    "signalized-junction-left-turn-enter-flow": "turn left at a signalised junction and merge into the traffic flow",
+    "signalized-junction-right-turn": "turn right at a signalised junction",
+    "static-cut-in": "handle a stationary vehicle cutting into the lane",
+    "t_-junction": "negotiate a T-junction and take the commanded branch",
+    "vanilla-non-signalized-turn": "make the commanded turn at an unsignalised junction",
+    "vanilla-non-signalized-turn-encounter-stopsign": "stop at the stop sign, then make the commanded turn",
+    "vanilla-signalized-turn-encounter-green-light": "make the commanded turn on a green light without stopping unnecessarily",
+    "vanilla-signalized-turn-encounter-red-light": "stop for the red light, then make the commanded turn once it clears",
+    "vehicle-opens-door-two-ways": "avoid a car door opening into the lane",
+    "vehicle-turning-route": "handle a vehicle turning across the ego's path",
+    "vehicle-turning-route-pedestrian": "handle a vehicle turning across the ego's path while a pedestrian is present",
+    "yield-to-emergency-vehicle": "let an emergency vehicle past, then resume the route",
+}
+
+
+def route_family(route_name: str) -> str:
+    """Scenario family for a route name: ``highway-exit-002`` -> ``highway-exit``."""
+    return re.sub(r"[-_]?\d+$", "", str(route_name or "").strip()).strip("-_")
+
+
+def describe_route_goal(route_name: str) -> str:
+    """One-sentence statement of what this route is asking the ego to accomplish.
+
+    Falls back to the humanised family name when the family is not in the table, which still
+    gives the reviewer the scenario type to reason from alongside the routing-command plan.
+    """
+    fam = route_family(route_name)
+    if not fam:
+        return ""
+    goal = ROUTE_GOAL_BY_FAMILY.get(fam)
+    if goal:
+        return goal
+    return "complete the '" + fam.replace("-", " ").replace("_", " ").strip() + "' scenario"
+
+
 def _build_task_overview_block(metadata: dict[str, Any]) -> str:
     """Render the episode's routing-command plan, and where the ego currently sits in it.
 
@@ -98,6 +177,22 @@ def _build_task_overview_block(metadata: dict[str, Any]) -> str:
     """
     plan = metadata.get("route_command_plan") or []
     sections: list[str] = []
+
+    # The objective, before the maneuver list. The routing commands describe HOW to drive; this
+    # says WHAT the episode is for. Without it a reviewer grades obedience to each command in
+    # isolation and will pass an episode that obeyed every command and still failed the task --
+    # e.g. "follow the road" -> "lane change right" on a highway-exit route is the ego leaving
+    # the motorway, and never taking the ramp is a total failure however tidily it drove.
+    goal = describe_route_goal(str(metadata.get("route", "")))
+    if goal:
+        sections.append(
+            f"\nPRIMARY GOAL of this episode (route `{metadata.get('route', '')}`): {goal}.\n"
+            "This is what the ego is TRYING TO ACHIEVE. The routing commands below are the means "
+            "to it, not the end. Judge the episode first and foremost on whether it is making "
+            "real progress toward this goal; an episode that follows each command literally but "
+            "never accomplishes the goal has FAILED, and the failure to accomplish it is itself "
+            "the most important BAD event to report."
+        )
 
     plan_lines: list[str] = []
     if isinstance(plan, list):
@@ -364,9 +459,9 @@ def build_coaching_prompt(
     )
 
     # Bounded record of what earlier windows of this run already corrected, so successive reviews
-    # don't flip the same behaviour back and forth. Written by coaches.correction_memory; absent
+    # don't flip the same behaviour back and forth. Written by coaches.strategy_memory; absent
     # until something has actually been corrected.
-    memory_block = str(metadata.get("correction_memory") or "")
+    memory_block = str(metadata.get("strategy_memory") or "")
 
     _header = textwrap.dedent(
         f"""
@@ -485,6 +580,14 @@ def build_coaching_prompt(
           advancing the route when the way is clear is GOOD. (Do NOT penalize stopping that is
           genuinely justified by a red light, stop sign, close leading vehicle, or a
           pedestrian/yield — but require that justification to be visible, not assumed.)
+        - FIRST AND MOST IMPORTANT: is the vehicle actually accomplishing the PRIMARY GOAL
+          stated at the top of this prompt? That goal is inferred from the route's scenario type
+          and its routing-command plan together, and it is the point of the episode. If the ego
+          is drifting away from it — missing the exit it was supposed to take, failing to get
+          around the obstacle it was supposed to pass, never completing the merge — that is the
+          single most important BAD event in the window, and the correction must say what it
+          needed to do to achieve the goal. Obeying the individual routing commands while
+          failing the goal is NOT success.
         - Is the vehicle completing the maneuver the routing command asks for? A turn that is
           begun and then abandoned, or a junction the vehicle enters and then stalls in, is BAD:
           the correction is to carry the turn through and clear the junction.
@@ -493,6 +596,17 @@ def build_coaching_prompt(
           closer to the crosswalk to not leave an unnecessary gap.
         - If the vehicle encounters an obstacle blocking the entire route, does it stop entirely before the obstruction? (if yes, GOOD; if no, BAD)
         - If the vehicle encounters an obstacle blocking part of the route (one lane), does it stop and wait for a gap to go around the obstruction? (if yes, GOOD; if no, BAD)
+        - When the vehicle is waiting to merge into or cross a flow of traffic, does it pull out
+          as soon as a gap opens? Other traffic in this simulator does NOT yield: no oncoming or
+          cross-traffic vehicle will slow down or stop to let our vehicle in, and no gap will be
+          created for it. The only safe gap is the one immediately behind a vehicle that has just
+          passed, so the correct behavior is to go the moment that vehicle clears — hesitating
+          there means the next vehicle arrives and the opportunity is gone, which is BAD and
+          eventually causes a collision when the vehicle finally commits too late. Waiting for a
+          driver to wave it through or expecting traffic to make room is never correct. Judge this
+          on the gap that was actually available: pulling out in front of a closing vehicle is
+          still BAD, but sitting still through a clear gap behind one that has just passed is BAD
+          as well, and the correction is to accelerate promptly as that vehicle clears.
 
         Return ONLY valid JSON with this schema (no markdown fences):
         {{
@@ -525,6 +639,28 @@ def build_coaching_prompt(
           stopped climbing, you MUST emit at least one event about it — BAD with a corrective
           instruction if the vehicle was free to move, GOOD naming the specific hazard or signal
           if the halt was genuinely required. Silence about a stall is not an option.
+        - MANDATORY: check the executed SUBTASK against the vehicle's own REASONING and against
+          the ROUTING COMMAND in force at that moment, and report any disagreement between the
+          three. All three are in the per-timestamp trajectory data (``subtask``, ``reasoning``,
+          and ``prompt``, which carries the routing command) and in the routing-command plan at
+          the top. They are supposed to describe the SAME intent; when they do not, the policy is
+          about to act on a subtask that contradicts what it reasoned or what the route asked, and
+          that is a defect to report even if the vehicle happened to drive acceptably.
+          The authority order is: ROUTING COMMAND first (it is the route's instruction and is
+          never wrong), then REASONING, then SUBTASK. So:
+            * subtask disagrees with reasoning AND routing command -> the SUBTASK is wrong. Emit a
+              BAD event whose correction is the subtask that matches them. Example: the subtask
+              says "turn right", the reasoning says "turn left" and the routing command says
+              "turn left" -> the subtask must be corrected to turning left.
+            * subtask and reasoning agree with each other but disagree with the routing command ->
+              BOTH are wrong; the correction is the subtask that follows the routing command.
+            * subtask matches the routing command but the reasoning contradicts it -> report it as
+              BAD naming the inconsistent reasoning; the correction keeps the routing command's
+              maneuver.
+          Judge against the command in force AT THAT TIMESTAMP, not the one at the end of the
+          window. Ignore pure wording differences -- "go left at the next intersection" and "turn
+          left at the junction" are the same intent; only a genuine conflict of maneuver,
+          direction, or target counts.
         - MANDATORY: any event whose description mentions a red/green light, a stop light, a
           signal or a stop sign MUST also state the traffic-flow evidence that established that
           state (cross-traffic moving, the queue discharging, the lead vehicle pulling away or
@@ -721,6 +857,15 @@ class VLMCOach(ABC):
         """Single-image + text completion (used by the GRPO VLM critic to score candidates)."""
         raise NotImplementedError(f"{type(self).__name__} does not support image+text completion.")
 
+    def analyze_video_text(self, video_path: str | Path, prompt: str) -> str:
+        """Free-form question about a whole video, returning raw text.
+
+        Distinct from :meth:`analyze`, which imposes the CAST window prompt and parses the reply
+        into events. This one asks whatever it is given -- used by ``strategy_memory`` to review a
+        FULL episode rather than a window.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support video+text completion.")
+
 
 # ── Gemini REST API helpers (Python-3.8-compatible; no google-genai package needed) ──
 
@@ -754,7 +899,11 @@ def _gemini_upload_file(path: Path, api_key: str) -> dict[str, Any]:
         json={"file": {"display_name": path.name}},
         timeout=30,
     )
-    start_resp.raise_for_status()
+    if not start_resp.ok:
+        raise RuntimeError(
+            f"Gemini upload: session start failed HTTP {start_resp.status_code} "
+            f"for {path.name} ({file_size} bytes, {mime_type}): {start_resp.text[:1000]}"
+        )
     upload_url = start_resp.headers.get("X-Goog-Upload-URL")
     if not upload_url:
         raise RuntimeError("Gemini upload: missing X-Goog-Upload-URL in response headers.")
@@ -773,10 +922,26 @@ def _gemini_upload_file(path: Path, api_key: str) -> dict[str, Any]:
         data=data,
         timeout=120,
     )
-    upload_resp.raise_for_status()
+    if not upload_resp.ok:
+        raise RuntimeError(
+            f"Gemini upload: content POST failed HTTP {upload_resp.status_code} "
+            f"for {path.name} ({file_size} bytes, {mime_type}): {upload_resp.text[:1000]}"
+        )
     body = upload_resp.json()
     # The Files API wraps the metadata under a "file" key on upload.
     return body.get("file", body)
+
+
+def _gemini_delete_file_quiet(name: str | None, api_key: str) -> None:
+    """Best-effort delete of an uploaded File. Never raises -- it is cleanup, not the task."""
+    if not name:
+        return
+    try:
+        import requests
+
+        requests.delete(f"{_GEMINI_API_BASE}/{name}", params={"key": api_key}, timeout=15)
+    except Exception:  # noqa: BLE001 - a failed cleanup must not fail the upload
+        pass
 
 
 def _gemini_get_file(name: str, api_key: str) -> dict[str, Any]:
@@ -788,11 +953,25 @@ def _gemini_get_file(name: str, api_key: str) -> dict[str, Any]:
         params={"key": api_key},
         timeout=15,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        raise RuntimeError(
+            f"Gemini get-file failed HTTP {resp.status_code} for {name}: {resp.text[:1000]}"
+        )
     return resp.json()
 
 
 _GEMINI_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+# google.rpc.Code values that mean "the file was fine, the service faltered", so re-sending the
+# identical bytes has a real chance of working. Observed 2026-09-10: a ~70% window-drop rate whose
+# File resources all read {"code": 13, "message": "The file failed to be processed."} -- INTERNAL,
+# after the upload itself had succeeded (correct sizeBytes, sha256Hash present, mime video/mp4).
+#   13 INTERNAL, 14 UNAVAILABLE, 4 DEADLINE_EXCEEDED, 8 RESOURCE_EXHAUSTED
+# Deliberately NOT 3 INVALID_ARGUMENT or 9 FAILED_PRECONDITION: those mean the file itself is
+# unacceptable, and resending it just burns the retry budget and another upload.
+_GEMINI_RETRYABLE_FILE_ERROR_CODES = {4, 8, 13, 14}
+_GEMINI_UPLOAD_MAX_RETRIES = 4
+
 
 
 def _gemini_generate_content(model: str, contents: list[Any], api_key: str, max_retries: int = 5) -> str:
@@ -910,18 +1089,81 @@ class GeminiVLMCOach(VLMCOach):
         path = Path(video_path)
         if not path.is_file():
             raise FileNotFoundError(f"Video not found: {path}")
+        import mimetypes
 
-        # Upload video and wait for it to become ACTIVE.
-        # The upload response may omit "state" when the file is already ready;
-        # in that case do a GET to get the authoritative status.
-        uploaded = _gemini_upload_file(path, self.api_key)
-        if uploaded.get("state") is None:
-            uploaded = _gemini_get_file(uploaded["name"], self.api_key)
-        while uploaded.get("state") == "PROCESSING":
-            time.sleep(1.0)
-            uploaded = _gemini_get_file(uploaded["name"], self.api_key)
-        if uploaded.get("state") != "ACTIVE":
-            raise RuntimeError(f"Gemini file upload failed with state={uploaded.get('state')!r}.")
+        mime_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+
+        # Upload video and wait for it to become ACTIVE, retrying a service-side failure.
+        # The upload response may omit "state" when the file is already ready; in that case do a
+        # GET for the authoritative status.
+        #
+        # The retry exists because the failure we actually see is INTERNAL *after* a successful
+        # upload -- the bytes arrive intact and Gemini's own processing falls over. Without it a
+        # single such blip discards the whole window: no review, no HL samples, no debug video,
+        # and only a non-fatal log line to show for it.
+        uploaded = None
+        last_exc: Exception | None = None
+        for attempt in range(_GEMINI_UPLOAD_MAX_RETRIES + 1):
+            try:
+                uploaded = _gemini_upload_file(path, self.api_key)
+                if uploaded.get("state") is None:
+                    uploaded = _gemini_get_file(uploaded["name"], self.api_key)
+                _poll_start = time.time()
+                _polls = 0
+                while uploaded.get("state") == "PROCESSING":
+                    time.sleep(1.0)
+                    _polls += 1
+                    uploaded = _gemini_get_file(uploaded["name"], self.api_key)
+                if uploaded.get("state") == "ACTIVE":
+                    if attempt:
+                        print(
+                            f"[vlm_feedback] upload of {path.name} succeeded on attempt "
+                            f"{attempt + 1}/{_GEMINI_UPLOAD_MAX_RETRIES + 1}.",
+                            flush=True,
+                        )
+                    break
+
+                err = uploaded.get("error") or {}
+                code = err.get("code")
+                try:
+                    detail = json.dumps(uploaded, indent=2, sort_keys=True)[:2000]
+                except Exception:  # noqa: BLE001 - diagnostics must not mask the failure
+                    detail = repr(uploaded)[:2000]
+                last_exc = RuntimeError(
+                    f"Gemini file upload failed with state={uploaded.get('state')!r} "
+                    f"after {_polls} poll(s) / {time.time() - _poll_start:.1f}s. "
+                    f"error.code={code!r} error.status={err.get('status')!r} "
+                    f"error.message={err.get('message')!r}. "
+                    f"local_file={path.name} size={path.stat().st_size} bytes mime={mime_type!r}. "
+                    f"full File resource:\n{detail}"
+                )
+                # A failed File still occupies the account's quota until it expires; drop it
+                # rather than leaving one behind per attempt.
+                _gemini_delete_file_quiet(uploaded.get("name"), self.api_key)
+                if code not in _GEMINI_RETRYABLE_FILE_ERROR_CODES:
+                    raise last_exc
+            except RuntimeError as exc:
+                if exc is last_exc and (uploaded or {}).get("error", {}).get(
+                    "code"
+                ) not in _GEMINI_RETRYABLE_FILE_ERROR_CODES:
+                    raise
+                last_exc = exc
+            except Exception as exc:  # noqa: BLE001 - transport errors are retryable too
+                last_exc = exc
+
+            if attempt == _GEMINI_UPLOAD_MAX_RETRIES:
+                assert last_exc is not None
+                raise last_exc
+            delay = 2.0 * (2 ** attempt)
+            print(
+                f"[vlm_feedback] upload of {path.name} failed "
+                f"(attempt {attempt + 1}/{_GEMINI_UPLOAD_MAX_RETRIES + 1}); "
+                f"retrying in {delay:.0f}s -- {str(last_exc).splitlines()[0][:160]}",
+                flush=True,
+            )
+            time.sleep(delay)
+
+        assert uploaded is not None and uploaded.get("state") == "ACTIVE"
 
         parts: list[Any] = [
             {
@@ -963,6 +1205,11 @@ class GeminiVLMCOach(VLMCOach):
             [{"parts": [{"text": prompt}]}],
             self.api_key,
         )
+
+    def analyze_video_text(self, video_path: str | Path, prompt: str) -> str:
+        """Ask ``prompt`` about a whole video. Goes through the same retrying upload as reviews."""
+        parts = self._upload_media(video_path, None, False) + [{"text": prompt}]
+        return _gemini_generate_content(self.model, [{"parts": parts}], self.api_key)
 
     def complete_image_text(self, image: Any, prompt: str) -> str:
         """Single-frame + text completion via an inline JPEG part."""

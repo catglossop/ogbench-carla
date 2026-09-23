@@ -86,7 +86,12 @@ class SigLIPEncoder:
 
         import torch
 
-        inputs = self._processor(text=[cleaned], return_tensors="pt", padding=True)
+        # Truncate at the text tower's position limit (64 for SigLIP): longer text used to raise and
+        # kill the run. Inputs that already fit tokenize exactly as before.
+        max_len = int(getattr(getattr(self._model.config, "text_config", self._model.config), "max_position_embeddings", 64))
+        inputs = self._processor(
+            text=[cleaned], return_tensors="pt", padding=True, truncation=True, max_length=max_len
+        )
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
 
         with self._lock:

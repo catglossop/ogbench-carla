@@ -217,7 +217,11 @@ def _patch_configured_walker_models(scenario_classes: dict) -> None:
     concrete animal actors also bypass its human-walker destroy/re-spawn
     workaround so they can be restored visibly by the behavior tree.
     """
-    for class_name in ('DynamicObjectCrossing', 'VehicleTurningRoutePedestrian'):
+    for class_name in (
+        'DynamicObjectCrossing',
+        'VehicleTurningRoutePedestrian',
+        'PedestrianCrossing',
+    ):
         cls = scenario_classes.get(class_name)
         if cls is None:
             continue
@@ -324,7 +328,17 @@ def _patch_configured_walker_models(scenario_classes: dict) -> None:
                     import py_trees
 
                     actor = actors[0]
-                    spawn_z = float(self._spawn_transform.location.z)
+                    # Turning scenarios use _spawn_transform; dynamic crossing
+                    # uses _adversary_transform. Diagnostics must not abort
+                    # scenario construction and silently remove the hazard.
+                    spawn_transform = getattr(self, '_spawn_transform', None)
+                    if spawn_transform is None:
+                        spawn_transform = getattr(self, '_adversary_transform', None)
+                    if spawn_transform is None:
+                        print('[fail2drive animal lifecycle] spawn transform unavailable; '
+                              'retaining original scenario without lifecycle monitor', flush=True)
+                        return behavior
+                    spawn_z = float(spawn_transform.location.z)
 
                     class AnimalLifecycleMonitor(py_trees.behaviour.Behaviour):
                         def __init__(monitor_self):

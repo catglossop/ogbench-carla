@@ -40,7 +40,13 @@ _PROMPT_PREAMBLE = (
 
 
 class GeminiActionSelector:
-    def __init__(self, model: str = "gemini-2.5-flash", api_key: str | None = None):
+    def __init__(self, model: str | None = None, api_key: str | None = None):
+        # None -> the repo-wide default (coaches.gemini_models). Passing a model explicitly
+        # still wins; this only removes the stale per-file literal.
+        if model is None:
+            from coaches.gemini_models import DEFAULT_GEMINI_MODEL
+
+            model = DEFAULT_GEMINI_MODEL
         from google import genai
 
         key = api_key or os.environ.get("GEMINI_API_KEY")

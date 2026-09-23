@@ -73,7 +73,7 @@ def get_config():
             raw_video=True,
             async_review=False,
             provider="gemini",
-            gemini_model="gemini-3.5-flash",
+            gemini_model="gemini-3.7-flash",
             # Must match the rollout's action chunk length (config.action_horizon).
             action_chunk_steps=10,
             # How many subtasks to suggest per chunk that needs improvement.
@@ -87,13 +87,14 @@ def get_config():
             # channels are thinned to every 2nd timestamp -- so the plot is where their shape over
             # the window is actually legible. Set False for a video-and-text-only review.
             include_plots_in_prompt=True,
-            # Cross-window correction memory: a bounded record of the longitudinal changes earlier
-            # windows already made ("stop -> accelerate: 7x"), injected into BOTH the review and
-            # the credit prompt so successive windows don't reverse each other and the HL dataset
-            # doesn't end up teaching both directions of the same decision. This is the whole
-            # rendered block's word budget -- it is pruned oldest-note-first and, if still over,
-            # summarized by the coach. Persisted to cast_relabel/correction_memory.json. 0 = off.
-            correction_memory_words=300,
+            # How many previous-episode strategy summaries to carry in the memory bank that is
+            # injected into BOTH the review and the credit prompt (coaches/strategy_memory.py).
+            # Each is one sentence plus the score it earned. 0 disables the bank.
+            # Replaced ``correction_memory_words``: the old bank tracked longitudinal mode
+            # transitions, notes, vehicle-state carry-over and crash ageing, then pruned and
+            # coach-summarised itself to fit a word budget -- five interacting mechanisms to say
+            # what one episode summary says directly, so it was removed rather than tuned.
+            strategy_memory_entries=8,
             save_artifacts=True,
             # Persist every BAD/relabeled chunk as a SteerVLA high-level (VLM-backbone) training
             # sample in the steervla_hl_dataset_format schema (image + ego state + prompt +
@@ -110,6 +111,25 @@ def get_config():
             # moment it happens: nothing after it is worth imitating.
             hl_stop_after_failure=True,
             hl_stop_on_off_route=True,
+            # Leaving the planned ROUTE (as opposed to the lane) is detected programmatically by
+            # two independent signals, so it no longer depends on the VLM noticing it:
+            #   * the leaderboard's own InRouteTest counter (``route_deviation_delta``) --
+            #     authoritative, it is what scores the ``route_dev`` infraction, but late by
+            #     construction: MAX_ROUTE_PERCENTAGE=30 means 30% of the route length must
+            #     accumulate off-route before it fires;
+            #   * "driving but not progressing" -- ``route_distance_m`` comes from
+            #     RouteCompletionTest and only advances while the ego is ON the plan, so an ego
+            #     that is clearly moving while that number stalls has taken a wrong branch. This
+            #     catches the common wrong-turn case within seconds.
+            # The cut is backdated to where the run of motion began, not where the detector became
+            # confident, so the states after leaving the plan are all dropped.
+            hl_stop_on_route_divergence=True,
+            # Thresholds for the behavioural half: >2 m/s continuously for 60 ticks (3 s at 20 Hz,
+            # so >6 m driven) while gaining <2 m of route. A stopped or crawling ego never trips
+            # it -- waiting at a light or yielding is not divergence.
+            hl_divergence_speed_mps=2.0,
+            hl_divergence_ticks=60,
+            hl_divergence_progress_m=2.0,
             # A collision is NOT. Clipping a cone or brushing a barrier and driving on leaves the
             # rest of the episode perfectly good supervision, and cutting there threw it away for
             # nothing. Only a collision the ego gets STUCK in ends supervision: this many

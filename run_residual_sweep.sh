@@ -10,6 +10,7 @@
 #   SWEEP_PROFILE=coarse_grid_v1 ./run_residual_sweep.sh 3
 #   SWEEP_PROFILE=initial_scale ./run_residual_sweep.sh 3
 #   DRY_RUN=1 ./run_residual_sweep.sh 3
+#   START_INDEX=6 ./run_residual_sweep.sh 3  # Continue when prior .done markers are unavailable.
 #   SEEDS="0 1 2" ./run_residual_sweep.sh 3 /raid/users/$USER/carla_exps/residual_sweep
 set -euo pipefail
 
@@ -19,12 +20,16 @@ cd "$ROOT_DIR"
 PHYSICAL_GPU="${1:-${SWEEP_GPU:-0}}"
 RUN_ROOT="${2:-${SWEEP_ROOT:-/raid/users/${USER}/carla_exps/residual_scale_sweep}}"
 SWEEP_CONFIG="${SWEEP_CONFIG:-$ROOT_DIR/impls/configs/residual_rl_sweeps.yaml}"
-SWEEP_PROFILE="${SWEEP_PROFILE:-coarse_grid_v3}"
+SWEEP_PROFILE="${SWEEP_PROFILE:-coarse_grid_v4}"
 MAX_RETRIES="${MAX_RETRIES:-50}"
 WANDB_MODE="${WANDB_MODE:-online}"
 SAVE_BUFFER="${SAVE_BUFFER:-true}"
 SAVE_VIDEO_LOCAL="${SAVE_VIDEO_LOCAL:-true}"
 SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
+# Skip queue entries before this one without creating completion markers. Normally
+# the stable status namespace supplies .done markers; this is a safe fallback when
+# resuming the known remainder of a sweep on a machine without that namespace.
+START_INDEX="${START_INDEX:-1}"
 # Empty -> selected YAML profile's launcher policy.
 CONTINUE_ON_FAILURE="${CONTINUE_ON_FAILURE:-}"
 RETRY_FAILED="${RETRY_FAILED:-}"
@@ -32,6 +37,10 @@ DRY_RUN="${DRY_RUN:-0}"
 
 if [[ ! -f "$SWEEP_CONFIG" ]]; then
   echo "Sweep YAML not found: $SWEEP_CONFIG" >&2
+  exit 2
+fi
+if ! [[ "$START_INDEX" =~ ^[1-9][0-9]*$ ]]; then
+  echo "START_INDEX must be a positive integer (got: $START_INDEX)" >&2
   exit 2
 fi
 
@@ -58,7 +67,7 @@ if not isinstance(profile, dict):
     available = ", ".join(sorted(map(str, profiles)))
     raise SystemExit(f"unknown sweep profile {profile_name!r}; available: {available}")
 merged = {**common, **profile}
-required = ("label", "run_group", "routes", "betas", "encoders", "seeds", "online_steps", "fixed_agent_overrides", "steervla_overrides", "launcher")
+required = ("label", "run_group", "routes", "betas", "encoders", "seeds", "online_steps", "max_episode_steps", "fixed_agent_overrides", "steervla_overrides", "launcher")
 missing = [key for key in required if key not in merged]
 if missing:
     raise SystemExit(f"{path}:{profile_name}: missing required keys: {', '.join(missing)}")
@@ -66,6 +75,8 @@ for key in ("routes", "betas", "encoders", "seeds"):
     value = merged[key]
     if not isinstance(value, list) or not value:
         raise SystemExit(f"{path}:{profile_name}: {key} must be a non-empty list")
+if not isinstance(merged["max_episode_steps"], int) or merged["max_episode_steps"] < 1:
+    raise SystemExit(f"{path}:{profile_name}: max_episode_steps must be a positive integer")
 if "scale_pairs" in merged:
     raw_pairs = merged["scale_pairs"]
     if not isinstance(raw_pairs, list) or not raw_pairs:
@@ -109,6 +120,7 @@ def emit_list(name, values):
 emit("YAML_LABEL", merged["label"])
 emit("YAML_RUN_GROUP", merged["run_group"])
 emit("YAML_ONLINE_STEPS", merged["online_steps"])
+emit("YAML_MAX_EPISODE_STEPS", merged["max_episode_steps"])
 emit_list("YAML_ROUTES", merged["routes"])
 emit_list("YAML_SEEDS", merged["seeds"])
 emit_list("YAML_SCALE_PAIRS", [f"{accel}:{steer}" for accel, steer in scale_pairs])
@@ -126,6 +138,7 @@ PY
 # Environment values intentionally override YAML for one-off variants. Use a new
 # SWEEP_LABEL when an override should have its own artifact/status namespace.
 ONLINE_STEPS="${ONLINE_STEPS:-$YAML_ONLINE_STEPS}"
+MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-$YAML_MAX_EPISODE_STEPS}"
 RUN_GROUP="${SWEEP_RUN_GROUP:-$YAML_RUN_GROUP}"
 SWEEP_LABEL="${SWEEP_LABEL:-$YAML_LABEL}"
 CONTINUE_ON_FAILURE="${CONTINUE_ON_FAILURE:-$YAML_LAUNCHER_CONTINUE_ON_FAILURE}"
@@ -153,6 +166,7 @@ physical_gpu=$PHYSICAL_GPU
 train_gpu=0
 render_adapter=$PHYSICAL_GPU
 online_steps=$ONLINE_STEPS
+max_episode_steps=$MAX_EPISODE_STEPS
 routes=${ROUTES[*]}
 seeds=${SEEDS[*]}
 scale_pairs=${SCALE_PAIRS[*]}
@@ -162,6 +176,7 @@ actions_per_model_query=$YAML_STEERVLA_ACTIONS_PER_MODEL_QUERY
 actions_per_cot=$YAML_STEERVLA_ACTIONS_PER_COT
 continue_on_failure=$CONTINUE_ON_FAILURE
 retry_failed=$RETRY_FAILED
+start_index=$START_INDEX
 fixed_config: expo=$YAML_AGENT_EXPO, best_of_n=$YAML_AGENT_BEST_OF_N, otf_td_backup=$YAML_AGENT_OTF_TD_BACKUP, residual_bc_normalize=$YAML_AGENT_RESIDUAL_BC_NORMALIZE
 SPEC
 
@@ -184,6 +199,10 @@ for encoder in "${ENCODERS[@]}"; do
             done_file="$RUN_ROOT/status/$SWEEP_LABEL/${tag}.done"
             failure_file="$RUN_ROOT/status/$SWEEP_LABEL/${tag}.failed"
             log_file="$RUN_ROOT/logs/$SWEEP_LABEL/${tag}.log"
+            if (( index < START_INDEX )); then
+              echo "[$index/$total] SKIP before START_INDEX=$START_INDEX: $tag"
+              continue
+            fi
             if [[ "$SKIP_COMPLETED" == "1" && -f "$done_file" ]]; then
               echo "[$index/$total] SKIP completed: $tag"
               continue
@@ -207,6 +226,7 @@ for encoder in "${ENCODERS[@]}"; do
                 --seed "$seed" \
                 --exp-name "$exp_name" \
                 --online-steps "$ONLINE_STEPS" \
+                --max-episode-steps "$MAX_EPISODE_STEPS" \
                 --train-gpu 0 \
                 --render-adapter "$PHYSICAL_GPU" \
                 --run-group "$RUN_GROUP" \

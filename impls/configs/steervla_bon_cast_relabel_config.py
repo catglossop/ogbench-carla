@@ -97,7 +97,7 @@ def get_config():
             query_every_n_episode_steps=150,
             query_on_episode_end=True,
             provider="gemini",
-            gemini_model="gemini-3.5-flash",
+            gemini_model="gemini-3.7-flash",
             # Must match config.action_horizon (and steervla.action_horizon).
             action_chunk_steps=10,
             num_subtask_suggestions=3,

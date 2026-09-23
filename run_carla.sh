@@ -49,13 +49,17 @@ PRETRAINED_CRITIC=""
 QGF_CRITIC_CKPT=""
 QGF_GUIDANCE_WEIGHT="0.0"
 EVAL_ONLY="false"
+EVAL_MODE="false"
+CARLA_SEED=""
+TRAIN_SEED=""
+EVAL_SEEDS=""
 BON_CRITIC_CKPT=""
-BON_NUM_CANDIDATES="8"
+BON_NUM_CANDIDATES="4"
 BON_ONLINE_CRITIC="false"
 BON_CANDIDATES_LOG_EVERY="20"
 BON_CANDIDATES_WANDB="false"
-BON_MAX_SAMPLE_ATTEMPTS="6"
-BON_BATCH_POLICY_CANDIDATES="false"
+BON_MAX_SAMPLE_ATTEMPTS="1"
+BON_BATCH_POLICY_CANDIDATES="true"
 # 0.0 (the base config's default) makes subtask decoding greedy/deterministic, so every
 # candidate would decode to the identical subtask text and the diversity search in
 # _sample_diverse_candidates could never find a different one. run_carla_teleop.sh's
@@ -77,6 +81,7 @@ BON_QWEN_CADENCE="5"
 QWEN_ONLINE_TRAIN="false"
 QWEN_ONLINE_WARMUP_EPISODES="2"
 MAX_EPISODES=""
+MAX_EPISODE_STEPS=""
 TERMINATE_ON_COLLISION="false"
 EXPERT_CONTROLLER=""
 SAVE_VIDEO_LOCAL="true"
@@ -112,6 +117,9 @@ STATE_ENCODER=""
 RLT_CHECKPOINT=""
 # Override the frozen base policy: e.g. deploy a relabelled Stage-1 ckpt. Empty -> config default.
 STEERVLA_CKPT=""
+FROZEN_EVAL="false"
+FROZEN_EVAL_OUT=""
+POST_STOP_EVAL_EPISODES=""
 ACTOR_CONFIG=""
 # GRPO-only: greedy-base warmup steps before scoring/updates begin. Empty -> config default (0).
 GRPO_WARMUP=""
@@ -123,6 +131,12 @@ GRPO_GROUP_SIZE=""
 GRPO_SCORE_TEMP=""
 # Override config.steervla.cot_temperature (e.g. 1.0 to sample the base CoT). Empty -> config default.
 COT_TEMPERATURE=""
+# Override config.steervla.hl_kl_coef: KL penalty tethering the HL CoT policy to its starting
+# checkpoint (loss = bc_loss + coef * KL). Empty -> config default (0.0 = off).
+HL_KL_COEF=""
+# Consecutive qualifying episodes required before --stop-on-score arms. Empty -> 1 (legacy).
+STOP_SCORE_STREAK=""
+FIXED_TRAIN_CARLA_SEED="false"
 # Crash supervisor: relaunch main_carla (resuming from checkpoint) after a CARLA native
 # crash (SIGSEGV/SIGABRT, exit code >=128). 0 disables the retry loop.
 MAX_RETRIES="${MAX_RETRIES:-50}"
@@ -141,6 +155,15 @@ Options:
   --route NAME              Bench2Drive route name/id. Default: parking-cut-in-001
   --online-steps N          Number of env steps. Default: 5000
   --seed N                  Random seed. Default: 0
+  --carla-seed N            Simulator-side seed: traffic manager, scenario actors,
+                            env.reset(). Held fixed through the --eval-mode eval
+                            episodes. Default: --seed.
+  --train-seed N            Model-side seed: JAX PRNG, numpy/random, agent construction,
+                            and the actor's CoT / action / noise sampling. Default: --seed.
+  --eval-seeds A,B,C        Comma-separated MODEL seeds for the --eval-mode eval episodes
+                            (no spaces). Each replays the same --carla-seed, so their
+                            spread measures the policy, not the scenario.
+                            Default: train-seed+1001, +1002, ... one per eval episode.
   --run-group NAME          W&B / experiment group. Default: Debug
   --save-buffer BOOL        true|false. Default: true
   --expert-debug BOOL       true|false. Default: false
@@ -190,13 +213,26 @@ Options:
 
   --agent-config PATH       Base agent config. Default: impls/configs/pi0_residual_sac_config.py
   --carla-config PATH       Base CARLA yaml. Default: impls/configs/carla_config.yaml
+  --max-episode-steps N     Override CARLA's per-episode step cap (0 = no cap).
   --steervla-checkpoint PATH  Override config.steervla.checkpoint (deploy a relabelled ckpt).
+  --frozen-eval [true|false]  Run ONLY frozen eval episodes from the checkpoint: no updates,
+                            no CAST review, no checkpointing. Replays --carla-seed with one
+                            --eval-seeds entry per episode. Writes run_summary_frozen_eval.json
+                            and leaves the original run_summary.json alone. Bare = true.
+  --post-stop-eval-episodes N  Number of frozen eval episodes (default 3).
   --actor-config NAME       Override config.steervla.actor_config (match the ckpt's model).
   --grpo-warmup N           GRPO only: drive the greedy base for N steps before scoring/updates.
   --grpo-select MODE        GRPO only: executed candidate = argmax|random|first. Default: argmax.
   --grpo-group-size N       GRPO only: candidates sampled/scored per state (1 = single-sample).
   --grpo-score-temp T       GRPO only: candidate CoT sampling temperature (low/0 = near-greedy BoN).
   --cot-temperature T       Override config.steervla.cot_temperature (e.g. 1.0 to sample base CoTs).
+  --fixed-carla-seed [true|false]  Pin the sim seed to --carla-seed for TRAINING episodes too
+                            (eval already does). Train and eval then differ only in the
+                            model sampling seed. Bare = true. Default false.
+  --stop-score-streak N     Require N CONSECUTIVE episodes at --stop-on-score before the
+                            stop arms. Default 1 (a single qualifying episode).
+  --hl-kl-coef F            KL penalty on the HL update, tethering the CoT policy to the
+                            checkpoint it started from (loss = bc_loss + F * KL). 0 = off.
 
   --pretrained-critic PATH  Path to a pretrained critic .pkl from pretrain_critic.py.
                             Injects obs_encoder + critic params before online training begins.
@@ -211,11 +247,21 @@ Options:
                             used to score N candidate action chunks sampled straight from the
                             frozen pi0 base policy (no residual actor); the highest-Q candidate
                             is executed each step. Requires --train-mode=rl.
-  --bon-num-candidates N    Number of candidates to sample/score per step. Default: 8.
+  --bon-num-candidates N    Number of candidates to sample/score per step. Default: 4.
   --bon-online-critic BOOL  true|false. Best-of-N scored with the live online critic instead
                             of a frozen --bon-critic-ckpt; keeps training via update_with_vla()
                             on collected transitions. Warm-start with --pretrained-critic.
                             Requires --eval-only=false. Default: false.
+  --eval-mode [true|false]  Treat this as a run whose numbers will be reported, and enforce
+                            what that needs: pin the simulator seed to --carla-seed, checkpoint
+                            the model every 2000 env steps (tightening --save_interval too),
+                            always export the weights training ended with, replay the training
+                            carla seed through the post-training eval while varying only the
+                            model seed, and write run_summary.json alongside the run.
+                            Bare --eval-mode means true. Default: false, so an exploratory run
+                            pays none of it.
+                            NOT --eval-only: that skips training entirely, whereas --eval-mode
+                            is for a run that DOES train and whose result must be reproducible.
   --bon-candidates-log-every N
                             Save a local overlay frame every N env steps showing every best-of-N
                             candidate's subtask + score, selected one marked. 0 disables.
@@ -226,10 +272,10 @@ Options:
   --bon-max-sample-attempts N
                             Best-of-N diverse-subtask search: max resample attempts per
                             candidate slot (beyond the first). Each attempt is a full VLA
-                            forward pass; lower this to trade diversity for speed. Default: 6.
+                            forward pass; higher values use sequential diversity search. Default: 1.
   --bon-batch-policy-candidates BOOL
                             Batch all policy candidates in one SteerVLA call when Qwen BoN
-                            and --bon-max-sample-attempts=1 are active. Default: false.
+                            and --bon-max-sample-attempts=1 are active. Default: true.
   --bon-cot-temperature F   CoT/subtask sampling temperature when best-of-N is active. The
                             base config defaults to 0.0 (greedy -- every candidate would
                             decode to the same subtask), so this defaults to 1.0 here,
@@ -278,6 +324,9 @@ while [[ $# -gt 0 ]]; do
     --route) ROUTE="$2"; shift 2 ;;
     --online-steps) ONLINE_STEPS="$2"; shift 2 ;;
     --seed) SEED="$2"; shift 2 ;;
+    --carla-seed|--carla_seed) CARLA_SEED="$2"; shift 2 ;;
+    --train-seed|--train_seed) TRAIN_SEED="$2"; shift 2 ;;
+    --eval-seeds|--eval_seeds) EVAL_SEEDS="$2"; shift 2 ;;
     --run-group) RUN_GROUP="$2"; shift 2 ;;
     --save-buffer) SAVE_BUFFER="$2"; shift 2 ;;
     --expert-debug) EXPERT_DEBUG="$2"; shift 2 ;;
@@ -308,12 +357,22 @@ while [[ $# -gt 0 ]]; do
     --agent-config) BASE_AGENT_CFG="$2"; shift 2 ;;
     --carla-config) BASE_CARLA_CFG="$2"; shift 2 ;;
     --steervla-checkpoint|--steervla_checkpoint) STEERVLA_CKPT="$2"; shift 2 ;;
+    --frozen-eval|--frozen_eval)
+      if [[ "${2:-}" == "true" || "${2:-}" == "false" ]]; then FROZEN_EVAL="$2"; shift 2;
+      else FROZEN_EVAL="true"; shift 1; fi ;;
+    --post-stop-eval-episodes|--post_stop_eval_episodes) POST_STOP_EVAL_EPISODES="$2"; shift 2 ;;
+    --frozen-eval-out|--frozen_eval_out) FROZEN_EVAL_OUT="$2"; shift 2 ;;
     --actor-config|--actor_config) ACTOR_CONFIG="$2"; shift 2 ;;
     --grpo-warmup|--grpo_warmup) GRPO_WARMUP="$2"; shift 2 ;;
     --grpo-select|--grpo_select) GRPO_SELECT="$2"; shift 2 ;;
     --grpo-group-size|--grpo_group_size) GRPO_GROUP_SIZE="$2"; shift 2 ;;
     --grpo-score-temp|--grpo_score_temp) GRPO_SCORE_TEMP="$2"; shift 2 ;;
     --cot-temperature|--cot_temperature) COT_TEMPERATURE="$2"; shift 2 ;;
+    --hl-kl-coef|--hl_kl_coef) HL_KL_COEF="$2"; shift 2 ;;
+    --stop-score-streak|--stop_score_streak) STOP_SCORE_STREAK="$2"; shift 2 ;;
+    --fixed-carla-seed|--fixed_carla_seed)
+      if [[ "${2:-}" == "true" || "${2:-}" == "false" ]]; then FIXED_TRAIN_CARLA_SEED="$2"; shift 2;
+      else FIXED_TRAIN_CARLA_SEED="true"; shift 1; fi ;;
     --pretrained-critic|--pretrained_critic) PRETRAINED_CRITIC="$2"; shift 2 ;;
     --qgf-critic-ckpt|--qgf_critic_ckpt) QGF_CRITIC_CKPT="$2"; shift 2 ;;
     --qgf-guidance-weight|--qgf_guidance_weight) QGF_GUIDANCE_WEIGHT="$2"; shift 2 ;;
@@ -340,10 +399,14 @@ while [[ $# -gt 0 ]]; do
     --qwen-online-train|--qwen_online_train) QWEN_ONLINE_TRAIN="$2"; shift 2 ;;
     --qwen-online-warmup-episodes|--qwen_online_warmup_episodes) QWEN_ONLINE_WARMUP_EPISODES="$2"; shift 2 ;;
     --max-episodes|--max_episodes) MAX_EPISODES="$2"; shift 2 ;;
+    --max-episode-steps|--max_episode_steps) MAX_EPISODE_STEPS="$2"; shift 2 ;;
     --terminate-on-collision|--terminate_on_collision) TERMINATE_ON_COLLISION="$2"; shift 2 ;;
     --expert-controller|--expert_controller) EXPERT_CONTROLLER="$2"; shift 2 ;;
     --save-video-local|--save_video_local) SAVE_VIDEO_LOCAL="$2"; shift 2 ;;
     --eval-only|--eval_only) EVAL_ONLY="$2"; shift 2 ;;
+    --eval-mode|--eval_mode)
+      if [[ "${2:-}" == "true" || "${2:-}" == "false" ]]; then EVAL_MODE="$2"; shift 2
+      else EVAL_MODE="true"; shift; fi ;;
     --fail2drive-carla-root) FAIL2DRIVE_CARLA_ROOT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; EXTRA_ARGS+=("$@"); break ;;
@@ -422,6 +485,10 @@ case "$BASE_ONLY" in
   ""|true|false) ;;
   *) echo "Invalid --base-only: $BASE_ONLY (expected true|false)" >&2; exit 2 ;;
 esac
+if [[ -n "$MAX_EPISODE_STEPS" ]] && ! [[ "$MAX_EPISODE_STEPS" =~ ^[0-9]+$ ]]; then
+  echo "Invalid --max-episode-steps: $MAX_EPISODE_STEPS (expected a non-negative integer)" >&2
+  exit 2
+fi
 
 TMP_ROOT="$ROOT_DIR/.run_carla"
 mkdir -p "$TMP_ROOT"
@@ -486,13 +553,19 @@ def get_config():
     _STEERVLA_CKPT = r"${STEERVLA_CKPT}"
     _ACTOR_CONFIG = r"${ACTOR_CONFIG}"
     _COT_TEMP = "${COT_TEMPERATURE}"
+    _HL_KL_COEF = "${HL_KL_COEF}"
     if "steervla" in config:
         if _STEERVLA_CKPT != "":
             config.steervla.checkpoint = _STEERVLA_CKPT
+            if str(config.steervla.get("vla", "steervla")) == "simlingo_steervla":
+                # SimLingo reloads only the (trained) HL; the LL stays at steervla.ll_checkpoint.
+                config.steervla.hl_checkpoint = _STEERVLA_CKPT
         if _ACTOR_CONFIG != "":
             config.steervla.actor_config = _ACTOR_CONFIG
         if _COT_TEMP != "":
             config.steervla.cot_temperature = float(_COT_TEMP)
+        if _HL_KL_COEF != "":
+            config.steervla.hl_kl_coef = float(_HL_KL_COEF)
         if _HL_CKPT_DIR != "":
             config.steervla.hl_checkpoint_dir = _HL_CKPT_DIR
         if _HL_CKPT_EVERY != "":
@@ -542,6 +615,8 @@ cfg["traffic_manager_port"] = int("${TM_PORT}")
 cfg["gpu_rank"] = int("${SIM_GPU_RANK}")
 cfg["x_display_num"] = int("${X_DISPLAY_NUM}")
 cfg["use_cuda_visible_devices"] = False
+if "${MAX_EPISODE_STEPS}" != "":
+    cfg["max_episode_steps"] = int("${MAX_EPISODE_STEPS}")
 if r"${EXPERT_CONTROLLER}":
     cfg["expert_controller"] = r"${EXPERT_CONTROLLER}"
 Path(r"${CARLA_CFG_TMP}").write_text(yaml.safe_dump(cfg, sort_keys=False))
@@ -569,7 +644,7 @@ echo "[run_carla.sh] train_mode=${TRAIN_MODE}"
 echo "[run_carla.sh] critic_mode=${CRITIC_FEEDBACK_MODE}"
 echo "[run_carla.sh] train_gpu_rank=${TRAIN_GPU_RANK} render_adapter=${SIM_GPU_RANK}"
 echo "[run_carla.sh] carla_host=${CARLA_HOST} carla_port=${CARLA_PORT} streaming_port=${CARLA_STREAMING_PORT} tm_port=${TM_PORT} x_display=:${X_DISPLAY_NUM}"
-echo "[run_carla.sh] expert_debug=${EXPERT_DEBUG} expert_recover_debug=${EXPERT_RECOVER_DEBUG} save_buffer=${SAVE_BUFFER} online_steps=${ONLINE_STEPS} include_proprio=${INCLUDE_PROPRIO}"
+echo "[run_carla.sh] expert_debug=${EXPERT_DEBUG} expert_recover_debug=${EXPERT_RECOVER_DEBUG} save_buffer=${SAVE_BUFFER} online_steps=${ONLINE_STEPS} max_episode_steps=${MAX_EPISODE_STEPS:-<config default>} include_proprio=${INCLUDE_PROPRIO}"
 echo "[run_carla.sh] temp agent config: ${AGENT_CFG_TMP}"
 echo "[run_carla.sh] temp carla config: ${CARLA_CFG_TMP}"
 if [[ -n "$BON_CRITIC_CKPT" ]]; then
@@ -583,6 +658,7 @@ export PYTHONPATH="${CARLA_ROOT}/PythonAPI/carla:${ROOT_DIR}/simlingo-rebuttal${
 
 echo "[run_carla.sh] agent_config=${BASE_AGENT_CFG}${STEERVLA_CKPT:+ steervla_checkpoint=${STEERVLA_CKPT}}${ACTOR_CONFIG:+ actor_config=${ACTOR_CONFIG}}"
 echo "[run_carla.sh] enable_updates=${ENABLE_UPDATES} base_only=${BASE_ONLY:-<config default>} state_encoder=${STATE_ENCODER:-<config default>}${RLT_CHECKPOINT:+ rlt_checkpoint=${RLT_CHECKPOINT}}"
+echo "[run_carla.sh] hl_kl_coef=${HL_KL_COEF:-<config default>}"
 echo "[run_carla.sh] hl_gpu_rank=${HL_TRAIN_GPU_RANK:-<config>} max_retries=${MAX_RETRIES}${GRPO_WARMUP:+ grpo_warmup=${GRPO_WARMUP}}${GRPO_SELECT:+ grpo_select=${GRPO_SELECT}}${GRPO_GROUP_SIZE:+ grpo_group_size=${GRPO_GROUP_SIZE}}${GRPO_SCORE_TEMP:+ grpo_score_temp=${GRPO_SCORE_TEMP}}${COT_TEMPERATURE:+ cot_temperature=${COT_TEMPERATURE}}"
 echo "[run_carla.sh] hl_ckpt_dir=${HL_CKPT_DIR:-<config>} hl_ckpt_every=${HL_CKPT_EVERY:-<config>} hl_ckpt_keep_last=${HL_CKPT_KEEP_LAST:-<config>}"
 
@@ -619,6 +695,9 @@ while :; do
     --online_steps="${ONLINE_STEPS}" \
     --save_buffer="${SAVE_BUFFER}" \
     --seed="${SEED}" \
+    ${CARLA_SEED:+--carla_seed="${CARLA_SEED}"} \
+    ${TRAIN_SEED:+--train_seed="${TRAIN_SEED}"} \
+    ${EVAL_SEEDS:+--eval_seeds="${EVAL_SEEDS}"} \
     --run_group="${RUN_GROUP}" \
     --expert_debug="${EXPERT_DEBUG}" \
     --expert_recover_debug="${EXPERT_RECOVER_DEBUG}" \
@@ -650,6 +729,12 @@ while :; do
     --terminate_on_collision="${TERMINATE_ON_COLLISION}" \
     --save_video_local="${SAVE_VIDEO_LOCAL}" \
     --eval_only="${EVAL_ONLY}" \
+    --eval_mode="${EVAL_MODE}" \
+    --frozen_eval="${FROZEN_EVAL}" \
+    --fixed_train_carla_seed="${FIXED_TRAIN_CARLA_SEED}" \
+    ${STOP_SCORE_STREAK:+--stop_on_driving_score_streak="${STOP_SCORE_STREAK}"} \
+    ${FROZEN_EVAL_OUT:+--frozen_eval_out="${FROZEN_EVAL_OUT}"} \
+    ${POST_STOP_EVAL_EPISODES:+--post_stop_eval_episodes="${POST_STOP_EVAL_EPISODES}"} \
     "${EXTRA_ARGS[@]}" \
     --exp_name="${EXP_NAME}" \
     --resume="${RESUME_FLAG}"

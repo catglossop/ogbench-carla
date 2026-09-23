@@ -131,7 +131,8 @@ def setup_wandb(
             # both spellings are offered and the unsupported one is filtered out.
             _disable_stats=False,
             x_disable_stats=False,
-            code_dir=str(Path(__file__).resolve().parent.parent.parent),
+            # Use the filtered log_code call below. Setting code_dir also triggers
+            # an automatic unfiltered upload, including the virtual environments.
         ),
         mode=mode,
         save_code=True,
@@ -148,6 +149,13 @@ def setup_wandb(
         run.log_code(
             root=str(Path(__file__).resolve().parent.parent.parent),
             include_fn=lambda p, root: p.endswith(".py") or p.endswith(".sh") or p.endswith(".json"),
+            # Virtual environments contain tens of thousands of matching source files.
+            # Uploading those before CARLA's first tick can exceed the simulator's
+            # render-fence watchdog and kill an otherwise healthy rollout.
+            exclude_fn=lambda p, root: any(
+                part in {".git", ".run_carla", ".venv", ".venv-carla-0915", "wandb"}
+                for part in Path(p).relative_to(root).parts
+            ),
         )
     except Exception:
         pass
