@@ -10,13 +10,23 @@ Samples frames from the SimLingo database and writes one ``hl_samples.json`` in 
 
 ``reasoning`` is the part before the marker, ``subtask`` the meta action. With ``--simplified``
 (the bellman HL's ``use_simplified_reasoning``) coordinate clauses are removed with simlingo's own
-``filter_coordinate_clauses``. Images are not copied: ``sample_file`` is the absolute path of the
-database JPEG, which ``SimLingoSteerVLAActor._read_hl_record`` decodes.
+``filter_coordinate_clauses``.
+
+Images: by default ``sample_file`` is the absolute path of the database JPEG, which
+``SimLingoSteerVLAActor._read_hl_record`` decodes on the fly. With ``--embed-images`` the frame is
+decoded once and stored beside the manifest as ``sample_%06d.npz`` (key ``image``, RGB uint8) and
+``sample_file`` becomes that relative name -- the same self-contained layout as the SteerVLA pools in
+``steervla_hl_pools/``. Use it when the pool has to move to a machine that does not mount the SimLingo
+database (~1.6 MB per 512x1024 frame, so ~6.3 GB for 4000).
 
     .venv/bin/python impls/vlas/extract_simlingo_hl_replay.py \\
       --data-path /raid/datasets/simlingo/database/simlingo \\
       --simlingo-source-root /home/cglossop/simlingo-steervla \\
       --out-root /raid/users/cglossop/simlingo_hl_pools --name simlingo_hl_simplified --n 4000
+
+    # self-contained copy (images in the pool):
+    .venv/bin/python impls/vlas/extract_simlingo_hl_replay.py ... --embed-images \\
+      --name simlingo_hl_simplified_img
 """
 
 from __future__ import annotations
@@ -119,6 +129,12 @@ def main() -> int:
     p.add_argument("--skip-first-n-frames", type=int, default=10, help="dataset skip_first_n_frames")
     p.add_argument("--ego-history-count", type=int, default=3)
     p.add_argument("--simplified", type=lambda s: s.lower() in ("1", "true", "yes"), default=True)
+    p.add_argument(
+        "--embed-images",
+        action="store_true",
+        help="Store each frame in the pool as sample_%%06d.npz (RGB uint8) instead of pointing at the "
+        "database JPEG, so the pool is self-contained. ~1.6 MB per frame.",
+    )
     args = p.parse_args()
 
     db = Path(args.data_path)
@@ -150,6 +166,31 @@ def main() -> int:
 
     out_dir = Path(args.out_root) / args.name
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.embed_images:
+        # Decode once into the pool. RGB, because _read_hl_record's JPEG path converts BGR->RGB and the
+        # two layouts must feed the model identical pixels. Uncompressed, like the SteerVLA pools: the
+        # trainer reads these at random every HL update and decode time is what matters, not disk.
+        import cv2  # local: only this mode needs OpenCV
+        import numpy as np
+
+        kept = []
+        for i, s in enumerate(samples):
+            src = s["sample_file"]
+            bgr = cv2.imread(str(src), cv2.IMREAD_COLOR)
+            if bgr is None:
+                print(f"  unreadable, dropping: {src}", flush=True)
+                continue
+            npz_name = f"sample_{len(kept):06d}.npz"
+            np.savez(
+                out_dir / npz_name,
+                image=cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.uint8),
+                current_speed=np.float32(s["current_speed"]),
+            )
+            s = dict(s, sample_file=npz_name, source_image=str(src))
+            kept.append(s)
+            if len(kept) % 500 == 0:
+                print(f"  embedded {len(kept)}/{len(samples)} images", flush=True)
+        samples = kept
     manifest = {
         "dataset_format": "simlingo_hl_dataset_format",
         "schema_version": 1,
