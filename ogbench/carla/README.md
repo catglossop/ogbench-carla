@@ -42,6 +42,8 @@ WANDB_MODE=disabled .venv/bin/python impls/main_carla.py \
   --steervla_actor_config=pi05_steervla_inference
 ```
 
+
+
 ### Frozen Qwen critic best-of-N
 
 `steervla_dsrl_config.py` defaults to the 14000-step commentary policy checkpoint on
@@ -85,8 +87,6 @@ Qwen batch. Candidate images remain local
 when `--bon-candidates-wandb false`, while episode videos are still logged. Keep
 `--enable-updates false`, `--bon-online-critic false`, and omit `--online-train` from
 the Qwen server for frozen offline-critic evaluation.
-
-
 
 ## Configuring your env
 
@@ -302,10 +302,12 @@ uv run python impls/main_carla.py \
 There are a couple levers to pull to optimize the speed a bit: 
 
 - `actions_per_model_query`: int - how many **env steps** (20 Hz CARLA ticks) to serve from one
-  model query before querying again (speed)
+model query before querying again (speed)
 - `actions_per_cot`: int - how many actions to execute before getting new CoT (speed)
 - `reanchor_cached_chunk`: bool, default `True` - re-express the replayed chunk's route waypoints
-  in the ego's current body frame on every held tick
+in the ego's current body frame on every held tick
+
+
 
 ### What `actions_per_model_query` actually holds
 
@@ -334,10 +336,10 @@ Two things to watch when tuning this knob, both logged to W&B by `main_carla.py`
 
 - `pid/heading_error` — pinned to a constant between model queries means the lateral loop is open.
 - `vla/action_cached` — fraction of executed actions replayed from the cache. A replayed chunk
-  ignores the sampled noise, so under DSRL the noise actor only shapes 1 in
-  `actions_per_model_query` executed actions. Use `actions_per_model_query=1` for a fully
-  on-policy RL run; the action expert cannot be re-run cheaply on held ticks, because a new
-  observation needs a fresh (expensive) prefix forward.
+ignores the sampled noise, so under DSRL the noise actor only shapes 1 in
+`actions_per_model_query` executed actions. Use `actions_per_model_query=1` for a fully
+on-policy RL run; the action expert cannot be re-run cheaply on held ticks, because a new
+observation needs a fresh (expensive) prefix forward.
 
 
 
@@ -368,6 +370,8 @@ install and registers the *static props* via `Content/*/Config/*.Package.json`. 
 not touch any bench2drive feature.
 
 ### 2. Animals need a separate CARLA 0.9.15 install
+
+
 
 #### 2a. Download the Fail2Drive simulator
 
@@ -409,6 +413,8 @@ Check:
 .venv-carla-0915/bin/python -c \
   "import carla, srunner, fail2drive; print(carla.__file__, fail2drive.__file__)"
 ```
+
+
 
 #### 2c. Run
 
