@@ -93,6 +93,7 @@ from coaches.critic_feedback import (
 )
 from impls.coaches.online_vlm_coach import OnlineVLMSession
 from impls.coaches.cast_relabel import OnlineCastRelabelSession
+from impls.coaches.yay_robot import OnlineYayRobotSession
 
 _IMPLS_ROOT = Path(__file__).resolve().parent
 if str(_IMPLS_ROOT) not in sys.path:
@@ -2628,6 +2629,30 @@ def run_online_carla(
             )
         capture_rollout_video = True
 
+    # YAY-Robot is a foresight corrector: corrections condition the next LL query and become
+    # online HL supervision. It is mutually exclusive with CAST because both own one dataset dir.
+    _yay_robot: OnlineYayRobotSession | None = None
+    yay_cfg = agent_config.get("yay_robot")
+    if yay_cfg is not None and bool(yay_cfg.get("enabled", False)):
+        if _cast_relabel is not None:
+            raise ValueError("cast_relabel and yay_robot are alternative HL-data producers; enable only one.")
+        if FLAGS.eval_mode:
+            _cfg_model = str(yay_cfg.get("gemini_model", "") or "")
+            if _cfg_model != EVAL_MODE_GEMINI_MODEL:
+                print(f"[main_carla] --eval-mode: forcing yay_robot.gemini_model {_cfg_model} -> {EVAL_MODE_GEMINI_MODEL}", flush=True)
+                yay_cfg["gemini_model"] = EVAL_MODE_GEMINI_MODEL
+        _yay_robot = OnlineYayRobotSession(
+            yay_cfg, save_dir=FLAGS.save_dir,
+            action_chunk_steps=int(agent_config.get("action_horizon", 10)), run_tag=exp_name,
+        )
+        if steervla_actor is None:
+            raise ValueError("yay_robot requires a SteerVLA actor.")
+        steervla_actor.cot_intervention_fn = _yay_robot.cot_intervention
+        if getattr(steervla_actor, "load_trainable_params", False):
+            steervla_actor.hl_dataset_dir = _yay_robot.hl_dataset_dir
+        print(f"[main_carla] YAY-Robot enabled: every {_yay_robot.query_every_n_cot_queries} CoT queries; HL data={_yay_robot.hl_dataset_dir}", flush=True)
+        capture_rollout_video = True
+
     # Pooled CAST run: this process is one of N rollout workers feeding a shared sample pool that a
     # separate trainer consumes (impls/train_hl_pooled.py). The worker takes no gradient steps -- it
     # only produces relabeled samples and hot-reloads whatever policy version the trainer publishes.
@@ -2845,6 +2870,13 @@ def run_online_carla(
             route_id=str(FLAGS.route or "?"),
         )
 
+    if _yay_robot is not None:
+        _yay_robot.begin_episode(
+            episode_count=max(1, episode_count),
+            route_name=str(obs_raw.get("routing_command", "?") if isinstance(obs_raw, dict) else "?"),
+            route_id=str(FLAGS.route or "?"),
+        )
+
     # Video annotation for this loop (routing-commands / cast_relabel): candidates panel,
     # waypoint overlay, text panel and the violation banners. These nested helpers shadow the
     # module-level _viz_image_from_raw / _annotate_text_panel / _annotate_full_frame pipeline
@@ -3050,6 +3082,9 @@ def run_online_carla(
                 f"Reasoning: {reasoning}",
                 f"Subtask: {subtask}",
             ]
+            if isinstance(raw, dict) and raw.get("yay_intervention"):
+                original = _clean_overlay_text(str(raw.get("yay_original_subtask", "")))
+                lines.append(f"YAY correction: {original or '?'} -> {subtask}")
             if base_action is not None or composed_action is not None:
                 res_np = (np.asarray(composed_action) - np.asarray(base_action)) if (base_action is not None and composed_action is not None) else None
                 lines.append(
@@ -4178,6 +4213,8 @@ def run_online_carla(
             obs = _extract_agent_obs(env, obs_raw, obs_mode, **_extract_obs_kwargs)
         if steervla_actor is not None and steervla_actor.debug_noise:
             steervla_actor.debug_noise_episode_step = episode_steps + 1
+        if _yay_robot is not None:
+            _yay_robot.set_step(episode_step=episode_steps + 1, global_step=step)
         # Figure capture: record every env step's action + Q-value for the whole trajectory.
         # Saved to disk at episode end (or run end). The figure script picks the
         # interesting window post-hoc rather than guessing it upfront.
@@ -4584,8 +4621,10 @@ def run_online_carla(
             should_sample_periodic = episode_steps % episode_video_every == 0
             had_collision_this_step = collision_delta > 0
             had_violation_this_step = traffic_violation_delta > 0
+            had_yay_intervention = bool(cot_obs_raw.get("yay_intervention", False))
             step_in_video = (
                 should_sample_periodic or had_collision_this_step or had_violation_this_step
+                or had_yay_intervention
             )
             if step_in_video:
                 step_video_frame_index = episode_video_frame_index
@@ -4744,6 +4783,20 @@ def run_online_carla(
             if getattr(_cast_relabel, "async_review", False):
                 _cast_relabel.drain_wandb()
 
+        if _yay_robot is not None:
+            _yay_robot.record_model_input(
+                episode_step=episode_steps,
+                image=cot_obs_raw.get(str((agent_config.get("steervla") or {}).get("image_key", "image"))),
+                state=cot_obs_raw.get("state"),
+                current_speed=float(_ego_speed_mps_from_raw(cot_obs_raw)),
+                prompt=_format_text_field(cot_obs_raw, "openpi_prompt_raw_text") or _format_text_field(cot_obs_raw, "openpi_prompt_text"),
+                subtask=_format_text_field(cot_obs_raw, "subtask_text") or _format_text_field(cot_obs_raw, "subtask"),
+                reasoning=_format_text_field(cot_obs_raw, "reasoning_text") or _format_text_field(cot_obs_raw, "reasoning"),
+                action_chunk=replay_action,
+                routing_command=_format_text_field(cot_obs_raw, "routing_command"),
+                global_step=step,
+            )
+
         # Pooled run: pick up a newly published policy version mid-episode (see CastPoolWatcher).
         if _cast_pool_watcher is not None and _cast_pool_watcher.maybe_reload(env, step):
             wandb.log(
@@ -4780,6 +4833,8 @@ def run_online_carla(
 
         step_wb: dict[str, Any] = {f"rollout/{k}": v for k, v in drive_metrics.items()}
         step_wb.update(_reward_breakdown_log(info))
+        if _yay_robot is not None:
+            step_wb.update(_yay_robot.wandb_metrics())
         if _bon_q_fn is not None or _bon_online or _gemini_selector is not None:
             step_wb["bon/q_best"] = _bon_last_q_best[0]
             step_wb["bon/q_mean"] = _bon_last_q_mean[0]
@@ -5039,6 +5094,19 @@ def run_online_carla(
                         f"[main_carla] episode strategy summary failed (non-fatal): {_exc}",
                         flush=True,
                     )
+            if _yay_robot is not None:
+                _ep_video = Path(FLAGS.save_dir) / "videos" / f"ep{episode_count:04d}.mp4"
+                _yay_robot.end_episode(
+                    driving_score=_ep_ds, route_completion=done_info.get("route_progress_pct"),
+                    video_path=_ep_video if _ep_video.is_file() else None,
+                    route_goal=describe_route_goal(str(FLAGS.route or "")), global_step=step,
+                )
+                _yay_robot.finalize_episode(metadata={
+                    "termination_reason": done_info.get("termination_reason"),
+                    "success": done_info.get("success"),
+                    "route_completed": float(done_info.get("route_progress_pct", 0.0) or 0.0) >= 99.5,
+                })
+
             # GRADIENT steps, not update_hl bodies. steervla.py keeps both and they are not the
             # same number: _hl_updates_applied counts one per update_hl call that reached the
             # gradient loop, while _hl_grad_steps is the sum of hl_update_num_steps -- "the real
@@ -5234,6 +5302,10 @@ def run_online_carla(
                     # eval episodes would keep paying for Gemini window reviews whose HL samples
                     # nothing will ever train on.
                     _cast_relabel = None
+                    if _yay_robot is not None:
+                        steervla_actor.cot_intervention_fn = None
+                        _yay_robot.close()
+                        _yay_robot = None
                     _set_eval_stuck_cutoff(True)
                     print(
                         f"[main_carla] STOP TRAINING ({stop_reason}); running "
@@ -5326,6 +5398,12 @@ def run_online_carla(
                     route_name=done_route,
                     # ``done_route`` is the env's own scenario name (info["route"]); fall back to
                     # the launched route if the leaderboard did not report one.
+                    route_id=str(done_route if done_route != "?" else (FLAGS.route or "?")),
+                )
+            if _yay_robot is not None:
+                _yay_robot.reset_episode()
+                _yay_robot.begin_episode(
+                    episode_count=episode_count, route_name=done_route,
                     route_id=str(done_route if done_route != "?" else (FLAGS.route or "?")),
                 )
             _sync_steervla_debug_noise_context(done_route)
@@ -5425,6 +5503,10 @@ def run_online_carla(
                 _periodic_saved_gates = None
                 rl_updates_on = bc_updates_on = hl_updates_on = any_updates_on = False
                 _cast_relabel = None
+                if _yay_robot is not None:
+                    steervla_actor.cot_intervention_fn = None
+                    _yay_robot.close()
+                    _yay_robot = None
                 print(
                     f"[main_carla] training budget reached at train step {train_step}: updates frozen; "
                     f"{FLAGS.post_stop_eval_episodes} eval episodes run when this episode ends.",
@@ -5488,6 +5570,8 @@ def run_online_carla(
         )
 
     train_logger.close()
+    if _yay_robot is not None:
+        _yay_robot.close()
 
     # Final export of the fine-tuned backbone at exit -- but ONLY if a stop condition did not
     # already export it. When --eval-mode stops training at, say, step 3884, the weights are
@@ -5570,7 +5654,7 @@ def run_online_residual(
     updates_per_step = int(config["updates_per_step"])
     capacity = int(config["buffer_capacity"])
     debug_task = bool(config.get("debug_task", False))
-    enable_updates = bool(FLAGS.enable_updates) if FLAGS.enable_updates is not None else bool(config["enable_updates"])
+    enable_updates = False if FLAGS.eval_only else (bool(FLAGS.enable_updates) if FLAGS.enable_updates is not None else bool(config["enable_updates"]))
     if base_only:
         print("[main_carla] base_only=True: rolling out the frozen base policy (no RL).", flush=True)
     elif not enable_updates:
@@ -5615,6 +5699,50 @@ def run_online_residual(
     video_fps = float(config.get("episode_video_fps", 10.0))
     video_every = max(1, int(config.get("episode_video_every", 2)))
     episode_frames: list[np.ndarray] = []
+
+    # Optional simultaneous CAST path. This deliberately lives in the standalone
+    # SAC-residual loop: CAST trains only SteerVLA, while SAC keeps its independent
+    # replay/update schedule and remains active after CAST freezes.
+    cast_cfg = config.get("cast_relabel")
+    cast_relabel: OnlineCastRelabelSession | None = None
+    cast_score_streak = 0
+    cast_target_after_score: int | None = None
+    cast_ckpt_every = int((config.get("steervla") or {}).get("hl_checkpoint_every_steps", 0))
+    cast_ckpt_dir = str((config.get("steervla") or {}).get("hl_checkpoint_dir", "") or "")
+    cast_ckpt_keep = int((config.get("steervla") or {}).get("hl_checkpoint_keep_last", 0))
+
+    def _save_cast_checkpoint(step_tag: int, *, final: bool = False) -> None:
+        if (
+            cast_relabel is None
+            or steervla_actor is None
+            or not getattr(steervla_actor, "load_trainable_params", False)
+            or cast_ckpt_every <= 0
+            or (not final and step_tag % cast_ckpt_every != 0)
+        ):
+            return
+        steervla_actor.save_checkpoint(
+            cast_ckpt_dir or os.path.join(FLAGS.save_dir, "checkpoints"),
+            int(step_tag), keep_last=cast_ckpt_keep,
+        )
+
+    if cast_cfg is not None and bool(cast_cfg.get("enabled", False)):
+        cast_relabel = OnlineCastRelabelSession(
+            cast_cfg, save_dir=FLAGS.save_dir,
+            action_chunk_steps=int(config["steervla"]["action_horizon"]),
+            run_tag=str(FLAGS.exp_name or "residual-cast"),
+        )
+        if not getattr(steervla_actor, "load_trainable_params", False):
+            raise ValueError("simultaneous CAST requires steervla.load_trainable_params=True")
+        steervla_actor.hl_dataset_dir = cast_relabel.hl_dataset_dir
+        cast_relabel.begin_episode(
+            episode_count=max(1, episode_count_start + 1),
+            route_name=str(obs.get("routing_command", "?")),
+            route_id=str(FLAGS.route or "?"),
+        )
+        print(
+            f"[main_carla] simultaneous CAST enabled; HL dataset={cast_relabel.hl_dataset_dir}",
+            flush=True,
+        )
 
     live_viewer: LivePolicyViewer | None = None
     if FLAGS.live_policy_view:
@@ -5852,6 +5980,9 @@ def run_online_residual(
                 winner_x = None if x_cands is None else x_cands[0]
             # Winner's raw VLA chunk drives the waypoint overlay in accel_steer mode.
             base_chunk = base_chunks[winner_idx % n_cand]
+            # _compute_base(next_obs, ...) replaces raw_holder["obs"], so retain the
+            # actual pre-action model input for the CAST sample before taking the next step.
+            cast_input_obs = raw_holder.get("obs", obs)
 
             t_step_start = time.time()
             next_obs, reward, terminated, truncated, info = env.step(final)
@@ -5925,7 +6056,7 @@ def run_online_residual(
                     "ep_step": episode_steps,
                     "ep_return": episode_return,
                 }
-            _maybe_capture_frame(
+            captured_frame = _maybe_capture_frame(
                 episode_frames, next_obs, debug_step_reward if debug_task else reward,
                 episode_steps=episode_steps, done=done,
                 log_video=log_video, video_every=video_every,
@@ -5939,6 +6070,45 @@ def run_online_residual(
             )
             if live_viewer is not None and episode_frames:
                 live_viewer.publish_frames(episode_frames, step)
+
+            if cast_relabel is not None and not eval_phase:
+                cast_raw = cast_input_obs
+                subtask = _format_text_field(cast_raw, "subtask_text") or _format_text_field(cast_raw, "subtask")
+                reasoning = _format_text_field(cast_raw, "reasoning_text") or _format_text_field(cast_raw, "reasoning")
+                prompt = _format_text_field(cast_raw, "openpi_prompt_raw_text") or _format_text_field(cast_raw, "openpi_prompt_text")
+                if captured_frame is not None:
+                    cast_relabel.record_frame(
+                        _viz_image_from_raw(next_obs) if getattr(cast_relabel, "raw_video", True) else captured_frame,
+                        annotated=captured_frame, subtask_text=subtask, episode_step=episode_steps,
+                    )
+                cast_relabel.record_trajectory_step({
+                    "step": int(step), "episode_step": int(episode_steps),
+                    "ego_speed_mps": float(_ego_speed_mps(next_obs)),
+                    "collision": bool(collision_delta), "collision_delta": float(collision_delta),
+                    "outside_route_delta": float(info.get("outside_route_delta", 0.0)),
+                    "route_deviation_delta": float(info.get("route_deviation_delta", 0.0)),
+                    "crash_stuck_ticks": int(info.get("crash_stuck_ticks", 0)),
+                    "termination_reason": info.get("termination_reason"),
+                    "route_progress_pct": float(info.get("route_progress_pct", 0.0)),
+                    "route_distance_m": float(info.get("route_distance_m", 0.0)),
+                    "route_total_distance_m": float(info.get("route_total_distance_m", 0.0)),
+                    "routing_command": str(cast_raw.get("routing_command", "")),
+                    "reward_total": float(reward), "in_video": captured_frame is not None,
+                })
+                cast_relabel.record_model_input(
+                    episode_step=episode_steps, image=cast_raw.get("image"), state=cast_raw.get("state"),
+                    current_speed=float(_ego_speed_mps(cast_raw)), prompt=prompt, subtask=subtask,
+                    reasoning=reasoning, action_chunk=base_chunk,
+                    routing_command=str(cast_raw.get("routing_command", "")), global_step=step,
+                )
+                if cast_relabel.should_query(episode_steps):
+                    cast_relabel.maybe_query(episode_step=episode_steps, done_info=info, global_step=step)
+                if getattr(cast_relabel, "async_review", False):
+                    cast_relabel.drain_wandb()
+                cast_info = steervla_actor.update_hl(global_step=step)
+                if cast_info:
+                    wandb.log({f"cast/{k}": float(v) for k, v in cast_info.items()}, step=step)
+                _save_cast_checkpoint(step)
 
             train_info: dict[str, Any] = {}
             # Hold updates until warmup ends: at scale=0 the residual can't affect the executed
@@ -6056,6 +6226,37 @@ def run_online_residual(
                 )
                 episode_count += 1
                 _ep_ds = float(info.get("driving_score", 0.0) or 0.0)
+                if cast_relabel is not None and not eval_phase:
+                    if getattr(cast_relabel, "async_review", False):
+                        cast_relabel.wait_for_reviews()
+                    cast_relabel.maybe_query(
+                        episode_step=episode_steps, done_info=info, force=True, global_step=step,
+                    )
+                    cast_info = steervla_actor.update_hl(global_step=step)
+                    if cast_info:
+                        wandb.log({f"cast/{k}": float(v) for k, v in cast_info.items()}, step=step)
+                    try:
+                        cast_relabel.end_episode(
+                            driving_score=_ep_ds,
+                            route_completion=info.get("route_progress_pct"),
+                            route_goal=describe_route_goal(str(FLAGS.route or "")), global_step=step,
+                        )
+                    except Exception as exc:  # Episode is already complete; memory is best-effort.
+                        print(f"[main_carla] CAST strategy summary failed (non-fatal): {exc}", flush=True)
+                    cast_updates = int(getattr(steervla_actor, "_hl_grad_steps", 0) or 0)
+                    if FLAGS.stop_on_driving_score > 0:
+                        cast_score_streak = cast_score_streak + 1 if _ep_ds >= FLAGS.stop_on_driving_score else 0
+                    if cast_target_after_score is None and cast_score_streak >= max(1, int(FLAGS.stop_on_driving_score_streak)):
+                        cast_target_after_score = cast_updates + max(0, int(FLAGS.updates_after_driving_score))
+                    cast_stop = (
+                        (cast_target_after_score is not None and cast_updates >= cast_target_after_score)
+                        or (FLAGS.max_hl_updates > 0 and cast_updates >= FLAGS.max_hl_updates)
+                    )
+                    if cast_stop:
+                        _save_cast_checkpoint(step, final=True)
+                        cast_relabel = None
+                        wandb.log({"cast/frozen_at_env_step": float(step), "cast/frozen_at_hl_grad_steps": float(cast_updates)}, step=step)
+                        print("[main_carla] CAST frozen; continuing standalone SAC-residual.", flush=True)
                 if eval_phase:
                     # Frozen eval on the weights training produced: collect, then report and exit.
                     eval_scores.append(_ep_ds)
@@ -6172,6 +6373,13 @@ def run_online_residual(
                     _reset_seed = run_carla_seed() + episode_count
                 obs, _info = env.reset(seed=_reset_seed)
                 steervla_actor.reset_action_cache()
+                if cast_relabel is not None and not eval_phase:
+                    cast_relabel.reset_episode()
+                    cast_relabel.begin_episode(
+                        episode_count=episode_count + 1,
+                        route_name=str(obs.get("routing_command", "?")),
+                        route_id=str(FLAGS.route or "?"),
+                    )
                 rng, nk = jax.random.split(rng)
                 base_cands, x_cands, base_chunks, cands = _compute_base(
                     obs, use_otf and step + 1 > warmup, nk
@@ -6182,6 +6390,8 @@ def run_online_residual(
                     next_base_cands, next_x_cands, next_base_chunks, next_cands,
                 )
     finally:
+        if cast_relabel is not None:
+            _save_cast_checkpoint(last_step or FLAGS.online_steps, final=True)
         train_logger.close()
         # Training already exported its final weights when the stop fired; the eval episodes that
         # followed changed nothing, so a second export here would only add a checkpoint at a
@@ -6329,6 +6539,7 @@ def _run_residual_entry(config):
             vla_sample_fn, steervla_actor = create_steervla_pi0_cot_sample_fn(
                 steervla_cfg, raw_holder, training_gpu_rank=training_gpu_rank
             )
+        steervla_actor.sampling_seed = int(run_train_seed())
 
         _configure_jax_training_device(training_gpu_rank)
 
@@ -6861,8 +7072,12 @@ def _run_dsrl_entry(config):
     _exp_name_parts.extend(
         [_coach_tag(), _updates_tag(), _slug(_route_name), get_exp_name(FLAGS.seed)]
     )
-    exp_name = "_".join(_exp_name_parts)
-    setup_wandb(project="OGBench-CARLA", group=FLAGS.run_group, name=exp_name, mode=wandb_mode)
+    exp_name = FLAGS.exp_name or "_".join(_exp_name_parts)
+    wandb_id = re.sub(r"[^A-Za-z0-9_-]+", "-", exp_name).strip("-")[:128] or None
+    setup_wandb(
+        project="OGBench-CARLA", group=FLAGS.run_group, name=exp_name, mode=wandb_mode,
+        id=wandb_id, resume=("allow" if FLAGS.resume else None),
+    )
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
     with open(os.path.join(FLAGS.save_dir, "flags.json"), "w") as f:

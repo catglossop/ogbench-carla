@@ -1519,19 +1519,30 @@ def _install_carla_physics_guard() -> None:
     """
     if getattr(carla.Actor, "_physics_guard_installed", False):
         return
-    _orig_set_simulate_physics = carla.Actor.set_simulate_physics
-
     def guarded_set_simulate_physics(self, enabled=True):
         try:
-            if hasattr(self, "is_alive") and not self.is_alive:
+            client = CarlaDataProvider.get_client()
+            if client is None:
                 return
-        except Exception:
+            response = client.apply_batch([
+                carla.command.SetSimulatePhysics(self.id, bool(enabled))
+            ])[0]
+            if response.error:
+                print(
+                    f"[carla physics guard] skipped missing actor {self.id}: {response.error}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                f"[carla physics guard] skipped physics change for actor "
+                f"{getattr(self, 'id', '?')}: {exc}",
+                flush=True,
+            )
             return
-        return _orig_set_simulate_physics(self, enabled)
 
     carla.Actor.set_simulate_physics = guarded_set_simulate_physics
     carla.Actor._physics_guard_installed = True
-    print("[carla physics guard] installed set_simulate_physics liveness guard", flush=True)
+    print("[carla physics guard] installed batch set_simulate_physics guard", flush=True)
 
 
 class CarlaBench2DriveWrapper(gymnasium.Env):

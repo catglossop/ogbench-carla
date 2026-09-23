@@ -27,7 +27,7 @@ ACTIONS_PER_MODEL_QUERY = 3
 def apply_simlingo_steervla(s):
     """Point a ``config.steervla`` block at the SimLingo HL -> LL policy (shared with the residual config)."""
     s.vla = "simlingo_steervla"
-    s.simlingo_source_root = "/home/cglossop/simlingo-steervla"
+    s.simlingo_source_root = "/raid/users/surya/simlingo-steervla"
     s.hl_checkpoint = f"{_CKPT_ROOT}/2026_05_24_06_52_33_simlingo_seed1_bellman/checkpoints/epoch=019.ckpt"
     s.ll_checkpoint = f"{_CKPT_ROOT}/2026_05_23_21_39_41_simlingo_ll_vla_meta_conditioned/checkpoints/epoch=029.ckpt"
     # main_carla's generic "is a VLA configured" gate; OpenPI-only keys are unused by this actor.

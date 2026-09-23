@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Restartable B2D + F2D residual-RL evaluation queue.
-# Each route trains for 10k steps, then --eval-mode freezes the final policy
+# Restartable B2D + F2D YAY-Robot evaluation queue.
+# Each route trains the SimLingo HL planner for 10k steps, then --eval-mode freezes it
 # and rolls it out for three model seeds in the same CARLA process.
 set -euo pipefail
 
@@ -8,9 +8,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
 PHYSICAL_GPU="${1:-${EVAL_GPU:-0}}"
-RUN_ROOT="${2:-${EVAL_ROOT:-/raid/users/${USER}/carla_exps/evals/residual_rl}}"
-EVAL_LABEL="${EVAL_LABEL:-simlingo-steervla-residual-rl-b2d-f2d-failed-rerun-v1-20260921}"
-RUN_GROUP="${EVAL_RUN_GROUP:-SimLingoSteerVLAResidualRLB2DF2DFailedRerunV1}"
+HL_PHYSICAL_GPU="${EVAL_HL_GPU:-7}"
+RUN_ROOT="${2:-${EVAL_ROOT:-/raid/users/${USER}/carla_exps/evals/yay_robot}}"
+EVAL_LABEL="${EVAL_LABEL:-simlingo-steervla-yay-robot-b2d-f2d-remaining-v2-20260921}"
+RUN_GROUP="${EVAL_RUN_GROUP:-SimLingoSteerVLAYayRobotB2DF2DRemainingV2}"
 # A retry gets a fresh W&B name; completed routes still skip via their .done markers.
 # Supply EVAL_RUN_NONCE=<number> only to deliberately reuse names.
 if [[ -n "${EVAL_RUN_NONCE:-}" ]]; then
@@ -22,21 +23,53 @@ fi
 SEEDS="${SEEDS:-0 1 2}"
 MAX_RETRIES="${MAX_RETRIES:-50}"
 WANDB_MODE="${WANDB_MODE:-online}"
-SAVE_BUFFER="${SAVE_BUFFER:-true}"
+SAVE_BUFFER="${SAVE_BUFFER:-false}"
 SAVE_VIDEO_LOCAL="${SAVE_VIDEO_LOCAL:-true}"
 SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
 CONTINUE_ON_FAILURE="${CONTINUE_ON_FAILURE:-true}"
 DRY_RUN="${DRY_RUN:-0}"
+if [[ -z "${GEMINI_API_KEY:-}" ]]; then
+  echo "[yay_robot_eval] GEMINI_API_KEY must be exported; refusing to launch an uncorrected baseline." >&2
+  exit 1
+fi
 
-# Dedicated to this failed-route rerun; avoids the 14000 residual-eval and YAY ranges.
-CARLA_PORT="${EVAL_CARLA_PORT:-$((16000 + PHYSICAL_GPU * 20))}"
+if [[ "$PHYSICAL_GPU" == "$HL_PHYSICAL_GPU" ]]; then
+  echo "[yay_robot_eval] EVAL_HL_GPU must differ from the policy/CARLA GPU." >&2
+  exit 2
+fi
+
+# Validate the actual loaded HL model and one replay batch before allocating CARLA.
+if [[ "${EVAL_PREFLIGHT:-1}" == "1" ]]; then
+  echo "[yay_robot_eval] running SimLingo HL preflight (policy CUDA:0, HL CUDA:1)..."
+  env CUDA_VISIBLE_DEVICES="$PHYSICAL_GPU,$HL_PHYSICAL_GPU" PYTHONPATH="$ROOT_DIR/impls${PYTHONPATH:+:$PYTHONPATH}" \
+    .venv/bin/python impls/preflight_simlingo_yay_robot.py \
+      --agent-config impls/configs/simlingo_steervla_yay_robot_train_config.py --train-gpu 0 --hl-gpu 1
+fi
+
+# Dedicated to YAY Robot, avoiding both residual-evaluation port ranges.
+CARLA_PORT="${EVAL_CARLA_PORT:-$((18000 + PHYSICAL_GPU * 20))}"
 CARLA_STREAMING_PORT="${EVAL_CARLA_STREAMING_PORT:-$((CARLA_PORT + 1))}"
 TM_PORT="${EVAL_TM_PORT:-$((CARLA_PORT + 6000))}"
-X_DISPLAY_NUM="${EVAL_X_DISPLAY_NUM:-$((800 + PHYSICAL_GPU))}"
+X_DISPLAY_NUM="${EVAL_X_DISPLAY_NUM:-$((700 + PHYSICAL_GPU))}"
 
 ROUTES=(
+  signalized-junction-left-turn-001
   t_-junction-002
+  vehicle-turning-route-pedestrian-003
+  highway-exit-002
+  accident-two-ways-002
+  interurban-actor-flow-004
+  generalization-construction-permutations-1019
+  generalization-custom-obstacles-1020
+  generalization-pedestrians-on-road-1085
+  generalization-construction-pedestrian-1011
+  generalization-pedestrian-crowd-1069
+  generalization-custom-obstacles-1024
+  generalization-fully-blocked-1032
+  generalization-hard-brake-1036
+  generalization-pedestrian-other-blocker-1072
   generalization-right-construction-1094
+  generalization-right-of-way-1056
   generalization-image-on-object-1041
   generalization-obscured-stop-1046
   generalization-bad-parking-1004
@@ -60,6 +93,7 @@ eval_label=$EVAL_LABEL
 run_group=$RUN_GROUP
 run_nonce=$RUN_NONCE
 physical_gpu=$PHYSICAL_GPU
+hl_physical_gpu=$HL_PHYSICAL_GPU
 carla_port=$CARLA_PORT
 carla_streaming_port=$CARLA_STREAMING_PORT
 tm_port=$TM_PORT
@@ -68,18 +102,14 @@ seeds=${SEED_LIST[*]}
 routes=${ROUTES[*]}
 online_steps=10000
 max_episode_steps=4000
-agent_config=impls/configs/simlingo_steervla_residual_config.py
+agent_config=impls/configs/simlingo_steervla_yay_robot_train_config.py
 hl_checkpoint=/raid/users/celine/steervla-ckpts/2026_05_24_06_52_33_simlingo_seed1_bellman/checkpoints/epoch=019.ckpt
 ll_checkpoint=/raid/users/celine/steervla-ckpts/2026_05_23_21_39_41_simlingo_ll_vla_meta_conditioned/checkpoints/epoch=029.ckpt
-state_encoder=siglip_pool
-residual_accel_scale=0.1
-residual_steer_scale=0.1
-residual_bc_beta=1.0
-residual_warmup_steps=1000
-residual_ramp_steps=1500
-actions_per_model_query=3
-actions_per_cot=5
-proprio_norm=false
+yay_correction_period_env_steps=24
+yay_correction_every_cot_queries=4
+hl_update_schedule=10_gradient_steps_per_200_env_steps
+hl_replay_mix=0.5_offline_simlingo_hl_simplified__0.5_online_yay
+
 SPEC
 
 WATCHDOG_GRACE="${EVAL_WATCHDOG_GRACE:-600}"
@@ -129,7 +159,7 @@ for seed in "${SEED_LIST[@]}"; do
     done_file="$RUN_ROOT/status/$EVAL_LABEL/${tag}.done"
     failure_file="$RUN_ROOT/status/$EVAL_LABEL/${tag}.failed"
     log_file="$RUN_ROOT/logs/$EVAL_LABEL/${tag}.log"
-    exp_name="simlingo-steervla-residual-rl-rerun_${RUN_NONCE}_sd-${seed}_${route}"
+    exp_name="simlingo-steervla-yay-robot-remaining_${RUN_NONCE}_sd-${seed}_${route}"
     if [[ "$SKIP_COMPLETED" == "1" && -f "$done_file" ]]; then
       echo "[$index/$total] SKIP completed: $tag"
       continue
@@ -143,9 +173,9 @@ for seed in "${SEED_LIST[@]}"; do
     mkdir -p "$run_dir"
     set +e
     eval_seeds="$((seed + 1001)),$((seed + 1002)),$((seed + 1003))"
-    run_with_watchdog "$log_file" "$failure_file" env CUDA_VISIBLE_DEVICES="$PHYSICAL_GPU" OGBENCH_SAVE_DIR="$run_dir" \
+    run_with_watchdog "$log_file" "$failure_file" env CUDA_VISIBLE_DEVICES="$PHYSICAL_GPU,$HL_PHYSICAL_GPU" OGBENCH_SAVE_DIR="$run_dir" \
       ./run_carla.sh \
-        --agent-config impls/configs/simlingo_steervla_residual_config.py \
+        --agent-config impls/configs/simlingo_steervla_yay_robot_train_config.py \
         --route "$route" \
         --carla-seed "$seed" \
         --train-seed "$seed" \
@@ -155,6 +185,9 @@ for seed in "${SEED_LIST[@]}"; do
         --online-steps 10000 \
         --max-episode-steps 4000 \
         --train-gpu 0 \
+        --hl-gpu 1 \
+        --train-mode rl \
+        --critic-mode none \
         --render-adapter "$PHYSICAL_GPU" \
         --carla-port "$CARLA_PORT" \
         --carla-streaming-port "$CARLA_STREAMING_PORT" \
