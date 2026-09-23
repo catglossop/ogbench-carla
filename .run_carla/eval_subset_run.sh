@@ -57,6 +57,19 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 # silently lands the run under the netrc account. "catherineglossop" has no underscore.
 export WANDB_API_KEY="$(cat /home/cglossop/.wandb_school_key)"
 export WANDB_ENTITY=catherineglossop
+# Fail2Drive animal walkers only exist in the Fail2Drive CARLA 0.9.15 build, so with
+# F2D_CARLA_0915_ROOT set those routes -- and only those -- run on it (run_carla.sh does the switch
+# via CARLA_0915_ROOT); every other route stays on CARLA_ROOT (0.9.16 + content pack), as the
+# earlier f2d results did. Unset -> no per-route switching at all.
+if [[ -n "${F2D_CARLA_0915_ROOT:-}" ]]; then
+  if [[ "$ROUTE" == generalization-animals-* ]]; then
+    export CARLA_0915_ROOT="$F2D_CARLA_0915_ROOT"
+    [[ -n "${F2D_CARLA_0915_PYTHON:-}" ]] && export CARLA_0915_PYTHON="$F2D_CARLA_0915_PYTHON"
+    echo "[eval_run] $ROUTE: CARLA 0.9.15 (CARLA_0915_ROOT=$CARLA_0915_ROOT)"
+  else
+    unset CARLA_0915_ROOT CARLA_0915_PYTHON
+  fi
+fi
 : "${GEMINI_API_KEY:?GEMINI_API_KEY must be exported -- CAST relabel is a Gemini client}"
 
 for p in "$CARLA_PORT" $((CARLA_PORT + 1)) "$TM_PORT"; do
