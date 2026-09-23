@@ -100,8 +100,18 @@ echo "[eval_run] rpc=$CARLA_PORT tm=$TM_PORT display=:$DISPLAY_NUM group=$RUN_GR
 
 # CUDA_VISIBLE_DEVICES masks to one physical card; --train-gpu/--hl-gpu index INTO that mask
 # (always 0) while --render-adapter stays physical (CARLA gets a scrubbed env).
-CUDA_VISIBLE_DEVICES="$GPU" exec bash run_carla.sh \
-  --route "$ROUTE" --train-gpu 0 --hl-gpu 0 --render-adapter "$GPU" \
+RUN_ENV=(env "CUDA_VISIBLE_DEVICES=$GPU")
+GPU_FLAGS=(--train-gpu 0 --hl-gpu 0)
+if [ -n "${HL_GPU:-}" ]; then
+  # Two-GPU run (the mixed InternVL2-HL + pi05-LL stack): the HL is a separate torch process on its
+  # own card, which a one-GPU mask would hide. Keep every GPU visible instead, so --train-gpu and
+  # --hl-gpu are physical indices -- the convention the mixed Best-of-N runner uses too.
+  echo "[eval_run] two-GPU split: policy/sim gpu=$GPU, HL gpu=$HL_GPU"
+  RUN_ENV=(env -u CUDA_VISIBLE_DEVICES)
+  GPU_FLAGS=(--train-gpu "$GPU" --hl-gpu "$HL_GPU")
+fi
+exec "${RUN_ENV[@]}" bash run_carla.sh \
+  --route "$ROUTE" "${GPU_FLAGS[@]}" --render-adapter "$GPU" \
   --carla-port "$CARLA_PORT" --carla-streaming-port $((CARLA_PORT + 1)) \
   --tm-port "$TM_PORT" --x-display-num "$DISPLAY_NUM" \
   --agent-config "$AGENT_CFG" \

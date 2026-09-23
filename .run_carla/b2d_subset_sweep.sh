@@ -23,6 +23,10 @@ export CARLA_PORT_BASE="${CARLA_PORT_BASE:-16400}" TM_PORT_BASE="${TM_PORT_BASE:
 
 SEED="${SEED:-0}"
 GPUS=(${SWEEP_GPUS:-5 6})
+# Optional second card per worker, for stacks whose high level is its own process (the mixed
+# InternVL2 HL + pi05 LL runs). Entry i pairs with SWEEP_GPUS entry i; unset keeps the one-GPU
+# layout every earlier sweep used.
+HL_GPUS=(${SWEEP_HL_GPUS:-})
 ROUTES_FILE="${ROUTES_FILE:-b2d_subset.txt}"
 AGENT_CFG="${AGENT_CFG:-impls/configs/steervla_cast_relabel_hl200x10_adaptive_config.py}"
 SWEEP="${SWEEP_NAME:-hl200x10_b2dsubset_seed${SEED}}"
@@ -137,6 +141,7 @@ next_route() { flock 9; local r; r=$(head -n1 "$QUEUE"); [ -n "$r" ] && sed -i '
 
 worker() {
   local slot=$1 gpu=$2 port=$((CARLA_PORT_BASE + $1 * 20))
+  local hl_gpu="${HL_GPUS[$slot]:-}"
   while :; do
     local route; route=$(next_route)
     [ -z "$route" ] && { log "w$slot/gpu$gpu: queue empty"; break; }
@@ -145,15 +150,21 @@ worker() {
     # previous route -- starting into either gives an immediate OOM and burns a queue entry.
     local _waited=0
     while :; do
-      local _used
+      local _used _used_hl
       _used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$gpu" 2>/dev/null | tr -d ' ')
+      # A two-GPU run needs both cards clear, not just the policy one.
+      if [ -n "$hl_gpu" ]; then
+        _used_hl=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$hl_gpu" 2>/dev/null | tr -d ' ')
+        _used=$(( ${_used:-999999} > ${_used_hl:-999999} ? ${_used:-999999} : ${_used_hl:-999999} ))
+      fi
       [ "${_used:-999999}" -lt "${GPU_FREE_MIB:-20000}" ] && break
       [ "$_waited" -eq 0 ] && log "w$slot/gpu$gpu: waiting for gpu (${_used} MiB in use) before $route"
       _waited=$((_waited + 1))
       [ "$_waited" -ge 300 ] && { log "w$slot/gpu$gpu: gpu still busy after 5h; giving up on $route"; echo "$route" >> "$DIED"; break; }
       sleep 60
     done
-    log "w$slot/gpu$gpu: START $route"
+    log "w$slot/gpu$gpu${hl_gpu:+ (hl gpu$hl_gpu)}: START $route"
+    HL_GPU="$hl_gpu" \
     SEED="$SEED" AGENT_CFG="$AGENT_CFG" RUN_GROUP="$SWEEP" OGBENCH_SAVE_DIR="$OGBENCH_SAVE_DIR" \
     UPDATES_AFTER_SCORE="$UPDATES_AFTER_SCORE" MAX_HL_UPDATES="$MAX_HL_UPDATES" \
     STOP_ON_SCORE="$STOP_ON_SCORE" STOP_SCORE_STREAK="$STOP_SCORE_STREAK" \

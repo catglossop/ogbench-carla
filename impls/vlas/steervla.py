@@ -5286,6 +5286,12 @@ def create_steervla_pi0_cot_sample_fn(
             hl_checkpoint=str(steervla_cfg["hl_checkpoint"]),
             simlingo_source_root=str(steervla_cfg["simlingo_source_root"]),
             hl_python=str(steervla_cfg["hl_python"]),
+            # Torch-side HL optimizer knobs (the InternVL2 worker owns them, not OpenPI's optax
+            # state). Same names and defaults as vlas/simlingo_steervla.py, whose recipe the
+            # worker's trainer mirrors.
+            hl_micro_batch_size=int(steervla_cfg.get("hl_micro_batch_size", 8)),
+            hl_weight_decay=float(steervla_cfg.get("hl_weight_decay", 0.1)),
+            hl_grad_clip=float(steervla_cfg.get("hl_grad_clip", 1.0)),
         )
 
     if url_clean:
