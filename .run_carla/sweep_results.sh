@@ -343,6 +343,10 @@ for pj in sorted(save.rglob("periodic_evals.jsonl")):
         except Exception:
             continue
         e["run"] = pj.parent.name
+        # Same ROUTES_FILE restriction the headline table uses: a route dropped from the subset
+        # keeps its run dir on disk but stops being reported, here as everywhere else.
+        if ALLOWED is not None and (e.get("route") or e["run"]) not in ALLOWED:
+            continue
         pe_rows.append(e)
 if pe_rows:
     by_route = {}
