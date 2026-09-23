@@ -75,7 +75,7 @@ SimLingo base via `apply_simlingo_steervla()`. Values it set for this sweep:
 | `vla` | `simlingo_steervla` |
 | `hl_checkpoint` | `/raid/users/celine/steervla-ckpts/2026_05_24_06_52_33_simlingo_seed1_bellman/checkpoints/epoch=019.ckpt` |
 | `ll_checkpoint` | `/raid/users/celine/steervla-ckpts/2026_05_23_21_39_41_simlingo_ll_vla_meta_conditioned/checkpoints/epoch=029.ckpt` |
-| `simlingo_source_root` | `/home/cglossop/simlingo-steervla` (simlingo-steervla checkout; `simlingo_training` imported from it) |
+| `simlingo_source_root` | `/home/cglossop/simlingo-steervla` at the time of the sweep. **Machine-specific and already changed on `dev`** (now `/raid/users/surya/simlingo-steervla`) — point it at your own simlingo-steervla checkout; `simlingo_training` is imported from it. |
 | `image_key` | `image_viz` (native 1024×512 front camera) |
 | `actions_per_model_query` / `actions_per_cot` | 3 / 5 (LL every 3 env steps; HL re-plans every 6) |
 | `cot_temperature` | 0.1 (from `EXTRA_ARGS`; config default is 0.0) |
@@ -122,6 +122,7 @@ Route logs: `.run_carla/jobs/<SWEEP_NAME>/<route>.log`; driver log `sweep.log`; 
 1. **SimLingo checkpoints** — the two `.ckpt` dirs in §3. DeepSpeed dirs work as-is (`converted/pytorch_model.bin`
    is used if present); a `.hydra/config.yaml` must sit above the weights.
 2. **simlingo-steervla checkout** at `simlingo_source_root`. Source only — its py3.8 env is not needed.
+   This path is edited per machine in the config, so check it before launching rather than trusting the committed value.
 3. **Python deps**: `uv sync --extra all-gpu --extra simlingo`, or reuse a prebuilt dir on `PYTHONPATH`
    (here `/raid/users/cglossop/ogbench-simlingo-deps`), which is what these runs did.
 4. **HL replay pool** `simlingo_hl_simplified` (4000 samples) under `hl_replay_root`. Rebuild with:
