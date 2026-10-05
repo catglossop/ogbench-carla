@@ -21,6 +21,7 @@ class MixedSteerVLAActor(SteerVLAActor):
         if kwargs.get('load_trainable_params') or kwargs.get('fixed_subtask_text'):
             raise ValueError('Mixed SteerVLA is an inference-only, live-HL actor.')
         self._hl_history = deque(maxlen=402)
+        self._candidate_scene_id = 0
         super().__init__(**kwargs)
         parent, child = socket.socketpair()
         self._hl_conn = Connection(parent.detach())
@@ -69,6 +70,9 @@ class MixedSteerVLAActor(SteerVLAActor):
         super().reset_action_cache()
         self._hl_history.clear()
 
+    def begin_candidate_scene(self):
+        self._candidate_scene_id += 1
+
     def _sample_cot_checked(self, rng, obs_jax):
         if obs_jax.tokenized_prompt.shape[0] != 1:
             raise ValueError('Mixed HL evaluation expects one live scene at a time.')
@@ -90,8 +94,10 @@ class MixedSteerVLAActor(SteerVLAActor):
         # every sequential BoN slot draws independently yet reproducibly.
         seed = int(jax.random.randint(rng, (), 0, np.iinfo(np.int32).max))
         self._hl_conn.send(dict(image=np.asarray(raw['image_viz'], dtype=np.uint8), prompt=prompt,
-                                temperature=float(self.cot_temperature), seed=seed))
+                                temperature=float(self.cot_temperature), seed=seed,
+                                scene_id=self._candidate_scene_id))
         result = self._receive_hl()
+        self.last_hl_vision_cache_hits = result.get('vision_cache_hits', 0)
         raw['simlingo_hl_output'] = result['output']
         raw['simlingo_hl_prompt'] = prompt
         print(f"[mixed-steervla] InternVL2 subtask: {result['subtask']}", flush=True)

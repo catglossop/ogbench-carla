@@ -66,3 +66,41 @@ For a critic trained on raw actor commentary, select `commentary` instead.
 Actor segment markers are removed without substituting one text head for the
 other. Videos are logged to W&B and saved locally; candidate images are not
 uploaded. No online critic updates or artificial brake candidate are enabled.
+
+## Opt-in description overlap and mixed-HL vision reuse
+
+With a `qwen-critic` server that advertises `prepare_scene: true` in `/health`, set
+`QWEN_OVERLAP_DESCRIPTION=1` on the CARLA client to prepare the current frame's
+scene description while the actor samples candidates. This requires frozen
+critic inference (`--qwen-online-train false`). The client preserves the JPEG
+encoding; the server binds a single-use description ticket to those exact JPEG
+bytes and the route. Expired or mismatched tickets fail explicitly. Descriptions
+are still generated fresh for every decision. Candidate overlays and all scoring
+terms remain unchanged. Separate actor/critic GPUs give the best opportunity to
+hide description latency.
+
+For the mixed InternVL2 HL + pi05 LL actor, also set `HL_REUSE_VISION=1` to reuse
+InternVL2's frozen image features within the current four-candidate decision.
+The worker compares image tensors exactly and invalidates its cache at each new
+decision. Text generation remains sequential with the original seeds and prompts.
+This does not enable HL KV caching or batched candidate sampling, and does not
+reuse features across the distinct Qwen candidate-overlay images.
+
+Both options default off. Updated client code works with existing servers when
+overlap is off; enabling overlap requires starting an updated server. Additional
+`bon/qwen_inference_*` timings include `candidate_sample_s`, `decision_sample_s`,
+`prepare_client_wait_s`, `description_s`, `overlay_s`, and `lock_wait_s`.
+
+## Gemini conservative alternative
+
+The same HTTP selector can use the one-call Gemini conservative service in
+`/home/cglossop/qwen-critic/scripts/serve_gemini_conservative_bon.sh`. It sends all
+candidate overlays together and returns self-reported event probabilities plus
+Gemini's selection. Set `QWEN_OVERLAP_DESCRIPTION=0`, retain `HL_REUSE_VISION=1`,
+and point `--qwen-bon-url` at that service (default port 18767). Keep
+`--bon-qwen-select true`, `--bon-gemini-select false`, `--qwen-online-train false`,
+and `--bon_include_brake_candidate=false` (the last flag goes after `--`).
+Use `--bon-qwen-cadence 10`; all four candidates come from the policy.
+The old `--bon-gemini-select` implementation is separate. See
+`/home/cglossop/qwen-critic/GEMINI_CONSERVATIVE.md` for setup and
+`/home/cglossop/qwen-critic/GEMINI_BENCHMARK.md` for matched-input timings.

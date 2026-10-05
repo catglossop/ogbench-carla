@@ -3686,7 +3686,18 @@ def run_online_carla(
 
     def _score_candidates_with_qwen(rng_key):
         """Sample each candidate exactly once and score it with the local Qwen service."""
+        prepared_scene = None
+        decision_started = time.perf_counter()
+        if os.environ.get("QWEN_OVERLAP_DESCRIPTION") == "1":
+            if FLAGS.qwen_online_train:
+                raise ValueError("Description overlap requires frozen Qwen inference")
+            prepared_scene = _qwen_selector.prepare_scene(
+                _as_video_frame(_viz_image_from_raw(obs_raw)), _qwen_route_id)
+        if hasattr(steervla_actor, "begin_candidate_scene"):
+            steervla_actor.begin_candidate_scene()
+        candidates_started = time.perf_counter()
         chunks_np, candidate_subtasks = _sample_diverse_candidates(rng_key, _bon_n)
+        candidate_sample_s = time.perf_counter() - candidates_started
         if FLAGS.bon_include_brake_candidate:
             chunks_np, candidate_subtasks = _append_brake_candidate(
                 chunks_np, candidate_subtasks
@@ -3705,6 +3716,12 @@ def run_online_carla(
             fallback_index=len(candidate_subtasks) - 1
             if FLAGS.bon_include_brake_candidate
             else None,
+            prepared_scene=prepared_scene,
+        )
+        result.setdefault("timings", {}).update(
+            candidate_sample_s=candidate_sample_s,
+            hl_vision_cache_hits=getattr(steervla_actor, "last_hl_vision_cache_hits", 0),
+            decision_sample_s=time.perf_counter() - decision_started,
         )
         if os.environ.get("QWEN_RECORD_PDM_PLAN") == "1":
             from ogbench.carla.expert_plan_record import save_query_comparison
@@ -3770,13 +3787,14 @@ def run_online_carla(
             )
             for score in qwen_scores
         ]
+        correctness = [round(float(score.get("correctness", 0.0)), 4) for score in qwen_scores]
         progress = [round(float(score["progress"]), 4) for score in qwen_scores]
         goal = [round(float(score["goal"]), 4) for score in qwen_scores]
         print(
             f"[QWEN-BON] step={step} routing={routing_command!r} choice={best_idx} "
             f"accepted={result['accepted']} utility={utility.round(4).tolist()} "
             f"crash={crash} offroad={offroad} traffic={traffic} "
-            f"risk_max={risk_max} progress={progress} goal={goal} "
+            f"risk_max={risk_max} progress={progress} goal={goal} correctness={correctness} "
             f"timings={result.get('timings', {})}",
             flush=True,
         )

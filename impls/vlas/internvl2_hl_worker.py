@@ -48,10 +48,21 @@ def main():
         conn.send(dict(ready=True, weights=str(hl.weights),
                        use_ego_history=bool(hl.dataset_cfg.get('use_ego_state_history', False)),
                        history_count=int(hl.dataset_cfg.get('ego_state_history_count', 3))))
+        vision_cache = None
+        scene_id = None
+        if os.environ.get('HL_REUSE_VISION') == '1':
+            from frozen_vision_cache import FrozenVisionCache
+            vision_cache = FrozenVisionCache(hl.model.vision_model.image_encoder.model)
         while True:
             request = conn.recv()
             if request is None:
                 break
+            if vision_cache is not None:
+                # A missing ID is deliberately uncacheable (legacy callers).
+                incoming_scene = request.get('scene_id')
+                if incoming_scene is None or incoming_scene != scene_id:
+                    vision_cache.clear()
+                scene_id = incoming_scene
             sampling['temperature'] = float(request.get('temperature', 0.0))
             if request.get('seed') is not None:
                 torch.manual_seed(int(request['seed']))
@@ -60,7 +71,9 @@ def main():
             reasoning, subtask = split_hl_output(output)
             if not subtask.strip():
                 raise ValueError(f'InternVL2 returned an empty subtask: {output!r}')
-            conn.send(dict(reasoning=reasoning, subtask=subtask, output=output))
+            conn.send(dict(reasoning=reasoning, subtask=subtask, output=output,
+                           vision_cache_hits=vision_cache.hits if vision_cache else 0,
+                           vision_cache_misses=vision_cache.misses if vision_cache else 0))
     except EOFError:
         pass
     except Exception:
