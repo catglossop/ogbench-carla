@@ -48,10 +48,13 @@ ACTOR_CONFIG="${ACTOR_CONFIG:-pi05_steervla_cot_simplified_reasoning_ll_heavy}"
 N_EVAL="${N_EVAL:-3}"
 N_CANDIDATES="${N_CANDIDATES:-8}"
 EVAL_SEED_OFFSET="${EVAL_SEED_OFFSET:-1001}"
-# Leaderboard-faithful episode ends: no wrapper step cap (0) -- the route ends only on the
-# leaderboard's own criteria (AgentBlockedTest 60 s, InRouteTest, completion, ...). Frozen eval
-# still stops at --online-steps even mid-episode, so that budget is a far-off safety net.
-MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-0}"
+# Episodes are capped at 4000 wrapper steps (200 s of sim time).  The leaderboard's own criteria
+# still end a route first in the normal case -- no cell of the completed b2d mixed sweep exceeded
+# 618 steps -- but AgentBlockedTest only fires after 60 s continuously below 0.1 m/s, so an ego
+# that creeps (full throttle, <0.3 m/s, twitching every few seconds) never trips it and runs to the
+# --online-steps budget instead: one such cell reached 3162 steps and was on track for ~31 h.
+# The cap ends those as a TIMEOUT with a real score.  Set MAX_EPISODE_STEPS=0 for the old behaviour.
+MAX_EPISODE_STEPS="${MAX_EPISODE_STEPS:-4000}"
 if [ "$MAX_EPISODE_STEPS" -gt 0 ]; then
   ONLINE_STEPS="${ONLINE_STEPS:-$((N_EVAL * MAX_EPISODE_STEPS + 1000))}"
 else
