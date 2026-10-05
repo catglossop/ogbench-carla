@@ -245,6 +245,13 @@ fi
 # --arm
 : "${SWEEP_GPUS:?SWEEP_GPUS must be set to arm (space-separated physical GPUs, one route each)}"
 GPUS=($SWEEP_GPUS)
+# Render GPUs per worker (RENDER_GPUS lines up with SWEEP_GPUS; unset entries render on the
+# worker's own GPU).  A card whose CUDA compute is healthy can still have a wedged Vulkan
+# device -- UE4 then hangs in world setup -- so the simulator may need a different GPU than
+# the policy.  Workers run qwen_zs_bon_run_render.sh, which is qwen_zs_bon_run.sh plus a
+# RENDER_GPU that defaults to GPU, so an unset RENDER_GPUS keeps the original command.
+RGPUS=(${RENDER_GPUS:-}); WRGPU=()
+for i in "${!GPUS[@]}"; do WRGPU[$i]="${RGPUS[$i]:-${GPUS[$i]}}"; done
 # Critics per worker: QWEN_GPUS / QWEN_PORTS line up with SWEEP_GPUS (worker i uses entry i), so one
 # worker can share its GPU with its critic while another keeps the critic on a separate card.
 # Unset entries fall back to QWEN_GPU / QWEN_PORT -- the original single shared critic.
@@ -259,7 +266,7 @@ if [ "$(ps -o pgid= $$ | tr -d ' ')" != "$$" ]; then exec setsid "$0" "$@"; fi
 echo "$$" > "${LOG_DIR}/sweep.pgid"
 mkdir -p "${LOG_DIR}/running"
 printf '%s\n' "${JOBS[@]}" | grep -v '^$' > "$QUEUE"; : > "$LOCK"
-_plan=""; for i in "${!GPUS[@]}"; do _plan+=" w$i:gpu${GPUS[$i]}->critic gpu${WQGPU[$i]}:${WQPORT[$i]}"; done
+_plan=""; for i in "${!GPUS[@]}"; do _plan+=" w$i:gpu${GPUS[$i]}/render gpu${WRGPU[$i]}->critic gpu${WQGPU[$i]}:${WQPORT[$i]}"; done
 log "armed: ${#JOBS[@]} cells;${_plan}"
 
 STARTED_PORTS=()
@@ -281,7 +288,7 @@ next_job() { flock 9; local j; j=$(head -n1 "$QUEUE"); [ -n "$j" ] && sed -i '1d
 requeue_job() { flock 9; printf '%s\n' "$1" >> "$QUEUE"; } 9>>"$LOCK"
 
 worker() {
-  local slot=$1 gpu=$2 qport=$3 qgpu=$4 port=$((17400 + $1 * 20))
+  local slot=$1 gpu=$2 qport=$3 qgpu=$4 rgpu=${5:-$2} port=$((17400 + $1 * 20))
   local qurl="http://127.0.0.1:${qport}"
   kill_slot_leftovers "$slot"
   while :; do
@@ -301,12 +308,12 @@ worker() {
     until QWEN_PORT="$qport" ./.run_carla/qwen_zs_critic_server.sh status >/dev/null 2>&1; do
       log "w$slot/gpu$gpu: critic unhealthy (port $qport); waiting before $tag"; sleep 120
     done
-    log "w$slot/gpu$gpu: START $tag ($(basename "$ck"))$([ "$attempt" -gt 0 ] && echo " retry $attempt")"
+    log "w$slot/gpu$gpu(render gpu$rgpu): START $tag ($(basename "$ck"))$([ "$attempt" -gt 0 ] && echo " retry $attempt")"
     local rlog="${LOG_DIR}/${tag}.log"
     [ "$attempt" -gt 0 ] && rlog="${LOG_DIR}/${tag}.retry${attempt}.log"
     local started; started=$(date +%s)
-    BENCH="$BENCH" QWEN_URL="$qurl" RUN_GROUP="$RUN_GROUP" \
-      setsid ./.run_carla/qwen_zs_bon_run.sh "$route" "$gpu" "$slot" "$ck" "$s" "$out" > "$rlog" 2>&1 &
+    BENCH="$BENCH" QWEN_URL="$qurl" RUN_GROUP="$RUN_GROUP" RENDER_GPU="$rgpu" \
+      setsid ./.run_carla/qwen_zs_bon_run_render.sh "$route" "$gpu" "$slot" "$ck" "$s" "$out" > "$rlog" 2>&1 &
     local rc=$!
     echo "$rc" > "${LOG_DIR}/running/${slot}.pid"; echo "$tag" > "${LOG_DIR}/running/${slot}.job"
     # CARLA dying leaves no process; CARLA deadlocking leaves a silent log. Check both.
@@ -349,7 +356,7 @@ worker() {
   done
 }
 
-for i in "${!GPUS[@]}"; do worker "$i" "${GPUS[$i]}" "${WQPORT[$i]}" "${WQGPU[$i]}" & sleep 8; done
+for i in "${!GPUS[@]}"; do worker "$i" "${GPUS[$i]}" "${WQPORT[$i]}" "${WQGPU[$i]}" "${WRGPU[$i]}" & sleep 8; done
 wait
 log "sweep complete"
 ./.run_carla/qwen_zs_bon_sweep.sh --results 2>&1 | tee "${RESULTS_DIR}/summary.txt"
