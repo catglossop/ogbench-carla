@@ -9,6 +9,7 @@ cd "$ROOT_DIR"
 
 PHYSICAL_GPU="${1:-${EVAL_GPU:-0}}"
 HL_PHYSICAL_GPU="${EVAL_HL_GPU:-7}"
+SINGLE_GPU="${EVAL_SINGLE_GPU:-0}"
 RUN_ROOT="${2:-${EVAL_ROOT:-/raid/users/${USER}/carla_exps/evals/yay_robot}}"
 EVAL_LABEL="${EVAL_LABEL:-simlingo-steervla-yay-robot-b2d-f2d-remaining-v2-20260921}"
 RUN_GROUP="${EVAL_RUN_GROUP:-SimLingoSteerVLAYayRobotB2DF2DRemainingV2}"
@@ -33,17 +34,24 @@ if [[ -z "${GEMINI_API_KEY:-}" ]]; then
   exit 1
 fi
 
-if [[ "$PHYSICAL_GPU" == "$HL_PHYSICAL_GPU" ]]; then
-  echo "[yay_robot_eval] EVAL_HL_GPU must differ from the policy/CARLA GPU." >&2
+case "$SINGLE_GPU" in
+  0|false|1|true) ;;
+  *) echo "[yay_robot_eval] EVAL_SINGLE_GPU must be 0, 1, false, or true." >&2; exit 2 ;;
+esac
+CUDA_DEVICES="$PHYSICAL_GPU,$HL_PHYSICAL_GPU"
+HL_GPU_RANK=1
+MEMORY_ENV=()
+if [[ "$SINGLE_GPU" == "1" || "$SINGLE_GPU" == "true" ]]; then
+  HL_PHYSICAL_GPU="$PHYSICAL_GPU"
+  CUDA_DEVICES="$PHYSICAL_GPU"
+  HL_GPU_RANK=0
+  MEMORY_ENV=(
+    "XLA_PYTHON_CLIENT_MEM_FRACTION=${EVAL_JAX_MEM_FRACTION:-0.30}"
+    "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+  )
+elif [[ "$PHYSICAL_GPU" == "$HL_PHYSICAL_GPU" ]]; then
+  echo "[yay_robot_eval] EVAL_HL_GPU must differ from the policy/CARLA GPU unless EVAL_SINGLE_GPU=1." >&2
   exit 2
-fi
-
-# Validate the actual loaded HL model and one replay batch before allocating CARLA.
-if [[ "${EVAL_PREFLIGHT:-1}" == "1" ]]; then
-  echo "[yay_robot_eval] running SimLingo HL preflight (policy CUDA:0, HL CUDA:1)..."
-  env CUDA_VISIBLE_DEVICES="$PHYSICAL_GPU,$HL_PHYSICAL_GPU" PYTHONPATH="$ROOT_DIR/impls${PYTHONPATH:+:$PYTHONPATH}" \
-    .venv/bin/python impls/preflight_simlingo_yay_robot.py \
-      --agent-config impls/configs/simlingo_steervla_yay_robot_train_config.py --train-gpu 0 --hl-gpu 1
 fi
 
 # Dedicated to YAY Robot, avoiding both residual-evaluation port ranges.
@@ -94,6 +102,9 @@ run_group=$RUN_GROUP
 run_nonce=$RUN_NONCE
 physical_gpu=$PHYSICAL_GPU
 hl_physical_gpu=$HL_PHYSICAL_GPU
+single_gpu=$SINGLE_GPU
+cuda_visible_devices=$CUDA_DEVICES
+xla_mem_fraction=${EVAL_JAX_MEM_FRACTION:-<default>}
 carla_port=$CARLA_PORT
 carla_streaming_port=$CARLA_STREAMING_PORT
 tm_port=$TM_PORT
@@ -173,7 +184,7 @@ for seed in "${SEED_LIST[@]}"; do
     mkdir -p "$run_dir"
     set +e
     eval_seeds="$((seed + 1001)),$((seed + 1002)),$((seed + 1003))"
-    run_with_watchdog "$log_file" "$failure_file" env CUDA_VISIBLE_DEVICES="$PHYSICAL_GPU,$HL_PHYSICAL_GPU" OGBENCH_SAVE_DIR="$run_dir" \
+    run_with_watchdog "$log_file" "$failure_file" env CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" "${MEMORY_ENV[@]}" OGBENCH_SAVE_DIR="$run_dir" \
       ./run_carla.sh \
         --agent-config impls/configs/simlingo_steervla_yay_robot_train_config.py \
         --route "$route" \
@@ -185,7 +196,7 @@ for seed in "${SEED_LIST[@]}"; do
         --online-steps 10000 \
         --max-episode-steps 4000 \
         --train-gpu 0 \
-        --hl-gpu 1 \
+        --hl-gpu "$HL_GPU_RANK" \
         --train-mode rl \
         --critic-mode none \
         --render-adapter "$PHYSICAL_GPU" \

@@ -9,7 +9,7 @@ cd "$ROOT_DIR"
 
 PHYSICAL_GPU="${1:-${EVAL_GPU:-0}}"
 RUN_ROOT="${2:-${EVAL_ROOT:-/raid/users/${USER}/carla_exps/evals/residual_rl}}"
-EVAL_LABEL="${EVAL_LABEL:-simlingo-steervla-residual-rl-b2d-f2d-failed-rerun-v1-20260921}"
+EVAL_LABEL="${EVAL_LABEL:-simlingo-steervla-residual-rl-b2d-f2d-failed-rerun-v2-20260921}"
 RUN_GROUP="${EVAL_RUN_GROUP:-SimLingoSteerVLAResidualRLB2DF2DFailedRerunV1}"
 # A retry gets a fresh W&B name; completed routes still skip via their .done markers.
 # Supply EVAL_RUN_NONCE=<number> only to deliberately reuse names.
@@ -27,6 +27,7 @@ SAVE_VIDEO_LOCAL="${SAVE_VIDEO_LOCAL:-true}"
 SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
 CONTINUE_ON_FAILURE="${CONTINUE_ON_FAILURE:-true}"
 DRY_RUN="${DRY_RUN:-0}"
+REVERSE_ROUTES="${REVERSE_ROUTES:-0}"
 
 # Dedicated to this failed-route rerun; avoids the 14000 residual-eval and YAY ranges.
 CARLA_PORT="${EVAL_CARLA_PORT:-$((16000 + PHYSICAL_GPU * 20))}"
@@ -35,14 +36,27 @@ TM_PORT="${EVAL_TM_PORT:-$((CARLA_PORT + 6000))}"
 X_DISPLAY_NUM="${EVAL_X_DISPLAY_NUM:-$((800 + PHYSICAL_GPU))}"
 
 ROUTES=(
-  t_-junction-002
   generalization-right-construction-1094
-  generalization-image-on-object-1041
-  generalization-obscured-stop-1046
-  generalization-bad-parking-1004
-  generalization-animals-1076
   generalization-wall-1097
+  generalization-animals-1076
+  generalization-bad-parking-1004
+  generalization-obscured-stop-1046
+  generalization-image-on-object-1041
 )
+
+case "$REVERSE_ROUTES" in
+  0|false) ;;
+  1|true)
+    ROUTES=(
+      generalization-right-construction-1094
+      generalization-wall-1097
+      generalization-animals-1076
+      generalization-bad-parking-1004
+      generalization-obscured-stop-1046
+    )
+    ;;
+  *) echo "REVERSE_ROUTES must be 0, 1, false, or true." >&2; exit 2 ;;
+esac
 
 read -r -a SEED_LIST <<< "$SEEDS"
 if (( ${#SEED_LIST[@]} == 0 )); then
@@ -120,6 +134,11 @@ run_with_watchdog() {
   return "$run_code"
 }
 
+release_route_lock() {
+  flock -u "$route_lock_fd" 2>/dev/null || true
+  eval "exec ${route_lock_fd}>&-"
+}
+
 total=$(( ${#ROUTES[@]} * ${#SEED_LIST[@]} ))
 index=0
 for seed in "${SEED_LIST[@]}"; do
@@ -130,12 +149,21 @@ for seed in "${SEED_LIST[@]}"; do
     failure_file="$RUN_ROOT/status/$EVAL_LABEL/${tag}.failed"
     log_file="$RUN_ROOT/logs/$EVAL_LABEL/${tag}.log"
     exp_name="simlingo-steervla-residual-rl-rerun_${RUN_NONCE}_sd-${seed}_${route}"
+    lock_file="$RUN_ROOT/status/$EVAL_LABEL/${tag}.lock"
+    exec {route_lock_fd}>"$lock_file"
+    if ! flock -n "$route_lock_fd"; then
+      echo "[$index/$total] SKIP claimed by another queue: $tag"
+      release_route_lock
+      continue
+    fi
     if [[ "$SKIP_COMPLETED" == "1" && -f "$done_file" ]]; then
       echo "[$index/$total] SKIP completed: $tag"
+      release_route_lock
       continue
     fi
     echo "[$index/$total] START: $tag (wandb_name=$exp_name)"
     if [[ "$DRY_RUN" == "1" ]]; then
+      release_route_lock
       continue
     fi
 
@@ -172,18 +200,22 @@ for seed in "${SEED_LIST[@]}"; do
     if [[ "$run_code" -eq 0 && "$tee_code" -eq 0 ]]; then
       touch "$done_file"
       echo "[$index/$total] DONE: $tag"
+      release_route_lock
       continue
     fi
     if [[ "$run_code" -eq 130 ]]; then
       echo "[$index/$total] interrupted; stopping evaluation queue." >&2
+      release_route_lock
       exit 130
     fi
     printf 'timestamp=%s\nrun_exit_code=%s\ntee_exit_code=%s\n' "$(date --iso-8601=seconds)" "$run_code" "$tee_code" > "$failure_file"
     echo "[$index/$total] FAILED: $tag (run=$run_code tee=$tee_code; marker=$failure_file)" >&2
     if [[ "$CONTINUE_ON_FAILURE" == "1" || "$CONTINUE_ON_FAILURE" == "true" ]]; then
       echo "[$index/$total] continuing after recorded failure." >&2
+      release_route_lock
       continue
     fi
+    release_route_lock
     exit "$run_code"
   done
 done
