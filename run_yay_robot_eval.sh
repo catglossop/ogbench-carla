@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Restartable B2D + F2D YAY-Robot evaluation queue.
+# Restartable F2D YAY-Robot evaluation queue.
 # Each route trains the SimLingo HL planner for 10k steps, then --eval-mode freezes it
 # and rolls it out for three model seeds in the same CARLA process.
 set -euo pipefail
@@ -11,8 +11,8 @@ PHYSICAL_GPU="${1:-${EVAL_GPU:-0}}"
 HL_PHYSICAL_GPU="${EVAL_HL_GPU:-7}"
 SINGLE_GPU="${EVAL_SINGLE_GPU:-0}"
 RUN_ROOT="${2:-${EVAL_ROOT:-/raid/users/${USER}/carla_exps/evals/yay_robot}}"
-EVAL_LABEL="${EVAL_LABEL:-simlingo-steervla-yay-robot-b2d-f2d-remaining-v2-20260921}"
-RUN_GROUP="${EVAL_RUN_GROUP:-SimLingoSteerVLAYayRobotB2DF2DRemainingV2}"
+EVAL_LABEL="${EVAL_LABEL:-simlingo-steervla-yay-robot-f2d-evalmode-v1-20261012}"
+RUN_GROUP="${EVAL_RUN_GROUP:-SimLingoSteerVLAYayRobotF2DEvalModeV1}"
 # A retry gets a fresh W&B name; completed routes still skip via their .done markers.
 # Supply EVAL_RUN_NONCE=<number> only to deliberately reuse names.
 if [[ -n "${EVAL_RUN_NONCE:-}" ]]; then
@@ -21,7 +21,8 @@ else
   printf -v RUN_NONCE '%05d%05d' "$RANDOM" "$RANDOM"
 fi
 [[ "$RUN_NONCE" =~ ^[0-9]+$ ]] || { echo 'EVAL_RUN_NONCE must be numeric.' >&2; exit 2; }
-SEEDS="${SEEDS:-0 1 2}"
+# Default to one training seed; the loop completes every route before advancing to a later seed.
+SEEDS="${SEEDS:-0}"
 MAX_RETRIES="${MAX_RETRIES:-50}"
 WANDB_MODE="${WANDB_MODE:-online}"
 SAVE_BUFFER="${SAVE_BUFFER:-false}"
@@ -61,12 +62,6 @@ TM_PORT="${EVAL_TM_PORT:-$((CARLA_PORT + 6000))}"
 X_DISPLAY_NUM="${EVAL_X_DISPLAY_NUM:-$((700 + PHYSICAL_GPU))}"
 
 ROUTES=(
-  signalized-junction-left-turn-001
-  t_-junction-002
-  vehicle-turning-route-pedestrian-003
-  highway-exit-002
-  accident-two-ways-002
-  interurban-actor-flow-004
   generalization-construction-permutations-1019
   generalization-custom-obstacles-1020
   generalization-pedestrians-on-road-1085
