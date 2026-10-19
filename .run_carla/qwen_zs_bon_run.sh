@@ -17,6 +17,11 @@
 # is the eval-subset contract; EVAL_SEED_OFFSET=0 N_EVAL=1 is the README protocol (one episode,
 # carla_seed = train_seed = SEED).
 #
+# BON_SELECT=qwen (default) selects every action with the critic at QWEN_URL. BON_SELECT=none rolls
+# the actor out on its own -- one sample per step, no critic, QWEN_URL not needed -- for the plain
+# policy baseline (generalization experiments, 2026-10-19). The actor's own config then sets the CoT
+# temperature (steervla_mixed_eval_config: 1.0, the same HL sampling the BoN candidates get).
+#
 # Env: BENCH=b2d|f2d (selects the simulator), QWEN_URL, RUN_GROUP, OGBENCH_SAVE_DIR.
 #   b2d -> CARLA 0.9.16 at /home/cglossop/carla
 #   f2d -> Fail2Drive CARLA 0.9.15 at /home/cglossop/f2d_carla (CARLA_ROOT and CARLA_0915_ROOT)
@@ -27,6 +32,8 @@ cd "$ROOT_DIR"
 
 ROUTE="${1:?route}"; GPU="${2:?gpu}"; SLOT="${3:?slot}"
 CKPT="${4:?checkpoint}"; CARLA_SEED="${5:?carla seed}"; OUT_DIR="${6:?out dir}"
+# CARLA may render on a different GPU than the policy (e.g. policy on a card UE4 cannot use).
+RENDER_GPU="${RENDER_GPU:-$GPU}"
 
 # Hand-queued extra evals (e.g. an intermediate checkpoint) pass CHECKPOINT as "<dir>#<tag>". The
 # tag keeps them out of the route's own cell: results go to <route>__<tag>/carla_seed_N instead of
@@ -40,7 +47,12 @@ case "$CKPT" in
 esac
 
 BENCH="${BENCH:?BENCH must be b2d or f2d}"
-QWEN_URL="${QWEN_URL:?QWEN_URL must be set}"
+BON_SELECT="${BON_SELECT:-qwen}"
+case "$BON_SELECT" in
+  qwen) QWEN_URL="${QWEN_URL:?QWEN_URL must be set}" ;;
+  none) QWEN_URL="" ;;
+  *) echo "[qwen_zs_run] ABORT: BON_SELECT must be qwen or none, got '$BON_SELECT'" >&2; exit 2 ;;
+esac
 RUN_GROUP="${RUN_GROUP:?RUN_GROUP must be set}"
 : "${OGBENCH_SAVE_DIR:?OGBENCH_SAVE_DIR must be set}"
 ACTOR="${ACTOR:-pi05}"
@@ -96,7 +108,7 @@ WANDB_KEY_FILE="${WANDB_KEY_FILE:-/home/cglossop/.wandb_school_key}"
 export WANDB_API_KEY="$(cat "$WANDB_KEY_FILE")"
 export WANDB_ENTITY=catherineglossop
 
-EXP_NAME="${ROUTE}-cs${CARLA_SEED}${EXTRA_TAG:+-$EXTRA_TAG}-qwenzs_$(date +%Y%m%d_%H%M%S)"
+EXP_NAME="${ROUTE}-cs${CARLA_SEED}${EXTRA_TAG:+-$EXTRA_TAG}-$([ "$BON_SELECT" = qwen ] && echo qwenzs || echo plain)_$(date +%Y%m%d_%H%M%S)"
 # Per-job CARLA config with the wrapper's post-collision stuck cutoff disabled, so a blocked ego
 # gets the leaderboard's own AgentBlockedTest (0.1 m/s for 60 s). main_carla's --eval_crash_stuck_steps
 # does this in-process, but cannot reach the 0.9.15 env subprocess; the yaml is read by both.
@@ -116,20 +128,27 @@ COMMON=(
   --tm-port "$TM_PORT" --x-display-num "$DISPLAY_NUM"
   --critic-mode none --train-mode rl
   --enable-updates false --max-retries 0
-  --bon-num-candidates "$N_CANDIDATES" --bon-max-sample-attempts 1
-  --bon-batch-policy-candidates "$BON_BATCH" --bon-cot-temperature 1.0
-  --bon-candidates-log-every 20 --bon-candidates-wandb false
-  --bon-qwen-select true --qwen-bon-url "$QWEN_URL"
-  --bon-qwen-cadence 3 --qwen-online-train false
   --terminate-on-collision false --save-video-local true
 )
+if [ "$BON_SELECT" = qwen ]; then
+  COMMON+=(
+    --bon-num-candidates "$N_CANDIDATES" --bon-max-sample-attempts 1
+    --bon-batch-policy-candidates "$BON_BATCH" --bon-cot-temperature 1.0
+    --bon-candidates-log-every 20 --bon-candidates-wandb false
+    --bon-qwen-select true --qwen-bon-url "$QWEN_URL"
+    --bon-qwen-cadence 3 --qwen-online-train false
+  )
+else
+  COMMON+=(--bon-num-candidates 1)
+  N_CANDIDATES=1
+fi
 
 case "$ACTOR" in
   pi05)
     [ -d "$CKPT/params" ] || { echo "[qwen_zs_run] ABORT: no params/ under checkpoint $CKPT" >&2; exit 1; }
     export QWEN_RECORD_PDM_PLAN=0
     # The actor restores inference-only params (SteerVLAActor default load_trainable_params=False).
-    CMD=(bash run_carla.sh "${COMMON[@]}" --train-gpu 0 --render-adapter "$GPU"
+    CMD=(bash run_carla.sh "${COMMON[@]}" --train-gpu 0 --render-adapter "$RENDER_GPU"
          --base-only true --eval-only true
          --steervla-checkpoint "$CKPT" --actor-config "$ACTOR_CONFIG" --
          --bon_qwen_label_source=subtask --bon_include_brake_candidate=false
@@ -147,7 +166,7 @@ case "$ACTOR" in
     export PYTHONPATH="$ROOT_DIR:${SIMLINGO_DEPS:-/raid/users/cglossop/ogbench-simlingo-deps}"
     export QWEN_RECORD_PDM_PLAN="${QWEN_RECORD_PDM_PLAN:-1}"
     # README: keep every GPU visible so --train-gpu is the physical index.
-    CMD=(bash run_carla.sh "${COMMON[@]}" --train-gpu "$GPU" --render-adapter "$GPU"
+    CMD=(bash run_carla.sh "${COMMON[@]}" --train-gpu "$GPU" --render-adapter "$RENDER_GPU"
          --agent-config impls/configs/simlingo_steervla_qwen_bon_eval_config.py
          --cot-temperature 1.0 --
          --bon_qwen_label_source=subtask --bon_include_brake_candidate=false)
@@ -173,7 +192,7 @@ case "$ACTOR" in
     [ -d "$MIXED_LL_CHECKPOINT/params" ] || { echo "[qwen_zs_run] ABORT: no params/ under $MIXED_LL_CHECKPOINT" >&2; exit 1; }
     export QWEN_RECORD_PDM_PLAN=0
     CMD=(bash run_carla.sh "${COMMON[@]}"
-         --train-gpu "$GPU" --render-adapter "$GPU"
+         --train-gpu "$GPU" --render-adapter "$RENDER_GPU"
          --agent-config impls/configs/steervla_mixed_eval_config.py
          --steervla-checkpoint "$MIXED_LL_CHECKPOINT" --actor-config "$MIXED_LL_ACTOR_CONFIG" --
          --bon_qwen_label_source=subtask --bon_include_brake_candidate=false
@@ -192,14 +211,14 @@ echo "[qwen_zs_run] actor=$ACTOR bench=$BENCH route=$ROUTE gpu=$GPU slot=$SLOT r
 echo "[qwen_zs_run] carla_root=$CARLA_ROOT carla_0915_root=${CARLA_0915_ROOT:-<unset>} ckpt=$CKPT candidates=$N_CANDIDATES"
 [ "$ACTOR" = simlingo ] && echo "[qwen_zs_run] simlingo hl=$SIMLINGO_HL_CHECKPOINT ll=$SIMLINGO_LL_CHECKPOINT src=$SIMLINGO_SOURCE_ROOT"
 echo "[qwen_zs_run] carla_seed=$CARLA_SEED train_seed=$TRAIN_SEED eval_seeds=$EVAL_SEEDS online_steps=$ONLINE_STEPS"
-echo "[qwen_zs_run] critic=$QWEN_URL group=$RUN_GROUP summary -> $OUT_DIR/run_summary_frozen_eval.json"
+echo "[qwen_zs_run] select=$BON_SELECT critic=${QWEN_URL:-<none>} group=$RUN_GROUP summary -> $OUT_DIR/run_summary_frozen_eval.json"
 
 if [ "${DRY_RUN:-0}" = 1 ]; then
   printf '%s ' "${GPU_ENV[@]}"; printf '%q ' "${CMD[@]}"; echo
   exit 0
 fi
 
-if ! QWEN_PORT="${QWEN_URL##*:}" "$ROOT_DIR/.run_carla/qwen_zs_critic_server.sh" status >/dev/null 2>&1; then
+if [ "$BON_SELECT" = qwen ] && ! QWEN_PORT="${QWEN_URL##*:}" "$ROOT_DIR/.run_carla/qwen_zs_critic_server.sh" status >/dev/null 2>&1; then
   QWEN_PORT="${QWEN_URL##*:}" "$ROOT_DIR/.run_carla/qwen_zs_critic_server.sh" status >&2
   echo "[qwen_zs_run] ABORT: $QWEN_URL is not a healthy zero-shot critic" >&2; exit 1
 fi
