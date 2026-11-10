@@ -201,9 +201,26 @@ class HLPoolSamplingMixin:
         """Active HL sources: the online cast_relabel pool plus any configured replay pools."""
         pools: list[dict[str, Any]] = []
         if self.hl_dataset_dir is not None and float(self.hl_online_weight) > 0.0:
-            pools.append(
-                {"dir": Path(self.hl_dataset_dir), "name": "online", "weight": float(self.hl_online_weight), "kind": "online"}
+            root = Path(self.hl_dataset_dir)
+            # Opt-in (offline pooled training, impls/train_hl_offline_pooled.py): treat each immediate
+            # subdir of the online root as its own online pool with an equal share of
+            # ``hl_online_weight``, so a source with many more samples cannot crowd the others out
+            # of the batch. Each share keeps the BAD/precursor bucketing and replay backfill. The
+            # name stays "online" because _read_hl_record keys subtask-only supervision off it.
+            subdirs = (
+                sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
+                if getattr(self, "hl_online_balance_subdirs", False) and root.is_dir()
+                else []
             )
+            if subdirs:
+                w = float(self.hl_online_weight) / len(subdirs)
+                pools.extend(
+                    {"dir": d, "name": "online", "weight": w, "kind": "online", "source": d.name} for d in subdirs
+                )
+            else:
+                pools.append(
+                    {"dir": root, "name": "online", "weight": float(self.hl_online_weight), "kind": "online"}
+                )
         pools.extend(self._hl_replay_pool_specs)
         return [p for p in pools if float(p.get("weight", 0.0)) > 0.0]
 
@@ -518,15 +535,17 @@ class HLPoolSamplingMixin:
                     "impls/vlas/extract_hl_replay.py to populate the pools.",
                     flush=True,
                 )
-        online = next((s for s in scanned if s["pool"].get("kind") == "online"), None)
+        # Usually one online pool; several when hl_online_balance_subdirs splits it per source.
+        online_scans = [s for s in scanned if s["pool"].get("kind") == "online"]
+        n_online_entries = sum(len(s["entries"]) for s in online_scans)
         # ``_hl_pool_size`` reports the *online* pool fill (what the skip messages talk about).
         self._hl_pool_size = (
-            len(online["entries"]) if online is not None else sum(len(s["entries"]) for s in scanned)
+            n_online_entries if online_scans else sum(len(s["entries"]) for s in scanned)
         )
         # Gate only on *starting* the online stream, not on it filling its share: below
         # ``hl_min_online_samples`` we'd be training on replay alone, which is not the point of the
         # online HL update. At or above it, whatever is on disk goes in and replay covers the rest.
-        if online is not None and len(online["entries"]) < self.hl_min_online_samples:
+        if online_scans and n_online_entries < self.hl_min_online_samples:
             return None
 
         active = [s for s in scanned if s["entries"]]
@@ -558,7 +577,7 @@ class HLPoolSamplingMixin:
                     ordered, take = self._order_online_entries(
                         s["entries"], cnt, self.hl_online_bad_fraction, self.hl_online_precursor_fraction
                     )
-                online_short = max(0, cnt - take)
+                online_short += max(0, cnt - take)
             else:
                 ordered = [s["entries"][int(j)] for j in np.random.permutation(len(s["entries"]))]
                 take = cnt
