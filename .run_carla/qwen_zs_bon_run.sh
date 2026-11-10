@@ -203,6 +203,15 @@ case "$ACTOR" in
          --agent.steervla.proprio_norm=false)
     GPU_ENV=()
     unset CUDA_VISIBLE_DEVICES
+    # ISOLATE_GPU=1: pin the whole cell to $GPU (CUDA_VISIBLE_DEVICES=$GPU, --train-gpu 0) so JAX does
+    # not open a context on every GPU of the box. MixedSteerVLAActor maps the HL worker's rank back
+    # through CUDA_VISIBLE_DEVICES; CARLA's -graphicsadapter is a Vulkan index and stays $RENDER_GPU.
+    if [ "${ISOLATE_GPU:-0}" = 1 ]; then
+      for i in "${!CMD[@]}"; do
+        [ "${CMD[$i]}" = --train-gpu ] && CMD[$((i + 1))]=0
+      done
+      GPU_ENV=(CUDA_VISIBLE_DEVICES="$GPU")
+    fi
     ;;
   *) echo "[qwen_zs_run] ABORT: ACTOR must be pi05, simlingo or mixed, got '$ACTOR'" >&2; exit 2 ;;
 esac

@@ -26,7 +26,12 @@ class MixedSteerVLAActor(SteerVLAActor):
         parent, child = socket.socketpair()
         self._hl_conn = Connection(parent.detach())
         env = os.environ.copy()
-        env['CUDA_VISIBLE_DEVICES'] = str(kwargs['training_gpu_rank'])
+        # training_gpu_rank indexes the devices THIS process sees. If the parent was already pinned
+        # (CUDA_VISIBLE_DEVICES=2 with --train-gpu 0), translate the rank to the physical id so the
+        # worker lands on the same GPU instead of physical GPU <rank>.
+        rank = int(kwargs['training_gpu_rank'])
+        parent_visible = [d for d in os.environ.get('CUDA_VISIBLE_DEVICES', '').split(',') if d.strip()]
+        env['CUDA_VISIBLE_DEVICES'] = parent_visible[rank].strip() if 0 <= rank < len(parent_visible) else str(rank)
         env.pop('PYTHONPATH', None)
         self._hl_proc = subprocess.Popen([
             hl_python, '-u', str(Path(__file__).with_name('internvl2_hl_worker.py')),
