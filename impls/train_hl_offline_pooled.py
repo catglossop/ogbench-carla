@@ -47,6 +47,10 @@ flags.DEFINE_list(
 )
 flags.DEFINE_integer("steps_per_update", 0, "Grad steps per sampled batch (0 = source hl_update_num_steps).")
 flags.DEFINE_bool("balance_routes", True, "Equal online share per source run.")
+flags.DEFINE_integer(
+    "batch_size", 0, "HL batch size per grad step (0 = source runs' hl_update_batch_size). Peak memory is set by "
+    "hl_micro_batch_size (gradient accumulation), so a larger batch costs time, not VRAM."
+)
 flags.DEFINE_integer("seed", 0, "numpy/torch/random seed for batch sampling.")
 flags.DEFINE_string("wandb_project", "OGBench-CARLA", "wandb project.")
 flags.DEFINE_string("wandb_group", "pooled_hl", "wandb group (<=64 chars).")
@@ -109,6 +113,11 @@ def main(_):
         training_gpu_rank=0,
         hl_training_gpu_rank=0,
     )
+    # --batch_size wins; else HL_BATCH_SIZE from the environment (the launchers export every key of
+    # a run's env file, so a run can set it without a launcher change); else the source runs' value.
+    batch_size = FLAGS.batch_size or int(os.environ.get("HL_BATCH_SIZE") or 0)
+    if batch_size > 0:
+        cfg["hl_update_batch_size"] = int(batch_size)
     steps_per_update = int(FLAGS.steps_per_update or cfg.get("hl_update_num_steps", 10))
     n_updates = -(-FLAGS.total_grad_steps // steps_per_update)
     save_steps = {int(s) for s in FLAGS.save_steps}
