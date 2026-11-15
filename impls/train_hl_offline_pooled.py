@@ -42,6 +42,9 @@ flags.DEFINE_list("source_runs", [], "Finished HARP run dirs whose cast_relabel_
 flags.DEFINE_string("out_dir", "", "Output run dir (pool symlinks, checkpoints, logs).")
 flags.DEFINE_integer("total_grad_steps", 500, "Total HL gradient steps.")
 flags.DEFINE_integer("checkpoint_every", 150, "Save a checkpoint every N grad steps (plus the final step).")
+flags.DEFINE_list(
+    "save_steps", [], "Save checkpoints at exactly these grad steps (overrides --checkpoint_every when set)."
+)
 flags.DEFINE_integer("steps_per_update", 0, "Grad steps per sampled batch (0 = source hl_update_num_steps).")
 flags.DEFINE_bool("balance_routes", True, "Equal online share per source run.")
 flags.DEFINE_integer("seed", 0, "numpy/torch/random seed for batch sampling.")
@@ -108,6 +111,10 @@ def main(_):
     )
     steps_per_update = int(FLAGS.steps_per_update or cfg.get("hl_update_num_steps", 10))
     n_updates = -(-FLAGS.total_grad_steps // steps_per_update)
+    save_steps = {int(s) for s in FLAGS.save_steps}
+    bad = sorted(s for s in save_steps if s % steps_per_update or s > FLAGS.total_grad_steps)
+    if bad:
+        raise SystemExit(f"--save_steps {bad} must be multiples of {steps_per_update} and <= total_grad_steps")
 
     np.random.seed(FLAGS.seed)
     random.seed(FLAGS.seed)
@@ -120,6 +127,7 @@ def main(_):
         "steps_per_update": steps_per_update,
         "n_updates": n_updates,
         "checkpoint_every": FLAGS.checkpoint_every,
+        "save_steps": sorted(save_steps),
         "balance_routes": FLAGS.balance_routes,
         "seed": FLAGS.seed,
         "steervla": cfg,
@@ -157,7 +165,11 @@ def main(_):
         log_f.write(json.dumps(rec) + "\n")
         log_f.flush()
         wandb.log({f"hl/{k}": v for k, v in rec.items()}, step=grad_steps)
-        if (grad_steps % FLAGS.checkpoint_every == 0 or grad_steps == FLAGS.total_grad_steps) and grad_steps not in saved:
+        if save_steps:
+            due = grad_steps in save_steps
+        else:
+            due = grad_steps % FLAGS.checkpoint_every == 0 or grad_steps == FLAGS.total_grad_steps
+        if due and grad_steps not in saved:
             if actor.save_checkpoint(ckpt_dir, step=grad_steps, keep_last=0) is None:
                 raise SystemExit(f"checkpoint export failed at {grad_steps}")
             saved.add(grad_steps)
