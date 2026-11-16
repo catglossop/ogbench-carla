@@ -671,7 +671,9 @@ class IsolatedLeaderboardEvaluator(LeaderboardEvaluator):
         streaming_port = int(getattr(args, "streaming_port", 0) or 0)
         if streaming_port > 0:
             cmd.append(f"-carla-streaming-port={streaming_port}")
-        _carla_log_path = f"/tmp/carla_rpc{rpc_port}.log"
+        # /tmp is shared across users; a port-only filename can belong to another
+        # user's prior run and be unwritable under /tmp's sticky-bit semantics.
+        _carla_log_path = f"/tmp/carla_rpc{rpc_port}_{os.getuid()}_{os.getpid()}.log"
         self._carla_log_file = open(_carla_log_path, "w", buffering=1)
         self.server = subprocess.Popen(
             cmd,
@@ -3494,6 +3496,12 @@ class CarlaBench2DriveWrapper(gymnasium.Env):
                 self._info_with_sensors({"error": "tick_runtime", "exception": str(e)}),
             )
         except Exception as e:
+            print(
+                f"[carla step] manager.step_once failed; finalizing route before returning "
+                f"a simulation error: {e!r}",
+                flush=True,
+            )
+            traceback.print_exc()
             self._update_routing_command()
             self._finalize_route(*FAILURE_MESSAGES["Simulation"])
             return (

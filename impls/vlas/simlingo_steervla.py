@@ -299,13 +299,16 @@ class _SimLingoModel:
                 for j, i in enumerate(indices):
                     outputs[i] = (speed[j], route[j])
             return (torch.stack([x[0] for x in outputs]), torch.stack([x[1] for x in outputs]), []), None
-        if not model.predict_language or model.adaptors.driving is not None:
+        # HL checkpoints can still instantiate the waypoint adaptor (it is required
+        # by the shared DrivingModel config); like generate(), this path uses only
+        # the language inputs and bypasses waypoint decoding.
+        if not model.predict_language:
             raise RuntimeError("Batched HL requires the language-only planner.")
         adaptor = model.adaptors(inputs, inference=True)
         adaptor = model.vision_model.image_encoder.replace_placeholder_tokens(
             adaptor_dict=adaptor, pixel_values=inputs.camera_images,
             placeholder_values=inputs.prompt_inference.placeholder_values,
-            camera_images_history=inputs.camera_images_history,
+            wp_encoder=model.wp_encoder,
         )
         variant = model.language_model.variant
         eos = (model.tokenizer.added_tokens_encoder['<|end|>'] if variant == 'OpenGVLab/InternVL2-4B'
@@ -690,6 +693,46 @@ class SimLingoSteerVLAActor(HLPoolSamplingMixin):
         return dict(actions_normalized=chunks, subtask_texts=subtasks,
                     reasoning_texts=[x[0] for x in parsed], reasoning_overflowed=overflow)
 
+    def grpo_records_from_candidates(self, cands: dict[str, Any], raw: dict[str, Any]) -> list[dict[str, Any]]:
+        """Build teacher-forced HL records for the candidate CoTs scored by the GRPO loop."""
+        prompt = self.hl_prompt(raw)
+        image = self._image(raw).copy()
+        return [
+            {
+                "image": image,
+                "prompt": prompt,
+                "reasoning": str(reasoning),
+                "subtask": str(subtask) or _TRAINING_HL_FALLBACK,
+                "loss_scope": "full",
+            }
+            for reasoning, subtask in zip(cands["reasoning_texts"], cands["subtask_texts"])
+        ]
+
+    def grpo_stop_record(self, raw: dict[str, Any], *, reasoning: str, subtask: str) -> dict[str, Any]:
+        return {
+            "image": self._image(raw).copy(),
+            "prompt": self.hl_prompt(raw),
+            "reasoning": str(reasoning),
+            "subtask": str(subtask),
+            "loss_scope": "full",
+        }
+
+    def set_grpo_selection(
+        self, raw: dict[str, Any], *, reasoning: str, subtask: str, action_chunk: np.ndarray
+    ) -> None:
+        """Keep the selected GRPO CoT/chunk as the base policy while unscored steps execute."""
+        self._cot = {
+            "prompt": self.hl_prompt(raw),
+            "reasoning": str(reasoning),
+            "subtask": str(subtask),
+            "output": f"{reasoning}\n\n{DRIVING_BEHAVIOR_MARKER} {subtask}",
+        }
+        self._cot_age = 0
+        self._cached_action_chunk = np.asarray(action_chunk, dtype=np.float32).reshape(1, -1).copy()
+        self._cached_action_pose = self._current_ego_pose()
+        self._cached_action_step = 1
+        self._stash_cot_in_raw(raw)
+
     def _next_cached_action(self, batch_size: int) -> np.ndarray | None:
         """Serve a held chunk, shifted one row per ``env_steps_per_chunk_row`` and re-anchored (see steervla)."""
         if self.actions_per_model_query <= 1 or batch_size != 1 or self._cached_action_chunk is None:
@@ -1001,6 +1044,102 @@ class SimLingoSteerVLAActor(HLPoolSamplingMixin):
             f"[simlingo_steervla.update_hl] loss={out['loss']:.4f} grad_norm={grad_norm:.3f} "
             f"policy_updates={self._hl_grad_steps} bs={len(records)} (online {int(out['n_online'])}) "
             f"tokens={total_tokens} {out['update_seconds']:.1f}s peak={out['hl_mem_peak_gb']:.1f}GB",
+            flush=True,
+        )
+        return out
+
+    def update_hl_grpo(
+        self,
+        records: list[dict[str, Any]],
+        advantages: np.ndarray,
+        *,
+        beta: float,
+        num_epochs: int = 1,
+        global_step: int | None = None,
+    ) -> dict[str, float]:
+        """Apply advantage-weighted CoT log-likelihood updates with a frozen-reference KL penalty."""
+        if self._hl_optimizer is None or self._hl_ref_model is None:
+            return self._hl_skip("SimLingo GRPO needs a trainable HL and frozen reference model")
+        records = list(records)
+        advantages = np.asarray(advantages, dtype=np.float32).reshape(-1)
+        if not records or advantages.shape[0] != len(records):
+            return self._hl_skip("GRPO update got no records or mismatched advantages")
+
+        rng = np.random.default_rng(int(global_step or 0))
+        micro_size = self.hl_micro_batch_size
+        model = self.hl.model
+        ref_model = self._hl_ref_model
+        model.train()
+        losses: list[float] = []
+        pg_losses: list[float] = []
+        kl_losses: list[float] = []
+        grad_norm = 0.0
+        update_steps = 0
+        t0 = time.time()
+        torch.cuda.reset_peak_memory_stats(self.hl_device)
+        try:
+            for _ in range(max(1, int(num_epochs))):
+                order = rng.permutation(len(records))
+                for start in range(0, len(order), self.hl_update_batch_size):
+                    batch_idx = order[start : start + self.hl_update_batch_size]
+                    model.zero_grad(set_to_none=True)
+                    self._hl_optimizer.zero_grad(set_to_none=True)
+                    batch_n = len(batch_idx)
+                    for micro_start in range(0, batch_n, micro_size):
+                        idx = batch_idx[micro_start : micro_start + micro_size]
+                        micro = [records[int(i)] for i in idx]
+                        example, _ = self._build_hl_example(micro)
+                        loss_dict, _ = model.forward_loss(example, per_sample=True)
+                        token_loss, token_mask = loss_dict["language_loss"]
+                        token_loss = token_loss.float()
+                        token_mask = token_mask.float()
+                        n_tokens = token_mask.sum(-1).clamp(min=1.0)
+                        ce_theta = (token_loss * token_mask).sum(-1) / n_tokens
+                        with torch.no_grad():
+                            ref_dict, _ = ref_model.forward_loss(example, per_sample=True)
+                            ref_loss, ref_mask = ref_dict["language_loss"]
+                            ref_mask = ref_mask.float()
+                            ce_ref = (ref_loss.float() * ref_mask).sum(-1) / ref_mask.sum(-1).clamp(min=1.0)
+                        log_ratio = ce_ref - ce_theta
+                        kl = torch.exp(-log_ratio) + log_ratio - 1.0
+                        adv = torch.as_tensor(advantages[idx], device=ce_theta.device, dtype=ce_theta.dtype)
+                        pg = adv * ce_theta
+                        objective = (pg + float(beta) * kl).mean() * (len(idx) / batch_n)
+                        objective.backward()
+                        pg_losses.append(float(pg.detach().mean()))
+                        kl_losses.append(float(kl.detach().mean()))
+                        losses.append(float(objective.detach()))
+
+                    for param, master in zip(self._hl_params, self._hl_master):
+                        master.grad = None if param.grad is None else param.grad.detach().float()
+                        param.grad = None
+                    grad_norm = float(torch.nn.utils.clip_grad_norm_(self._hl_master, self.hl_grad_clip))
+                    self._hl_optimizer.step()
+                    self._hl_optimizer.zero_grad(set_to_none=True)
+                    with torch.no_grad():
+                        for param, master in zip(self._hl_params, self._hl_master):
+                            param.copy_(master.to(param.dtype))
+                    self._hl_grad_steps += 1
+                    update_steps += 1
+        finally:
+            model.eval()
+        self._hl_updates_applied += 1
+        out = {
+            "loss": float(np.mean(losses)),
+            "pg_loss": float(np.mean(pg_losses)),
+            "kl": float(np.mean(kl_losses)),
+            "grad_norm": grad_norm,
+            "n_samples": float(len(records)),
+            "n_minibatches": float(update_steps),
+            "policy_updates": float(self._hl_grad_steps),
+            "updates_applied": float(self._hl_updates_applied),
+            "update_seconds": float(time.time() - t0),
+            "hl_mem_peak_gb": float(torch.cuda.max_memory_allocated(self.hl_device)) / 1e9,
+        }
+        print(
+            f"[simlingo_steervla.update_hl_grpo] loss={out['loss']:.4f} pg={out['pg_loss']:.4f} "
+            f"kl={out['kl']:.4f} grad_norm={grad_norm:.3f} n={len(records)} "
+            f"{out['update_seconds']:.1f}s peak={out['hl_mem_peak_gb']:.1f}GB",
             flush=True,
         )
         return out

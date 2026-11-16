@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Restartable B2D + F2D residual-RL evaluation queue.
+# Restartable remaining-F2D residual-RL evaluation queue.
 # Each route trains for 10k steps, then --eval-mode freezes the final policy
 # and rolls it out for three model seeds in the same CARLA process.
 set -euo pipefail
@@ -9,8 +9,12 @@ cd "$ROOT_DIR"
 
 PHYSICAL_GPU="${1:-${EVAL_GPU:-0}}"
 RUN_ROOT="${2:-${EVAL_ROOT:-/raid/users/${USER}/carla_exps/evals/residual_rl}}"
-EVAL_LABEL="${EVAL_LABEL:-simlingo-steervla-residual-rl-b2d-f2d-failed-rerun-v2-20260921}"
-RUN_GROUP="${EVAL_RUN_GROUP:-SimLingoSteerVLAResidualRLB2DF2DFailedRerunV1}"
+EVAL_LABEL="${EVAL_LABEL:-simlingo-steervla-residual-rl-f2d-remaining-v1-20261019}"
+RUN_GROUP="${EVAL_RUN_GROUP:-SimLingoSteerVLAResidualRLF2DRemainingV1}"
+# Keep the caller's local CARLA installation (with install_f2d_content.sh assets) by default.
+FAIL2DRIVE_CARLA_ROOT="${EVAL_FAIL2DRIVE_CARLA_ROOT:-}"
+CARLA_0915_ROOT="${CARLA_0915_ROOT:-${EVAL_CARLA_0915_ROOT:-/raid/users/${USER}/f2d_carla}}"
+CARLA_0915_PYTHON="${CARLA_0915_PYTHON:-${EVAL_CARLA_0915_PYTHON:-${ROOT_DIR}/.venv-carla-0915/bin/python}}"
 # A retry gets a fresh W&B name; completed routes still skip via their .done markers.
 # Supply EVAL_RUN_NONCE=<number> only to deliberately reuse names.
 if [[ -n "${EVAL_RUN_NONCE:-}" ]]; then
@@ -29,34 +33,42 @@ CONTINUE_ON_FAILURE="${CONTINUE_ON_FAILURE:-true}"
 DRY_RUN="${DRY_RUN:-0}"
 REVERSE_ROUTES="${REVERSE_ROUTES:-0}"
 
-# Dedicated to this failed-route rerun; avoids the 14000 residual-eval and YAY ranges.
+# Dedicated to this remaining-route queue; avoids the 14000 residual-eval and YAY ranges.
 CARLA_PORT="${EVAL_CARLA_PORT:-$((16000 + PHYSICAL_GPU * 20))}"
 CARLA_STREAMING_PORT="${EVAL_CARLA_STREAMING_PORT:-$((CARLA_PORT + 1))}"
 TM_PORT="${EVAL_TM_PORT:-$((CARLA_PORT + 6000))}"
 X_DISPLAY_NUM="${EVAL_X_DISPLAY_NUM:-$((800 + PHYSICAL_GPU))}"
 
 ROUTES=(
-  generalization-right-construction-1094
-  generalization-wall-1097
   generalization-animals-1076
-  generalization-bad-parking-1004
-  generalization-obscured-stop-1046
-  generalization-image-on-object-1041
+  generalization-wall-1097
 )
 
 case "$REVERSE_ROUTES" in
   0|false) ;;
   1|true)
-    ROUTES=(
-      generalization-right-construction-1094
-      generalization-wall-1097
-      generalization-animals-1076
-      generalization-bad-parking-1004
-      generalization-obscured-stop-1046
-    )
+    ROUTES=(generalization-wall-1097 generalization-animals-1076)
     ;;
   *) echo "REVERSE_ROUTES must be 0, 1, false, or true." >&2; exit 2 ;;
 esac
+if [[ -n "${EVAL_ROUTES:-}" ]]; then
+  read -r -a ROUTES <<< "$EVAL_ROUTES"
+fi
+if (( ${#ROUTES[@]} == 0 )); then
+  echo 'EVAL_ROUTES selected no routes.' >&2
+  exit 2
+fi
+if [[ " ${ROUTES[*]} " == *" generalization-animals-1076 "* ]]; then
+  [[ -x "$CARLA_0915_ROOT/CarlaUE4.sh" ]] || {
+    echo "CARLA 0.9.15 simulator not found at $CARLA_0915_ROOT/CarlaUE4.sh" >&2; exit 2;
+  }
+  [[ -x "$CARLA_0915_PYTHON" ]] || {
+    echo "CARLA 0.9.15 Python environment not found at $CARLA_0915_PYTHON" >&2; exit 2;
+  }
+  [[ -f "$CARLA_0915_ROOT/CarlaUE4/Content/Carla/Blueprints/Walkers/BP_Elephant.uasset" ]] || {
+    echo "Elephant blueprint missing from CARLA 0.9.15 root: $CARLA_0915_ROOT" >&2; exit 2;
+  }
+fi
 
 read -r -a SEED_LIST <<< "$SEEDS"
 if (( ${#SEED_LIST[@]} == 0 )); then
@@ -85,6 +97,9 @@ max_episode_steps=4000
 agent_config=impls/configs/simlingo_steervla_residual_config.py
 hl_checkpoint=/raid/users/celine/steervla-ckpts/2026_05_24_06_52_33_simlingo_seed1_bellman/checkpoints/epoch=019.ckpt
 ll_checkpoint=/raid/users/celine/steervla-ckpts/2026_05_23_21_39_41_simlingo_ll_vla_meta_conditioned/checkpoints/epoch=029.ckpt
+fail2drive_carla_root=${FAIL2DRIVE_CARLA_ROOT:-<current CARLA_ROOT>}
+carla_0915_root_for_animals=$CARLA_0915_ROOT
+carla_0915_python_for_animals=$CARLA_0915_PYTHON
 state_encoder=siglip_pool
 residual_accel_scale=0.1
 residual_steer_scale=0.1
@@ -148,7 +163,10 @@ for seed in "${SEED_LIST[@]}"; do
     done_file="$RUN_ROOT/status/$EVAL_LABEL/${tag}.done"
     failure_file="$RUN_ROOT/status/$EVAL_LABEL/${tag}.failed"
     log_file="$RUN_ROOT/logs/$EVAL_LABEL/${tag}.log"
-    exp_name="simlingo-steervla-residual-rl-rerun_${RUN_NONCE}_sd-${seed}_${route}"
+    exp_name="simlingo-steervla-residual-rl-remaining_${RUN_NONCE}_sd-${seed}_${route}"
+    if [[ "$route" == "generalization-animals-1076" ]]; then
+      exp_name="simlingo-steervla-residual-rl-animals-0915_${RUN_NONCE}_sd-${seed}_${route}"
+    fi
     lock_file="$RUN_ROOT/status/$EVAL_LABEL/${tag}.lock"
     exec {route_lock_fd}>"$lock_file"
     if ! flock -n "$route_lock_fd"; then
@@ -171,7 +189,11 @@ for seed in "${SEED_LIST[@]}"; do
     mkdir -p "$run_dir"
     set +e
     eval_seeds="$((seed + 1001)),$((seed + 1002)),$((seed + 1003))"
-    run_with_watchdog "$log_file" "$failure_file" env CUDA_VISIBLE_DEVICES="$PHYSICAL_GPU" OGBENCH_SAVE_DIR="$run_dir" \
+    carla_version_env=(CARLA_0915_ROOT= CARLA_0915_PYTHON=)
+    if [[ "$route" == "generalization-animals-1076" ]]; then
+      carla_version_env=(CARLA_0915_ROOT="$CARLA_0915_ROOT" CARLA_0915_PYTHON="$CARLA_0915_PYTHON")
+    fi
+    run_with_watchdog "$log_file" "$failure_file" env CUDA_VISIBLE_DEVICES="$PHYSICAL_GPU" FAIL2DRIVE_CARLA_ROOT="$FAIL2DRIVE_CARLA_ROOT" OGBENCH_SAVE_DIR="$run_dir" "${carla_version_env[@]}" \
       ./run_carla.sh \
         --agent-config impls/configs/simlingo_steervla_residual_config.py \
         --route "$route" \

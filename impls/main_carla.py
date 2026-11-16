@@ -5872,7 +5872,8 @@ def run_online_residual(
         if otf_mode:
             cands = steervla_actor.sample_candidates(n_cand, temperature=cot_temp, rng=key)
             chunks = np.asarray(
-                cands.get("actions_normalized", cands["actions"]), dtype=np.float32
+                cands["actions_normalized"] if "actions_normalized" in cands else cands["actions"],
+                dtype=np.float32,
             ).reshape(n_cand, -1)
             base_cands = np.stack(
                 [np.asarray(_agent_base_action(o, chunks[i]), dtype=np.float32) for i in range(n_cand)],
@@ -6640,8 +6641,8 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
     scores form the group: advantage ``A_k=(s_k-mean)/std``. The K candidate CoTs are recorded with
     those advantages, and the argmax-score candidate's action chunk is executed to advance the episode.
     Records accumulate across ``update_every_states`` scored states, then :meth:`update_hl_grpo` takes
-    the (minibatched) policy-gradient step with a KL penalty to a frozen reference. Runs until the
-    ``online_steps`` env-step budget is spent.
+    the (minibatched) policy-gradient step with a KL penalty to a frozen reference. With eval mode,
+    updates stop at ``online_steps`` and the current episode finishes before frozen evaluation begins.
     """
     from coaches.cast_relabel import build_candidate_score_prompt, parse_candidate_scores
 
@@ -6711,6 +6712,11 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
     episode_return, episode_steps, episode_count, last_reward = 0.0, 0, 0, 0.0
     episode_speed_sum = 0.0
     frames: list[np.ndarray] = []
+    final_train_driving_score = 0.0
+    final_checkpoint = None
+    budget_checkpoint_saved = False
+    drain_steps = max(1, int(getattr(env, "_max_episode_steps", 4000) or 4000)) if FLAGS.eval_mode else 0
+    progress = tqdm.tqdm(total=total_steps, dynamic_ncols=True)
 
     def _do_update(step_tag: int) -> None:
         nonlocal pooled, pooled_adv, score_stats, winner_scores, inject_wins, states_since_update, update_idx
@@ -6746,7 +6752,8 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
         score_fail_count = 0
         update_idx += 1
 
-    for step in tqdm.tqdm(range(1, total_steps + 1), dynamic_ncols=True):
+    for step in range(1, total_steps + drain_steps + 1):
+        step_started = time.time()
         raw_holder["obs"] = obs
         if warmup_steps > 0 and step == warmup_steps + 1:
             steervla_actor.cot_temperature = base_cot_temp  # end warmup -> restore CoT sampling
@@ -6755,16 +6762,31 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
         win_reasoning = win_subtask = None
         scoring_failed = False
         in_warmup = step <= warmup_steps
-        scored = (not in_warmup) and (step % score_every == 0)
+        scored = step <= total_steps and (not in_warmup) and (step % score_every == 0)
         if scored:
             # Sample K candidate CoTs, VLM-score them, record them with advantages; execute the top one.
             rng, ck = jax.random.split(rng)
-            cands = steervla_actor.sample_candidates(n_cand, temperature=score_temp, raw=obs, rng=ck)
+            try:
+                cands = steervla_actor.sample_candidates(
+                    n_cand, temperature=score_temp, raw=obs, rng=ck
+                )
+            except Exception:
+                import traceback
+
+                print(
+                    f"[grpo] candidate sampling failed at step={step}, route={FLAGS.route}; "
+                    "traceback follows before environment teardown",
+                    flush=True,
+                )
+                traceback.print_exc()
+                sys.stderr.flush()
+                raise
             subtasks = list(cands["subtask_texts"])
             reasonings = list(cands["reasoning_texts"])
             # Execute the RAW normalized chunk (env applies denormalize_actions)
             chunks = np.asarray(
-                cands.get("actions_normalized", cands["actions"]), dtype=np.float32
+                cands["actions_normalized"] if "actions_normalized" in cands else cands["actions"],
+                dtype=np.float32,
             ).reshape(n_cand, -1)
             recs = steervla_actor.grpo_records_from_candidates(cands, obs)
             if inject_stop:
@@ -6799,6 +6821,8 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
                     print(f"[grpo] VLM scoring attempt {attempt + 1}/{vlm_retries} failed: {exc}", flush=True)
             if scores is None:
                 print("[grpo] VLM scoring failed after retries; driving base chunk (state not pooled).", flush=True)
+                reset_candidate = getattr(steervla_actor, "reset_candidate_cache", steervla_actor.reset_action_cache)
+                reset_candidate()
                 scored, scoring_failed, score_fail_count = False, True, score_fail_count + 1
         if scored:
             if updates_enabled:
@@ -6818,6 +6842,10 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
             states_since_update += 1
             action = chunks[winner]
             win_reasoning, win_subtask = reasonings[winner], subtasks[winner]
+            if hasattr(steervla_actor, "set_grpo_selection"):
+                steervla_actor.set_grpo_selection(
+                    obs, reasoning=win_reasoning, subtask=win_subtask, action_chunk=action
+                )
             # HUD: one line per candidate (score + subtask); the executed winner is drawn in green
             # ('>' marker + WIN tag), the injected stop candidate in cyan.
             hud_lines = [f"step={episode_steps} ret={episode_return:+.1f} win=c{winner}"]
@@ -6852,7 +6880,20 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
                     "line_colors": [(0, 200, 255)],
                 }
 
-        next_obs, reward, terminated, truncated, info = env.step(action)
+        try:
+            next_obs, reward, terminated, truncated, info = env.step(action)
+        except BaseException:
+            import traceback
+
+            print(
+                f"[grpo] env.step raised at step={step}, route={FLAGS.route}, "
+                f"action_shape={np.asarray(action).shape}; traceback follows before teardown",
+                flush=True,
+            )
+            traceback.print_exc()
+            sys.stderr.flush()
+            raise
+        progress.update(1)
         if isinstance(next_obs, dict) and win_subtask is not None:
             # Surface the executed candidate's CoT so the video panel's Reasoning/Subtask populate.
             next_obs["reasoning_text"], next_obs["subtask_text"] = win_reasoning, win_subtask
@@ -6864,6 +6905,24 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
         episode_speed_sum += speed
         last_reward = reward_used
         done = bool(terminated or truncated)
+        step_metrics = {
+            "rollout/reward": float(reward),
+            "rollout/episode_return": float(episode_return),
+            "rollout/episode_step": float(episode_steps),
+            "rollout/episode_count": float(episode_count),
+            "rollout/mean_speed_mps": float(episode_speed_sum / max(episode_steps, 1)),
+            "training/in_warmup": float(in_warmup),
+            "training/enable_updates": float(updates_enabled and step <= total_steps),
+            "training/frozen_episode_drain": float(step > total_steps),
+            "training/frozen_eval": 0.0,
+            "time/step_time": float(time.time() - step_started),
+        }
+        for key in ("route_progress_pct", "collision_count", "collision_events", "driving_score"):
+            if key in info:
+                step_metrics[f"rollout/{key}"] = float(info[key])
+        step_metrics.update(_reward_breakdown_log(info))
+        wandb.log(step_metrics, step=step)
+        train_logger.log(step_metrics, step=step)
         if log_video:
             _maybe_capture_frame(
                 frames, next_obs, reward_used, episode_steps=episode_steps, done=done,
@@ -6873,6 +6932,7 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
         obs = next_obs
 
         if done:
+            final_train_driving_score = float(info.get("driving_score", 0.0))
             # Full rollout logging (success / route progress / collisions / termination / video); in debug
             # mode episode_return is the -speed objective and is logged under debug/episode_return.
             _log_episode_end(
@@ -6897,27 +6957,154 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
             train_logger.log(grpo_ep, step=step)
             print(
                 f"[grpo] episode {episode_count}: return={episode_return:.3f} steps={episode_steps} "
-                f"mean_speed={episode_speed_sum / max(episode_steps, 1):.3f} (env_step {step}/{total_steps})",
+                f"mean_speed={episode_speed_sum / max(episode_steps, 1):.3f} "
+                f"(env_step={step}, train_budget={total_steps})",
                 flush=True,
             )
             episode_count += 1
             episode_return, episode_steps, last_reward, episode_speed_sum = 0.0, 0, 0.0, 0.0
             frames = []
-            obs, info = env.reset(seed=run_carla_seed() + episode_count)
-            steervla_actor.reset_action_cache()
+            eval_boundary_reached = FLAGS.eval_mode and step >= total_steps
+            if not eval_boundary_reached:
+                obs, info = env.reset(seed=run_carla_seed() + episode_count)
+                steervla_actor.reset_action_cache()
+        else:
+            eval_boundary_reached = False
 
         if states_since_update >= update_every:
             _do_update(step)  # flushes score logs; skips the gradient step when updates disabled
-        if updates_enabled and ckpt_every_steps > 0 and step % ckpt_every_steps == 0:
+        if FLAGS.eval_mode and step == total_steps:
+            _do_update(total_steps)
+            print(
+                "[grpo] training budget reached; updates frozen, finishing the current episode before eval.",
+                flush=True,
+            )
+            if updates_enabled:
+                try:
+                    steervla_actor.save_checkpoint(ckpt_root, total_steps)
+                    final_checkpoint = os.path.join(ckpt_root, str(total_steps))
+                    budget_checkpoint_saved = True
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[grpo] budget checkpoint save failed: {exc}", flush=True)
+        if updates_enabled and ckpt_every_steps > 0 and step < total_steps and step % ckpt_every_steps == 0:
             steervla_actor.save_checkpoint(ckpt_root, step)
+        if eval_boundary_reached:
+            print(
+                f"[grpo] finished the budget-crossing episode at env_step={step}; "
+                "starting frozen evaluation.",
+                flush=True,
+            )
+            break
 
     _do_update(total_steps)
-    if not updates_enabled:
+    if updates_enabled and not budget_checkpoint_saved:
+        try:
+            steervla_actor.save_checkpoint(ckpt_root, total_steps)  # final export
+            final_checkpoint = os.path.join(ckpt_root, str(total_steps))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[grpo] final checkpoint save failed (non-fatal): {exc}", flush=True)
+
+    if not FLAGS.eval_mode:
+        progress.close()
         return
-    try:
-        steervla_actor.save_checkpoint(ckpt_root, total_steps)  # final export
-    except Exception as exc:  # noqa: BLE001
-        print(f"[grpo] final checkpoint save failed (non-fatal): {exc}", flush=True)
+
+    # Evaluate the updated policy itself, not the Gemini candidate selector used during
+    # training.  This matches the frozen-policy evaluation used by the other methods.
+    carla_seed, train_seed, eval_seeds = resolve_run_seeds()
+    eval_scores: list[float] = []
+    global_env_step = step
+    saved_sampling_seed = getattr(steervla_actor, "sampling_seed", None)
+    for eval_index, eval_seed in enumerate(eval_seeds[: max(1, int(FLAGS.post_stop_eval_episodes))]):
+        print(
+            f"[grpo] frozen eval {eval_index + 1}: carla_seed={carla_seed} model_seed={eval_seed}",
+            flush=True,
+        )
+        steervla_actor.sampling_seed = int(eval_seed)
+        steervla_actor.reset_action_cache()
+        obs, info = env.reset(seed=carla_seed)
+        eval_rng = jax.random.PRNGKey(int(eval_seed))
+        episode_return = 0.0
+        episode_steps = 0
+        frames = []
+        while True:
+            step_started = time.time()
+            raw_holder["obs"] = obs
+            eval_rng, noise_key = jax.random.split(eval_rng)
+            action = _base_chunk(
+                vla_sample_fn,
+                raw_holder,
+                obs,
+                jax.random.normal(noise_key, (1, base_noise_dim), dtype=jnp.float32),
+            )
+            obs, reward, terminated, truncated, info = env.step(action)
+            episode_return += float(reward)
+            episode_steps += 1
+            global_env_step += 1
+            progress.update(1)
+            step_metrics = {
+                "rollout/reward": float(reward),
+                "rollout/episode_return": float(episode_return),
+                "rollout/episode_step": float(episode_steps),
+                "rollout/episode_count": float(episode_count + eval_index),
+                "training/in_warmup": 0.0,
+                "training/enable_updates": 0.0,
+                "training/frozen_episode_drain": 0.0,
+                "training/frozen_eval": 1.0,
+                "time/step_time": float(time.time() - step_started),
+            }
+            for key in ("route_progress_pct", "collision_count", "collision_events", "driving_score"):
+                if key in info:
+                    step_metrics[f"rollout/{key}"] = float(info[key])
+            step_metrics.update(_reward_breakdown_log(info))
+            wandb.log(step_metrics, step=global_env_step)
+            train_logger.log(step_metrics, step=global_env_step)
+            done = bool(terminated or truncated)
+            if log_video:
+                _maybe_capture_frame(
+                    frames, obs, float(reward), episode_steps=episode_steps, done=done,
+                    log_video=log_video, video_every=video_every, action_flat=action,
+                    exec_cfg=exec_cfg, steervla_actor=steervla_actor,
+                )
+            if done:
+                break
+        score = float(info.get("driving_score", 0.0))
+        eval_scores.append(score)
+        _log_episode_end(
+            info,
+            episode_return=episode_return,
+            episode_steps=episode_steps,
+            episode_index=episode_count + eval_index,
+            frames=frames,
+            log_video=log_video,
+            video_fps=video_fps,
+            step=global_env_step,
+            train_logger=train_logger,
+            collision_events=int(info.get("collision_count", 0)),
+        )
+        print(f"[grpo] frozen eval {eval_index + 1}: driving_score={score:.2f}", flush=True)
+
+    if saved_sampling_seed is not None:
+        steervla_actor.sampling_seed = saved_sampling_seed
+    progress.close()
+    mean_score = float(np.mean(eval_scores)) if eval_scores else 0.0
+    wandb.log({
+        "eval/mean_driving_score": mean_score,
+        "eval/episodes": float(len(eval_scores)),
+        **{f"eval/driving_score_seed{seed}": score for seed, score in zip(eval_seeds, eval_scores)},
+    }, step=global_env_step)
+    write_run_summary(
+        FLAGS.save_dir,
+        route=str(FLAGS.route or ""),
+        carla_seed=carla_seed,
+        train_seed=train_seed,
+        eval_seeds=eval_seeds[: len(eval_scores)],
+        eval_scores=eval_scores,
+        final_train_driving_score=final_train_driving_score,
+        stop_reason=f"reached --online_steps={total_steps}",
+        hl_updates_applied=update_idx,
+        env_steps=global_env_step,
+        final_checkpoint=final_checkpoint,
+    )
 
 
 def _run_grpo_entry(config):
@@ -6952,8 +7139,6 @@ def _run_grpo_entry(config):
     with open(os.path.join(FLAGS.save_dir, "flags.json"), "w") as f:
         json.dump(get_flag_dict(), f)
 
-    if _is_simlingo_steervla(steervla_cfg):
-        raise NotImplementedError("GRPO samples Pi0 CoT candidates; steervla.vla='simlingo_steervla' is not supported.")
     carla_yaml, extra_carla, exec_cfg = _resolve_carla_env_config(config)
     env = _make_carla_env(carla_yaml, FLAGS.route, extra_carla_config=extra_carla)
     try:
@@ -6964,11 +7149,18 @@ def _run_grpo_entry(config):
             raise ValueError("CARLA env must return a Dict obs with 'state' and 'image'.")
 
         raw_holder: dict = {"obs": obs}
-        from vlas.steervla import create_steervla_pi0_cot_sample_fn
+        if _is_simlingo_steervla(steervla_cfg):
+            vla_sample_fn, steervla_actor = _build_vla_sample_fn(
+                steervla_cfg, raw_holder, training_gpu_rank=int(config.get("training_gpu_rank", -1)),
+                noise_scale=float(config.get("noise_scale", 1.0)),
+            )
+        else:
+            from vlas.steervla import create_steervla_pi0_cot_sample_fn
 
-        vla_sample_fn, steervla_actor = create_steervla_pi0_cot_sample_fn(
-            steervla_cfg, raw_holder, training_gpu_rank=int(config.get("training_gpu_rank", -1))
-        )
+            vla_sample_fn, steervla_actor = create_steervla_pi0_cot_sample_fn(
+                steervla_cfg, raw_holder, training_gpu_rank=int(config.get("training_gpu_rank", -1))
+            )
+        steervla_actor.sampling_seed = int(run_train_seed())
         _configure_jax_training_device(int(config.get("training_gpu_rank", -1)))
 
         # VLM critic: reuse the coach the DSRL/CAST path uses (provider/model from the vlm_coach block).
@@ -6985,6 +7177,16 @@ def _run_grpo_entry(config):
             raw_holder=raw_holder, exec_cfg=exec_cfg,
         )
         _mark_run_complete()
+    except BaseException:
+        import traceback
+
+        print(
+            f"[grpo] run raised for route={FLAGS.route}; traceback follows before env.close()",
+            flush=True,
+        )
+        traceback.print_exc()
+        sys.stderr.flush()
+        raise
     finally:
         try:
             env.close()

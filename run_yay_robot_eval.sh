@@ -11,8 +11,10 @@ PHYSICAL_GPU="${1:-${EVAL_GPU:-0}}"
 HL_PHYSICAL_GPU="${EVAL_HL_GPU:-7}"
 SINGLE_GPU="${EVAL_SINGLE_GPU:-0}"
 RUN_ROOT="${2:-${EVAL_ROOT:-/raid/users/${USER}/carla_exps/evals/yay_robot}}"
-EVAL_LABEL="${EVAL_LABEL:-simlingo-steervla-yay-robot-f2d-evalmode-v1-20261012}"
-RUN_GROUP="${EVAL_RUN_GROUP:-SimLingoSteerVLAYayRobotF2DEvalModeV1}"
+EVAL_LABEL="${EVAL_LABEL:-simlingo-steervla-yay-robot-f2d-evalmode-v2-20261019}"
+RUN_GROUP="${EVAL_RUN_GROUP:-SimLingoSteerVLAYayRobotF2DEvalModeV2}"
+# Keep the caller's local CARLA installation (with install_f2d_content.sh assets) by default.
+FAIL2DRIVE_CARLA_ROOT="${EVAL_FAIL2DRIVE_CARLA_ROOT:-}"
 # A retry gets a fresh W&B name; completed routes still skip via their .done markers.
 # Supply EVAL_RUN_NONCE=<number> only to deliberately reuse names.
 if [[ -n "${EVAL_RUN_NONCE:-}" ]]; then
@@ -111,6 +113,7 @@ max_episode_steps=4000
 agent_config=impls/configs/simlingo_steervla_yay_robot_train_config.py
 hl_checkpoint=/raid/users/celine/steervla-ckpts/2026_05_24_06_52_33_simlingo_seed1_bellman/checkpoints/epoch=019.ckpt
 ll_checkpoint=/raid/users/celine/steervla-ckpts/2026_05_23_21_39_41_simlingo_ll_vla_meta_conditioned/checkpoints/epoch=029.ckpt
+fail2drive_carla_root=${FAIL2DRIVE_CARLA_ROOT:-<current CARLA_ROOT>}
 yay_correction_period_env_steps=24
 yay_correction_every_cot_queries=4
 hl_update_schedule=10_gradient_steps_per_200_env_steps
@@ -179,7 +182,7 @@ for seed in "${SEED_LIST[@]}"; do
     mkdir -p "$run_dir"
     set +e
     eval_seeds="$((seed + 1001)),$((seed + 1002)),$((seed + 1003))"
-    run_with_watchdog "$log_file" "$failure_file" env CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" "${MEMORY_ENV[@]}" OGBENCH_SAVE_DIR="$run_dir" \
+    run_with_watchdog "$log_file" "$failure_file" env CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" "${MEMORY_ENV[@]}" FAIL2DRIVE_CARLA_ROOT="$FAIL2DRIVE_CARLA_ROOT" OGBENCH_SAVE_DIR="$run_dir" \
       ./run_carla.sh \
         --agent-config impls/configs/simlingo_steervla_yay_robot_train_config.py \
         --route "$route" \
