@@ -225,6 +225,11 @@ run_with_watchdog() {
   return "$run_code"
 }
 
+release_route_lock() {
+  flock -u "$route_lock_fd" 2>/dev/null || true
+  eval "exec ${route_lock_fd}>&-"
+}
+
 total=$(( ${#ROUTES[@]} * ${#SEED_LIST[@]} ))
 index=0
 for seed in "${SEED_LIST[@]}"; do
@@ -243,12 +248,20 @@ for seed in "${SEED_LIST[@]}"; do
       # run_carla.sh applies this override after the 0.9.15 switch; leave it unset for this route.
       fail2drive_root_env=(FAIL2DRIVE_CARLA_ROOT=)
     fi
+    exec {route_lock_fd}>"$RUN_ROOT/status/$EVAL_LABEL/${tag}.lock"
+    if ! flock -n "$route_lock_fd"; then
+      echo "[$index/$total] SKIP claimed by another queue: $tag"
+      release_route_lock
+      continue
+    fi
     if [[ "$SKIP_COMPLETED" == "1" && -f "$done_file" ]]; then
       echo "[$index/$total] SKIP completed: $tag"
+      release_route_lock
       continue
     fi
     echo "[$index/$total] START: $tag (wandb_name=$exp_name)"
     if [[ "$DRY_RUN" == "1" ]]; then
+      release_route_lock
       continue
     fi
 
@@ -289,18 +302,22 @@ for seed in "${SEED_LIST[@]}"; do
     if [[ "$run_code" -eq 0 && "$tee_code" -eq 0 ]]; then
       touch "$done_file"
       echo "[$index/$total] DONE: $tag"
+      release_route_lock
       continue
     fi
     if [[ "$run_code" -eq 130 ]]; then
       echo "[$index/$total] interrupted; stopping evaluation queue." >&2
+      release_route_lock
       exit 130
     fi
     printf 'timestamp=%s\nrun_exit_code=%s\ntee_exit_code=%s\n' "$(date --iso-8601=seconds)" "$run_code" "$tee_code" > "$failure_file"
     echo "[$index/$total] FAILED: $tag (run=$run_code tee=$tee_code; marker=$failure_file)" >&2
     if [[ "$CONTINUE_ON_FAILURE" == "1" || "$CONTINUE_ON_FAILURE" == "true" ]]; then
       echo "[$index/$total] continuing after recorded failure." >&2
+      release_route_lock
       continue
     fi
+    release_route_lock
     exit "$run_code"
   done
 done

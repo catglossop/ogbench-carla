@@ -83,6 +83,7 @@ class MixedSteerVLAActor(SteerVLAActor):
             self.hl_dataset_dir = None
             self.hl_update_every = max(1, int(cfg.get('hl_update_every', 1)))
             self.hl_update_batch_size = max(1, int(cfg.get('hl_update_batch_size', 16)))
+            self._hl_grad_steps = self._hl_updates_applied = self._hl_update_calls = 0
             print(f'[mixed-steervla] InternVL2 HL trainable in worker: {cfg}', flush=True)
 
     def update_hl(self, *, batch_size=None, num_steps=None, rng=None, global_step=None):
@@ -91,7 +92,15 @@ class MixedSteerVLAActor(SteerVLAActor):
             return {}
         self._hl_conn.send(dict(cmd='update_hl', global_step=global_step,
                                 hl_dataset_dir=None if self.hl_dataset_dir is None else str(self.hl_dataset_dir)))
-        return self._receive_hl(3600)['info']
+        info = self._receive_hl(3600)['info']
+        # main_carla's stop rules (--max_hl_updates, DS-streak target) read these off the actor.
+        if 'policy_updates' in info:
+            self._hl_grad_steps = int(info['policy_updates'])
+        if 'updates_applied' in info:
+            self._hl_updates_applied = int(info['updates_applied'])
+        if 'update_calls' in info:
+            self._hl_update_calls = int(info['update_calls'])
+        return info
 
     def save_checkpoint(self, out_root, step, *, keep_last=0):
         if not self._hl_trainable:
