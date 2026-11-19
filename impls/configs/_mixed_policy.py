@@ -3,7 +3,8 @@
 InternVL2 HL (SimLingo HL checkpoint, run in a torch worker by ``vlas/mixed_steervla.py``) plans text;
 pi05 ``no_ego_history_v1 @ 6000`` reads the camera and emits the action chunk. Cadence and HL sampling
 are those of ``.run_carla/qwen_zs_bon_run.sh ACTOR=mixed`` (``steervla_mixed_eval_config`` + overrides):
-HL every 5 LL queries, LL every 3 env steps, HL sampled at ``cot_temperature`` 1.0, ``proprio_norm`` off.
+HL every 5 LL queries, LL every 3 env steps, ``proprio_norm`` off. HL sampling temperature 0.1 (the user's
+choice for the residual / YAY sweep; the HARP SimLingo training used 0.1, the HARP mixed evals 1.0).
 """
 
 MIXED_LL_CHECKPOINT = (
@@ -33,5 +34,5 @@ def apply_mixed_policy(s):
     s.actions_per_cot = 5
     s.actions_per_model_query = 3
     s.proprio_norm = False
-    s.cot_temperature = 1.0
+    s.cot_temperature = 0.1
     return s
