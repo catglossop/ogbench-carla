@@ -252,11 +252,16 @@ class _SimLingoModel:
             return self.model(driving_input)
 
         adaptor_dict = self.model.adaptors(driving_input, inference=True)
+        # Older simlingo-steervla checkouts (e.g. 07e9434) build ``wp_encoder`` for LL models only and
+        # their own HL forward omits it; pass it only when the model has one.
+        placeholder_kw = {}
+        if getattr(self.model, "wp_encoder", None) is not None:
+            placeholder_kw["wp_encoder"] = self.model.wp_encoder
         adaptor_dict = self.model.vision_model.image_encoder.replace_placeholder_tokens(
             adaptor_dict=adaptor_dict,
             pixel_values=driving_input.camera_images,
             placeholder_values=driving_input.prompt_inference.placeholder_values,
-            wp_encoder=self.model.wp_encoder,
+            **placeholder_kw,
         )
         if self.variant == "OpenGVLab/InternVL2-4B":
             eos = self.tokenizer.added_tokens_encoder["<|end|>"]

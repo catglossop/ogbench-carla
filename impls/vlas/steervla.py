@@ -5287,6 +5287,27 @@ def create_steervla_pi0_cot_sample_fn(
             simlingo_source_root=str(steervla_cfg["simlingo_source_root"]),
             hl_python=str(steervla_cfg["hl_python"]),
         )
+        if bool(steervla_cfg.get("hl_trainable", False)):
+            # Online InternVL2 HL training inside the worker (YAY-Robot on the mixed policy). Same
+            # knobs, same defaults as create_simlingo_steervla_sample_fn; pi05 stays frozen.
+            _hl_keys = (
+                "hl_update_every", "hl_update_batch_size", "hl_update_num_steps", "hl_micro_batch_size",
+                "hl_lr", "hl_weight_decay", "hl_grad_clip", "hl_replay_root", "hl_replay_pools",
+                "hl_online_weight", "hl_online_bad_fraction", "hl_online_precursor_fraction",
+                "hl_online_backfill_from_replay", "use_adaptive_sampling", "adaptive_sampling_weights",
+                "hl_min_online_samples", "hl_keep_last_rounds", "hl_kl_coef", "hl_log_kl",
+            )
+            _hl_cfg = {}
+            for _k in _hl_keys:
+                _v = steervla_cfg.get(_k, None)
+                if _v is None:
+                    continue
+                if hasattr(_v, "to_dict"):
+                    _v = _v.to_dict()
+                elif isinstance(_v, (list, tuple)):
+                    _v = [x.to_dict() if hasattr(x, "to_dict") else dict(x) if isinstance(x, dict) else x for x in _v]
+                _hl_cfg[_k] = _v
+            ctor_kw["hl_train_config"] = _hl_cfg
 
     if url_clean:
         actor = SteerVLAActor(actor_url=url_clean, actor_config=None, checkpoint_path=None, **ctor_kw)
