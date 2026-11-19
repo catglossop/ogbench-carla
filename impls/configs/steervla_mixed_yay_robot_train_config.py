@@ -42,4 +42,7 @@ def get_config():
     ll_period = max(1, int(s.actions_per_model_query))
     cot_period = -(-max(1, int(s.actions_per_cot)) // ll_period) * ll_period
     config.yay_robot.query_every_n_cot_queries = max(1, round(24 / cot_period))
+    # Corrector model (the user's choice for this sweep). --eval-mode still forces EVAL_MODE_GEMINI_MODEL,
+    # so the launcher also exports OGBENCH_GEMINI_MODEL=gemini-3.8-flash.
+    config.yay_robot.gemini_model = "gemini-3.8-flash"
     return config

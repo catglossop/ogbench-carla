@@ -53,6 +53,40 @@ SAVE_VIDEO_LOCAL="${SAVE_VIDEO_LOCAL:-true}"
 SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
 CONTINUE_ON_FAILURE="${CONTINUE_ON_FAILURE:-true}"
 DRY_RUN="${DRY_RUN:-0}"
+AGENT_CONFIG="${EVAL_AGENT_CONFIG:-impls/configs/simlingo_steervla_yay_robot_train_config.py}"
+EXP_PREFIX="${EVAL_EXP_PREFIX:-simlingo-steervla-yay-robot-f2d-remaining}"
+
+# Optional: hold each cell until the GPU has this much free memory (MiB). 0 = start immediately.
+WAIT_FREE_MIB="${EVAL_WAIT_FREE_MIB:-0}"
+# Lanes sharing a GPU serialize their starts through a gate file: a cell starts only when the GPU has
+# WAIT_FREE_MIB free AND no other lane started on it in the last EVAL_GPU_GATE_HOLD seconds (its CARLA
+# and models are still loading, so free memory over-reports).
+GATE_DIR="${EVAL_GPU_GATE_DIR:-/tmp/${USER}_carla_gpu_gates}"
+GATE_HOLD="${EVAL_GPU_GATE_HOLD:-900}"
+wait_for_gpu_memory() {
+  [[ "$WAIT_FREE_MIB" -gt 0 ]] || return 0
+  mkdir -p "$GATE_DIR"
+  local gate="$GATE_DIR/gpu${PHYSICAL_GPU}" free last now waited=0 gate_fd ok
+  while true; do
+    exec {gate_fd}>"$gate.lock"
+    flock "$gate_fd"
+    free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$PHYSICAL_GPU" 2>/dev/null | tr -d ' ')
+    last=$(cat "$gate" 2>/dev/null || echo 0); now=$(date +%s); ok=0
+    if [[ "$free" =~ ^[0-9]+$ && "$free" -ge "$WAIT_FREE_MIB" && $((now - last)) -ge "$GATE_HOLD" ]]; then
+      echo "$now" > "$gate"; ok=1
+    fi
+    flock -u "$gate_fd"; eval "exec ${gate_fd}>&-"
+    [[ "$ok" == 1 ]] && { echo "[$(date --iso-8601=seconds)] GPU $PHYSICAL_GPU gate open (${free} MiB free)"; return 0; }
+    (( waited % 1800 == 0 )) && echo "[$(date --iso-8601=seconds)] waiting for GPU $PHYSICAL_GPU: ${free:-?} MiB free (need $WAIT_FREE_MIB), last start $((now - last))s ago"
+    sleep 60; waited=$((waited + 60))
+  done
+}
+# Optional: EVAL_F2D_0915=1 runs every Fail2Drive (generalization-*) route on CARLA 0.9.15, not only animals.
+F2D_0915="${EVAL_F2D_0915:-0}"
+uses_0915() {
+  [[ "$1" == "generalization-animals-1076" ]] && return 0
+  [[ "$F2D_0915" == "1" && "$1" == generalization-* ]]
+}
 if [[ -z "${GEMINI_API_KEY:-}" ]]; then
   echo "[yay_robot_eval] GEMINI_API_KEY must be exported; refusing to launch an uncorrected baseline." >&2
   exit 1
@@ -90,8 +124,14 @@ ROUTES=(
   generalization-right-construction-1094
   generalization-animals-1076
 )
+if [[ -n "${EVAL_ROUTES:-}" ]]; then
+  read -r -a ROUTES <<< "$EVAL_ROUTES"
+fi
+(( ${#ROUTES[@]} > 0 )) || { echo 'EVAL_ROUTES selected no routes.' >&2; exit 2; }
 
-if [[ " ${ROUTES[*]} " == *" generalization-animals-1076 "* ]]; then
+needs_0915=0
+for r in "${ROUTES[@]}"; do uses_0915 "$r" && needs_0915=1; done
+if [[ "$needs_0915" == 1 ]]; then
   [[ -x "$CARLA_0915_ROOT/CarlaUE4.sh" ]] || {
     echo "[yay_robot_eval] CARLA 0.9.15 simulator not found at $CARLA_0915_ROOT/CarlaUE4.sh" >&2; exit 2;
   }
@@ -131,7 +171,10 @@ seeds=${SEED_LIST[*]}
 routes=${ROUTES[*]}
 online_steps=10000
 max_episode_steps=4000
-agent_config=impls/configs/simlingo_steervla_yay_robot_train_config.py
+agent_config=$AGENT_CONFIG
+f2d_all_0915=$F2D_0915
+wait_free_mib=$WAIT_FREE_MIB
+xla_preallocate=${XLA_PYTHON_CLIENT_PREALLOCATE:-<default>}
 hl_checkpoint=/raid/users/celine/steervla-ckpts/2026_05_24_06_52_33_simlingo_seed1_bellman/checkpoints/epoch=019.ckpt
 ll_checkpoint=/raid/users/celine/steervla-ckpts/2026_05_23_21_39_41_simlingo_ll_vla_meta_conditioned/checkpoints/epoch=029.ckpt
 fail2drive_carla_root=${FAIL2DRIVE_CARLA_ROOT:-<current CARLA_ROOT>}
@@ -191,11 +234,11 @@ for seed in "${SEED_LIST[@]}"; do
     done_file="$RUN_ROOT/status/$EVAL_LABEL/${tag}.done"
     failure_file="$RUN_ROOT/status/$EVAL_LABEL/${tag}.failed"
     log_file="$RUN_ROOT/logs/$EVAL_LABEL/${tag}.log"
-    exp_name="simlingo-steervla-yay-robot-f2d-remaining_${RUN_NONCE}_sd-${seed}_${route}"
+    exp_name="${EXP_PREFIX}_${RUN_NONCE}_sd-${seed}_${route}"
     carla_version_env=(CARLA_0915_ROOT= CARLA_0915_PYTHON=)
     fail2drive_root_env=(FAIL2DRIVE_CARLA_ROOT="$FAIL2DRIVE_CARLA_ROOT")
-    if [[ "$route" == "generalization-animals-1076" ]]; then
-      exp_name="simlingo-steervla-yay-robot-f2d-animals-0915_${RUN_NONCE}_sd-${seed}_${route}"
+    if uses_0915 "$route"; then
+      [[ -z "${EVAL_EXP_PREFIX:-}" ]] && exp_name="simlingo-steervla-yay-robot-f2d-animals-0915_${RUN_NONCE}_sd-${seed}_${route}"
       carla_version_env=(CARLA_0915_ROOT="$CARLA_0915_ROOT" CARLA_0915_PYTHON="$CARLA_0915_PYTHON")
       # run_carla.sh applies this override after the 0.9.15 switch; leave it unset for this route.
       fail2drive_root_env=(FAIL2DRIVE_CARLA_ROOT=)
@@ -213,9 +256,10 @@ for seed in "${SEED_LIST[@]}"; do
     mkdir -p "$run_dir"
     set +e
     eval_seeds="$((seed + 1001)),$((seed + 1002)),$((seed + 1003))"
+    wait_for_gpu_memory
     run_with_watchdog "$log_file" "$failure_file" env CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" "${MEMORY_ENV[@]}" "${fail2drive_root_env[@]}" OGBENCH_SAVE_DIR="$run_dir" "${carla_version_env[@]}" \
       ./run_carla.sh \
-        --agent-config impls/configs/simlingo_steervla_yay_robot_train_config.py \
+        --agent-config "$AGENT_CONFIG" \
         --route "$route" \
         --carla-seed "$seed" \
         --train-seed "$seed" \

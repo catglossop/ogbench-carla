@@ -9,8 +9,11 @@ Two runs could differ in their reviewer and agree in every logged config field.
 Change the model HERE. Anything that needs a different one must pass it explicitly.
 """
 
-# The model every coach uses unless a caller overrides it.
-DEFAULT_GEMINI_MODEL = "gemini-3.7-flash"
+import os
+
+# The model every coach uses unless a caller overrides it. ``OGBENCH_GEMINI_MODEL`` overrides it for a
+# whole run (and therefore EVAL_MODE_GEMINI_MODEL below, which --eval-mode forces on every coach).
+DEFAULT_GEMINI_MODEL = os.environ.get("OGBENCH_GEMINI_MODEL", "").strip() or "gemini-3.7-flash"
 
 # Runs launched with --eval-mode are the ones whose numbers get reported, so they must not
 # silently inherit an older model from a stale config. main_carla forces this for them.
