@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from multiprocessing.connection import Connection
+import os
 from pathlib import Path
 import traceback
 
@@ -26,25 +27,53 @@ def main():
         if hl.dataset_cfg.get('use_history_image', False):
             raise ValueError('History images are not supported by this HL bridge.')
         original_sample = hl.model.language_model.greedy_sample
+        # Per-request HL sampling temperature (0 = greedy, the default). Best-of-N needs > 0 so each
+        # candidate gets its own subtask; a per-request seed keeps those draws reproducible.
+        sampling = dict(temperature=0.0)
 
-        def greedy(*args, **kwargs):
-            kwargs['temperature'] = 0.0
+        def sample(*args, **kwargs):
+            kwargs['temperature'] = sampling['temperature']
             return original_sample(*args, **kwargs)
 
-        hl.model.language_model.greedy_sample = greedy
+        hl.model.language_model.greedy_sample = sample
+        # HL_KV_CACHE=1 swaps in a KV-cached loop instead (hl_kv_cache.py). Same model, same
+        # positions -- step 0 is bitwise identical -- but bf16 attention takes a different
+        # reduction path once the cache is in play, so a step whose top-1/top-2 margin is inside
+        # that noise can flip. Sampled text is therefore a valid draw, not a reproducible one.
+        if os.environ.get('HL_KV_CACHE') == '1':
+            from hl_kv_cache import install_kv_cache
+
+            install_kv_cache(hl, sampling)
+            print('[internvl2-hl] KV-cached greedy_sample enabled (HL_KV_CACHE=1)', flush=True)
         conn.send(dict(ready=True, weights=str(hl.weights),
                        use_ego_history=bool(hl.dataset_cfg.get('use_ego_state_history', False)),
                        history_count=int(hl.dataset_cfg.get('ego_state_history_count', 3))))
+        vision_cache = None
+        scene_id = None
+        if os.environ.get('HL_REUSE_VISION') == '1':
+            from frozen_vision_cache import FrozenVisionCache
+            vision_cache = FrozenVisionCache(hl.model.vision_model.image_encoder.model)
         while True:
             request = conn.recv()
             if request is None:
                 break
+            if vision_cache is not None:
+                # A missing ID is deliberately uncacheable (legacy callers).
+                incoming_scene = request.get('scene_id')
+                if incoming_scene is None or incoming_scene != scene_id:
+                    vision_cache.clear()
+                scene_id = incoming_scene
+            sampling['temperature'] = float(request.get('temperature', 0.0))
+            if request.get('seed') is not None:
+                torch.manual_seed(int(request['seed']))
             _, _, language = hl.generate(request['image'], request['prompt'])
             output = str(language[0] if language else '')
             reasoning, subtask = split_hl_output(output)
             if not subtask.strip():
                 raise ValueError(f'InternVL2 returned an empty subtask: {output!r}')
-            conn.send(dict(reasoning=reasoning, subtask=subtask, output=output))
+            conn.send(dict(reasoning=reasoning, subtask=subtask, output=output,
+                           vision_cache_hits=vision_cache.hits if vision_cache else 0,
+                           vision_cache_misses=vision_cache.misses if vision_cache else 0))
     except EOFError:
         pass
     except Exception:

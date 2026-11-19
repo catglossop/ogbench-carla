@@ -21,11 +21,17 @@ class MixedSteerVLAActor(SteerVLAActor):
         if kwargs.get('load_trainable_params') or kwargs.get('fixed_subtask_text'):
             raise ValueError('Mixed SteerVLA is an inference-only, live-HL actor.')
         self._hl_history = deque(maxlen=402)
+        self._candidate_scene_id = 0
         super().__init__(**kwargs)
         parent, child = socket.socketpair()
         self._hl_conn = Connection(parent.detach())
         env = os.environ.copy()
-        env['CUDA_VISIBLE_DEVICES'] = str(kwargs['training_gpu_rank'])
+        # training_gpu_rank indexes the devices THIS process sees. If the parent was already pinned
+        # (CUDA_VISIBLE_DEVICES=2 with --train-gpu 0), translate the rank to the physical id so the
+        # worker lands on the same GPU instead of physical GPU <rank>.
+        rank = int(kwargs['training_gpu_rank'])
+        parent_visible = [d for d in os.environ.get('CUDA_VISIBLE_DEVICES', '').split(',') if d.strip()]
+        env['CUDA_VISIBLE_DEVICES'] = parent_visible[rank].strip() if 0 <= rank < len(parent_visible) else str(rank)
         env.pop('PYTHONPATH', None)
         self._hl_proc = subprocess.Popen([
             hl_python, '-u', str(Path(__file__).with_name('internvl2_hl_worker.py')),
@@ -69,6 +75,9 @@ class MixedSteerVLAActor(SteerVLAActor):
         super().reset_action_cache()
         self._hl_history.clear()
 
+    def begin_candidate_scene(self):
+        self._candidate_scene_id += 1
+
     def _sample_cot_checked(self, rng, obs_jax):
         if obs_jax.tokenized_prompt.shape[0] != 1:
             raise ValueError('Mixed HL evaluation expects one live scene at a time.')
@@ -85,8 +94,15 @@ class MixedSteerVLAActor(SteerVLAActor):
                   f"Command: {raw.get('routing_command') or self.routing_command}")
         # The native camera is for InternVL2 only. The superclass still constructs
         # pi05's Observation from raw['image'] and encodes it with pi05's backbone.
-        self._hl_conn.send(dict(image=np.asarray(raw['image_viz'], dtype=np.uint8), prompt=prompt))
+        # Sample the HL at the actor's CoT temperature (Best-of-N sets 1.0 so each candidate slot gets
+        # its own subtask; 0 keeps the original greedy HL). The seed comes from this call's JAX key, so
+        # every sequential BoN slot draws independently yet reproducibly.
+        seed = int(jax.random.randint(rng, (), 0, np.iinfo(np.int32).max))
+        self._hl_conn.send(dict(image=np.asarray(raw['image_viz'], dtype=np.uint8), prompt=prompt,
+                                temperature=float(self.cot_temperature), seed=seed,
+                                scene_id=self._candidate_scene_id))
         result = self._receive_hl()
+        self.last_hl_vision_cache_hits = result.get('vision_cache_hits', 0)
         raw['simlingo_hl_output'] = result['output']
         raw['simlingo_hl_prompt'] = prompt
         print(f"[mixed-steervla] InternVL2 subtask: {result['subtask']}", flush=True)
