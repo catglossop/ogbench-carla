@@ -129,6 +129,8 @@ GRPO_SELECT=""
 GRPO_GROUP_SIZE=""
 # GRPO-only: candidate CoT sampling temperature. Empty -> config default. Low (even 0) = near-greedy BoN.
 GRPO_SCORE_TEMP=""
+# GRPO-only: candidate scorer (simulator or gemini). Empty -> config default.
+GRPO_SCORER=""
 # Override config.steervla.cot_temperature (e.g. 1.0 to sample the base CoT). Empty -> config default.
 COT_TEMPERATURE=""
 # Override config.steervla.hl_kl_coef: KL penalty tethering the HL CoT policy to its starting
@@ -225,6 +227,7 @@ Options:
   --grpo-select MODE        GRPO only: executed candidate = argmax|random|first. Default: argmax.
   --grpo-group-size N       GRPO only: candidates sampled/scored per state (1 = single-sample).
   --grpo-score-temp T       GRPO only: candidate CoT sampling temperature (low/0 = near-greedy BoN).
+  --grpo-scorer NAME        GRPO only: simulator (default) or gemini.
   --cot-temperature T       Override config.steervla.cot_temperature (e.g. 1.0 to sample base CoTs).
   --fixed-carla-seed [true|false]  Pin the sim seed to --carla-seed for TRAINING episodes too
                             (eval already does). Train and eval then differ only in the
@@ -367,6 +370,7 @@ while [[ $# -gt 0 ]]; do
     --grpo-select|--grpo_select) GRPO_SELECT="$2"; shift 2 ;;
     --grpo-group-size|--grpo_group_size) GRPO_GROUP_SIZE="$2"; shift 2 ;;
     --grpo-score-temp|--grpo_score_temp) GRPO_SCORE_TEMP="$2"; shift 2 ;;
+    --grpo-scorer|--grpo_scorer) GRPO_SCORER="$2"; shift 2 ;;
     --cot-temperature|--cot_temperature) COT_TEMPERATURE="$2"; shift 2 ;;
     --hl-kl-coef|--hl_kl_coef) HL_KL_COEF="$2"; shift 2 ;;
     --stop-score-streak|--stop_score_streak) STOP_SCORE_STREAK="$2"; shift 2 ;;
@@ -584,6 +588,9 @@ def get_config():
     _GRPO_SCORE_TEMP = "${GRPO_SCORE_TEMP}"
     if _GRPO_SCORE_TEMP != "" and "grpo" in config:
         config.grpo.score_temperature = float(_GRPO_SCORE_TEMP)
+    _GRPO_SCORER = "${GRPO_SCORER}"
+    if _GRPO_SCORER != "" and "grpo" in config:
+        config.grpo.scorer = _GRPO_SCORER
     config.enable_updates = ${ENABLE_UPDATES^}
     config.critic_feedback_mode = "${CRITIC_FEEDBACK_MODE}"
     config.online_training_mode = "${TRAIN_MODE}"

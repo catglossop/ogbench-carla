@@ -8,8 +8,10 @@ cd "$ROOT_DIR"
 PHYSICAL_GPU="${1:-${EVAL_GPU:-0}}"
 HL_PHYSICAL_GPU="${GRPO_HL_GPU:-1}"
 RUN_ROOT="${2:-${EVAL_ROOT:-/raid/users/${USER}/carla_exps/evals/grpo}}"
-EVAL_LABEL="${EVAL_LABEL:-simlingo-steervla-grpo-b2d-f2d-evalmode-v1-20261104}"
-RUN_GROUP="${EVAL_RUN_GROUP:-SimLingoSteerVLAGRPOB2DF2DEvalModeV1}"
+GRPO_SCORER="${GRPO_SCORER:-simulator}"
+GRPO_REWARD_LABEL="${GRPO_REWARD_LABEL:-$GRPO_SCORER}"
+EVAL_LABEL="${EVAL_LABEL:-simlingo-steervla-grpo-${GRPO_REWARD_LABEL}-b2d-f2d-evalmode-v1-20261116}"
+RUN_GROUP="${EVAL_RUN_GROUP:-SimLingoSteerVLAGRPO${GRPO_REWARD_LABEL^}B2DF2DEvalModeV1}"
 # Keep the caller's local CARLA installation (with install_f2d_content.sh assets) by default.
 FAIL2DRIVE_CARLA_ROOT="${EVAL_FAIL2DRIVE_CARLA_ROOT:-}"
 SEEDS="${SEEDS:-0}"
@@ -19,7 +21,16 @@ SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
 CONTINUE_ON_FAILURE="${CONTINUE_ON_FAILURE:-true}"
 DRY_RUN="${DRY_RUN:-0}"
 
-[[ -n "${GEMINI_API_KEY:-}" ]] || { echo 'GEMINI_API_KEY must be exported for GRPO.' >&2; exit 1; }
+[[ "$GRPO_SCORER" == simulator || "$GRPO_SCORER" == gemini ]] || {
+  echo 'GRPO_SCORER must be simulator or gemini.' >&2; exit 2;
+}
+[[ "$GRPO_REWARD_LABEL" =~ ^[a-zA-Z0-9_-]+$ ]] || {
+  echo 'GRPO_REWARD_LABEL may contain only letters, numbers, underscores, and hyphens.' >&2; exit 2;
+}
+if [[ "$GRPO_SCORER" == gemini && -z "${GEMINI_API_KEY:-}" ]]; then
+  echo 'GEMINI_API_KEY must be exported when GRPO_SCORER=gemini.' >&2
+  exit 1
+fi
 [[ "$PHYSICAL_GPU" != "$HL_PHYSICAL_GPU" ]] || { echo 'GRPO_HL_GPU must differ from the policy/CARLA GPU.' >&2; exit 2; }
 
 if [[ -n "${EVAL_RUN_NONCE:-}" ]]; then RUN_NONCE="$EVAL_RUN_NONCE"; else printf -v RUN_NONCE '%05d%05d' "$RANDOM" "$RANDOM"; fi
@@ -52,6 +63,8 @@ mkdir -p "$RUN_ROOT/logs/$EVAL_LABEL" "$RUN_ROOT/status/$EVAL_LABEL" "$RUN_ROOT/
 cat > "$RUN_ROOT/eval_spec_${EVAL_LABEL}.txt" <<SPEC
 created=$(date --iso-8601=seconds)
 run_group=$RUN_GROUP
+scorer=$GRPO_SCORER
+reward_label=$GRPO_REWARD_LABEL
 run_nonce=$RUN_NONCE
 policy_gpu=$PHYSICAL_GPU
 hl_gpu=$HL_PHYSICAL_GPU
@@ -100,7 +113,7 @@ for seed in "${SEED_LIST[@]}"; do
     index=$((index + 1)); tag="${route}__seed-${seed}"
     done_file="$RUN_ROOT/status/$EVAL_LABEL/${tag}.done"
     log_file="$RUN_ROOT/logs/$EVAL_LABEL/${tag}.log"
-    exp_name="simlingo-steervla-grpo-evalmode-v1_${RUN_NONCE}_sd-${seed}_${route}"
+    exp_name="simlingo-steervla-grpo-${GRPO_REWARD_LABEL}-evalmode-v1_${RUN_NONCE}_sd-${seed}_${route}"
     if [[ "$SKIP_COMPLETED" == 1 && -f "$done_file" ]]; then echo "[$index/$total] SKIP completed: $tag"; continue; fi
     echo "[$index/$total] START: $tag (wandb_name=$exp_name)"
     [[ "$DRY_RUN" == 1 ]] && continue
@@ -114,7 +127,8 @@ for seed in "${SEED_LIST[@]}"; do
       --carla-seed "$seed" --train-seed "$seed" --eval-seeds "$eval_seeds" --seed "$seed" --exp-name "$exp_name" \
       --online-steps 10000 --max-episode-steps 4000 --train-gpu 0 --hl-gpu 1 --train-mode grpo_hl --critic-mode none \
       --render-adapter "$PHYSICAL_GPU" --carla-port "$CARLA_PORT" --carla-streaming-port "$CARLA_STREAMING_PORT" \
-      --tm-port "$TM_PORT" --x-display-num "$X_DISPLAY_NUM" --run-group "$RUN_GROUP" --eval-mode \
+      --tm-port "$TM_PORT" --x-display-num "$X_DISPLAY_NUM" --run-group "$RUN_GROUP" \
+      --grpo-scorer "$GRPO_SCORER" --eval-mode \
       --post-stop-eval-episodes 3 --save-buffer false --save-video-local true --wandb-mode "$WANDB_MODE" --max-retries "$MAX_RETRIES"
     status=$?; set -e
     if [[ "$status" -eq 0 ]]; then touch "$done_file"; echo "[$index/$total] DONE: $tag"; continue; fi

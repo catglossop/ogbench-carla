@@ -6482,7 +6482,6 @@ def _run_residual_entry(config):
     os.makedirs(FLAGS.save_dir, exist_ok=True)
     with open(os.path.join(FLAGS.save_dir, "flags.json"), "w") as f:
         json.dump(get_flag_dict(), f)
-
     # Resume bookkeeping: if --resume and a prior resume_state exists, we continue from the last
     # checkpointed step (restore agent + buffer below). resume_state is None -> fresh run.
     resume_state = _read_resume_state(FLAGS.save_dir) if FLAGS.resume else None
@@ -6633,20 +6632,23 @@ def _run_residual_entry(config):
 
 
 def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, *, raw_holder, exec_cfg):
-    """GRPO on the SteerVLA high-level (CoT/subtask) policy, scored by a VLM critic (action expert frozen).
+    """GRPO on the high-level CoT policy with a configurable candidate scorer.
 
     At each scored decision state the actor samples ``group_size`` candidate CoTs for the current
-    observation (one batched forward); the VLM critic scores each candidate subtask in [0, 1] given the
-    current frame + env-reward context (speed / route progress / cumulative + last-step reward). The
+    observation (one batched forward); the configured scorer ranks each candidate's waypoint chunk. The
     scores form the group: advantage ``A_k=(s_k-mean)/std``. The K candidate CoTs are recorded with
     those advantages, and the argmax-score candidate's action chunk is executed to advance the episode.
     Records accumulate across ``update_every_states`` scored states, then :meth:`update_hl_grpo` takes
     the (minibatched) policy-gradient step with a KL penalty to a frozen reference. With eval mode,
     updates stop at ``online_steps`` and the current episode finishes before frozen evaluation begins.
     """
-    from coaches.cast_relabel import build_candidate_score_prompt, parse_candidate_scores
-
     grpo = config.get("grpo") or {}
+    scorer = str(grpo.get("scorer", "simulator")).strip().lower()
+    if scorer not in ("simulator", "gemini"):
+        raise ValueError(f"Unsupported GRPO scorer {scorer!r}; expected 'simulator' or 'gemini'.")
+    if scorer == "gemini":
+        from coaches.cast_relabel import build_candidate_score_prompt, parse_candidate_scores
+
     # No-learning diagnostic: score + execute as usual but skip the HL gradient step, to isolate
     # whether behavior changes come from updates or from inference (temperature/selection).
     updates_enabled = bool(config.get("enable_updates", True))
@@ -6655,7 +6657,7 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
     score_temp = float(grpo.get("score_temperature", 1.0))
     beta_kl = float(grpo.get("beta_kl", 0.01))
     num_epochs = int(grpo.get("num_update_steps", 1))
-    score_every = max(1, int(grpo.get("score_every", 1)))  # env steps between scored decision states
+    score_every = max(1, int(grpo.get("score_every", 6)))  # env steps between scored decision states
     update_every = max(1, int(grpo.get("update_every_states", 4)))  # scored states pooled per update
     adv_eps = float(grpo.get("advantage_eps", 1e-6))
     vlm_retries = max(1, int(grpo.get("vlm_score_retries", 3)))
@@ -6702,9 +6704,34 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
     score_stats: list[np.ndarray] = []
     winner_scores: list[float] = []  # top score picked per scored state (for update metrics)
     inject_wins: list[float] = []    # 1.0 when the injected stop candidate won, else 0.0
-    score_fail_count = 0             # scored states whose VLM scoring failed all retries (drove base)
+    score_fail_count = 0             # Gemini states whose scoring failed all retries (drove base)
     states_since_update = 0
     update_idx = 0
+    grpo_timing_totals = {
+        "candidate_generation": 0.0, "scoring": 0.0, "selection": 0.0,
+        "gemini_call": 0.0, "gemini_parse": 0.0, "gemini_call_count": 0.0,
+    }
+    pending_grpo_outcome: dict[str, float] | None = None
+
+    def _finish_grpo_outcome(prefix: str, end_info: dict[str, Any], *, terminal: bool = False):
+        nonlocal pending_grpo_outcome
+        if pending_grpo_outcome is None:
+            return {}
+        pending = pending_grpo_outcome
+        metrics = {
+            f"grpo/{prefix}_source_step": pending["step"],
+            f"grpo/{prefix}_selected_score": pending["score"],
+            f"grpo/{prefix}_realized_reward": pending["reward"],
+            f"grpo/{prefix}_realized_steps": pending["steps"],
+            f"grpo/{prefix}_route_progress_delta": float(end_info.get("route_progress_pct", 0.0))
+            - pending["route_progress_start"],
+            f"grpo/{prefix}_collision_delta": float(end_info.get("collision_count", 0.0))
+            - pending["collision_start"],
+        }
+        if terminal:
+            metrics[f"grpo/{prefix}_driving_score"] = float(end_info.get("driving_score", 0.0))
+        pending_grpo_outcome = None
+        return metrics
 
     obs = obs_raw
     info: dict[str, Any] = {}
@@ -6720,18 +6747,24 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
 
     def _do_update(step_tag: int) -> None:
         nonlocal pooled, pooled_adv, score_stats, winner_scores, inject_wins, states_since_update, update_idx
-        nonlocal score_fail_count
+        nonlocal score_fail_count, grpo_timing_totals
         # Nothing pooled (updates on) or no scored states (updates off) -> nothing to flush.
         if not score_stats:
             return
+        update_seconds = 0.0
         if updates_enabled:
+            update_started = time.perf_counter()
             uinfo = steervla_actor.update_hl_grpo(
                 pooled, np.asarray(pooled_adv, dtype=np.float32),
                 beta=beta_kl, num_epochs=num_epochs, global_step=step_tag,
             )
+            update_seconds = time.perf_counter() - update_started
             metrics = {f"grpo/{k}": float(v) for k, v in uinfo.items()}
         else:
             metrics = {}
+        timing_count = max(states_since_update, 1)
+        timing_means = {key: value / timing_count for key, value in grpo_timing_totals.items()}
+        decision_total = sum(grpo_timing_totals[key] for key in ("candidate_generation", "scoring", "selection"))
         all_scores = np.concatenate(score_stats) if score_stats else np.zeros((1,), dtype=np.float32)
         metrics.update({
             "grpo/update": float(update_idx),
@@ -6743,13 +6776,38 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
             # Scored states in this window whose VLM scoring failed all retries (drove the base chunk
             # instead, and were not pooled); a persistent nonzero value means the critic is unreliable.
             "grpo/score_failures": float(score_fail_count),
+            "time/grpo_candidate_generation_s": timing_means["candidate_generation"],
+            "time/grpo_scoring_s": timing_means["scoring"],
+            "time/grpo_selection_s": timing_means["selection"],
+            "time/grpo_decision_total_s": decision_total / timing_count,
+            "time/grpo_update_s": update_seconds,
+            "time/grpo_gemini_call_s_per_state": grpo_timing_totals["gemini_call"] / timing_count,
+            "time/grpo_gemini_call_s_per_request": grpo_timing_totals["gemini_call"]
+            / max(grpo_timing_totals["gemini_call_count"], 1.0),
+            "time/grpo_gemini_parse_s_per_state": grpo_timing_totals["gemini_parse"] / timing_count,
+            "grpo/gemini_requests": grpo_timing_totals["gemini_call_count"],
         })
         if inject_stop:
             metrics["grpo/inject_stop_won_frac"] = float(np.mean(inject_wins)) if inject_wins else 0.0
         wandb.log(metrics, step=step_tag)
         train_logger.log({k: v for k, v in metrics.items() if np.isscalar(v)}, step=step_tag)
+        print(
+            f"[grpo timing] step={step_tag} states={states_since_update} "
+            f"candidate_gen={timing_means['candidate_generation']:.3f}s/state "
+            f"score={timing_means['scoring']:.3f}s/state "
+            f"gemini_call={grpo_timing_totals['gemini_call'] / max(grpo_timing_totals['gemini_call_count'], 1.0):.3f}s/request "
+            f"({int(grpo_timing_totals['gemini_call_count'])} requests) "
+            f"gemini_parse={grpo_timing_totals['gemini_parse'] / timing_count:.4f}s/state "
+            f"select={timing_means['selection']:.3f}s/state "
+            f"update={update_seconds:.3f}s total={decision_total + update_seconds:.3f}s",
+            flush=True,
+        )
         pooled, pooled_adv, score_stats, winner_scores, inject_wins, states_since_update = [], [], [], [], [], 0
         score_fail_count = 0
+        grpo_timing_totals = {
+            "candidate_generation": 0.0, "scoring": 0.0, "selection": 0.0,
+            "gemini_call": 0.0, "gemini_parse": 0.0, "gemini_call_count": 0.0,
+        }
         update_idx += 1
 
     for step in range(1, total_steps + drain_steps + 1):
@@ -6761,11 +6819,16 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
         hud = None
         win_reasoning = win_subtask = None
         scoring_failed = False
+        score_components = None
+        winner = None
+        candidate_generation_seconds = scoring_seconds = selection_seconds = 0.0
+        resolved_outcome_metrics = {}
         in_warmup = step <= warmup_steps
         scored = step <= total_steps and (not in_warmup) and (step % score_every == 0)
         if scored:
-            # Sample K candidate CoTs, VLM-score them, record them with advantages; execute the top one.
+            # Sample K candidates, score their waypoint chunks, and execute only the selected one.
             rng, ck = jax.random.split(rng)
+            candidate_generation_started = time.perf_counter()
             try:
                 cands = steervla_actor.sample_candidates(
                     n_cand, temperature=score_temp, raw=obs, rng=ck
@@ -6795,42 +6858,87 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
                 subtasks[0] = stop_subtask
                 reasonings[0] = stop_reasoning
                 recs[0] = steervla_actor.grpo_stop_record(obs, reasoning=stop_reasoning, subtask=stop_subtask)
-            context = {
-                "routing_command": routing_command,
-                "current_speed_mps": round(float(_ego_speed_mps(obs)), 2),
-                "route_progress_pct": round(float(info.get("route_progress_pct", 0.0)), 2),
-                "episode_return_so_far": round(episode_return, 3),
-                "last_step_reward": round(last_reward, 3),
-                "episode_step": episode_steps,
-            }
-            frame = _viz_image_from_raw(obs)
-            if frame is None:
-                frame = obs.get("image")
-            prompt = build_candidate_score_prompt(context, subtasks, objective=score_objective)
-            # The VLM occasionally returns malformed JSON (worsening as the HL policy degrades and its
-            # CoTs garble); retry, then skip the state so one bad reply can't kill a multi-thousand-step run.
-            scores = None
-            for attempt in range(vlm_retries):
-                try:
-                    scores = np.asarray(
-                        parse_candidate_scores(coach.complete_image_text(frame, prompt), num=n_cand),
-                        dtype=np.float32,
+            candidate_generation_seconds = time.perf_counter() - candidate_generation_started
+            scoring_started = time.perf_counter()
+            if scorer == "simulator":
+                from grpo_simulator_reward import score_candidate_chunks
+
+                score_components = score_candidate_chunks(
+                    env, chunks, exec_cfg, grpo.get("simulator_reward") or {}
+                )
+                scores = score_components.pop("scores")
+            else:
+                context = {
+                    "routing_command": routing_command,
+                    "current_speed_mps": round(float(_ego_speed_mps(obs)), 2),
+                    "route_progress_pct": round(float(info.get("route_progress_pct", 0.0)), 2),
+                    "episode_return_so_far": round(episode_return, 3),
+                    "last_step_reward": round(last_reward, 3),
+                    "episode_step": episode_steps,
+                }
+                frame = _viz_image_from_raw(obs)
+                if frame is None:
+                    frame = obs.get("image")
+                prompt = build_candidate_score_prompt(context, subtasks, objective=score_objective)
+                # Preserve the previous Gemini scorer as an optional comparison.
+                scores = None
+                for attempt in range(vlm_retries):
+                    request_started = time.perf_counter()
+                    try:
+                        response = coach.complete_image_text(frame, prompt)
+                    except Exception as exc:  # noqa: BLE001 - retry transient Gemini request failures.
+                        request_seconds = time.perf_counter() - request_started
+                        grpo_timing_totals["gemini_call"] += request_seconds
+                        grpo_timing_totals["gemini_call_count"] += 1.0
+                        print(
+                            f"[grpo gemini timing] step={step} attempt={attempt + 1} "
+                            f"request={request_seconds:.3f}s failed",
+                            flush=True,
+                        )
+                        print(f"[grpo] Gemini scoring attempt {attempt + 1}/{vlm_retries} failed: {exc}", flush=True)
+                        continue
+
+                    request_seconds = time.perf_counter() - request_started
+                    grpo_timing_totals["gemini_call"] += request_seconds
+                    grpo_timing_totals["gemini_call_count"] += 1.0
+                    parse_started = time.perf_counter()
+                    try:
+                        scores = np.asarray(
+                            parse_candidate_scores(response, num=n_cand), dtype=np.float32
+                        )
+                    except Exception as exc:  # noqa: BLE001 - retry malformed Gemini score responses.
+                        parse_seconds = time.perf_counter() - parse_started
+                        grpo_timing_totals["gemini_parse"] += parse_seconds
+                        print(
+                            f"[grpo gemini timing] step={step} attempt={attempt + 1} "
+                            f"request={request_seconds:.3f}s parse={parse_seconds:.4f}s parse_failed",
+                            flush=True,
+                        )
+                        print(f"[grpo] Gemini scoring attempt {attempt + 1}/{vlm_retries} failed: {exc}", flush=True)
+                        continue
+                    parse_seconds = time.perf_counter() - parse_started
+                    grpo_timing_totals["gemini_parse"] += parse_seconds
+                    print(
+                        f"[grpo gemini timing] step={step} attempt={attempt + 1} "
+                        f"request={request_seconds:.3f}s parse={parse_seconds:.4f}s",
+                        flush=True,
                     )
                     break
-                except Exception as exc:  # noqa: BLE001 - transient VLM/JSON errors are retried below.
-                    print(f"[grpo] VLM scoring attempt {attempt + 1}/{vlm_retries} failed: {exc}", flush=True)
-            if scores is None:
-                print("[grpo] VLM scoring failed after retries; driving base chunk (state not pooled).", flush=True)
-                reset_candidate = getattr(steervla_actor, "reset_candidate_cache", steervla_actor.reset_action_cache)
-                reset_candidate()
-                scored, scoring_failed, score_fail_count = False, True, score_fail_count + 1
+                if scores is None:
+                    print("[grpo] Gemini scoring failed after retries; driving base chunk (state not pooled).", flush=True)
+                    reset_candidate = getattr(steervla_actor, "reset_candidate_cache", steervla_actor.reset_action_cache)
+                    reset_candidate()
+                    scored, scoring_failed, score_fail_count = False, True, score_fail_count + 1
+            scoring_seconds = time.perf_counter() - scoring_started
         if scored:
+            selection_started = time.perf_counter()
+            resolved_outcome_metrics.update(_finish_grpo_outcome("previous_decision", info))
             if updates_enabled:
                 adv = (scores - scores.mean()) / (scores.std() + adv_eps)
                 pooled.extend(recs)
                 pooled_adv.extend(float(a) for a in adv)
             score_stats.append(scores)
-            # Which candidate is EXECUTED (pooling/advantages/updates use all K regardless).
+            # Select one candidate; unselected candidates never go through env.step().
             if select_mode == "random":
                 winner = int(select_rng.integers(n_cand))
             elif select_mode == "first":
@@ -6846,6 +6954,14 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
                 steervla_actor.set_grpo_selection(
                     obs, reasoning=win_reasoning, subtask=win_subtask, action_chunk=action
                 )
+            pending_grpo_outcome = {
+                "step": float(step),
+                "score": float(scores[winner]),
+                "reward": 0.0,
+                "steps": 0.0,
+                "route_progress_start": float(info.get("route_progress_pct", 0.0)),
+                "collision_start": float(info.get("collision_count", 0.0)),
+            }
             # HUD: one line per candidate (score + subtask); the executed winner is drawn in green
             # ('>' marker + WIN tag), the injected stop candidate in cyan.
             hud_lines = [f"step={episode_steps} ret={episode_return:+.1f} win=c{winner}"]
@@ -6859,6 +6975,10 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
                 )
                 hud_colors.append((0, 255, 0) if is_win else ((255, 255, 0) if is_stop else (255, 255, 255)))
             hud = {"lines": hud_lines, "line_colors": hud_colors}
+            selection_seconds = time.perf_counter() - selection_started
+            grpo_timing_totals["candidate_generation"] += candidate_generation_seconds
+            grpo_timing_totals["scoring"] += scoring_seconds
+            grpo_timing_totals["selection"] += selection_seconds
         else:
             rng, nk = jax.random.split(rng)
             action = _base_chunk(
@@ -6905,6 +7025,11 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
         episode_speed_sum += speed
         last_reward = reward_used
         done = bool(terminated or truncated)
+        if pending_grpo_outcome is not None:
+            pending_grpo_outcome["reward"] += float(reward)
+            pending_grpo_outcome["steps"] += 1.0
+        if done:
+            resolved_outcome_metrics.update(_finish_grpo_outcome("terminal_decision", info, terminal=True))
         step_metrics = {
             "rollout/reward": float(reward),
             "rollout/episode_return": float(episode_return),
@@ -6921,6 +7046,17 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
             if key in info:
                 step_metrics[f"rollout/{key}"] = float(info[key])
         step_metrics.update(_reward_breakdown_log(info))
+        step_metrics.update(resolved_outcome_metrics)
+        if scored and winner is not None:
+            step_metrics["grpo/selected_score"] = float(scores[winner])
+            step_metrics["grpo/candidate_score_mean"] = float(np.mean(scores))
+            step_metrics["grpo/candidate_score_std"] = float(np.std(scores))
+            for candidate_idx, score in enumerate(scores):
+                step_metrics[f"grpo/candidate_{candidate_idx}_score"] = float(score)
+        if score_components is not None and winner is not None:
+            for key, values in score_components.items():
+                step_metrics[f"grpo/winner_{key}"] = float(values[winner])
+                step_metrics[f"grpo/group_{key}_mean"] = float(np.mean(values))
         wandb.log(step_metrics, step=step)
         train_logger.log(step_metrics, step=step)
         if log_video:
@@ -6996,6 +7132,10 @@ def run_online_grpo(env, steervla_actor, vla_sample_fn, coach, config, obs_raw, 
             )
             break
 
+    if pending_grpo_outcome is not None:
+        final_outcome_metrics = _finish_grpo_outcome("budget_final_decision", info)
+        wandb.log(final_outcome_metrics, step=step)
+        train_logger.log(final_outcome_metrics, step=step)
     _do_update(total_steps)
     if updates_enabled and not budget_checkpoint_saved:
         try:
@@ -7121,7 +7261,10 @@ def _run_grpo_entry(config):
     wandb_mode = _resolve_wandb_mode()
     # Match the residual scheme: <route>-<mode>-sd###_<ts>, where <mode> encodes the GRPO variant.
     grpo_cfg = config.get("grpo") or {}
-    mode_parts = ["grpo"]
+    scorer = str(grpo_cfg.get("scorer", "simulator")).strip().lower()
+    if scorer not in ("simulator", "gemini"):
+        raise ValueError(f"Unsupported GRPO scorer {scorer!r}; expected 'simulator' or 'gemini'.")
+    mode_parts = ["grpo", scorer]
     if bool(grpo_cfg.get("debug_task", False)):
         mode_parts.append("dbg")
     if bool(grpo_cfg.get("inject_stop_candidate", False)):
@@ -7138,6 +7281,10 @@ def _run_grpo_entry(config):
     os.makedirs(FLAGS.save_dir, exist_ok=True)
     with open(os.path.join(FLAGS.save_dir, "flags.json"), "w") as f:
         json.dump(get_flag_dict(), f)
+    grpo_log_config = grpo_cfg.to_dict() if hasattr(grpo_cfg, "to_dict") else dict(grpo_cfg)
+    wandb.config.update({"grpo": grpo_log_config}, allow_val_change=True)
+    with open(os.path.join(FLAGS.save_dir, "grpo_config.json"), "w") as f:
+        json.dump(grpo_log_config, f, indent=2)
 
     carla_yaml, extra_carla, exec_cfg = _resolve_carla_env_config(config)
     env = _make_carla_env(carla_yaml, FLAGS.route, extra_carla_config=extra_carla)
@@ -7163,14 +7310,15 @@ def _run_grpo_entry(config):
         steervla_actor.sampling_seed = int(run_train_seed())
         _configure_jax_training_device(int(config.get("training_gpu_rank", -1)))
 
-        # VLM critic: reuse the coach the DSRL/CAST path uses (provider/model from the vlm_coach block).
-        from coaches.vlm_feedback import create_coach
+        coach = None
+        if scorer == "gemini":
+            from coaches.vlm_feedback import create_coach
 
-        vlm_cfg = config.get("vlm_coach") or {}
-        coach = create_coach(
-            str(vlm_cfg.get("provider", "gemini")),
-            model=str(vlm_cfg.get("gemini_model", DEFAULT_GEMINI_MODEL)),
-        )
+            vlm_cfg = config.get("vlm_coach") or {}
+            coach = create_coach(
+                str(vlm_cfg.get("provider", "gemini")),
+                model=str(vlm_cfg.get("gemini_model", DEFAULT_GEMINI_MODEL)),
+            )
 
         run_online_grpo(
             env, steervla_actor, vla_sample_fn, coach, config, obs,

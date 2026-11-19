@@ -7,14 +7,35 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-PHYSICAL_GPU="${1:-${EVAL_GPU:-0}}"
+POSITIONAL_ARGS=()
 HL_PHYSICAL_GPU="${EVAL_HL_GPU:-7}"
+while (($#)); do
+  case "$1" in
+    --hl-gpu)
+      [[ $# -ge 2 ]] || { echo '--hl-gpu requires a GPU id.' >&2; exit 2; }
+      HL_PHYSICAL_GPU="$2"
+      shift 2
+      ;;
+    --help|-h)
+      echo "Usage: bash run_yay_robot_eval.sh [policy_gpu] [run_root] [--hl-gpu GPU]"
+      exit 0
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+PHYSICAL_GPU="${POSITIONAL_ARGS[0]:-${EVAL_GPU:-0}}"
 SINGLE_GPU="${EVAL_SINGLE_GPU:-0}"
-RUN_ROOT="${2:-${EVAL_ROOT:-/raid/users/${USER}/carla_exps/evals/yay_robot}}"
-EVAL_LABEL="${EVAL_LABEL:-simlingo-steervla-yay-robot-f2d-evalmode-v2-20261019}"
+RUN_ROOT="${POSITIONAL_ARGS[1]:-${EVAL_ROOT:-/raid/users/${USER}/carla_exps/evals/yay_robot}}"
+EVAL_LABEL="${EVAL_LABEL:-simlingo-steervla-yay-robot-f2d-remaining-v1-20261116}"
 RUN_GROUP="${EVAL_RUN_GROUP:-SimLingoSteerVLAYayRobotF2DEvalModeV2}"
 # Keep the caller's local CARLA installation (with install_f2d_content.sh assets) by default.
 FAIL2DRIVE_CARLA_ROOT="${EVAL_FAIL2DRIVE_CARLA_ROOT:-}"
+CARLA_0915_ROOT="${CARLA_0915_ROOT:-${EVAL_CARLA_0915_ROOT:-/raid/users/${USER}/f2d_carla}}"
+CARLA_0915_PYTHON="${CARLA_0915_PYTHON:-${EVAL_CARLA_0915_PYTHON:-${ROOT_DIR}/.venv-carla-0915/bin/python}}"
 # A retry gets a fresh W&B name; completed routes still skip via their .done markers.
 # Supply EVAL_RUN_NONCE=<number> only to deliberately reuse names.
 if [[ -n "${EVAL_RUN_NONCE:-}" ]]; then
@@ -64,23 +85,23 @@ TM_PORT="${EVAL_TM_PORT:-$((CARLA_PORT + 6000))}"
 X_DISPLAY_NUM="${EVAL_X_DISPLAY_NUM:-$((700 + PHYSICAL_GPU))}"
 
 ROUTES=(
-  generalization-construction-permutations-1019
-  generalization-custom-obstacles-1020
-  generalization-pedestrians-on-road-1085
-  generalization-construction-pedestrian-1011
-  generalization-pedestrian-crowd-1069
-  generalization-custom-obstacles-1024
-  generalization-fully-blocked-1032
   generalization-hard-brake-1036
   generalization-pedestrian-other-blocker-1072
   generalization-right-construction-1094
-  generalization-right-of-way-1056
-  generalization-image-on-object-1041
-  generalization-obscured-stop-1046
-  generalization-bad-parking-1004
   generalization-animals-1076
-  generalization-wall-1097
 )
+
+if [[ " ${ROUTES[*]} " == *" generalization-animals-1076 "* ]]; then
+  [[ -x "$CARLA_0915_ROOT/CarlaUE4.sh" ]] || {
+    echo "[yay_robot_eval] CARLA 0.9.15 simulator not found at $CARLA_0915_ROOT/CarlaUE4.sh" >&2; exit 2;
+  }
+  [[ -x "$CARLA_0915_PYTHON" ]] || {
+    echo "[yay_robot_eval] CARLA 0.9.15 Python environment not found at $CARLA_0915_PYTHON" >&2; exit 2;
+  }
+  [[ -f "$CARLA_0915_ROOT/CarlaUE4/Content/Carla/Blueprints/Walkers/BP_Elephant.uasset" ]] || {
+    echo "[yay_robot_eval] Elephant blueprint missing from CARLA 0.9.15 root: $CARLA_0915_ROOT" >&2; exit 2;
+  }
+fi
 
 read -r -a SEED_LIST <<< "$SEEDS"
 if (( ${#SEED_LIST[@]} == 0 )); then
@@ -114,6 +135,8 @@ agent_config=impls/configs/simlingo_steervla_yay_robot_train_config.py
 hl_checkpoint=/raid/users/celine/steervla-ckpts/2026_05_24_06_52_33_simlingo_seed1_bellman/checkpoints/epoch=019.ckpt
 ll_checkpoint=/raid/users/celine/steervla-ckpts/2026_05_23_21_39_41_simlingo_ll_vla_meta_conditioned/checkpoints/epoch=029.ckpt
 fail2drive_carla_root=${FAIL2DRIVE_CARLA_ROOT:-<current CARLA_ROOT>}
+carla_0915_root_for_animals=$CARLA_0915_ROOT
+carla_0915_python_for_animals=$CARLA_0915_PYTHON
 yay_correction_period_env_steps=24
 yay_correction_every_cot_queries=4
 hl_update_schedule=10_gradient_steps_per_200_env_steps
@@ -168,7 +191,15 @@ for seed in "${SEED_LIST[@]}"; do
     done_file="$RUN_ROOT/status/$EVAL_LABEL/${tag}.done"
     failure_file="$RUN_ROOT/status/$EVAL_LABEL/${tag}.failed"
     log_file="$RUN_ROOT/logs/$EVAL_LABEL/${tag}.log"
-    exp_name="simlingo-steervla-yay-robot-remaining_${RUN_NONCE}_sd-${seed}_${route}"
+    exp_name="simlingo-steervla-yay-robot-f2d-remaining_${RUN_NONCE}_sd-${seed}_${route}"
+    carla_version_env=(CARLA_0915_ROOT= CARLA_0915_PYTHON=)
+    fail2drive_root_env=(FAIL2DRIVE_CARLA_ROOT="$FAIL2DRIVE_CARLA_ROOT")
+    if [[ "$route" == "generalization-animals-1076" ]]; then
+      exp_name="simlingo-steervla-yay-robot-f2d-animals-0915_${RUN_NONCE}_sd-${seed}_${route}"
+      carla_version_env=(CARLA_0915_ROOT="$CARLA_0915_ROOT" CARLA_0915_PYTHON="$CARLA_0915_PYTHON")
+      # run_carla.sh applies this override after the 0.9.15 switch; leave it unset for this route.
+      fail2drive_root_env=(FAIL2DRIVE_CARLA_ROOT=)
+    fi
     if [[ "$SKIP_COMPLETED" == "1" && -f "$done_file" ]]; then
       echo "[$index/$total] SKIP completed: $tag"
       continue
@@ -182,7 +213,7 @@ for seed in "${SEED_LIST[@]}"; do
     mkdir -p "$run_dir"
     set +e
     eval_seeds="$((seed + 1001)),$((seed + 1002)),$((seed + 1003))"
-    run_with_watchdog "$log_file" "$failure_file" env CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" "${MEMORY_ENV[@]}" FAIL2DRIVE_CARLA_ROOT="$FAIL2DRIVE_CARLA_ROOT" OGBENCH_SAVE_DIR="$run_dir" \
+    run_with_watchdog "$log_file" "$failure_file" env CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" "${MEMORY_ENV[@]}" "${fail2drive_root_env[@]}" OGBENCH_SAVE_DIR="$run_dir" "${carla_version_env[@]}" \
       ./run_carla.sh \
         --agent-config impls/configs/simlingo_steervla_yay_robot_train_config.py \
         --route "$route" \

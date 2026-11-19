@@ -1,16 +1,15 @@
-"""GRPO on the SimLingo SteerVLA high-level planner, scored by a VLM critic.
+"""GRPO on the SimLingo SteerVLA high-level planner.
 
 Use with ``--agent=impls/configs/steervla_grpo_config.py``. ``main_carla`` dispatches to the GRPO path
 when ``online_training_mode == "grpo_hl"`` (see :func:`main_carla._run_grpo_entry`). At each scored
 decision state along a single rolling rollout, the actor samples ``grpo.group_size`` candidate CoTs for
-the current observation and a VLM critic scores each candidate subtask in [0, 1] from the current frame +
-env-reward context (speed / route progress / cumulative + last-step reward). The scores form the group
+the current observation and the configured scorer ranks the resulting action chunks. Simulator scoring
+uses only CARLA route/map/actor state; Gemini scoring remains an optional alternative. The scores form the group
 (``A_k=(s_k-mean)/std``); the K candidate CoTs are recorded with those advantages, the top-scored
 candidate is executed through the frozen SimLingo low-level policy, and
 :meth:`vlas.simlingo_steervla.SimLingoSteerVLAActor.update_hl_grpo` updates only the high-level planner.
 
-Requires ``steervla.load_trainable_params=True`` and a positive ``grpo.score_temperature``. The VLM
-critic uses the inherited ``vlm_coach`` block (provider / model).
+Requires ``steervla.load_trainable_params=True`` and a positive ``grpo.score_temperature``.
 """
 
 import ml_collections
@@ -22,8 +21,7 @@ from configs.simlingo_steervla_cast_relabel_train_config import apply_simlingo_s
 def get_config():
     config = get_dsrl_config()
 
-    # GRPO runs its own loop; the DSRL critic is unused (the VLM critic is built directly from the
-    # vlm_coach block in _run_grpo_entry). Keep the DSRL critic language source off.
+    # GRPO runs its own loop; keep the DSRL critic language source off.
     config.language_feedback.source = "expert"
     config.language_feedback.expert_mode = "none"
     config.online_training_mode = "grpo_hl"
@@ -52,28 +50,57 @@ def get_config():
 
     config.grpo = ml_collections.ConfigDict(
         dict(
+            # Simulator scores use candidate waypoints against the current CARLA route, map,
+            # traffic controls, and actor snapshot. Set to "gemini" for the previous VLM scorer.
+            scorer="simulator",
+            simulator_reward=ml_collections.ConfigDict(
+                dict(
+                    waypoint_dt_s=0.25,
+                    route_lookahead_m=60.0,
+                    actor_query_radius_m=60.0,
+                    collision_margin_m=3.0,
+                    traffic_control_radius_m=5.0,
+                    stop_speed_mps=0.5,
+                    weights=ml_collections.ConfigDict(
+                        dict(
+                            route_progress=1.0,
+                            route_deviation=0.75,
+                            lane_deviation=0.25,
+                            heading_alignment=0.25,
+                            speed_efficiency=0.1,
+                            speed_limit=0.5,
+                            vehicle_collision=3.0,
+                            pedestrian_collision=6.0,
+                            static_obstacle=3.0,
+                            red_light=2.0,
+                            stop_sign=1.5,
+                            acceleration_smoothness=0.1,
+                            jerk_smoothness=0.05,
+                            path_smoothness=0.1,
+                        )
+                    ),
+                )
+            ),
             # Drive the GREEDY base (cot_temperature=0, no scoring/pooling/updates) for the first N env
             # steps to log an in-run base baseline before GRPO exploration begins. 0 = off.
             warmup_steps=50,
-            # Which scored candidate to EXECUTE (pooling/advantages/updates are unaffected): "argmax"
-            # (VLM-best, default), "random" (diagnostic: isolates selection bias), or "first".
+            # Which scored candidate to EXECUTE: "argmax" (default), "random" (diagnostic), or "first".
             select_mode="argmax",
-            # Candidate CoTs sampled + VLM-scored per decision state (all K scored in one call); >=2.
+            # Candidate CoTs sampled and scored per decision state; >=2.
             group_size=4,
             # Candidate sampling temperature; >0 for diversity (greedy -> zero-variance scores).
             score_temperature=1.0,
-            # GRPO needs per-state candidate comparisons; keep scoring dense enough for learning,
-            # while reducing VLM cost from every control step.
-            score_every=20,
-            # Pool eight scored states (32 records at group_size=4), matching the HL update batch size.
+            # Match base-policy CoT cadence: actions_per_cot=5, checked on LL queries every 3 env steps,
+            # so a new CoT/candidate group is normally selected about every 6 env steps.
+            score_every=6,
+            # Pool eight scored states (32 records at group_size=4) per HL update.
             update_every_states=8,
             # KL(πθ‖π_ref) penalty weight vs the frozen base HL policy (0 = pure REINFORCE).
             beta_kl=0.01,
             # Passes over the pooled group per update (minibatched inside update_hl_grpo).
             num_update_steps=1,
             advantage_eps=1e-6,
-            # VLM scoring attempts before giving up on a state (transient/malformed replies get retried;
-            # after this many failures the state is skipped and the base policy drives that step).
+            # Gemini scoring attempts before giving up on a state (only used with scorer="gemini").
             vlm_score_retries=3,
             # Export the SimLingo HL to <save_dir>/steervla_hl_ckpt/<step> every N env steps (0 = final only).
             checkpoint_every_steps=2000,
