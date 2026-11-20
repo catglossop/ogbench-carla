@@ -7362,6 +7362,12 @@ def _run_grpo_entry(config):
 
 
 def main(_):
+    # SIGUSR1 -> every thread's Python stack on stderr (the run log), so a hung run can be diagnosed
+    # without ptrace (yama ptrace_scope=1 here blocks py-spy). The process keeps running.
+    import faulthandler
+    import signal as _signal
+
+    faulthandler.register(_signal.SIGUSR1, all_threads=True, chain=False)
     if FLAGS.list_routes:
         _list_routes_and_exit()
         return
