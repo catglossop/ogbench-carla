@@ -185,6 +185,12 @@ run_with_watchdog() {
   wait "$run_pid"; local run_code=$?
   kill "$watchdog_pid" 2>/dev/null || true
   wait "$watchdog_pid" 2>/dev/null || true
+  # Reap the whole run however it ended. main_carla can ignore the watchdog's TERM, and the watchdog
+  # subshell is killed just above -- possibly during its 15 s grace, before it sends KILL -- which left
+  # a stalled cell's main_carla + CARLA running (and holding GPU memory) after the lane moved on.
+  kill -KILL -"$run_pid" 2>/dev/null || true
+  pgrep -u "$USER" -f "carla-rpc-port=${CARLA_PORT}" | xargs -r kill -KILL 2>/dev/null || true
+  rm -f "/tmp/.X${X_DISPLAY_NUM}-lock" 2>/dev/null || true
   return "$run_code"
 }
 
