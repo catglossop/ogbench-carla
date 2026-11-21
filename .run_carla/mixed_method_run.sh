@@ -48,6 +48,13 @@ case "$METHOD" in
     AGENT_CFG=impls/configs/steervla_mixed_residual_sweep_config.py
     RUN_GROUP=mixed_residual_rl_b2d_f2d_cs0
     METHOD_ARGS=(--save-buffer true)
+    # Crash-resume (resume_state.json + agent + buffer, committed every resume_interval = 1000 steps): a retry
+    # continues the same run dir / W&B run from its last commit instead of re-training from step 0. The
+    # Bench2Drive BackgroundActivity junction-topology hang at an episode start otherwise costs the whole cell.
+    # Retries therefore keep the first attempt's exp name (the sweep driver appends __aN).
+    EXP_NAME="${EXP_NAME%%__a[0-9]*}"
+    export OGBENCH_RESUME=true   # run_carla.sh passes --resume last, so set it there, not via `--`
+    TAIL_ARGS=()
     ;;
   yay)
     : "${GEMINI_API_KEY:?GEMINI_API_KEY must be exported -- the YAY corrector is a Gemini client}"
@@ -57,6 +64,7 @@ case "$METHOD" in
     export XLA_PYTHON_CLIENT_MEM_FRACTION="${YAY_JAX_MEM_FRACTION:-0.30}"
     export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
     METHOD_ARGS=(--hl-gpu 0 --train-mode rl --critic-mode none --save-buffer false)
+    TAIL_ARGS=()
     ;;
   *) echo "[mixed_run] ABORT: METHOD must be residual or yay, got $METHOD" >&2; exit 2 ;;
 esac
@@ -81,6 +89,7 @@ if [ -e "$LOCK" ]; then
 fi
 
 mkdir -p "$OUT_DIR"
+echo "[mixed_run] tail args: ${TAIL_ARGS[*]:-none}"
 echo "[mixed_run] method=$METHOD route=$ROUTE gpu=$GPU slot=$SLOT exp=$EXP_NAME"
 echo "[mixed_run] seed=$SEED -> carla_seed=$SEED train_seed=$SEED eval_seeds=$EVAL_SEEDS"
 echo "[mixed_run] rpc=$CARLA_PORT tm=$TM_PORT display=:$DISPLAY_NUM group=$RUN_GROUP gemini=$OGBENCH_GEMINI_MODEL"
@@ -95,4 +104,4 @@ CUDA_VISIBLE_DEVICES="$GPU" exec bash run_carla.sh \
   --tm-port "$TM_PORT" --x-display-num "$DISPLAY_NUM" \
   --post-stop-eval-episodes 3 --run-group "$RUN_GROUP" --eval-mode \
   --save-video-local true --wandb-mode online --max-retries 50 \
-  "${METHOD_ARGS[@]}"
+  "${METHOD_ARGS[@]}" "${TAIL_ARGS[@]}"

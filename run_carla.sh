@@ -681,7 +681,9 @@ echo "[run_carla.sh] exp_name=${EXP_NAME}"
 # relaunch with --resume=true. A clean exit (0), SIGINT (130), or a non-crash error (<128,
 # e.g. a config bug) stops the loop.
 attempt=0
-RESUME_FLAG="false"
+# OGBENCH_RESUME=true: resume an earlier run with the same exp name from its first launch (a sweep's
+# retry of a cell that was killed mid-run); main_carla starts fresh when there is no resume_state.
+RESUME_FLAG="${OGBENCH_RESUME:-false}"
 # Completion marker. CARLA frequently aborts in teardown (std::runtime_error from
 # set_actor_simulate_physics), which is SIGABRT -> exit 134, indistinguishable here from a real
 # mid-run crash. Without this, a run that already finished its whole step budget gets relaunched
