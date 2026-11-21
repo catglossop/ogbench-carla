@@ -6226,7 +6226,9 @@ def run_online_residual(
             # the HL loop the equivalent saves rotated the final export off disk entirely.
             if agent is not None and (milestone or recover) and not eval_phase:
                 save_agent(agent, FLAGS.save_dir, step)
-            if recover:
+            # Not in eval_phase: params are not saved there (above), so a resume_state written then would
+            # point at a params_<step>.pkl that never exists and the resume would die on restore (2026-11-20).
+            if recover and not eval_phase:
                 if FLAGS.save_buffer and buffer is not None:
                     _atomic_buffer_save(buffer, _buffer_persist_path(FLAGS.save_dir))
                 _write_resume_state(
@@ -6621,7 +6623,19 @@ def _run_residual_entry(config):
             start_step = int(resume_state["step"])
             episode_count_start = int(resume_state["episode_count"])
             if agent is not None and int(resume_state["agent_epoch"]) >= 0:
-                agent = restore_agent(agent, FLAGS.save_dir, int(resume_state["agent_epoch"]))
+                _epoch = int(resume_state["agent_epoch"])
+                if not os.path.exists(os.path.join(FLAGS.save_dir, f"params_{_epoch}.pkl")):
+                    # Older resume_states written during eval_phase name a checkpoint that was never saved;
+                    # the newest saved one at or below it is the final trained policy.
+                    _have = sorted(
+                        int(m.group(1)) for m in (re.match(r"params_(\d+)\.pkl$", n) for n in os.listdir(FLAGS.save_dir)) if m
+                    )
+                    _older = [e for e in _have if e <= _epoch]
+                    if not _older:
+                        raise FileNotFoundError(f"no params_<step>.pkl <= {_epoch} in {FLAGS.save_dir} to resume from")
+                    print(f"[main_carla] resume: params_{_epoch}.pkl missing; restoring params_{_older[-1]}.pkl", flush=True)
+                    _epoch = _older[-1]
+                agent = restore_agent(agent, FLAGS.save_dir, _epoch)
                 bpath = _buffer_persist_path(FLAGS.save_dir)
                 if os.path.exists(bpath):
                     resumed_buffer = ReplayBuffer.load(bpath, max_size=int(config["buffer_capacity"]))
